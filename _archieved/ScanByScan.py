@@ -5,7 +5,7 @@ import time
 import argparse
 import pandas as pd
 import numpy as np
-import postprocessing.post_processing as post_processing
+import postprocessing.no_ims_2d as no_ims_2d
 from optimization.dictionary import LoadMZML
 from multiprocessing import cpu_count
 from optimization.inference import process_scans_parallel
@@ -30,15 +30,20 @@ def main():
         "--MQ_path",
         type=str,
         required=True,
-        help="path to MaxQuant results (evidence.txt) of the same RAW file, \
-                            used for constructing reference dictionary",
+        help=(
+            "path to MaxQuant results (evidence.txt) of the same RAW file,             "
+            "                used for constructing reference dictionary"
+        ),
     )
     parser.add_argument(
         "-RT_tol",
         "--RT_tol",
         type=float,
         required=True,
-        help="Tolerance when selecting candidate precursor by retention time, unit is minute",
+        help=(
+            "Tolerance when selecting candidate precursor by retention time, unit is"
+            " minute"
+        ),
     )
     parser.add_argument(
         "-cond",
@@ -54,7 +59,9 @@ def main():
         type=float,
         required=False,
         default=0,
-        help="Tolerance when matching theoratical isotope mz value to observed mz value",
+        help=(
+            "Tolerance when matching theoratical isotope mz value to observed mz value"
+        ),
     )
     # required if cond == '2stepNN'
     parser.add_argument(
@@ -79,7 +86,10 @@ def main():
         type=str,
         required=False,
         default="lasso_cd",
-        help="Algorithm to use for sparse encoding, default lasso with coordinate descent.",
+        help=(
+            "Algorithm to use for sparse encoding, default lasso with coordinate"
+            " descent."
+        ),
     )
     parser.add_argument(
         "-IE_ab",
@@ -87,7 +97,10 @@ def main():
         type=float,
         required=False,
         default=0.001,
-        help="Abundance threshold for generating Isotope Envelops when constructing dictionary",
+        help=(
+            "Abundance threshold for generating Isotope Envelops when constructing"
+            " dictionary"
+        ),
     )
     parser.add_argument(
         "-IE_mab",
@@ -95,8 +108,10 @@ def main():
         required=True,
         type=float,
         default=0.4,
-        help="Threshold for maximum allowed missing isotope abundance for a precursor \
-                            to be included into candidate list",
+        help=(
+            "Threshold for maximum allowed missing isotope abundance for a precursor   "
+            "                          to be included into candidate list"
+        ),
     )
     parser.add_argument(
         "-RT_ref",
@@ -104,16 +119,21 @@ def main():
         type=str,
         required=False,
         default="exp",
-        help="Reference retention time, exp - experimental retention time (from MQ), \
-                            pred - prediction from DeepLC, mix - exp RT from MQ if available, else from DeepLC",
+        help=(
+            "Reference retention time, exp - experimental retention time (from MQ),    "
+            "                         pred - prediction from DeepLC, mix - exp RT from"
+            " MQ if available, else from DeepLC"
+        ),
     )
     parser.add_argument(
         "-MQexp",
         "--MQ_exp_path",
         type=str,
         required=False,
-        help="path to MaxQuant experiment \
-                        results (evidence.txt) of the same RAW file, used for comparing inferred intensity",
+        help=(
+            "path to MaxQuant experiment                         results (evidence.txt)"
+            " of the same RAW file, used for comparing inferred intensity"
+        ),
     )
     # Parse the command-line arguments
     args = parser.parse_args()
@@ -269,13 +289,13 @@ def main():
         # process scans
         result_dict = process_scans_parallel(
             n_jobs=cpu_count(),
-            MS1Scans=MS1Scans,  # for small scale testing: MS1Scans.iloc[1000:1050, :]
-            Maxquant_result=Maxquant_result_dict,
+            ms1scans=MS1Scans,  # for small scale testing: MS1Scans.iloc[1000:1050, :]
+            maxquant_ref=Maxquant_result_dict,
             loss="lasso",
             opt_algo=opt_algo,
             # alphas=[0],  # TODO: use alpha = 0 for threshold, change if needed!!
             alpha_criteria=alpha_criteria,
-            AbundanceMissingThres=AbundanceMissingThres,
+            abundance_missing_threshold=AbundanceMissingThres,
         )
         minutes, seconds = divmod(time.time() - start_time, 60)
         logging.info(
@@ -334,7 +354,7 @@ def main():
     Maxquant_result_dict["SumActivation"] = activation.sum(
         axis=1
     )  # sample without smoothing
-    _, sum_raw = post_processing.SmoothActivationMatrix(
+    _, sum_raw = no_ims_2d.SmoothActivationMatrix(
         activation=activation, MS1Scans_noArray=MS1Scans_NoArray, method="Raw"
     )
     sum_raw.to_csv(os.path.join(result_dir, "sum_raw.csv"), index=False)
@@ -342,7 +362,7 @@ def main():
         refit_activation_minima = np.load(output_file + "_activationMinima.npy")
         sum_minima = pd.read_csv(os.path.join(result_dir, "sum_minima.csv"))
     except FileNotFoundError:
-        refit_activation_minima, sum_minima = post_processing.SmoothActivationMatrix(
+        refit_activation_minima, sum_minima = no_ims_2d.SmoothActivationMatrix(
             activation=activation,
             MS1Scans_noArray=MS1Scans_NoArray,
             method="LocalMinima",
@@ -357,7 +377,7 @@ def main():
         (
             refit_activation_gaussian,
             sum_gaussian,
-        ) = post_processing.SmoothActivationMatrix(
+        ) = no_ims_2d.SmoothActivationMatrix(
             activation=activation,
             MS1Scans_noArray=MS1Scans_NoArray,
             method="GaussianKernel",
@@ -407,7 +427,7 @@ def main():
         refit_activation_gaussian, index=Maxquant_result_dict["id"]
     )
 
-    Maxquant_result_dict_act_peak = post_processing.calculate_sum_activation(
+    Maxquant_result_dict_act_peak = no_ims_2d.calculate_sum_activation(
         Maxquant_result=Maxquant_result_dict,
         activation_df=refit_activation_minima_df,
         MS1ScansNoArray=MS1Scans_NoArray,
