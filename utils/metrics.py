@@ -14,6 +14,7 @@ class RT_metrics:
 
     def PlotDeltaRT(self):
         self.y_delta.hist()
+        plt.show()
 
     def CalcDeltaRTwidth(
         self, coverage: int = 95, calc: Literal["abs", "real"] = "abs"
@@ -31,9 +32,9 @@ class RT_metrics:
             self.p_high = np.percentile(self.y_delta, 100 - perc)
             return self.p_high - self.p_low
         elif calc == "abs":
-            width = np.percentile(abs(self.y_delta), self.coverage) * 2
-            self.p_low = -width / 2
-            self.p_high = width / 2
+            width = np.percentile(abs(self.y_delta), self.coverage)
+            self.p_low = -width
+            self.p_high = width
             return width
 
     def CalcPrsCorr(self):

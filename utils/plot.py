@@ -3,7 +3,7 @@ import os
 from typing import List, Set, Union, Literal
 
 import matplotlib.pyplot as plt
-from matplotlib import colormaps
+from matplotlib import colormaps, patches
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -16,6 +16,7 @@ from postprocessing.ims_3d import (
     get_ref_rt_im_range,
     slice_pept_act,
     prepare_slice_pept_act_df,
+    get_bbox_from_mq_exp,
 )
 
 Logger = logging.getLogger(__name__)
@@ -804,8 +805,12 @@ def plot_pept_im_rt_heatmap(
     plot_range: Literal["nonzero", "custom"] = "nonzero",
     rt_range: tuple | None = None,
     im_range: tuple | None = None,
+    pept_batch_idx: int = 0,
+    pept_batch_size: int = 50000,
+    log_intensity: bool = False,
 ):
     """plot the heatmap of peptide ion mobility and retention time"""
+    batch_corrected_pept_mz_rank = pept_mz_rank - pept_batch_idx * pept_batch_size
     (modseq, charge) = maxquant_result_dict.loc[
         maxquant_result_dict["mz_rank"] == pept_mz_rank, ["Modified sequence", "Charge"]
     ].values[0]
@@ -816,35 +821,52 @@ def plot_pept_im_rt_heatmap(
             [
                 "Modified sequence",
                 "Charge",
+                "1/K0",
                 "RT_search_left",
                 "RT_search_right",
                 "RT_search_center",
+                "Retention time",
+                "Number of data points",
+                "Number of scans",
             ],
         ],
     )
     if maxquant_result_exp is not None:
-        Logger.info(
-            "Experiment result: %s",
-            maxquant_result_exp.loc[
-                (maxquant_result_exp["Modified sequence"] == modseq)
-                & (maxquant_result_exp["Charge"] == charge),
-                [
-                    "Modified sequence",
-                    "Charge",
-                    "Calibrated retention time start",
-                    "Calibrated retention time finish",
-                    "Retention time",
-                    "Ion mobility index",
-                    "m/z",
-                    "1/K0",
-                    "1/K0 length",
-                    # "mz_rank",
-                    "Score",
-                    "Intensity",
+        maxquant_result_exp_row = maxquant_result_exp.loc[
+            (maxquant_result_exp["Modified sequence"] == modseq)
+            & (maxquant_result_exp["Charge"] == charge)
+        ]
+        if maxquant_result_exp_row.shape[0] == 0:
+            Logger.warning("No experiment match is found.")
+            bbox = None
+        else:       
+            bbox = get_bbox_from_mq_exp(maxquant_result_exp_row)
+            Logger.info(
+                "Experiment result: %s, bounding box available: %s",
+                maxquant_result_exp_row[
+                    [
+                        "Modified sequence",
+                        "Charge",
+                        "Calibrated retention time start",
+                        "Calibrated retention time finish",
+                        "1/K0",
+                        "1/K0 length",
+                        "Number of data points",
+                        "Retention length",
+                    ]
                 ],
-            ],
-        )
-    rt_idx_range, im_idx_range, reference_entry = get_ref_rt_im_range(
+                bbox,
+            )
+
+    else:
+        bbox = None
+
+    (
+        rt_idx_range,
+        im_idx_range,
+        reference_entry,
+        reference_entry_idx,
+    ) = get_ref_rt_im_range(
         pept_mz_rank=pept_mz_rank,
         maxquant_result_dict=maxquant_result_dict,
         mobility_values_df=mobility_values_df,
@@ -852,8 +874,9 @@ def plot_pept_im_rt_heatmap(
         ref_rt_range=rt_range,
         ref_im_range=im_range,
     )
+    Logger.info("Reference entry: %s", reference_entry)
     slice_pept_act_sparse, rt_idx_range, im_idx_range = slice_pept_act(
-        pept_act_sparse=act_3d[:, :, pept_mz_rank],
+        pept_act_sparse=act_3d[:, :, batch_corrected_pept_mz_rank],
         plot_range=plot_range,
         rt_idx_range=rt_idx_range,
         im_idx_range=im_idx_range,
@@ -861,4 +884,40 @@ def plot_pept_im_rt_heatmap(
     data_3d_heatmap = prepare_slice_pept_act_df(
         slice_pept_act_sparse, rt_idx_range, im_idx_range, mobility_values_df, ms1scans
     )
-    ax = sns.heatmap(data_3d_heatmap)
+    Logger.info("Sum of data 3D heatmap: %s", data_3d_heatmap.sum().sum())
+    if log_intensity:
+        data_3d_heatmap = np.log10(data_3d_heatmap + 1)
+    Logger.info("Data 3D heatmap shape: %s", data_3d_heatmap.shape)
+    # sns.color_palette("icefire", as_cmap=True)
+    ax = sns.heatmap(data_3d_heatmap, cmap="icefire")
+    if bbox is not None:
+        bbox_rt_min_idx = max(np.searchsorted(data_3d_heatmap.index, bbox[0], side="left") - 1, 0)
+        bbox_rt_max_idx = np.searchsorted(data_3d_heatmap.index, bbox[1], side="right")
+        bbox_im_min_idx = max(np.searchsorted(data_3d_heatmap.columns, bbox[3], side="left") - 1, 0)
+        bbox_im_max_idx = np.searchsorted(data_3d_heatmap.columns, bbox[4], side="right")
+        Logger.info(
+            "Bounding box: %s",
+            [
+                bbox_rt_min_idx,
+                bbox_rt_max_idx,
+                bbox_im_min_idx,
+                bbox_im_max_idx,
+            ],
+        )
+        ax.add_patch(
+            patches.Rectangle(
+                xy=(bbox_im_min_idx, bbox_rt_min_idx),
+                width=bbox_im_max_idx - bbox_im_min_idx,
+                height=bbox_rt_max_idx - bbox_rt_min_idx,
+                edgecolor="red",
+                fill=False,
+                lw=3,
+            )
+        )
+        plt.show()
+    else:
+        ref_rt_idx = np.searchsorted(data_3d_heatmap.index, reference_entry[0], side="left")
+        ref_im_idx = np.searchsorted(data_3d_heatmap.columns, reference_entry[1], side="left")
+        ax.scatter(ref_im_idx, ref_rt_idx, marker='o', color='red', s=50, label='Reference Point')
+        ax.legend()
+        plt.show()

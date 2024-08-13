@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import List
+from typing import List, Literal
 from pyteomics import mzml
 import numpy as np
 import pandas as pd
@@ -10,6 +10,85 @@ from scipy.signal import find_peaks, peak_widths
 from scipy.spatial import cKDTree
 
 Logger = logging.getLogger(__name__)
+
+
+def cleanup_maxquant(
+    maxquant_df: pd.DataFrame,
+    remove_decoys: bool = True,
+    how_duplicates: Literal[
+        "keep_all", "keep_highest_int", "keep_one"
+    ] = "keep_highest_int",
+):
+    """clean up the maxquant experiment file, remove decoys and duplicates"""
+    if remove_decoys:
+        n_pre_clean = maxquant_df.shape[0]
+        maxquant_df = maxquant_df.loc[maxquant_df["Reverse"] != "+", :]
+        n_post_clean = maxquant_df.shape[0]
+        Logger.info(
+            "Removing %s decoys from file, %s entries left.",
+            n_pre_clean - n_post_clean,
+            n_post_clean,
+        )
+
+    match how_duplicates:
+        case "keep_all":
+            pass
+        case "keep_highest_int":
+            n_pre_clean = maxquant_df.shape[0]
+            maxquant_df = maxquant_df.sort_values(
+                by=["Modified sequence", "Charge", "Intensity"], ascending=False
+            ).drop_duplicates(subset=["Modified sequence", "Charge"], keep="first")
+            n_post_clean = maxquant_df.shape[0]
+            Logger.info(
+                "Removing %s duplicate entries from experiment file, %s entries left.",
+                n_pre_clean - n_post_clean,
+                n_post_clean,
+            )
+        case "keep_one":
+            maxquant_df = maxquant_df.drop_duplicates(
+                subset=["Modified sequence", "Charge"]
+            )
+        case _:
+            raise ValueError(f"Unknown option {how_duplicates}")
+    return maxquant_df
+
+
+def _merge_activation_results(
+    processed_scan_dict: dict, ref_id: pd.Series, n_ms1scans: int
+):
+    """Merge the activation results."""
+    activation = pd.DataFrame(index=ref_id, columns=range(n_ms1scans))
+    precursor_scan_cos_dist = pd.DataFrame(index=ref_id, columns=range(n_ms1scans))
+    precursor_collinear_sets = pd.DataFrame(index=ref_id, columns=range(n_ms1scans))
+    scan_record_list = []
+    for scan_idx, result_dict_scan in processed_scan_dict.items():
+        if result_dict_scan["activation"] is not None:
+            activation.loc[result_dict_scan["activation"]["precursor"], scan_idx] = (
+                result_dict_scan["activation"]["activation"]
+            )
+        if result_dict_scan["precursor_cos_dist"] is not None:
+            precursor_scan_cos_dist.loc[
+                result_dict_scan["precursor_cos_dist"]["precursor"], scan_idx
+            ] = result_dict_scan["precursor_cos_dist"]["cos_dist"]
+        if result_dict_scan["precursor_collinear_sets"] is not None:
+            precursor_collinear_sets.loc[
+                result_dict_scan["precursor_collinear_sets"]["precursor"], scan_idx
+            ] = result_dict_scan["precursor_collinear_sets"]["collinear_candidates"]
+        scan_record_list.append(result_dict_scan["scans_record"])
+    scan_record = pd.DataFrame(
+        scan_record_list,
+        columns=[
+            "Scan",
+            "Time",
+            "CandidatePrecursorByRT",
+            "FilteredPrecursor",
+            "NumberHighlyCorrDictCandidate",
+            "BestAlpha",
+            "Cosine Dist",
+            "IntensityExplained",
+        ],
+    )
+    return activation, precursor_scan_cos_dist, scan_record, precursor_collinear_sets
 
 
 def _perc_fmt(x, total):

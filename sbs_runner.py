@@ -1,4 +1,5 @@
 """Module providing a function calling the scan by scan optimization."""
+
 import logging
 import os
 
@@ -9,10 +10,10 @@ import fire
 import numpy as np
 import pandas as pd
 
-import postprocessing.post_processing as post_processing
+import postprocessing.no_ims_2d as no_ims_2d
 from postprocessing.peak_selection import match_peaks_to_exp
 from utils.tools import load_mzml
-from utils.config import Config
+from utils.config_json import Config
 from optimization.inference import process_scans_parallel
 from result_analysis import result_analysis
 
@@ -63,9 +64,9 @@ def _merge_activation_results(
     scan_record_list = []
     for scan_idx, result_dict_scan in processed_scan_dict.items():
         if result_dict_scan["activation"] is not None:
-            activation.loc[
-                result_dict_scan["activation"]["precursor"], scan_idx
-            ] = result_dict_scan["activation"]["activation"]
+            activation.loc[result_dict_scan["activation"]["precursor"], scan_idx] = (
+                result_dict_scan["activation"]["activation"]
+            )
         if result_dict_scan["precursor_cos_dist"] is not None:
             precursor_scan_cos_dist.loc[
                 result_dict_scan["precursor_cos_dist"]["precursor"], scan_idx
@@ -134,13 +135,13 @@ def opt_scan_by_scan(config_path: str):
         # process scans
         processed_scan_dict = process_scans_parallel(
             n_jobs=cpu_count(),
-            MS1Scans=ms1scans,  # for small scale testing: MS1Scans.iloc[1000:1050, :]
-            Maxquant_result=maxquant_result_ref,
+            ms1scans=ms1scans,  # for small scale testing: MS1Scans.iloc[1000:1050, :]
+            maxquant_ref=maxquant_result_ref,
             loss="lasso",
             opt_algo=conf.opt_algo,
             alphas=conf.alphas,
             alpha_criteria=conf.alpha_criteria,
-            AbundanceMissingThres=conf.iso_ab_mis_thres,
+            abundance_missing_threshold=conf.iso_ab_mis_thres,
             return_precursor_scan_cos_dist=conf.peak_sel_cos_dist,
         )
 
@@ -190,7 +191,7 @@ def opt_scan_by_scan(config_path: str):
     try:
         sum_raw = pd.read_csv(os.path.join(conf.result_dir, "sum_raw.csv"))
     except FileNotFoundError:
-        _, sum_raw = post_processing.smooth_act_mat(
+        _, sum_raw = no_ims_2d.smooth_act_mat(
             activation=activation,
             ms1scans_no_array=ms1cans_no_array,
             method="Raw",
@@ -201,7 +202,7 @@ def opt_scan_by_scan(config_path: str):
         refit_activation_minima = np.load(conf.output_file + "_activationMinima.npy")
         sum_minima = pd.read_csv(os.path.join(conf.result_dir, "sum_minima.csv"))
     except FileNotFoundError:
-        refit_activation_minima, sum_minima = post_processing.smooth_act_mat(
+        refit_activation_minima, sum_minima = no_ims_2d.smooth_act_mat(
             activation=activation,
             ms1scans_no_array=ms1cans_no_array,
             method="LocalMinima",
@@ -218,7 +219,7 @@ def opt_scan_by_scan(config_path: str):
         (
             refit_activation_gaussian,
             sum_gaussian,
-        ) = post_processing.smooth_act_mat(
+        ) = no_ims_2d.smooth_act_mat(
             activation=activation,
             ms1scans_no_array=ms1cans_no_array,
             method="GaussianKernel",
@@ -233,7 +234,7 @@ def opt_scan_by_scan(config_path: str):
         sum_peak = pd.read_csv(os.path.join(conf.result_dir, "sum_peak.csv"))
         peak_results = pd.read_csv(os.path.join(conf.result_dir, "peak_results.csv"))
     except FileNotFoundError:
-        sum_peak, peak_results = post_processing.select_peak_from_activation(
+        sum_peak, peak_results = no_ims_2d.select_peak_from_activation(
             maxquant_result_ref=maxquant_result_ref,
             ms1scans_no_array=ms1cans_no_array,
             activation=refit_activation_minima,
@@ -256,7 +257,7 @@ def opt_scan_by_scan(config_path: str):
     sbs_result = result_analysis.SBSResult(
         maxquant_ref_df=maxquant_result_ref,
         maxquant_exp_df=maxquant_result_exp,
-        sum_raw=sum_raw,
+        pept_act_sum_df_list=sum_raw,
         sum_gaussian=sum_gaussian,
         sum_minima=sum_minima,
         sum_peak=sum_peak,

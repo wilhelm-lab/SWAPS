@@ -1,93 +1,28 @@
 """Module providing a function calling the scan by scan optimization."""
+
 import logging
 import os
-
+from datetime import datetime
 import time
-from typing import Literal
 import fire
-import numpy as np
 import pandas as pd
-import sparse
-import postprocessing.post_processing as post_processing
-from postprocessing.peak_selection import match_peaks_to_exp
-from utils.config import Config
+from utils.ims_utils import (
+    load_dotd_data,
+    export_im_and_ms1scans,
+    combine_3d_act_and_sum_int,
+)
+from utils.config import get_cfg_defaults
+from utils.singleton_swaps_optimization import swaps_optimization_cfg
 from optimization.inference import process_ims_frames_parallel, generate_id_partitions
+from peak_detection_2d.dataset.prepare_dataset import prepare_training_dataset
+from peak_detection_2d.infer_on_pept_act import infer_on_pept_act
+from peak_detection_2d.train import train
 from result_analysis import result_analysis
-import alphatims.bruker
+
+# from result_analysis import result_analysis
+from prepare_dict.prepare_dict import construct_dict, get_mzrank_batch_cutoff
 
 # os.environ["NUMEXPR_MAX_THREADS"] = "8"
-
-
-def _define_rt_search_range(
-    maxquant_result_dict: pd.DataFrame,
-    rt_tol: float,
-    rt_ref: Literal["exp", "pred", "mix"],
-):
-    """Define the search range for the precursor RT."""
-    if rt_ref == "exp":
-        maxquant_result_dict["RT_search_left"] = (
-            maxquant_result_dict["Calibrated retention time start"] - rt_tol
-        )
-        maxquant_result_dict["RT_search_right"] = (
-            maxquant_result_dict["Calibrated retention time finish"] + rt_tol
-        )
-        rt_ref_act_peak = "Calibrated retention time"
-    elif rt_ref == "pred":
-        maxquant_result_dict["RT_search_left"] = (
-            maxquant_result_dict["predicted_RT"] - rt_tol
-        )
-        maxquant_result_dict["RT_search_right"] = (
-            maxquant_result_dict["predicted_RT"] + rt_tol
-        )
-        rt_ref_act_peak = "predicted_RT"
-    elif rt_ref == "mix":
-        maxquant_result_dict["RT_search_left"] = (
-            maxquant_result_dict["Retention time new"] - rt_tol
-        )
-        maxquant_result_dict["RT_search_right"] = (
-            maxquant_result_dict["Retention time new"] + rt_tol
-        )
-        rt_ref_act_peak = "Retention time new"
-    maxquant_result_dict["RT_search_center"] = maxquant_result_dict[rt_ref_act_peak]
-    return maxquant_result_dict
-
-
-def _merge_activation_results(
-    processed_scan_dict: dict, ref_id: pd.Series, n_ms1scans: int
-):
-    """Merge the activation results."""
-    activation = pd.DataFrame(index=ref_id, columns=range(n_ms1scans))
-    precursor_scan_cos_dist = pd.DataFrame(index=ref_id, columns=range(n_ms1scans))
-    precursor_collinear_sets = pd.DataFrame(index=ref_id, columns=range(n_ms1scans))
-    scan_record_list = []
-    for scan_idx, result_dict_scan in processed_scan_dict.items():
-        if result_dict_scan["activation"] is not None:
-            activation.loc[
-                result_dict_scan["activation"]["precursor"], scan_idx
-            ] = result_dict_scan["activation"]["activation"]
-        if result_dict_scan["precursor_cos_dist"] is not None:
-            precursor_scan_cos_dist.loc[
-                result_dict_scan["precursor_cos_dist"]["precursor"], scan_idx
-            ] = result_dict_scan["precursor_cos_dist"]["cos_dist"]
-        if result_dict_scan["precursor_collinear_sets"] is not None:
-            precursor_collinear_sets.loc[
-                result_dict_scan["precursor_collinear_sets"]["precursor"], scan_idx
-            ] = result_dict_scan["precursor_collinear_sets"]["collinear_candidates"]
-        scan_record_list.append(result_dict_scan["scans_record"])
-    scan_record = pd.DataFrame(
-        scan_record_list,
-        columns=[
-            "Scan",
-            "Time",
-            "CandidatePrecursorByRT",
-            "FilteredPrecursor",
-            "NumberHighlyCorrDictCandidate",
-            "BestAlpha",
-            "Cosine Dist",
-            "IntensityExplained",
-        ],
-    )
-    return activation, precursor_scan_cos_dist, scan_record, precursor_collinear_sets
 
 
 def opt_scan_by_scan(config_path: str):
@@ -96,195 +31,265 @@ def opt_scan_by_scan(config_path: str):
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
         level=logging.INFO,
     )
-    conf = Config(config_path)
-    conf.make_result_dirs()
 
-    # start analysis
-    start_time_init = time.time()
+    cfg = get_cfg_defaults(swaps_optimization_cfg)
+    name_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    if config_path is not None:
+        cfg.merge_from_file(config_path)
+        logging.info("merge with cfg file %s", config_path)
+    if cfg.ADD_TIMESTAMP_TO_RESULT_PATH:
+        cfg.RESULT_PATH = cfg.RESULT_PATH + "_" + name_timestamp
+        cfg.ADD_TIMESTAMP_TO_RESULT_PATH = False  # in case of reuse of config file
     logging.info("==================Load data==================")
-
-    # Load data
-    maxquant_result_ref = pd.read_pickle(filepath_or_buffer=conf.mq_ref_path)
-    maxquant_result_exp = pd.read_csv(conf.mq_exp_path, sep="\t", low_memory=False)
-    data = alphatims.bruker.TimsTOF(conf.d_path)
-    hdf_path = os.path.join(data.directory, f"{data.sample_name}.hdf")
-    if not os.path.isfile(hdf_path):
-        hdf_file_name = data.save_as_hdf(
-            directory=data.directory, file_name=hdf_path, overwrite=False
-        )
+    os.makedirs(cfg.RESULT_PATH, exist_ok=True)
+    if cfg.N_CPU < 0:
+        cfg.N_CPU = int(os.getenv("SLURM_CPUS_PER_TASK", 1))
+        logging.info("Number of CPUs: %s", cfg.N_CPU)
+    if cfg.OPTIMIZATION.N_BATCH < 0:
+        cfg.OPTIMIZATION.N_BATCH = cfg.N_CPU  # set batches as the same as N_CPU
+    if cfg.DICT_PICKLE_PATH != "":
+        maxquant_result_ref = pd.read_pickle(filepath_or_buffer=cfg.DICT_PICKLE_PATH)
     else:
-        logging.info("HDF file already exists")
+        # Load data
+        data, hdf_file_name = load_dotd_data(
+            cfg.DATA_PATH, swaps_result_dir=cfg.EXPORT_DATA_HDF5_DIR
+        )
 
-    # ms1scans
-    ms1scans = data.frames.loc[data.frames.MsMsType == 0]
-    ms1scans["Time_minute"] = ms1scans["Time"] / 60
-    ms1scans["MS1_frame_idx"] = (
-        ms1scans["Time"].rank(axis=0, method="first", ascending=True).astype(int) - 1
-    )
-    ms1scans.set_index("MS1_frame_idx", inplace=True, drop=False)
-    ms1scans.to_csv(os.path.join(conf.result_dir, "ms1scans.csv"))
+        # Get the lowest level directory name with .d extension
+        dir_with_extension = os.path.basename(os.path.normpath(cfg.DATA_PATH))
+        if (
+            cfg.FILTER_EXP_BY_RAW_FILE == ""
+        ):  # if not specified, get the lowest level directory name with .d extension, by default None
+            cfg.FILTER_EXP_BY_RAW_FILE = dir_with_extension.rstrip(".d")
 
-    minutes, seconds = divmod(time.time() - start_time_init, 60)
-    logging.info("Script execution time: %dm %ds", int(minutes), int(seconds))
+        ms1scans, mobility_values_df = export_im_and_ms1scans(
+            data=data, swaps_result_dir=cfg.RESULT_PATH
+        )
+        maxquant_result_exp = pd.read_csv(cfg.MQ_EXP_PATH, sep="\t", low_memory=False)
+        maxquant_result_exp = maxquant_result_exp.loc[
+            maxquant_result_exp["Raw file"] == cfg.FILTER_EXP_BY_RAW_FILE,
+            :,
+        ]
+        maxquant_result_ref = pd.read_csv(cfg.MQ_REF_PATH, sep="\t", low_memory=False)
+        # TODO filter ref df if needed
 
-    # mobilty values
-    mobility_values = np.sort(data.mobility_values)
-    mobility_values_df = pd.DataFrame(
-        mobility_values, columns=["mobility_values"]
-    ).reset_index()
-    mobility_values_df.rename(columns={"index": "mobility_values_index"}, inplace=True)
-    mobility_values_df.to_csv(os.path.join(conf.result_dir, "mobility_values.csv"))
-
-    # add extra information into ref file, e.g. deifne RT search range
-    maxquant_result_ref = _define_rt_search_range(
-        maxquant_result_ref, conf.rt_tol, conf.rt_ref
-    )
-    maxquant_result_ref["mz_length"] = maxquant_result_ref["IsoMZ"].apply(
-        lambda x: len(x)
-    )
-    maxquant_result_ref = maxquant_result_ref.sort_values("1/K0")
-    maxquant_result_ref_with_im_index = pd.merge_asof(
-        left=maxquant_result_ref,
-        right=mobility_values_df,
-        left_on="1/K0",
-        right_on="mobility_values",
-        direction="nearest",
-    )
-    maxquant_result_ref_with_im_index_sortmz = maxquant_result_ref_with_im_index.copy()
-    maxquant_result_ref_with_im_index_sortmz["mz_rank"] = (
-        maxquant_result_ref_with_im_index_sortmz["m/z"]
-        .rank(axis=0, method="first", ascending=True)
-        .astype(int)
-    )
-    maxquant_result_ref_with_im_index_sortmz.to_pickle(
-        os.path.join(conf.result_dir, "maxquant_result_ref.pkl")
-    )
+        maxquant_result_ref, dict_pickle_path, cfg_prepare_dict = construct_dict(
+            cfg_prepare_dict=cfg.PREPARE_DICT,
+            maxquant_exp_df=maxquant_result_exp,
+            maxquant_ref_df=maxquant_result_ref,
+            result_dir=os.path.join(cfg.RESULT_PATH),
+            mobility_values_df=mobility_values_df,
+            rt_values_df=ms1scans,
+            random_seed=cfg.RANDOM_SEED,
+            n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
+        )
+        peptact_shape = (
+            (
+                len(ms1scans.index.values)
+                + 1,  # this index is rank, starting from 1, add 1 for the last frame
+                len(mobility_values_df),
+                len(maxquant_result_ref.mz_rank)
+                + 1,  # this index is rank, starting from 1, add 1 for the last frame
+            ),
+        )
+        cfg.PREPARE_DICT = cfg_prepare_dict
+        cfg.DICT_PICKLE_PATH = dict_pickle_path
+        cfg.OPTIMIZATION.PEPTACT_SHAPE = peptact_shape
+        cfg.dump(
+            stream=open(
+                os.path.join(cfg.RESULT_PATH, f"config_{name_timestamp}.yaml"),
+                "w",
+                encoding="utf-8",
+            )
+        )
+        logging.info(
+            "Finished dictionary preparation and saved config to %s",
+            os.path.join(cfg.RESULT_PATH, f"config_{name_timestamp}.yaml"),
+        )
+    act_dir = os.path.join(cfg.RESULT_PATH, "results", "activation")
     try:  # try and read results
         pept_act_sum_df = pd.read_csv(
-            os.path.join(conf.result_dir, "pept_act_sum.csv"), index_col=0
-        )
+            os.path.join(act_dir, "pept_act_sum.csv"), index_col=0
+        )  # TODO: pept_act_sum is not the end
+        if cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM:
+            pept_act_sum_filter_by_im_df = pd.read_csv(
+                os.path.join(act_dir, "pept_act_sum_filter_by_im.csv"), index_col=0
+            )
         logging.info("Loaded pre-calculated optimization.")
     except FileNotFoundError:
-        logging.info("Precalculated optimization not found, start Scan By Scan.")
-        logging.info("==================Scan By Scan==================")
-        # Optimization
-        start_time = time.time()
-        logging.info("-----------------Scan by Scan Optimization-----------------")
-        n_workers = conf.n_cpu
-        n_batch = conf.n_batch
-        logging.info("Number of batches: %s", n_batch)
-        batch_scan_indices = generate_id_partitions(
-            n_batch=n_batch,
-            id_array=ms1scans.index.values[conf.start_frame : conf.end_frame],
-            how="round_robin",
-        )  # for small scale testing: ms1scans["Id"].iloc[0:500]
-        logging.info("indices in first batch: %s", batch_scan_indices[0])
-        # process scans
-        process_ims_frames_parallel(
-            data=data,
-            n_jobs=n_workers,
-            ms1scans=ms1scans,
-            batch_scan_indices=batch_scan_indices,
-            maxquant_ref=maxquant_result_ref_with_im_index_sortmz,
-            mobility_values=mobility_values,
-            delta_mobility_thres=conf.delta_mobility_thres,
-            mz_bin_digits=conf.mz_bin_digits,
-            process_in_blocks=True,
-            width=conf.im_peak_extraction_width,
-            path_prefix=conf.output_file,
-            return_im_pept_act=True,
-            extract_im_peak=False,
-            n_blocks_by_pept= conf.n_blocks_by_pept
-        )
-
-        minutes, seconds = divmod(time.time() - start_time, 60)
-        logging.info(
-            "Process scans - Script execution time: %dm %ds", int(minutes), int(seconds)
-        )
-
-        # logging.info("=================Post Processing==================")
-
-        for batch_num in range(conf.n_batch):
-            # logging.info("Batch %s, output file path %s", batch_num, conf.output_file)
-            act_3d = sparse.load_npz(
-                conf.output_file + f"_im_rt_pept_act_coo_batch{batch_num}.npz"
+        try:
+            combine_3d_act_and_sum_int(
+                n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
+                n_batch=cfg.OPTIMIZATION.N_BATCH,
+                act_dir=act_dir,
+                remove_batch_file=False,
+                calc_pept_act_sum_filter_by_im=cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM,
+                maxquant_result_ref=maxquant_result_ref,
             )
-            pept_act_sum = act_3d.sum(axis=(0, 1))
-            logging.info("NNZ size of batch %s act_3d %s", batch_num, act_3d.nnz)
-            if batch_num == 0:
-                act_3d_all = act_3d
-                pept_act_sum_all = pept_act_sum
-                del act_3d, pept_act_sum
-            else:
-                act_3d_all += act_3d
-                pept_act_sum_all += pept_act_sum
-                logging.info("NNZ size of act_3d_all %s", act_3d_all.nnz)
-                del act_3d, pept_act_sum
-        # pept_act_sum = act_3d_all.sum(axis=(0, 1))
-        sparse.save_npz(
-            conf.output_file + "pept_act_sum.npz",
-            pept_act_sum_all,
+            logging.info("Loaded pre-calculated activation")
+        except FileNotFoundError:
+            logging.info("Precalculated activation not found, start Scan By Scan.")
+
+            logging.info("==================Scan By Scan==================")
+            # act_dir = os.path.join(cfg.RESULT_PATH, "results", "activation")
+            os.makedirs(act_dir, exist_ok=True)
+            # Optimization
+            start_time = time.time()
+            logging.info("-----------------Scan by Scan Optimization-----------------")
+
+            n_batch = cfg.OPTIMIZATION.N_BATCH
+            logging.info("Number of batches: %s", n_batch)
+            batch_scan_indices = generate_id_partitions(
+                n_batch=n_batch,
+                id_array=ms1scans.index.values,
+                how="round_robin",
+            )  # for small scale testing: ms1scans["Id"].iloc[0:500]
+            logging.info("indices in first batch: %s", batch_scan_indices[0])
+            # process scans
+            cutoff = get_mzrank_batch_cutoff(maxquant_result_ref)
+            process_ims_frames_parallel(
+                data=data,
+                n_jobs=cfg.N_CPU,
+                ms1scans=ms1scans,
+                batch_scan_indices=batch_scan_indices,
+                maxquant_ref=maxquant_result_ref,
+                mobility_values=mobility_values_df,
+                cutoff=cutoff,
+                delta_mobility_thres=cfg.OPTIMIZATION.DELTA_MOBILITY_INDEX_THRES,
+                mz_bin_digits=cfg.PREPARE_DICT.MZ_BIN_DIGITS,
+                process_in_blocks=True,
+                width=cfg.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH,
+                save_dir=act_dir,
+                return_im_pept_act=True,
+                extract_im_peak=False,
+            )
+
+            minutes, seconds = divmod(time.time() - start_time, 60)
+            logging.info(
+                "Process scans - Script execution time: %dm %ds",
+                int(minutes),
+                int(seconds),
+            )
+
+            logging.info("=================Post Processing==================")
+            # TODO: test when pept_batch_number > 1
+            combine_3d_act_and_sum_int(
+                n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
+                n_batch=cfg.OPTIMIZATION.N_BATCH,
+                act_dir=act_dir,
+                remove_batch_file=False,
+                calc_pept_act_sum_filter_by_im=cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM,
+                maxquant_result_ref=maxquant_result_ref,
+            )
+
+    if cfg.PEAK_SELECTION.ENABLE:
+        logging.info("==================Peak Selection==================")
+        if len(cfg.PEAK_SELECTION.TRAINING_DATA) == 0:
+            logging.info("No training data provided, start preparing training data.")
+            training_file_paths = prepare_training_dataset(
+                result_dir=cfg.RESULT_PATH,
+                maxquant_dict=maxquant_result_ref,
+                n_workers=cfg.N_CPU,
+                include_decoys=cfg.PEAK_SELECTION.INCLUDE_DECOYS,
+            )
+            cfg.PEAK_SELECTION.TRAINING_DATA = training_file_paths
+            cfg.dump(
+                stream=open(
+                    os.path.join(
+                        cfg.RESULT_PATH,
+                        f"config_{name_timestamp}.yaml",
+                    ),
+                    "w",
+                    encoding="utf-8",
+                )
+            )
+            logging.info(
+                "Finished peak selection dataset preparation and saved config to %s",
+                os.path.join(cfg.RESULT_PATH, f"config_{name_timestamp}.yaml"),
+            )
+        train_name_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        ps_exp_dir = os.path.join(
+            cfg.RESULT_PATH, "peak_selection", "exp_" + train_name_timestamp
         )
-        pept_act_sum_array = sparse.asnumpy(pept_act_sum_all)
-        del pept_act_sum_all
-        pept_act_sum_df = pd.DataFrame(
-            pept_act_sum_array[:],
-            columns=["pept_act_sum"],
-            index=np.arange(pept_act_sum_array.shape[0]),
+        if not os.path.exists(ps_exp_dir):
+            os.mkdir(ps_exp_dir)
+        best_model_path = train(
+            cfg_peak_selection=cfg.PEAK_SELECTION,
+            ps_exp_dir=ps_exp_dir,
+            random_state=cfg.RANDOM_SEED,
+            maxquant_dict=maxquant_result_ref,
         )
-        pept_act_sum_df.to_csv(os.path.join(conf.result_dir, "pept_act_sum.csv"))
-
-    logging.info("==================Result Analaysis==================")
-    if "predicted_RT" not in maxquant_result_ref_with_im_index_sortmz.columns:
-        maxquant_result_ref_with_im_index_sortmz[
-            "predicted_RT"
-        ] = maxquant_result_ref_with_im_index_sortmz["RT_search_center"]
-
-    sbs_result = result_analysis.SBSResult(
-        maxquant_ref_df=maxquant_result_ref_with_im_index_sortmz,
-        maxquant_exp_df=maxquant_result_exp,
-        sum_raw=pept_act_sum_df,
-        ims=True,
-    )
-
-    sbs_result.compare_with_maxquant_exp_int(
-        filter_by_rt_overlap=None, handle_mul_exp_pcm="drop", save_dir=conf.report_dir
-    )
-    merged_df = sbs_result.ref_exp_df_inner
-
-    # peak_results_matched = match_peaks_to_exp(
-    #     ref_exp_inner_df=merged_df, peak_results=peak_results
-    # )
-    # peak_results_matched.to_csv(
-    #     os.path.join(conf.result_dir, "peak_results_matched.csv")
-    # )
-
-    # Correlation
-    for sum_col in sbs_result.sum_cols:
-        sbs_result.plot_intensity_corr(
-            inf_col=sum_col, interactive=False, save_dir=conf.report_dir
+        # Inference
+        logging.info("Finished training peak selection model, start inference...")
+        infer_on_pept_act(
+            cfg=cfg,
+            best_model_path=best_model_path,
+            maxquant_dict=maxquant_result_ref,
+            ps_exp_dir=ps_exp_dir,
         )
+    if cfg.RESULT_ANALYSIS.ENABLE:  # TODO: haven't cleaned up the code
+        logging.info("==================Result Analaysis==================")
 
-    # Overlap with MQ
-    sbs_result.plot_overlap_with_MQ(save_dir=conf.report_dir, show_ref=True)
+        if cfg.RESULT_ANALYSIS.MQ_EXP_PATH == "":
+            maxquant_result_exp = maxquant_result_ref
+            logging.info(
+                "Experiment data not given, using reference intensity as experiment"
+                " data!"
+            )
+        elif cfg.RESULT_ANALYSIS.MQ_EXP_PATH[-4:] == ".txt":
+            maxquant_result_exp = pd.read_csv(cfg.RESULT_ANALYSIS.MQ_EXP_PATH, sep="\t")
+        elif cfg.RESULT_ANALYSIS.MQ_EXP_PATH[-4:] == ".pkl":
+            maxquant_result_exp = pd.read_pickle(cfg.RESULT_ANALYSIS.MQ_EXP_PATH)
+        elif cfg.RESULT_ANALYSIS.MQ_EXP_PATH[-4:] == ".csv":
+            maxquant_result_exp = pd.read_csv(cfg.RESULT_ANALYSIS.MQ_EXP_PATH)
 
-    # # evaluate target and decoy
-    # sbs_result.eval_target_decoy(save_dir=conf.report_dir)
+        if cfg.RESULT_ANALYSIS.FILTER_BY_RAW_FILE is not None:
+            if cfg.RESULT_ANALYSIS.FILTER_BY_RAW_FILE == "":
+                cfg.RESULT_ANALYSIS.FILTER_BY_RAW_FILE = dir_with_extension.rstrip(".d")
+            logging.info(
+                "Filtering experiment data by raw file: %s",
+                cfg.RESULT_ANALYSIS.FILTER_BY_RAW_FILE,
+            )
+            maxquant_result_exp = maxquant_result_exp[
+                maxquant_result_exp["Raw file"]
+                == cfg.RESULT_ANALYSIS.FILTER_BY_RAW_FILE
+            ]
+        eval_dir = os.path.join(cfg.RESULT_PATH, "results", "evaluation")
+        os.makedirs(eval_dir, exist_ok=True)
+        # if "predicted_RT" not in maxquant_result_ref.columns:
+        #     maxquant_result_ref["predicted_RT"] = maxquant_result_ref[
+        #         "RT_search_center"
+        #     ]
 
-    # # selected alpha
-    # if conf.opt_algo == "lasso_cd":
-    #     result_analysis.plot_alphas_across_scan(
-    #         scan_record=scan_record, x="Time", save_dir=conf.report_dir
-    #     )
+        pept_act_sum_df = pd.read_csv(os.path.join(act_dir, "pept_act_sum.csv"))
+        pept_act_sum_df_list = [pept_act_sum_df]
+        if cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM:
+            pept_act_sum_filter_by_im_df = pd.read_csv(
+                os.path.join(act_dir, "pept_act_sum_filter_by_im.csv")
+            )
+            pept_act_sum_df_list.append(pept_act_sum_filter_by_im_df)
 
-    # # Report
-    # scan_record = result_analysis.generate_result_report(
-    #     scan_record=scan_record,
-    #     intensity_cols=[sbs_result.ref_df[col] for col in sbs_result.sum_cols]
-    #     + [sbs_result.ref_exp_df_inner["Intensity"]],
-    #     save_dir=conf.report_dir,
-    # )
-    # scan_record.to_csv(conf.output_file + "_scan_record.csv")
+        sbs_result = result_analysis.SBSResult(
+            maxquant_ref_df=maxquant_result_ref,
+            # maxquant_merge_df=maxquant_result_ref,
+            maxquant_exp_df=maxquant_result_exp,
+            filter_by_rt_ovelap=cfg.RESULT_ANALYSIS.FILTER_BY_RT_OVERLAP,
+            pept_act_sum_df_list=pept_act_sum_df_list,
+            ims=True,
+            save_dir=eval_dir,
+        )
+        for col in sbs_result.sum_cols:
+            if col != "mz_rank":
+                sbs_result.plot_intensity_corr(
+                    ref_col="Intensity",
+                    inf_col=col,
+                    contour=False,
+                    # save_dir=None,
+                    # interactive = True, hover_data = ['Modified sequence', 'Charge', 'mz_rank']
+                )
+
+        # Overlap with MQ
+        sbs_result.plot_overlap_with_MQ(show_ref=True)
 
 
 if __name__ == "__main__":

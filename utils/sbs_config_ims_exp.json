@@ -1,5 +1,6 @@
 {
     "d_path": "/cmnfs/proj/ORIGINS/data/brain/FreshFrozenBrain/SingleShot/DDA/ssDDA_P064428_Fresh1_5ug_R1_BD5_1_4921.d",
+    "use_ims": true,
     "MQ_ref_path": "/cmnfs/proj/ORIGINS/data/brain/txt_ssDDA_LFQ_noMBR/evidence_fresh1_asref.pkl",
     "MQ_exp_path": "/cmnfs/proj/ORIGINS/data/brain/txt_ssDDA_LFQ_noMBR/evidence_fresh1.txt",
     "RT_tol": 0.0,
