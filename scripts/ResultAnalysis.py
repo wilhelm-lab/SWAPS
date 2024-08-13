@@ -2,7 +2,7 @@ import os
 import numpy as np
 import pandas as pd
 import argparse
-from postprocessing import post_processing
+from postprocessing import no_ims_2d
 
 
 def main():
@@ -67,7 +67,7 @@ def main():
         refit_activation_minima = np.load(output_file + "_activationMinima.npy")
         sum_minima = pd.read_csv(os.path.join(result_dir, "sum_minima.csv"))
     except FileNotFoundError:
-        refit_activation_minima, sum_minima = post_processing.smooth_act_mat(
+        refit_activation_minima, sum_minima = no_ims_2d.smooth_act_mat(
             activation=activation,
             ms1scans_no_array=MS1Scans_NoArray,
             method="LocalMinima",
@@ -81,7 +81,7 @@ def main():
         (
             refit_activation_gaussian,
             sum_gaussian,
-        ) = post_processing.smooth_act_mat(
+        ) = no_ims_2d.smooth_act_mat(
             activation=activation,
             ms1scans_no_array=MS1Scans_NoArray,
             method="GaussianKernel",
@@ -90,14 +90,14 @@ def main():
         sum_gaussian.to_csv(os.path.join(result_dir, "sum_gaussian.csv"), index=False)
 
     # Correlation
-    Maxquant_result_filtered = post_processing.TransformAndFilter(
+    Maxquant_result_filtered = no_ims_2d.TransformAndFilter(
         Maxquant_result=Maxquant_result
     )
     (
         Maxquant_result_filtered["RegressionIntensity"],
         Maxquant_result_filtered["AbsResidue"],
         _,
-    ) = post_processing.PlotCorr(
+    ) = no_ims_2d.PlotCorr(
         Maxquant_result_filtered["Intensity"],
         Maxquant_result_filtered["SumActivation"],
         save_dir=report_dir,
@@ -108,12 +108,12 @@ def main():
         sum_gaussian.iloc[:, 0],
         sum_gaussian.iloc[:, 1],
     ]:
-        _, _, _ = post_processing.PlotCorr(
+        _, _, _ = no_ims_2d.PlotCorr(
             Maxquant_result["Intensity"], sum_col, save_dir=report_dir
         )
 
     # Report
-    NonEmptyScans = post_processing.GenerateResultReport(
+    NonEmptyScans = no_ims_2d.GenerateResultReport(
         Maxquant_result=Maxquant_result,
         MS1Scan_noArray=MS1Scans_NoArray,
         emptyScans=emptyScans,
@@ -133,7 +133,7 @@ def main():
     Accurate50_idx = Maxquant_result_filtered["AbsResidue"].nsmallest(50).index
     Inaccurate50_idx = Maxquant_result_filtered["AbsResidue"].nlargest(50).index
     for idx in Accurate50_idx:
-        _ = post_processing.PlotActivation(
+        _ = no_ims_2d.PlotActivation(
             MaxquantEntry=Maxquant_result.iloc[idx, :],
             PrecursorTimeProfiles=[
                 activation[idx, :],
@@ -149,7 +149,7 @@ def main():
             save_dir=os.path.join(report_dir, "activation", "accurate"),
         )
     for idx in Inaccurate50_idx:
-        _ = post_processing.PlotActivation(
+        _ = no_ims_2d.PlotActivation(
             MaxquantEntry=Maxquant_result.iloc[idx, :],
             PrecursorTimeProfiles=[
                 activation[idx, :],

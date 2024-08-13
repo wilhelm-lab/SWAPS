@@ -1,4 +1,5 @@
 """ Module for comparing with maxquant results """
+
 import logging
 from typing import Literal, List
 import pandas as pd
@@ -11,54 +12,70 @@ Logger = logging.getLogger(__name__)
 
 
 def merge_with_maxquant_exp(
-    maxquant_exp_df: pd.DataFrame,
     maxquant_ref_df: pd.DataFrame,
-    ref_cols: List[str] | None = None,
+    maxquant_exp_df: pd.DataFrame,
+    ref_cols: List[str] = None,
+    exp_cols: List[str] = None,
+    other_cols: List[str] = None,
+    how_join: Literal["right", "left", "outer"] = "right",
 ):
     """compare the inferred intensities from maxquant and SBS,
         when a different dictionary then experiment MQ result is used
 
-    :MQ_exp: the maxquant result of the raw data whose MS1 scans were used for inference
-    :MQ_dict: the maxquant result used for SBS inference
+    :maxquant_ref_df: the maxquant result of reference dictionary, usually deeper than the experiment
+    :maxquant_exp_df: the maxquant result of the experiment MS2 data, usually shallower than the reference
+    :ref_cols: columns to keep from the maxquant_ref_df
+    :exp_cols: columns to keep from the maxquant_exp_df
+    :other_cols: columns to keep from reference
+    :how_join: how to join the two dataframes, "left" means keeping all entries from reference, /
+        right means keeping all entries from experiment, usually used in result evaluation, /
+        outer means keeping all entries from both dataframes, usually used in constructing complete dictionary
     """
-
-    maxquant_ref_and_exp = pd.merge(
-        left=maxquant_ref_df[
-            [
-                "Modified sequence",
-                "Charge",
-                "predicted_RT",
-                "m/z",
-                "Mass",
-                "Length",
-                "id",
-                "RT_search_left",
-                "RT_search_right",
-                "mz_rank",
-                "Reverse",
-            ]
-            + ref_cols
-        ],
-        right=maxquant_exp_df[
-            [
-                "Modified sequence",
-                "Charge",
-                "Calibrated retention time start",
-                "Calibrated retention time finish",
-                "Calibrated retention time",
-                "Retention time",
-                "Intensity",
-            ]
-        ],
-        on=["Modified sequence", "Charge"],
-        how="right",
-        indicator=True,
-    )
+    for cols in [ref_cols, exp_cols, other_cols]:  # fix [dangerous-default-value]
+        if cols is None:
+            cols = []
+    ref_fix_cols = [
+        "Sequence",
+        "Modified sequence",
+        "Charge",
+        "predicted_RT",
+        "m/z",
+        "Mass",
+        "Length",
+        "id",
+        "RT_search_left",
+        "RT_search_right",
+        "RT_search_center",
+        "mz_rank",
+        "Reverse",
+    ]
+    exp_fix_cols = [
+        "Modified sequence",
+        "Charge",
+        "Calibrated retention time start",
+        "Calibrated retention time finish",
+        "Calibrated retention time",
+        "Retention time",
+        "Intensity",
+    ]
+    if "mz_rank" in maxquant_exp_df.columns:
+        maxquant_ref_and_exp = pd.merge(
+            left=maxquant_ref_df[set(ref_fix_cols + ref_cols + other_cols)],
+            right=maxquant_exp_df[set(exp_fix_cols + exp_cols + ["mz_rank"])],
+            on=["mz_rank", "Modified sequence", "Charge"],
+            how=how_join,
+            indicator=True,
+        )
+    else:
+        maxquant_ref_and_exp = pd.merge(
+            left=maxquant_ref_df[set(ref_fix_cols + ref_cols + other_cols)],
+            right=maxquant_exp_df[set(exp_fix_cols + exp_cols)],
+            on=["Modified sequence", "Charge"],
+            how=how_join,
+            indicator=True,
+        )
     Logger.debug("Experiment file has %s entries.", maxquant_exp_df.shape[0])
     Logger.debug("Merged file has %s entries.", maxquant_ref_and_exp.shape[0])
-    # Logger.debug(
-    #     "columns after merge MQ dict and MQ exp %s", maxquant_ref_and_exp.columns
-    # )
     return maxquant_ref_and_exp
 
 
@@ -74,16 +91,16 @@ def evaluate_rt_overlap(
         ):
             return "full_overlap"
         elif (
-            row["RT_search_right"] >= row["Calibrated retention time start"]
-            or row["RT_search_left"] <= row["Calibrated retention time finish"]
+            row["RT_search_right"] <= row["Calibrated retention time start"]
+            or row["RT_search_left"] >= row["Calibrated retention time finish"]
         ):
-            return "partial_overlap"
+            return "no_overlap"
         elif np.isnan(row["Calibrated retention time start"]):
             return "no_entry_in_exp"
         elif np.isnan(row["RT_search_left"]):
             return "no_entry_in_ref"
         else:
-            return "no_overlap"
+            return "partial_overlap"
 
     maxquant_ref_and_exp["RT_overlap"] = maxquant_ref_and_exp.apply(
         _categorize_ranges, axis=1
@@ -96,31 +113,104 @@ def evaluate_rt_overlap(
         labels=maxquant_ref_and_exp["RT_overlap"].value_counts().index,
         autopct=lambda x: _perc_fmt(x, maxquant_ref_and_exp.shape[0]),
     )
-    save_plot(save_dir=save_dir, fig_type_name="PieChart_", fig_spec_name="RT_overlap")
+    save_plot(save_dir=save_dir, fig_type_name="PieChart", fig_spec_name="RT_overlap")
+    return maxquant_ref_and_exp
+
+
+def evaluate_im_overlap(
+    maxquant_ref_and_exp: pd.DataFrame,
+    save_dir: str | None = None,
+    delta_im: float = 0.04,
+):
+    """evaluate the IM overlap between the experiment and reference file"""
+    maxquant_ref_and_exp["IM_search_left"] = (
+        maxquant_ref_and_exp["mobility_values"] - delta_im
+    )
+    maxquant_ref_and_exp["IM_search_right"] = (
+        maxquant_ref_and_exp["mobility_values"] + delta_im
+    )
+
+    def _categorize_ranges(row):
+        if (
+            row["IM_search_left"] <= row["1/K0"] - row["1/K0 length"] / 2
+            and row["IM_search_right"] >= row["1/K0"] + row["1/K0 length"] / 2
+        ):
+            return "full_overlap"
+        elif (
+            row["IM_search_left"] >= row["1/K0"] + row["1/K0 length"] / 2
+            or row["IM_search_right"] <= row["1/K0"] - row["1/K0 length"] / 2
+        ):
+            return "no_overlap"
+
+        elif np.isnan(row["1/K0"]):
+            return "no_entry_in_exp"
+        elif np.isnan(row["IM_search_left"]):
+            return "no_entry_in_ref"
+        else:
+            return "partial_overlap"
+
+    maxquant_ref_and_exp["IM_overlap"] = maxquant_ref_and_exp.apply(
+        _categorize_ranges, axis=1
+    )
+    Logger.info(
+        "IM overlap counts: %s", maxquant_ref_and_exp["IM_overlap"].value_counts()
+    )
+    plt.pie(
+        maxquant_ref_and_exp["IM_overlap"].value_counts().values,
+        labels=maxquant_ref_and_exp["IM_overlap"].value_counts().index,
+        autopct=lambda x: _perc_fmt(x, maxquant_ref_and_exp.shape[0]),
+    )
+    save_plot(save_dir=save_dir, fig_type_name="PieChart_", fig_spec_name="IM_overlap")
     return maxquant_ref_and_exp
 
 
 def filter_merged_by_rt_overlap(
     maxquant_ref_and_exp: pd.DataFrame,
-    condition: List[Literal["full_overlap", "partial_overlap", "no_overlap"]]
-    | None = None,
+    keep_condition: (
+        List[Literal["full_overlap", "partial_overlap", "no_overlap"]] | None
+    ) = None,
 ):
     """filter the merged maxquant result by RT_overlap condition"""
-    if condition is None:
-        condition = ["full_overlap", "partial_overlap"]
-        Logger.info("No RT_overlap condition given, using %s", condition)
+    if keep_condition is None:
+        keep_condition = ["full_overlap", "partial_overlap"]
+        Logger.info("No RT_overlap condition given, using %s", keep_condition)
     n_pre_filter = maxquant_ref_and_exp.shape[0]
     filtered = maxquant_ref_and_exp.loc[
-        maxquant_ref_and_exp["RT_overlap"].isin(condition), :
+        maxquant_ref_and_exp["RT_overlap"].isin(keep_condition), :
     ]
     n_post_filter = filtered.shape[0]
     Logger.info(
-        "Removing %s entries with RT_overlap %s, %s entries left.",
+        "Removing %s entries with RT_overlap not in %s, %s entries left.",
         n_pre_filter - n_post_filter,
-        condition,
+        keep_condition,
         n_post_filter,
     )
     Logger.debug("columns after filter by RT %s", n_post_filter)
+    return filtered
+
+
+def filter_merged_by_im_overlap(
+    maxquant_ref_and_exp: pd.DataFrame,
+    keep_condition: (
+        List[Literal["full_overlap", "partial_overlap", "no_overlap"]] | None
+    ) = None,
+):
+    """filter the merged maxquant result by IM_overlap condition"""
+    if keep_condition is None:
+        keep_condition = ["full_overlap", "partial_overlap"]
+        Logger.info("No IM_overlap condition given, using %s", keep_condition)
+    n_pre_filter = maxquant_ref_and_exp.shape[0]
+    filtered = maxquant_ref_and_exp.loc[
+        maxquant_ref_and_exp["IM_overlap"].isin(keep_condition), :
+    ]
+    n_post_filter = filtered.shape[0]
+    Logger.info(
+        "Removing %s entries with IM_overlap not in %s, %s entries left.",
+        n_pre_filter - n_post_filter,
+        keep_condition,
+        n_post_filter,
+    )
+    Logger.debug("columns after filter by IM %s", n_post_filter)
     return filtered
 
 

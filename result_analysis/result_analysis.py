@@ -126,6 +126,7 @@ def plot_corr_int_ref_and_act(
     save_dir: Union[None, str] = None,
     log_x: bool = True,
     log_y: bool = True,
+    title: str | None = None,
 ):
     if hover_data is None:
         hover_data = [
@@ -134,6 +135,8 @@ def plot_corr_int_ref_and_act(
             "Charge",
             "id",
         ]
+    if title is None:
+        title = "Corr. of Quant. Results"
     reg_int, abs_residue, valid_idx = plot_scatter(
         x=ref_int,
         y=sum_act,
@@ -146,7 +149,7 @@ def plot_corr_int_ref_and_act(
         hover_data=hover_data,
         show_diag=show_diag,
         color=color,
-        title="Corr. of Quant. Results ",
+        title=title,
         save_dir=save_dir,
         x_label="Reference (log)",
         y_label="Infered (log)",
@@ -223,61 +226,91 @@ class SBSResult:
     def __init__(
         self,
         maxquant_ref_df: pd.DataFrame,
+        pept_act_sum_df_list: List[pd.DataFrame],
         maxquant_exp_df: pd.DataFrame | None = None,
-        sum_raw: pd.DataFrame | None = None,
-        sum_gaussian: pd.DataFrame | None = None,
-        sum_minima: pd.DataFrame | None = None,
-        sum_peak: pd.DataFrame | None = None,
+        filter_by_rt_ovelap: List[
+            Literal["full_overlap", "partial_overlap", "no_overlap"]
+        ] = ["full_overlap"],
+        maxquant_merge_df: pd.DataFrame | None = None,
         sum_cols: List[str] | None = None,
         ims: bool = False,
+        other_cols: List[str] = [],
+        save_dir: str = None,
     ) -> None:
-        """Initialize SBSResult object and intergrate all activation data."""
+        """
+        Initialize SBSResult object and intergrate all activation data.
+        :param maxquant_ref_df: The reference dataframe from MaxQuant, type pd.DataFrame.
+        :param maxquant_exp_df: The experiment dataframe from MaxQuant, type pd.DataFrame.
+        :param filter_by_rt_overlap: A list of conditions to filter the data based on retention time overlap.
+            Options are "full_overlap", "partial_overlap", or "no_overlap".
+        :param maxquant_merge_df: The merged dataframe from MaxQuant, type pd.DataFrame.
+        :param pept_act_sum_df_list: The list of activation sum dataframes, each contains columns "mz_rank" and sum of intensity", type List[pd.DataFrame]
+        :param sum_cols: The columns that records the activation sum, type List[str]
+        :param ims: Whether the data is from IMS, type bool
+        :param other_cols: Other columns to be included in the final dataframe, type List[str]
+        :param save_dir: The directory to save the plot. If None, the plot will not be saved.
 
-        assert any(
-            item is not None for item in [sum_raw, sum_peak, sum_gaussian, sum_minima]
-        )
+
+        """
+        assert len(pept_act_sum_df_list) > 0
+        self.save_dir = save_dir
+        self.other_cols = other_cols
         sum_cols = []
-        for s in [sum_raw, sum_peak, sum_gaussian, sum_minima]:
-            if s is not None:
-                s.reset_index(drop=True, inplace=True)
-                sum_cols += list(s.columns)
-        if sum_cols is None:
-            self.sum_cols = sum_cols
-        else:
-            self.sum_cols = sum_cols
-        pp_sumactivation = pd.concat(
-            [
-                sum_raw,
-                sum_gaussian,
-                sum_minima,
-                sum_peak,
-            ],
-            axis=1,
-        )
+        pp_sumactivation = pept_act_sum_df_list[0]
+        for idx, pept_act_sum_df in enumerate(pept_act_sum_df_list):
+            assert "mz_rank" in pept_act_sum_df.columns
+            Logger.debug("Pept activation sum columns: %s", pept_act_sum_df.columns)
+            sum_cols += list(pept_act_sum_df.columns)
+            if idx == 0:
+                pp_sumactivation = pept_act_sum_df
+            else:
+                pp_sumactivation = pd.merge(
+                    pp_sumactivation, pept_act_sum_df, on="mz_rank", how="inner"
+                )
+        self.sum_cols = list(set(sum_cols))
+        # pp_sumactivation = pd.concat(
+        #     [
+        #         sum_raw,
+        #         sum_gaussian,
+        #         sum_minima,
+        #         sum_peak,
+        #     ],
+        #     axis=1,
+        # )
+
         maxquant_ref_df["Reverse"] = np.where(maxquant_ref_df["Reverse"].isnull(), 0, 1)
         Logger.info("Reference shape: %s", maxquant_ref_df.shape)
-        Logger.info("Experiment shape: %s", maxquant_exp_df.shape)
+        # Logger.info("Experiment shape: %s", maxquant_exp_df.shape)
         if ims:
             self.ref_df = pd.merge(
                 left=maxquant_ref_df,
-                right=sum_raw,
-                left_on="mz_rank",
-                right_index=True,
+                right=pp_sumactivation,
+                on="mz_rank",
                 how="inner",
             )
             Logger.debug(
                 "Reference shape after merging activation sum: %s", self.ref_df.shape
             )
+            Logger.debug("Ref df mz_rank columns: %s", self.ref_df["mz_rank"].shape)
         else:
             pp_sumactivation = pp_sumactivation.set_index(maxquant_ref_df.index)
             self.ref_df = pd.concat([maxquant_ref_df, pp_sumactivation], axis=1)
-
-        self.exp_df = maxquant_exp_df.copy()
-        self.exp_df["Reverse"] = np.where(maxquant_exp_df["Reverse"].isnull(), 0, 1)
-
-        self.ref_exp_df_inner = None
-        Logger.debug("sum cols: %s", self.sum_cols)
         self.ref_df_non_zero = self.ref_df.loc[self.ref_df[self.sum_cols[0]] > 0, :]
+        if maxquant_exp_df is not None:
+            Logger.debug("Experiment shape: %s", maxquant_exp_df.shape)
+            self.exp_df = maxquant_exp_df.copy()
+            self.exp_df["Reverse"] = np.where(maxquant_exp_df["Reverse"].isnull(), 0, 1)
+            self.compare_with_maxquant_exp_int(
+                filter_by_rt_overlap=filter_by_rt_ovelap, save_dir=self.save_dir
+            )
+            Logger.debug("Ref inner shape %s", self.ref_exp_df_inner.shape)
+            Logger.debug(
+                "Ref inner mz_rank columns %s", self.ref_exp_df_inner["mz_rank"].shape
+            )
+        if maxquant_merge_df is not None:
+            self.ref_exp_df_inner = self.ref_df
+        Logger.debug("sum cols: %s", self.sum_cols)
+
         Logger.debug("Reference non zero shape: %s", self.ref_df_non_zero.shape)
 
     def compare_with_maxquant_exp_int(
@@ -323,6 +356,7 @@ class SBSResult:
             maxquant_exp_df=self.exp_df,
             maxquant_ref_df=self.ref_df_non_zero,
             ref_cols=self.sum_cols,
+            other_cols=self.other_cols,
         )
 
         maxquant_ref_and_exp = evaluate_rt_overlap(
@@ -330,7 +364,7 @@ class SBSResult:
         )
         if filter_by_rt_overlap is not None:
             maxquant_ref_and_exp = filter_merged_by_rt_overlap(
-                condition=filter_by_rt_overlap,
+                keep_condition=filter_by_rt_overlap,
                 maxquant_ref_and_exp=maxquant_ref_and_exp,
             )
         else:
@@ -346,25 +380,51 @@ class SBSResult:
         ref_col: str = "Intensity",
         inf_col: str = "AUCActivationRaw",
         interactive: bool = False,
-        save_dir: str | None = None,
+        save_dir: str | None = "",
+        group_by: str | None = None,
         **kwargs,
     ):
         """Plot the correlation between the intensity from the experiment file and the activation columns"""
-        reg_int, abs_residue, valid_idx = plot_corr_int_ref_and_act(
-            self.ref_exp_df_inner[ref_col],
-            self.ref_exp_df_inner[inf_col],
-            data=self.ref_exp_df_inner,
-            interactive=interactive,
-            save_dir=save_dir,
-            **kwargs,
-        )
+        if save_dir == "":
+            save_dir = self.save_dir
+        if group_by is not None and group_by in self.ref_exp_df_inner.columns:
+            Logger.info("Group by %s", group_by)
+            group_by_ref_exp_df_inner = self.ref_exp_df_inner.groupby(group_by).agg(
+                ref_col=(ref_col, "sum"), inf_col=(inf_col, "sum")
+            )
+            Logger.info(
+                "Grouped dataframe columns %s", group_by_ref_exp_df_inner.columns
+            )
+            reg_int, abs_residue, valid_idx = plot_corr_int_ref_and_act(
+                group_by_ref_exp_df_inner["ref_col"],
+                group_by_ref_exp_df_inner["inf_col"],
+                data=group_by_ref_exp_df_inner,
+                interactive=interactive,
+                save_dir=save_dir,
+                title=" Group by " + group_by + ", Corr. of Quant. Results ",
+                **kwargs,
+            )
+        else:
+            Logger.info("No grouping, show precurosr level correlation")
+            Logger.debug("Ref exp inner shape %s", self.ref_exp_df_inner.shape)
+            reg_int, abs_residue, valid_idx = plot_corr_int_ref_and_act(
+                self.ref_exp_df_inner[ref_col],
+                self.ref_exp_df_inner[inf_col],
+                data=self.ref_exp_df_inner,
+                interactive=interactive,
+                save_dir=save_dir,
+                title="Group by precursor, Corr. of Quant. Results ",
+                **kwargs,
+            )
 
     def plot_overlap_with_MQ(
         self,
-        save_dir: str | None = None,
+        save_dir: str | None = "",
         save_format: str = "png",
         show_ref: bool = False,
     ):
+        if save_dir == "":
+            save_dir = self.save_dir
         Logger.debug("Experiment columns: %s", self.exp_df.columns)
         self.exp_df_unique_PCM = (
             self.exp_df.groupby(["Modified sequence", "Charge", "Reverse"])
@@ -480,6 +540,8 @@ class SBSResult:
     def eval_target_decoy(
         self, ref_col: str = "AUCActivationRaw", save_dir: str | None = None
     ):
+        if save_dir is None:
+            save_dir = self.save_dir
         self.TDC_table = self.ref_df_non_zero.groupby("Reverse").agg(
             {"id": "count", ref_col: "mean"}
         )

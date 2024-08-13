@@ -1,5 +1,7 @@
+import os
 import logging
 from typing import Literal, List
+import sparse
 from sparse import SparseArray, asnumpy
 import pandas as pd
 import numpy as np
@@ -76,6 +78,7 @@ def get_ref_rt_im_range(
     delta_im: float = 0.04,
     ref_rt_range: tuple | None = None,
     ref_im_range: tuple | None = None,
+    # bbox: tuple | None = None,
 ):
     """
     Get the RT and IM range from the maxquant result dictionary
@@ -83,30 +86,54 @@ def get_ref_rt_im_range(
     reference_entry = []
     if ref_rt_range is not None:
         rt_min, rt_max = ref_rt_range
-        reference_entry.append((rt_min + rt_max) / 2)
+        rt_center = (rt_min + rt_max) / 2
+        reference_entry.append(rt_center)
     else:
-        Logger.debug("No reference rt range given, using dictionary entries.")
         (rt_min, rt_max, rt_center) = maxquant_result_dict.loc[
             maxquant_result_dict["mz_rank"] == pept_mz_rank,
             ["RT_search_left", "RT_search_right", "RT_search_center"],
         ].values[0]
         reference_entry.append(rt_center)
+        Logger.debug(
+            "No reference RT range given, using dictionary entries: %s, (%s, %s).",
+            rt_center,
+            rt_min,
+            rt_max,
+        )
     if ref_im_range is not None:
         im_min, im_max = ref_im_range
         reference_entry.append((im_min + im_max) / 2)
     else:
-        Logger.debug("No reference im range given, using dictionary entries.")
         im_center = maxquant_result_dict.loc[
             maxquant_result_dict["mz_rank"] == pept_mz_rank,
             ["mobility_values"],
         ].values[0][0]
         reference_entry.append(im_center)
         im_min, im_max = im_center - delta_im, im_center + delta_im
-    rt_min_idx = np.abs(ms1scans["Time_minute"].values - rt_min).argmin()
-    rt_max_idx = np.abs(ms1scans["Time_minute"].values - rt_max).argmin()
-    im_min_idx = np.abs(mobility_values_df["mobility_values"].values - im_min).argmin()
-    im_max_idx = np.abs(mobility_values_df["mobility_values"].values - im_max).argmin()
-    return [rt_min_idx, rt_max_idx + 1], [im_min_idx, im_max_idx + 1], reference_entry
+        Logger.debug(
+            "No reference IM range given, using dictionary entries: %s, (%s, %s).",
+            im_center,
+            im_min,
+            im_max,
+        )
+
+    rt_array = ms1scans["Time_minute"].values
+    rt_min_idx = max(np.searchsorted(rt_array, rt_min, side="left") - 1, 0)
+    rt_max_idx = np.searchsorted(rt_array, rt_max, side="right")
+    im_array = mobility_values_df["mobility_values"].values
+    im_min_idx = max(np.searchsorted(im_array, im_min, side="left") - 1, 0)
+    im_max_idx = np.searchsorted(im_array, im_max, side="right")
+    im_center_idx = np.abs(
+        mobility_values_df["mobility_values"].values - im_center
+    ).argmin()
+    rt_center_idx = np.abs(ms1scans["Time_minute"].values - rt_center).argmin()
+
+    return (
+        [rt_min_idx, rt_max_idx + 1],
+        [im_min_idx, im_max_idx + 1],
+        reference_entry,
+        [rt_center_idx, im_center_idx],
+    )
 
 
 def slice_pept_act(
@@ -136,14 +163,16 @@ def prepare_slice_pept_act_df(
     im_idx_range: tuple,
     mobility_values_df: pd.DataFrame,
     ms1scans: pd.DataFrame,
+    convert_idx_to_values: bool = True,
 ):
     slice_pept_act_df = pd.DataFrame(asnumpy(slice_pept_act_sparse))
-    slice_pept_act_df.columns = mobility_values_df["mobility_values"].values[
-        im_idx_range[0] : im_idx_range[1]
-    ]
-    slice_pept_act_df.index = ms1scans["Time_minute"].values[
-        rt_idx_range[0] : rt_idx_range[1]
-    ]
+    if convert_idx_to_values:
+        slice_pept_act_df.columns = mobility_values_df["mobility_values"].values[
+            im_idx_range[0] : im_idx_range[1]
+        ]
+        slice_pept_act_df.index = ms1scans["Time_minute"].values[
+            rt_idx_range[0] : rt_idx_range[1]
+        ]
     slice_pept_act_df.replace(0, np.nan, inplace=True)
     return slice_pept_act_df
 
@@ -239,3 +268,62 @@ def get_peak_rt_im_range(peak_apex: tuple, pept_ref_slice):
     rt_indices = nearest_na_index(rt_slice, peak_apex[0])
     im_indices = nearest_na_index(im_slice, peak_apex[1])
     return rt_indices, im_indices
+
+
+def get_bbox_from_mq_exp(maxquant_result_exp_row: pd.Series):
+    """
+    Get bounding box from MaxQuant result experiment table, in absolute values
+    """
+    min_rt = maxquant_result_exp_row["Calibrated retention time start"].values[0]
+    max_rt = maxquant_result_exp_row["Calibrated retention time finish"].values[0]
+    center_rt = (min_rt + max_rt) / 2
+    rt_width = max_rt - min_rt
+    center_im = maxquant_result_exp_row["1/K0"].values[0]
+    im_width = maxquant_result_exp_row["1/K0 length"].values[0]
+    min_im, max_im = center_im - im_width / 2, center_im + im_width / 2
+    return [min_rt, max_rt, rt_width, min_im, max_im, im_width]
+
+
+def sum_peptbatch_from_act(
+    pept_batch_idx_list: list, result_dir: str, n_act_batch: int = 10
+):
+    for pept_batch_idx, pept_batch_start_idx in enumerate(pept_batch_idx_list):
+        if os.path.exists(
+            os.path.join(
+                result_dir,
+                f"output_im_rt_pept_act_coo_peptbatch{pept_batch_idx}.npz",
+            )
+        ):
+            logging.info("File exists for peptide batch %s.", pept_batch_idx)
+        else:
+            for act_batch_num in range(n_act_batch):
+                act_3d = sparse.load_npz(
+                    os.path.join(
+                        result_dir,
+                        f"output_im_rt_pept_act_coo_batch{act_batch_num}.npz",
+                    )
+                )
+                logging.info(
+                    "NNZ size of batch %s act_3d %s", act_batch_num, act_3d.nnz
+                )
+                try:
+                    pept_batch_slice = act_3d[
+                        :,
+                        :,
+                        pept_batch_start_idx : pept_batch_idx_list[pept_batch_idx + 1],
+                    ]
+                except IndexError:
+                    pept_batch_slice = act_3d[:, :, pept_batch_start_idx:]
+                if act_batch_num == 0:
+                    pept_batch = pept_batch_slice
+                else:
+                    pept_batch += pept_batch_slice
+                del act_3d, pept_batch_slice
+            sparse.save_npz(
+                filename=os.path.join(
+                    result_dir,
+                    f"output_im_rt_pept_act_coo_peptbatch{pept_batch_idx}.npz",
+                ),
+                matrix=pept_batch,
+            )
+            logging.info("saved pept batch %s", pept_batch_idx)

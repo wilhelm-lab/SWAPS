@@ -1,0 +1,44 @@
+DEBUG: false
+DATASET:
+  INPUT_CHANNELS: ['normal', 'log']
+MODEL:
+  PARAMS:
+    DOWNHILL: 4
+    EXIT_CHANNELS: 1
+    FIRST_OUT_CHANNELS: 32
+  SOLVER:
+    EARLY_STOPPING:
+      MODE: max
+      PATIENCE: 10
+    LOSS:
+      NAME: ComboLoss
+      CHANNEL_WEIGHTS:
+      - 0.5
+      - 1
+      LOSSTYPES:
+      - bce
+      - dice
+      - wdice
+      - focal
+      WEIGHTS:
+      - 1
+      - 0
+      - 4
+      - 1
+    OPTIMIZER:
+      BASE_LR: 0.001
+    TOTAL_EPOCHS: 100
+    SCHEDULER:
+      NAME: one_cycle
+REMOVE_CONFIG_AFTER_RUN: false
+CONFMODEL:
+  DATASET_RESPLIT: True
+  PARAMS:
+    FIRST_OUT_CHANNELS: 16
+    DROPOUT_RATE: 0.25
+  SOLVER:
+    TOTAL_EPOCHS: 100
+    EARLY_STOPPING:
+      PATIENCE: 15
+    OPTIMIZER:
+      WEIGHT_DECAY: 0.0001

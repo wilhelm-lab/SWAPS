@@ -1,0 +1,33 @@
+DEBUG: false
+DATASET:
+  INPUT_CHANNELS: ['normal']
+MODEL:
+  PARAMS:
+    DOWNHILL: 4
+    EXIT_CHANNELS: 1
+    FIRST_OUT_CHANNELS: 32
+  SOLVER:
+    EARLY_STOPPING:
+      MODE: max
+      PATIENCE: 10
+    LOSS:
+      CHANNEL_WEIGHTS:
+      - 1
+      LOSSTYPES:
+      - bce
+      - dice
+      - wdice
+      - focal
+      NAME: ComboLoss
+      WEIGHTS:
+      - 1
+      - 4
+      - 0
+      - 1
+    OPTIMIZER:
+      BASE_LR: 0.01
+    TOTAL_EPOCHS: 100
+    SCHEDULER:
+      NAME: unchange
+REMOVE_CONFIG_AFTER_RUN: false
+RESUME_PATH: ''

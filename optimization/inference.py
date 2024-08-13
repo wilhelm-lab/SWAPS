@@ -22,7 +22,13 @@ from optimization.dictionary import Dict
 from optimization.custom_models import CustomLinearModel, mean_square_root_error
 from postprocessing import peak_selection
 from utils.plot import plot_comparison, plot_isopattern_and_obs
-from utils.config import _algo, _alpha_criteria, _alpha_opt_metric, _loss, _pp_method
+from utils.config_json import (
+    _algo,
+    _alpha_criteria,
+    _alpha_opt_metric,
+    _loss,
+    _pp_method,
+)
 import sparse
 
 Logger = logging.getLogger(__name__)
@@ -528,7 +534,7 @@ def process_one_scan(
             return result_dict_onescan
 
 
-def spare_encode_divide_and_conquer(frame_array, candidate_array):
+def sparse_encode_divide_and_conquer(frame_array, candidate_array):
     candidate_coo_blocks, col_start, col_end = slice_candidate_blocks_by_pept(
         candidate_array
     )
@@ -729,7 +735,7 @@ def process_one_frame_ims(
         "data": [],
     }
     if frame_data.shape[0] > 0:
-        scan_time = ms1scans.loc[ms1_frame_idx, "Time_minute"]
+        scan_time = np.round(ms1scans.loc[ms1_frame_idx, "Time_minute"], decimals=4)
         candidate_precursor_by_rt = maxquant_result_ref_with_im_index_sortmz.loc[
             (maxquant_result_ref_with_im_index_sortmz["RT_search_left"] <= scan_time)
             & (maxquant_result_ref_with_im_index_sortmz["RT_search_right"] >= scan_time)
@@ -758,7 +764,7 @@ def process_one_frame_ims(
             assert frame_array.shape[1] == candidate_array.shape[1]
             Logger.debug("Start optimization with sparse encoding.")
             if candidate_precursor_by_rt.shape[0] > 6000 and process_in_blocks:
-                im_pept_act = spare_encode_divide_and_conquer(
+                im_pept_act = sparse_encode_divide_and_conquer(
                     frame_array, candidate_array
                 )
             else:
@@ -806,21 +812,21 @@ def process_one_frame_ims(
     )  # TODO: remove candidate array
 
 
-def make_coo_from_dict(data_dict, shape=(1830, 937, 259551), n_blocks_by_pept: int = 0):
+def make_coo_from_dict(data_dict, shape: tuple, cutoff: List[int]):
     Logger.info("Shape of COO matrix: %s", shape)
-    if n_blocks_by_pept >= 2:
+    if len(cutoff) > 1:
         coo_list = []
-        n_pept_in_blocks = shape[2] // n_blocks_by_pept
-        cutoff = [(n_pept_in_blocks * (i + 1)) for i in range(n_blocks_by_pept - 1)]
-        cutoff.append(shape[2] + 1)
+        # n_pept_in_blocks = shape[2] // n_blocks_by_pept
+        # cutoff = [(n_pept_in_blocks * (i + 1)) for i in range(n_blocks_by_pept - 1)]
+        # cutoff.append(shape[2] + 1)
         Logger.debug("cutoff list %s", cutoff)
         prev_cutoff = 0
-        for idx, cutoff_i in enumerate(cutoff):
+        for cutoff_i in cutoff:
             block_idx = np.where(
                 (prev_cutoff <= np.array(data_dict["coord_pept_indices"]))
                 & (np.array(data_dict["coord_pept_indices"]) < cutoff_i)
             )[0].astype(int)
-            Logger.debug("blocd index %s", block_idx)
+            Logger.debug("block index %s", block_idx)
             coo_list.append(
                 sparse.COO(
                     coords=[
@@ -852,14 +858,14 @@ def process_batch_frame_ims(
     batch_scan_idx: list,
     maxquant_result_ref_with_im_index: pd.DataFrame,
     mobility_values: np.ndarray,
+    cutoff: List[int],
     delta_mobility_thres: int = 100,
     mz_bin_digits: int = 3,
     process_in_blocks: bool = True,
     batch_num: int = 0,
-    path_prefix: str = "",
+    save_dir: str = "",
     return_im_pept_act: bool = False,
     extract_im_peak: bool = True,
-    n_blocks_by_pept: int = 0,
     **kwargs,
 ):
     batch_peaks_df = []
@@ -893,7 +899,7 @@ def process_batch_frame_ims(
     if extract_im_peak:
         batch_peaks_df = pd.concat(batch_peaks_df).reset_index(drop=True)
         batch_peaks_df.to_csv(
-            path_prefix + f"batch_peaks_df_{batch_num}.csv", index=False
+            os.path.join(save_dir, f"batch_peaks_df_{batch_num}.csv"), index=False
         )
     if return_im_pept_act:
         batch_im_rt_pept_act_coo = make_coo_from_dict(
@@ -905,14 +911,16 @@ def process_batch_frame_ims(
                 len(maxquant_result_ref_with_im_index.mz_rank)
                 + 1,  # this index is rank, starting from 1, add 1 for the last frame
             ),
-            n_blocks_by_pept=n_blocks_by_pept,
+            cutoff=cutoff,
         )
 
         if isinstance(batch_im_rt_pept_act_coo, list):
             for pept_batch_idx, pept_batch_dict in enumerate(batch_im_rt_pept_act_coo):
                 sparse.save_npz(
-                    path_prefix
-                    + f"_im_rt_pept_act_coo_batch{batch_num}_peptbatch{pept_batch_idx}.npz",
+                    os.path.join(
+                        save_dir,
+                        f"im_rt_pept_act_coo_batch{batch_num}_peptbatch{pept_batch_idx}.npz",
+                    ),
                     pept_batch_dict,
                 )
                 Logger.info(
@@ -923,7 +931,9 @@ def process_batch_frame_ims(
                 )
         else:
             sparse.save_npz(
-                path_prefix + f"_im_rt_pept_act_coo_batch{batch_num}.npz",
+                os.path.join(
+                    save_dir, f"im_rt_pept_act_coo_batch{batch_num}_peptbatch0.npz"
+                ),
                 batch_im_rt_pept_act_coo,
             )
             Logger.info(
@@ -964,8 +974,12 @@ def _prepare_sparse_matrices(
     )
     candidate_mz_index = np.searchsorted(all_mz, candidate_mz)
     frame_mz_index = np.searchsorted(all_mz, frame_mz)
-
-    all_im = np.sort(mobility_values)
+    # Logger.info("all_mz shape %s", all_mz.shape)
+    # Logger.info("frame mz shape %s", frame_mz.shape)
+    all_im = np.sort(mobility_values["mobility_values"])
+    # Logger.info("mobility values columns %s", mobility_values.columns)
+    # Logger.info("all_im shape %s", all_im.shape)
+    # Logger.info("frame mobility shape %s", frame_data["mobility_values"].shape)
     frame_im_index = np.searchsorted(all_im, frame_data["mobility_values"])
 
     frame_coo = coo_matrix(
@@ -1164,14 +1178,15 @@ def process_ims_frames_parallel(
     ms1scans: pd.DataFrame,
     maxquant_ref: pd.DataFrame,
     mobility_values: np.array,
+    cutoff: List[int],
     delta_mobility_thres: int = 100,
     mz_bin_digits: int = 3,
     process_in_blocks: bool = True,
     width: int = 4,
-    path_prefix: str = "",
+    save_dir: str = "",
     return_im_pept_act: bool = False,
     extract_im_peak: bool = True,
-    n_blocks_by_pept: int = 0,
+    #n_blocks_by_pept: int = 0,
 ):
     list_batch_im_pept_act_coo_dict = Parallel(n_jobs=n_jobs)(
         delayed(process_batch_frame_ims)(
@@ -1185,10 +1200,10 @@ def process_ims_frames_parallel(
             process_in_blocks=process_in_blocks,
             width=width,
             batch_num=batch[0],
-            path_prefix=path_prefix,
+            save_dir=save_dir,
             return_im_pept_act=return_im_pept_act,
             extract_im_peak=extract_im_peak,
-            n_blocks_by_pept=n_blocks_by_pept,
+            cutoff=cutoff,
         )
         for batch in batch_scan_indices
     )

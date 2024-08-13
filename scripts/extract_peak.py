@@ -6,7 +6,7 @@ import fire
 import numpy as np
 import pandas as pd
 
-from postprocessing.post_processing import select_peak_from_activation
+from postprocessing.no_ims_2d import select_peak_from_activation
 from result_analysis.result_analysis import SBSResult
 
 

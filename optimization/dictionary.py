@@ -3,7 +3,7 @@ from typing import Union
 import numpy as np
 import pandas as pd
 from scipy import sparse
-import IsoSpecPy as iso
+
 import matplotlib.pyplot as plt
 import sklearn.preprocessing as pp
 import networkx as nx
@@ -13,53 +13,6 @@ from utils.tools import ExtractPeak
 
 
 Logger = logging.getLogger(__name__)
-
-
-def calculate_modpept_isopattern(
-    modpept: str, charge: int, ab_thres: float = 0.005, mod_CAM: bool = True
-):
-    """takes a peptide sequence with modification and charge,
-    calculate and return the two LISTs of isotope pattern with all isotopes m/z value
-    with abundance larger than ab_thres, both sorted by isotope mass
-
-    :modpept: str
-    :charge: charge state of the percursor, int
-    :mzrange: limitation of detection of mz range
-    :mm: bin size of mz value, int
-    :ab_thres: the threshold for filtering isotopes, float
-
-    return: two list
-    """
-
-    # account for extra atoms from modification and water
-    # count extra atoms
-    n_H = 2 + charge  # 2 from water and others from charge (proton)
-    n_Mox = modpept.count("M(ox)") + modpept.count("Oxidation (M)")
-    modpept = modpept.replace("(ox)", "")
-    modpept = modpept.replace("(Oxidation (M))", "")
-    n_acetylN = modpept.count("(ac)") + modpept.count("(Acetyl (Protein N-term))")
-    modpept = modpept.replace("(Acetyl (Protein N-term))", "")
-    modpept = modpept.replace("(ac)", "")
-  
-    if mod_CAM:
-        n_C = modpept.count("C")
-    else:
-        n_C = 0
-    # addition of extra atoms
-    atom_composition = iso.ParseFASTA(modpept)
-    atom_composition["H"] += 3 * n_C + n_H + 2 * n_acetylN
-    atom_composition["C"] += 2 * n_C + 2 * n_acetylN
-    atom_composition["N"] += 1 * n_C
-    atom_composition["O"] += 1 * n_C + 1 + n_acetylN + 1 * n_Mox
-
-    # Isotope calculation
-    formula = "".join([f"{key}{value}" for key, value in atom_composition.items()])
-    iso_distr = iso.IsoThreshold(formula=formula, threshold=ab_thres, absolute=True)
-    iso_distr.sort_by_mass()
-    mz_sort_by_mass = iso_distr.np_masses() / charge
-    probs_sort_by_mass = iso_distr.np_probs()
-
-    return mz_sort_by_mass, probs_sort_by_mass
 
 
 def csr_cosine_similarities(csrmat, normalize=True):

@@ -1,0 +1,5 @@
+PREPARE_DATASET:
+  RESULT_PATH: /cmnfs/proj/ORIGINS/SWAPS_exp/tims_ramp_time/corrected_RT_tol_pred_120min_library_80ms_20240729_105248_996985/
+  N_BLOCKS_BY_PEPT: 2
+  DICT_PICKLE_PATH: /cmnfs/proj/ORIGINS/SWAPS_exp/tims_ramp_time/corrected_RT_tol_pred_120min_library_80ms_20240729_105248_996985/maxquant_result_merged_cleaned_no_exp_only.pkl
+  N_WORKERS: 5
