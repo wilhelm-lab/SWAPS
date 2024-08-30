@@ -10,6 +10,7 @@ Options:
     --version              show version
 """
 
+from typing import List, Literal
 import re
 import os
 import logging
@@ -19,13 +20,19 @@ from math import ceil
 import pandas as pd
 import matplotlib.pyplot as plt
 import IsoSpecPy as iso
+import torch
 from utils.config import get_cfg_defaults
 from utils.constants import decoy_mutation_rule
 from utils.singleton_swaps_optimization import swaps_optimization_cfg
 from utils.plot import save_plot
 from utils.tools import _perc_fmt, cleanup_maxquant
+from utils.metrics import RT_metrics
 from .predict_rt import dict_add_rt_pred, update_rt_model
 import numpy as np
+from typing import Literal
+from alphabase.psm_reader import psm_reader_provider
+from sklearn.model_selection import train_test_split
+from peptdeep.pretrained_models import ModelManager
 
 Logger = logging.getLogger(__name__)
 
@@ -56,33 +63,73 @@ def merge_ref_and_exp(
 
     # clean up both dataframe
     maxquant_ref_df = cleanup_maxquant(
-        maxquant_ref_df, remove_decoys=True, how_duplicates="keep_one"
+        maxquant_ref_df, remove_decoys=True, how_duplicates="keep_highest_int"
     )
     maxquant_exp_df = cleanup_maxquant(
         maxquant_exp_df, remove_decoys=True, how_duplicates="keep_highest_int"
     )
 
-    ref_columns = ["Modified sequence", "Sequence", "Charge"]
-    ref_selected = maxquant_ref_df[ref_columns]
-    exp_selected = maxquant_exp_df[ref_columns]
+    join_on_columns = ["Modified sequence", "Sequence", "Charge"]
+    ref_selected = maxquant_ref_df[join_on_columns]
+    Logger.debug("maxquant ref df columns: %s", maxquant_ref_df.columns)
+    exp_selected = maxquant_exp_df[join_on_columns]
 
     # Perform a merge with an indicator
     merged_df = ref_selected.merge(
-        exp_selected, on=ref_columns, how="left", indicator=True
+        exp_selected, on=join_on_columns, how="outer", indicator=True
     )
 
     # Filter rows that only exist in maxquant_ref_df
     ref_unique_rows = merged_df[merged_df["_merge"] == "left_only"]
+    exp_unique_rows = merged_df[merged_df["_merge"] == "right_only"]
+    both_unique_rows = merged_df[merged_df["_merge"] == "both"]
 
     # Drop the indicator column
     ref_unique_rows = ref_unique_rows.drop(columns=["_merge"])
+    exp_unique_rows = exp_unique_rows.drop(columns=["_merge"])
+    both_unique_rows = both_unique_rows.drop(columns=["_merge"])
 
     # Optionally, you can merge the unique rows back to the original ref dataframe
-    ref_unqiue_df = maxquant_ref_df.merge(ref_unique_rows, on=ref_columns, how="inner")
-    maxquant_exp_df["source"] = "exp"
+    ref_unqiue_df = maxquant_ref_df.merge(
+        ref_unique_rows, on=join_on_columns, how="inner"
+    )
+    exp_unique_df = maxquant_exp_df.merge(
+        exp_unique_rows, on=join_on_columns, how="inner"
+    )
+    ref_spec_columns = [
+        # "MS1_frame_idx_left_ref",
+        # "MS1_frame_idx_right_ref",
+        # "MS1_frame_idx_center_ref",
+        # "MS1_frame_idx_left",
+        # "MS1_frame_idx_right",
+        # "MS1_frame_idx_center",
+        "mobility_values_index_left_ref",
+        "mobility_values_index_right_ref",
+        "mobility_values_index_center_ref",
+        #"mobility_values_left_ref",
+        #"mobility_values_right_ref",
+        "mobility_values_center_ref",
+        # "mobility_values_left_ref",
+        # "mobility_values_right_ref",
+        # "mobility_values_center_ref",
+        # "Time_minute_left_ref",
+        # "Time_minute_right_ref",
+        # "Time_minute_center_ref",
+    ]
+    Logger.info("Maxquant_ref_df columns: %s", maxquant_ref_df.columns)
+    both_unique_df = maxquant_exp_df.merge(
+        maxquant_ref_df[join_on_columns + ref_spec_columns],
+        on=join_on_columns,
+        how="inner",
+    )
+    exp_unique_df["source"] = "exp"
     ref_unqiue_df["source"] = "ref"
+    both_unique_df["source"] = "both"
     maxquant_merge_df = pd.concat(
-        [ref_unqiue_df, maxquant_exp_df], ignore_index=True, axis=0, join="outer"
+        [ref_unqiue_df, exp_unique_df, both_unique_df],
+        ignore_index=True,
+        axis=0,
+        join="outer",
     )
     # evaluate
     plt.bar(
@@ -170,6 +217,9 @@ def generate_decoy_seq(modseq, seq, method: Literal["mutate"] = "mutate"):
 
 def concat_decoy_and_target(maxquant_df: pd.DataFrame):
     """Concatenate target and decoy sequences"""
+    maxquant_df["TD pair id"] = (
+        maxquant_df["m/z"].rank(axis=0, method="first", ascending=True).astype(int)
+    )
     maxquant_decoy_df = maxquant_df.copy()
     maxquant_decoy_df.drop("m/z", inplace=True, axis=1)
     maxquant_df["Decoy"] = False
@@ -225,11 +275,14 @@ def dict_add_im_index(
         maxquant_df_with_im_index.columns,
     )
     max_im_index = mobility_values_df["mobility_values_index"].max()
-    if im_idx_length is None:
+    if (im_idx_length is None) and (
+        (mq_im_left_col is None) or (mq_im_right_col is None)
+    ):
         im_idx_length = maxquant_df_with_im_index["Ion mobility length"] // 2 + 1
         Logger.info(
-            "IM index length not given, using peptide specific im length values: %s",
-            im_idx_length,
+            "mq_im_left_col or mq_im_right_col not given, \
+                IM index length required but not given, \
+                    using peptide specific im length values"
         )
     if mq_im_left_col is None:
         maxquant_df_with_im_index["mobility_values_index_left" + idx_suffix] = (
@@ -307,6 +360,8 @@ def dict_add_rt_index(
     """Get RT index of RT_search_left, RT_search_center and RT_search_right/
     as indicated in RT values from .d file for each row in maxquant_dict_df/
     has built-in control of int type for index"""
+    Logger.debug("dict_add_rt_index columns: %s", maxquant_df.columns)
+    Logger.debug("mq_rt_center_col columns: %s", mq_rt_center_col)
     maxquant_df = maxquant_df.sort_values(mq_rt_center_col)
     maxquant_df = pd.merge_asof(
         left=maxquant_df,
@@ -346,21 +401,6 @@ def dict_add_rt_index(
     for col in ["Time_minute", "MS1_frame_idx"]:
         if col in maxquant_df.columns:
             maxquant_df.rename({col: col + "_right" + idx_suffix}, axis=1, inplace=True)
-    # maxquant_dict_df_with_rt_index_right["RT_left_index_length"] = (
-    #     maxquant_dict_df_with_rt_index_right["MS1_frame_idx"]
-    #     - maxquant_dict_df_with_rt_index_right["MS1_frame_idx_left"]
-    # )
-    # maxquant_dict_df_with_rt_index_right["RT_right_index_length"] = (
-    #     maxquant_dict_df_with_rt_index_right["MS1_frame_idx_right"]
-    #     - maxquant_dict_df_with_rt_index_right["MS1_frame_idx"]
-    # )
-    # maxquant_df_with_rt_index_right[
-    #     ["MS1_frame_idx", "MS1_frame_idx_right", "MS1_frame_idx_left"]
-    # ] = maxquant_df_with_rt_index_right[
-    #     ["MS1_frame_idx", "MS1_frame_idx_right", "MS1_frame_idx_left"]
-    # ].astype(
-    #     int
-    # )
 
     Logger.debug("dict_add_rt_index columns: %s", maxquant_df.columns)
     return maxquant_df
@@ -563,17 +603,29 @@ def _define_rt_search_range(
     return maxquant_result_dict
 
 
+def _get_im_idx_span_from_values(mobility_values_df: pd.DataFrame, im_length: float):
+    """Get the span of the ion mobility index given im value length."""
+    im_idx_span = ceil(im_length / mobility_values_df["mobility_values"].diff().mean())
+    return im_idx_span
+
+
 def _define_im_idx_search_range(
     maxquant_df: pd.DataFrame,
-    im_tol: int,
+    im_length: int,
     im_ref: Literal["exp", "pred", "mix", "ref"],
     im_idx_range: tuple[float, float],
+    delta_im_95: float | None = None,
+    mobility_values_df: pd.DataFrame | None = None,
 ):
-    """Ion mobility search range. It is not used in the activation optimization step, /
-    where the full IM range is used. However, it is used in the post-processing step /
-    to crop out only the activation in the relevant IM range, hence it is REPRESENTED AS INDEX!
     """
-    im_tol = int(im_tol)
+    Ion mobility search range. It is not used in the activation optimization step, /
+    where the full IM range is used. However, it is used in the post-processing step /
+    to crop out only the activation in the relevant IM range, /
+    hence it is REPRESENTED AS INDICES!
+    """
+
+    im_length = int(im_length)
+    half_im_length = ceil(im_length / 2)
     match im_ref:
         case "exp":  # TODO: not checked
             maxquant_df["IM_search_idx_left"] = maxquant_df[
@@ -583,14 +635,50 @@ def _define_im_idx_search_range(
                 "mobility_values_index_right"
             ]
             maxquant_df["IM_search_idx_center"] = maxquant_df["mobility_values_index"]
+        case "pred":
+            assert "mobility_pred" in maxquant_df.columns
+            assert mobility_values_df is not None
+            assert delta_im_95 is not None and delta_im_95 > 0
+            Logger.info(
+                "Calculating prediction right and left with delta_im_95: %s",
+                delta_im_95,
+            )
+            maxquant_df["mobility_pred_left"] = (
+                maxquant_df["mobility_pred"] - delta_im_95
+            )
+            maxquant_df["mobility_pred_right"] = (
+                maxquant_df["mobility_pred"] + delta_im_95
+            )
+            maxquant_df = dict_add_im_index(
+                maxquant_df=maxquant_df,
+                mobility_values_df=mobility_values_df,
+                mq_im_center_col="mobility_pred",
+                mq_im_left_col="mobility_pred_left",
+                mq_im_right_col="mobility_pred_right",
+                im_idx_length=None,
+                idx_suffix="_pred",
+            )
+            # maxquant_df = maxquant_df.rename(
+            #     mapper={
+            #         "mobility_values_index_left_pred": "IM_search_idx_left",
+            #         "mobility_values_index_right_pred": "IM_search_idx_right",
+            #         "mobility_values_index_center_pred": "IM_search_idx_center",
+            #     },
+            #     axis=1,
+            # )
+            maxquant_df["IM_search_idx_left"] = (
+                maxquant_df["mobility_values_index_left_pred"] - half_im_length
+            )
+            maxquant_df["IM_search_idx_right"] = (
+                maxquant_df["mobility_values_index_right_pred"] + half_im_length
+            )
+            maxquant_df["IM_search_idx_center"] = maxquant_df[
+                "mobility_values_index_center_pred"
+            ]
         case (
-            "pred"
-        ):  # TODO: no im prediciton model yet, and modify if conformal learning is available
-            assert "predicted_IM" in maxquant_df.columns
-            maxquant_df["IM_search_idx_left"] = maxquant_df["predicted_IM"] - im_tol
-            maxquant_df["IM_search_idx_right"] = maxquant_df["predicted_IM"] + im_tol
-            maxquant_df["IM_search_idx_center"] = maxquant_df["predicted_IM"]
-        case "mix":  # Use either exp IM or if not available, use ref IM
+            "mix"
+        ):  # Use either exp IM or if not available, use ref IM, im_length is not used
+            # TODO: whether to use im_length or not?
             maxquant_df["IM_search_idx_left"] = maxquant_df[
                 "mobility_values_index_left_exp"
             ]
@@ -609,7 +697,33 @@ def _define_im_idx_search_range(
             maxquant_df["IM_search_idx_right"].fillna(
                 maxquant_df["mobility_values_index_right_ref"], inplace=True
             )
-        case "ref":
+        case (
+            "ref"
+        ):  # Use primarily ref IM, if not available, use exp IM, expand with delta_im_95
+            Logger.info("Using primarily ref IM for IM search range.")
+            _merge_df = maxquant_df.loc[
+                (maxquant_df["source"] == "both") & (maxquant_df["Decoy"] == False)
+            ]
+            delta_im_idx_95_left = RT_metrics(
+                _merge_df["mobility_values_index_left_ref"],
+                _merge_df["mobility_values_index_left_exp"],
+            ).CalcDeltaRTwidth()
+            delta_im_idx_95_right = RT_metrics(
+                _merge_df["mobility_values_index_right_ref"],
+                _merge_df["mobility_values_index_right_exp"],
+            ).CalcDeltaRTwidth()
+            Logger.info(
+                "Delta IM index 95 left: %s, right: %s",
+                delta_im_idx_95_left,
+                delta_im_idx_95_right,
+            )
+            # assert mobility_values_df is not None
+            # delta_im_idx_95 = _get_im_idx_span_from_values(
+            #     mobility_values_df=mobility_values_df, im_length=delta_im_95
+            # )
+            # Logger.info(
+            #     "From delta_im_95: %s, calculated delta_im_idx_95: %s", delta_im_95, delta_im_idx_95
+            # )
             maxquant_df["IM_search_idx_center"] = maxquant_df[
                 "mobility_values_index_center_ref"
             ]
@@ -620,10 +734,14 @@ def _define_im_idx_search_range(
                 "IM_search_idx_center"
             ].astype(int)
             maxquant_df["IM_search_idx_left"] = (
-                maxquant_df["IM_search_idx_center"] - im_tol
+                maxquant_df["IM_search_idx_center"]
+                - half_im_length
+                - delta_im_idx_95_left
             )
             maxquant_df["IM_search_idx_right"] = (
-                maxquant_df["IM_search_idx_center"] + im_tol
+                maxquant_df["IM_search_idx_center"]
+                + half_im_length
+                + delta_im_idx_95_right
             )
     maxquant_df.loc[
         :,
@@ -640,16 +758,181 @@ def _define_im_idx_search_range(
     return maxquant_df
 
 
+def prepare_alpha_train_test_df(
+    maxquant_path: str, train_frac: float, filter_dict: dict, random_state: int = 42
+):
+    # Load
+    mq_reader = psm_reader_provider.get_reader("maxquant")
+    mq_reader.load(
+        maxquant_path,
+    )
+    psm_df = mq_reader.psm_df
+
+    # Filter
+    for key, value in filter_dict.items():
+        psm_df = psm_df[psm_df[key].isin(value)]
+        Logger.info(
+            "psm_df size after filtering %s in %s: %s", key, value, psm_df.shape
+        )
+
+    # Normalize RT
+    rt_max = psm_df["rt"].max()
+    Logger.info(f"Max RT used for normalization: {rt_max}")
+    psm_df["rt_norm"] = psm_df["rt"] / rt_max
+
+    # Split
+    train_df, test_df = train_test_split(
+        psm_df, test_size=1 - train_frac, random_state=random_state
+    )
+
+    return train_df, test_df, rt_max
+
+
+def _rescale_and_get_delta95(predict_df, lc_grad, obs_col, pred_col):
+    if pred_col == "rt_pred":
+        predict_df["rt_pred_norm"] = predict_df["rt_pred"]
+        predict_df[pred_col] = predict_df["rt_pred_norm"] * lc_grad
+
+    ori_rt_eval = RT_metrics(predict_df[obs_col], predict_df[pred_col])
+
+    return ori_rt_eval.CalcDeltaRTwidth()
+
+
+def update_alpha_pept_deep_model(
+    pept_property: Literal["rt", "mobility"],
+    train_df,
+    test_df,
+    save_dir: str,
+    lc_grad: float,
+    epoch=10,
+    device: str = "cuda:0",
+):
+    # init model
+    models = ModelManager(device=device)
+    models.load_installed_models()
+    if pept_property == "rt":
+        model = models.rt_model
+    elif pept_property == "mobility":
+        model = models.ccs_model
+
+    # train
+    model.train(train_df, epoch=epoch, verbose=True, verbose_each_epoch=False)
+
+    # eval
+    predict_train_df = model.predict(train_df)
+    predict_test_df = model.predict(test_df)
+    if pept_property == "mobility":
+        predict_train_df = model.ccs_to_mobility_pred(train_df)
+        predict_test_df = model.ccs_to_mobility_pred(test_df)
+
+    delta_95_train = _rescale_and_get_delta95(
+        predict_train_df,
+        lc_grad=lc_grad,
+        obs_col=pept_property,
+        pred_col=f"{pept_property}_pred",
+    )
+    delta_95_test = _rescale_and_get_delta95(
+        predict_test_df,
+        lc_grad=lc_grad,
+        obs_col=pept_property,
+        pred_col=f"{pept_property}_pred",
+    )
+    Logger.info(f"Training Delta95: {delta_95_train}, Testing Delta95: {delta_95_test}")
+
+    # save
+    save_model_name = os.path.join(save_dir, f"{pept_property}_model")
+    model.save(save_model_name)
+    return delta_95_test, save_model_name
+
+
+def dict_add_alpha_pept_pred(
+    model_path,
+    pept_property: Literal["rt", "mobility"],
+    dict_for_pred_path,
+    maxquant_dict: pd.DataFrame,
+    lc_grad: float | None = None,
+    device: str = "cuda:0",
+):
+    Logger.info(f"Device: {device}")
+    # load dict
+    # maxquant_dict = pd.read_csv(dict_for_pred_path, sep="\t")
+    Logger.info(f"dict size: {maxquant_dict.shape}")
+    mq_reader = psm_reader_provider.get_reader("maxquant")
+    mq_reader.load(dict_for_pred_path)
+    dict_for_pred = mq_reader.psm_df
+    Logger.info(f"dict_for_pred size: {dict_for_pred.shape}")
+
+    # predict
+    models = ModelManager(device=device)
+    models.load_installed_models()
+    if pept_property == "mobility":
+        model = models.ccs_model
+        model.load(model_path)
+        predict_df = model.predict(dict_for_pred)
+        predict_df = model.ccs_to_mobility_pred(predict_df)
+    elif pept_property == "rt":
+        assert lc_grad is not None and lc_grad > 0
+        model = models.rt_model
+        model.load(model_path)
+        predict_df = model.predict(dict_for_pred)
+        predict_df["rt_pred_norm"] = predict_df["rt_pred"]
+        predict_df["rt_pred"] = predict_df["rt_pred_norm"] * lc_grad
+
+    # merge
+    maxquant_dict_new = pd.merge(
+        left=maxquant_dict,
+        right=predict_df[
+            ["sequence", "charge", "scan_num", "raw_name", f"{pept_property}_pred"]
+        ],
+        left_on=["Sequence", "Charge", "MS/MS scan number", "Raw file"],
+        right_on=["sequence", "charge", "scan_num", "raw_name"],
+        how="left",
+    )
+    Logger.info(
+        "Number of entries with empty prediction: %s",
+        maxquant_dict_new[pept_property + "_pred"].isna().sum(),
+    )
+    maxquant_dict_new = maxquant_dict_new.dropna(subset=[pept_property + "_pred"])
+    maxquant_dict_new = maxquant_dict_new.drop(
+        labels=["scan_num", "raw_name", "sequence", "charge"], axis=1
+    )
+    Logger.info(f"dict size after dropping empty prediction: {maxquant_dict_new.shape}")
+    if pept_property == "rt":  # rename rt_pred to predicted_RT for compatibility
+        maxquant_dict_new["predicted_RT"] = maxquant_dict_new["rt_pred"]
+
+    return maxquant_dict_new
+
+
 def construct_dict(
     cfg_prepare_dict,
+    filter_exp_by_raw_file: List[str],
     maxquant_ref_df: pd.DataFrame,
-    maxquant_exp_df: pd.DataFrame,
+    maxquant_exp_path: str,
+    # maxquant_exp_df: pd.DataFrame,
     result_dir: str = None,
     mobility_values_df: pd.DataFrame = None,
     rt_values_df: pd.DataFrame = None,
     random_seed: int = 42,
     n_blocks_by_pept: int = 1,
+    # device: str = "gpu",
 ):
+    gpu_count = torch.cuda.device_count()
+    match gpu_count:
+        case 0:
+            device = "cpu"
+            Logger.info("No GPU available, using CPU")
+        case 1:
+            device = "cuda"
+            Logger.info("Using 1 GPU, device is %s", device)
+        case _:
+            device = "gpu"
+            Logger.info("Using multiple GPUs, device is %s", device)
+    # device = str("cuda" if torch.cuda.is_available() else "cpu")
+    # Logger.info(f"Device: {device}")
+    maxquant_exp_df = pd.read_csv(maxquant_exp_path, sep="\t", low_memory=False)
+    maxquant_exp_df = maxquant_exp_df.loc[
+        maxquant_exp_df["Raw file"].isin(filter_exp_by_raw_file)
+    ]
     rt_range = (
         rt_values_df["Time_minute"].min(),
         rt_values_df["Time_minute"].max(),
@@ -666,29 +949,92 @@ def construct_dict(
     Logger.info("IM index range: %s", im_range)
     construct_dict_dir = os.path.join(result_dir, "construct_dict")
     rt_transfer_dir = os.path.join(construct_dict_dir, "RT_transfer_learn")
+    im_transfer_dir = os.path.join(construct_dict_dir, "IM_transfer_learn")
     os.makedirs(construct_dict_dir, exist_ok=True)
     os.makedirs(rt_transfer_dir, exist_ok=True)
+    os.makedirs(im_transfer_dir, exist_ok=True)
 
-    # retrain model
-    if len(cfg_prepare_dict.UPDATED_MODEL_PATH) == 0:
-        Logger.info("Retraining RT model")
-        delta_rt_95, model_path = update_rt_model(
-            train_maxquant_df=maxquant_exp_df,
-            train_dir=rt_transfer_dir,
-            seed=random_seed,
-            keep_matched_precursors=cfg_prepare_dict.KEEP_MATCHED_PRECURSORS,
-            save_model_name="updated",
-        )  # delta rt 95 is one side
-        cfg_prepare_dict.UPDATED_MODEL_PATH = model_path
-        if cfg_prepare_dict.RT_TOL < 0:
-            cfg_prepare_dict.RT_TOL = delta_rt_95.item()
-    else:
-        Logger.info("Using existing RT model")
-        delta_rt_95 = cfg_prepare_dict.RT_TOL
+    # # retrain model
+    # if len(cfg_prepare_dict.UPDATED_MODEL_PATH) == 0:
+    #     Logger.info("Retraining RT model")
+    #     delta_rt_95, model_path = update_rt_model(
+    #         train_maxquant_df=maxquant_exp_df,
+    #         train_dir=rt_transfer_dir,
+    #         train_frac=cfg_prepare_dict.TRAIN_FRAC,
+    #         seed=random_seed,
+    #         keep_matched_precursors=cfg_prepare_dict.KEEP_MATCHED_PRECURSORS,
+    #         save_model_name="updated",
+    #     )  # delta rt 95 is one side
+    #     cfg_prepare_dict.UPDATED_MODEL_PATH = model_path
+    #     if cfg_prepare_dict.RT_TOL < 0:
+    #         cfg_prepare_dict.RT_TOL = delta_rt_95.item()
+    # else:
+    #     Logger.info("Using existing RT model")
+    #     delta_rt_95 = cfg_prepare_dict.RT_TOL
+
+    # retrain model w/ AlphaPeptDeep
+    # prepare train and test df: from maxquant_exp_df
+    _LOADED_ALPHA_DATASET = False
+    # RT
+    if cfg_prepare_dict.RT_REF == "pred":
+        if cfg_prepare_dict.UPDATED_RT_MODEL_PATH == "":
+            if not _LOADED_ALPHA_DATASET:
+                train_df, test_df, rt_max = prepare_alpha_train_test_df(
+                    maxquant_exp_path,
+                    train_frac=cfg_prepare_dict.TRAIN_FRAC,
+                    filter_dict={"raw_name": filter_exp_by_raw_file},
+                    random_state=random_seed,
+                )
+                cfg_prepare_dict.RT_MAX = rt_max.item()
+                _LOADED_ALPHA_DATASET = True
+            Logger.info("Retraining RT model with AlphaPeptDeep")
+            delta_rt_95, model_path = update_alpha_pept_deep_model(
+                pept_property="rt",
+                train_df=train_df,
+                test_df=test_df,
+                save_dir=rt_transfer_dir,
+                epoch=cfg_prepare_dict.RT_TRAIN_EPOCHS,
+                lc_grad=rt_max,
+                device=device,
+            )
+            cfg_prepare_dict.UPDATED_RT_MODEL_PATH = model_path
+            if cfg_prepare_dict.RT_TOL < 0:
+                cfg_prepare_dict.RT_TOL = delta_rt_95.item()
+        else:
+            Logger.info("Using existing RT model")
+            delta_rt_95 = cfg_prepare_dict.RT_TOL
+    # IM
+    if cfg_prepare_dict.IM_REF == "pred":
+        if cfg_prepare_dict.UPDATED_IM_MODEL_PATH == "":
+            Logger.info("Retraining IM model with AlphaPeptDeep")
+            if not _LOADED_ALPHA_DATASET:
+                train_df, test_df, rt_max = prepare_alpha_train_test_df(
+                    maxquant_exp_path,
+                    train_frac=cfg_prepare_dict.TRAIN_FRAC,
+                    filter_dict={"raw_name": filter_exp_by_raw_file},
+                    random_state=random_seed,
+                )
+                _LOADED_ALPHA_DATASET = True
+                cfg_prepare_dict.RT_MAX = rt_max.item()
+            delta_im_95, model_path = update_alpha_pept_deep_model(
+                pept_property="mobility",
+                train_df=train_df,
+                test_df=test_df,
+                save_dir=im_transfer_dir,
+                epoch=cfg_prepare_dict.IM_TRAIN_EPOCHS,
+                lc_grad=rt_max,
+                device=device,
+            )
+            cfg_prepare_dict.UPDATED_IM_MODEL_PATH = model_path
+            if cfg_prepare_dict.DELTA_IM_95 < 0:
+                cfg_prepare_dict.DELTA_IM_95 = delta_im_95.item()
+        else:
+            Logger.info("Using existing IM model")
+            delta_im_95 = cfg_prepare_dict.DELTA_IM_95
 
     # get idx of exp RT and IM values
     maxquant_exp_df = dict_add_rt_index(
-        maxquant_exp_df,
+        maxquant_df=maxquant_exp_df,
         rt_values_df=rt_values_df,
         mq_rt_left_col="Calibrated retention time start",
         mq_rt_center_col="Calibrated retention time",
@@ -723,35 +1069,74 @@ def construct_dict(
         maxquant_dict = concat_decoy_and_target(maxquant_dict)
 
     # IM/RT prediction for full dictionary, define RT and IM search range
+    dict_path = os.path.join(construct_dict_dir, "maxquant_dict_for_pred.txt")
     maxquant_dict.to_csv(
-        os.path.join(construct_dict_dir, "maxquant_dict_for_pred.csv"), index=False
+        os.path.join(construct_dict_dir, "maxquant_dict_for_pred.txt"),
+        sep="\t",
+        index=False,
     )
-    maxquant_dict = dict_add_rt_pred(
-        updated_models=cfg_prepare_dict.UPDATED_MODEL_PATH,
-        deeplc_train_path=os.path.join(rt_transfer_dir, "deeplc_train.csv"),
-        maxquant_df=maxquant_dict,
-        save_dir=construct_dict_dir,
-        keep_matched_precursors=cfg_prepare_dict.KEEP_MATCHED_PRECURSORS,
-        filter_by_rt_diff=None,  # TODO: no filter atm
+    # maxquant_dict = dict_add_rt_pred(
+    #     updated_models=cfg_prepare_dict.UPDATED_MODEL_PATH,
+    #     deeplc_train_path=os.path.join(rt_transfer_dir, "deeplc_train.csv"),
+    #     maxquant_df=maxquant_dict,
+    #     save_dir=construct_dict_dir,
+    #     keep_matched_precursors=cfg_prepare_dict.KEEP_MATCHED_PRECURSORS,
+    #     filter_by_rt_diff=None,  # TODO: no filter atm
+    # )
+
+    # add rt pred
+    if cfg_prepare_dict.RT_REF == "pred":
+        maxquant_dict = dict_add_alpha_pept_pred(
+            model_path=cfg_prepare_dict.UPDATED_RT_MODEL_PATH,
+            pept_property="rt",
+            dict_for_pred_path=dict_path,
+            maxquant_dict=maxquant_dict,
+            lc_grad=cfg_prepare_dict.RT_MAX,
+            device=device,
+        )
+
+    # add im pred
+    if cfg_prepare_dict.IM_REF == "pred":
+        maxquant_dict = dict_add_alpha_pept_pred(
+            model_path=cfg_prepare_dict.UPDATED_IM_MODEL_PATH,
+            pept_property="mobility",
+            dict_for_pred_path=dict_path,
+            maxquant_dict=maxquant_dict,
+            lc_grad=cfg_prepare_dict.RT_MAX,
+            device=device,
+        )
+    # maxquant_dict = maxquant_dict.sort_values("mobility_pred")
+    # maxquant_dict = pd.merge_asof(
+    #     left=maxquant_dict,
+    #     right=mobility_values_df[["mobility_values_index", "mobility_values"]],
+    #     left_on="mobility_pred",
+    #     right_on="mobility_values",
+    #     direction="nearest",
+    # )
+    maxquant_dict = maxquant_dict.rename(
+        mapper={"mobility_values_index": "mobility_pred_idx"}, axis=1
     )
-    # specify im tolerence for search range
-    if cfg_prepare_dict.IM_TOL < 0:
+    # specify im tolerence for search range (expected ion mobility length)
+    if cfg_prepare_dict.IM_LENGTH < 0:
         Logger.info(
             "IM tolerance not specified, using 99.9 percentile of experiment IM length"
         )
-        im_tol = (
+        im_length = (
             int(maxquant_exp_df["Ion mobility length"].quantile(0.999) + 2) // 2
-        )  # TODO: currently using exp IM length
-        cfg_prepare_dict.IM_TOL = im_tol
+        )  # TODO: currently using only exp IM length
+        cfg_prepare_dict.IM_LENGTH = im_length
+
     maxquant_dict = _define_im_idx_search_range(
         maxquant_df=maxquant_dict,
-        im_tol=im_tol,
+        im_length=cfg_prepare_dict.IM_LENGTH,
         im_ref=cfg_prepare_dict.IM_REF,
         im_idx_range=im_idx_range,
+        delta_im_95=cfg_prepare_dict.DELTA_IM_95,
+        mobility_values_df=mobility_values_df,
     )
     maxquant_dict = _define_rt_search_range(
         maxquant_result_dict=maxquant_dict,
-        rt_tol=float(delta_rt_95),
+        rt_tol=float(cfg_prepare_dict.RT_TOL),
         rt_ref=cfg_prepare_dict.RT_REF,
         rt_range=rt_range,
     )
