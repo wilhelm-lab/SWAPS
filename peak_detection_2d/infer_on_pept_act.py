@@ -1,4 +1,5 @@
 import os
+import logging
 import pandas as pd
 import sparse
 import torch
@@ -7,9 +8,15 @@ from .dataset.dataset import PeptActPeakSelection_Infer_Dataset
 from .model.seg_model import inference_and_sum_intensity
 from .dataset.dataset import build_transformation
 
+Logger = logging.getLogger(__name__)
+
 
 def infer_on_pept_act(
-    cfg, best_model_path: str, maxquant_dict: pd.DataFrame, ps_exp_dir: str
+    cfg,
+    best_seg_model_path: str,
+    best_cls_model_path: str,
+    maxquant_dict: pd.DataFrame,
+    ps_exp_dir: str,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     hint_matrix = sparse.load_npz(
@@ -18,12 +25,21 @@ def infer_on_pept_act(
         )
     )
     transformation, _ = build_transformation(cfg.PEAK_SELECTION.DATASET)
-    model = build_model(cfg.PEAK_SELECTION.MODEL)
-    checkpoint = torch.load(best_model_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+
+    # Load models
+    bst_seg_model = build_model(cfg.PEAK_SELECTION.MODEL)
+    checkpoint = torch.load(best_seg_model_path, map_location=device)
+    Logger.info("best_seg_model_path: %s", best_seg_model_path)
+    bst_seg_model.load_state_dict(checkpoint["model_state_dict"])
+
+    bst_cls_model = build_model(cfg.PEAK_SELECTION.CLSMODEL)
+    checkpoint = torch.load(best_cls_model_path, map_location=device)
+    bst_cls_model.load_state_dict(checkpoint["model_state_dict"])
+
     pept_act_sum_ps_df_list = []
     use_hint_channel = "hint" in cfg.PEAK_SELECTION.DATASET.INPUT_CHANNELS
     for i in range(cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT):
+        Logger.info("Infering on pept batch %d ...", i)
         act_3d = sparse.load_npz(
             os.path.join(
                 cfg.RESULT_PATH,
@@ -46,7 +62,10 @@ def infer_on_pept_act(
             shuffle=False,
         )
         pept_act_sum_ps_df = inference_and_sum_intensity(
-            seg_model=model, data_loader=infer_dataloader, device=device
+            seg_model=bst_seg_model,
+            cls_model=bst_cls_model,
+            data_loader=infer_dataloader,
+            device=device,
         )
         pept_act_sum_ps_df_list.append(pept_act_sum_ps_df)
     pept_act_sum_ps_df = pd.concat(pept_act_sum_ps_df_list, axis=0)

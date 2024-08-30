@@ -83,10 +83,13 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
     )
     if cfg_peak_selection.DATASET.INPUT_CHANNELS == ["log"]:
         cfg_peak_selection.DATASET.ONLY_LOG_CHANNEL = True
+    cfg_peak_selection.MODEL.PARAMS.IN_CHANNELS = len(
+        cfg_peak_selection.DATASET.INPUT_CHANNELS
+    )
     cfg_peak_selection.CLSMODEL.PARAMS.IN_CHANNELS = len(
         cfg_peak_selection.DATASET.INPUT_CHANNELS
     )
-    logging.info("Dataset channels: %d", cfg_peak_selection.CLSMODEL.PARAMS.IN_CHANNELS)
+    logging.info("Dataset channels: %d", cfg_peak_selection.MODEL.PARAMS.IN_CHANNELS)
 
     # Save configs
     cfg_peak_selection.dump(
@@ -127,7 +130,7 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
         shuffle=False,
     )
     _, train_eval_dataset = train_dataset.split_dataset(
-        train_ratio=0.8, seed=random_state
+        train_ratio=0.9, seed=random_state
     )
     train_eval_dataloader = torch.utils.data.DataLoader(
         train_eval_dataset,
@@ -172,6 +175,7 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
 
         current_epoch = 0
         if cfg_peak_selection.MODEL.RESUME_PATH != "":
+            Logger.info("Loading model from %s", cfg_peak_selection.MODEL.RESUME_PATH)
             checkpoint = torch.load(
                 cfg_peak_selection.MODEL.RESUME_PATH, map_location=device
             )
@@ -271,10 +275,10 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
                 f" VAL Weighted DICE and AUCROC: {val_metric}"
             )
             writer.add_scalar("Loss/seg/train", loss, epoch)
-            writer.add_scalar("Metric/seg/train", train_metric[0], epoch)
-            # writer.add_scalar("Metric/cls/train", train_metric[1], epoch)
-            writer.add_scalar("Metric/seg/val", val_metric[0], epoch)
-            # writer.add_scalar("Metric/cls/val", val_metric[1], epoch)
+            writer.add_scalar("Metric/seg/train", train_metric, epoch)
+            # writer.add_scalar("Metric/cls/train", train_metric, epoch)
+            writer.add_scalar("Metric/seg/val", val_metric, epoch)
+            # writer.add_scalar("Metric/cls/val", val_metric, epoch)
             writer.add_scalar("LR/seg", optimizer.param_groups[0]["lr"], epoch)
 
             ######################################
@@ -287,20 +291,20 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
                 else:
                     scheduler.step()
             es(
-                epoch_score=val_metric[0] + 0.5 * val_metric[1],
+                epoch_score=val_metric,
                 epoch_num=epoch,
                 loss=loss,
                 optimizer=optimizer,
                 model=model,
                 model_path=os.path.join(
                     backup_dir,
-                    f"bst_model_{np.round(val_metric[0] + 0.5 * val_metric[1],4)}.pt",
+                    f"bst_seg_model_{np.round(val_metric,4)}.pt",
                 ),
                 scheduler=scheduler,
             )
             best_seg_model_path = os.path.join(
                 backup_dir,
-                f"bst_model_{np.round(es.best_score,4)}.pt",
+                f"bst_seg_model_{np.round(es.best_score,4)}.pt",
             )
             # # Add model to Tensorboard to inspect the details of the architecture
             # input_data = next(iter(train_dataloader))[0].float().to(device)
@@ -318,6 +322,16 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
             os.path.join(ps_exp_results_dir, "metric.json"), "w", encoding="utf-8"
         ) as fp:
             json.dump(metric, fp)
+        cfg_peak_selection.MODEL.RESUME_PATH = best_seg_model_path
+        cfg_peak_selection.MODEL.KEEP_TRAINING = False
+        # Save configs
+        cfg_peak_selection.dump(
+            stream=open(
+                os.path.join(ps_exp_dir, "updated_peak_selection_config.yaml"),
+                "w",
+                encoding="utf-8",
+            )
+        )
     else:
         assert (
             cfg_peak_selection.MODEL.RESUME_PATH != ""
@@ -385,6 +399,7 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
                 model=model,
                 optimizer=optimizer,
                 loss_fn=criterion,
+                model_type="cls",
                 # seg_cls_loss_weight=cfg_peak_selection.CLSMODEL.SOLVER.LOSS.SEG_CLS_WEIGHTS,
                 use_image_as_input=True,
                 device=device,
@@ -429,9 +444,9 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
             )
             writer.add_scalar("Loss/cls/train", loss, epoch)
             # writer.add_scalar("Metric/seg/train", train_metric[0], epoch)
-            writer.add_scalar("Metric/cls/train", train_metric[1], epoch)
+            writer.add_scalar("Metric/cls/train", train_metric, epoch)
             # writer.add_scalar("Metric/seg/val", val_metric[0], epoch)
-            writer.add_scalar("Metric/cls/val", val_metric[1], epoch)
+            writer.add_scalar("Metric/cls/val", val_metric, epoch)
             writer.add_scalar("LR/cls", optimizer.param_groups[0]["lr"], epoch)
 
             ######################################
@@ -451,13 +466,13 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
                 model=model,
                 model_path=os.path.join(
                     backup_dir,
-                    f"bst_model_{np.round(val_metric)}.pt",
+                    f"bst_cls_model_{np.round(val_metric, 4)}.pt",
                 ),
                 scheduler=scheduler,
             )
-            best_seg_model_path = os.path.join(
+            best_cls_model_path = os.path.join(
                 backup_dir,
-                f"bst_model_{np.round(es.best_score,4)}.pt",
+                f"bst_cls_model_{np.round(es.best_score,4)}.pt",
             )
             # # Add model to Tensorboard to inspect the details of the architecture
             # input_data = next(iter(train_dataloader))[0].float().to(device)
@@ -475,6 +490,17 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
             os.path.join(ps_exp_results_dir, "metric.json"), "w", encoding="utf-8"
         ) as fp:
             json.dump(metric, fp)
+        cfg_peak_selection.CLSMODEL.RESUME_PATH = best_cls_model_path
+        cfg_peak_selection.CLSMODEL.KEEP_TRAINING = False
+        # Save configs
+        cfg_peak_selection.dump(
+            stream=open(
+                os.path.join(ps_exp_dir, "updated_peak_selection_config.yaml"),
+                "w",
+                encoding="utf-8",
+            )
+        )
+
     else:
         assert (
             cfg_peak_selection.CLSMODEL.RESUME_PATH != ""
@@ -483,15 +509,15 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
         Logger.info("Using previous model for classification")
     if cfg_peak_selection.EVAL_ON_TEST:
         testset_eval(
-            best_seg_model_path,
-            best_cls_model_path,
-            cfg_peak_selection.MODEL,
-            cfg_peak_selection.CLSMODEL,
-            test_dataset,
-            test_dataloader,
-            maxquant_dict,
-            ps_exp_results_dir,
-            device,
+            best_seg_model_path=best_seg_model_path,
+            best_cls_model_path=best_cls_model_path,
+            cfg_seg_model=cfg_peak_selection.MODEL,
+            cfg_cls_model=cfg_peak_selection.CLSMODEL,
+            test_dataset=test_dataset,
+            test_dataloader=test_dataloader,
+            maxquant_result_ref=maxquant_dict,
+            result_dir=ps_exp_results_dir,
+            device=device,
             exp=cfg_peak_selection.DATASET.ONLY_LOG_CHANNEL,
             # threshold=cfg_peak_selection.CLSMODEL.EVALUATION.THRESHOLD,
         )
@@ -520,7 +546,7 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
     # if cfg_peak_selection.REMOVE_CONFIG_AFTER_RUN:
     #     os.remove(cfg_peak_selection.CONFIG_PATH)
     #     logging.info("Training finished, config file removed.")
-    return best_seg_model_path
+    return best_seg_model_path, best_cls_model_path
 
 
 def testset_eval(
@@ -540,6 +566,7 @@ def testset_eval(
 
     bst_seg_model = build_model(cfg_seg_model)
     checkpoint = torch.load(best_seg_model_path, map_location=device)
+    Logger.info("best_seg_model_path: %s", best_seg_model_path)
     bst_seg_model.load_state_dict(checkpoint["model_state_dict"])
 
     bst_cls_model = build_model(cfg_cls_model)
@@ -633,7 +660,8 @@ def testset_eval(
     # Plot sample predictions
     plot_sample_predictions(
         test_dataset,
-        model=bst_seg_model,
+        seg_model=bst_seg_model,
+        cls_model=bst_cls_model,
         n=10,
         metric_list=["mask_wiou", "wdice", "dice"],
         use_hint=False,
@@ -652,7 +680,8 @@ def testset_eval(
     # Plot sample predictions
     plot_sample_predictions(
         test_dataset,
-        model=bst_seg_model,
+        seg_model=bst_seg_model,
+        cls_model=bst_cls_model,
         sample_indices=worst_performing_images,
         metric_list=["mask_wiou", "wdice", "dice"],
         use_hint=False,

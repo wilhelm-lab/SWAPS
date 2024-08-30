@@ -217,7 +217,7 @@ def opt_scan_by_scan(config_path: str):
         )
         if not os.path.exists(ps_exp_dir):
             os.mkdir(ps_exp_dir)
-        best_model_path = train(
+        best_seg_model_path, best_cls_model_path = train(
             cfg_peak_selection=cfg.PEAK_SELECTION,
             ps_exp_dir=ps_exp_dir,
             random_state=cfg.RANDOM_SEED,
@@ -228,7 +228,8 @@ def opt_scan_by_scan(config_path: str):
         logging.info("Finished training peak selection model, start inference...")
         infer_on_pept_act(
             cfg=cfg,
-            best_model_path=best_model_path,
+            best_seg_model_path=best_seg_model_path,
+            best_cls_model_path=best_cls_model_path,
             maxquant_dict=maxquant_result_ref,
             ps_exp_dir=ps_exp_dir,
         )

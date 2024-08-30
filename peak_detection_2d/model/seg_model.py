@@ -9,7 +9,6 @@ from torchvision.transforms.v2.functional import center_crop
 from torcheval.metrics.functional import binary_auroc
 from tqdm import tqdm
 
-from peak_detection_2d.loss.custom_loss import metric_iou_batch
 
 Logger = logging.getLogger(__name__)
 
@@ -39,6 +38,7 @@ def train_one_epoch(
     model,
     optimizer,
     loss_fn,
+    model_type: Literal["seg", "cls"] = "seg",
     # seg_cls_loss_weight: tuple,
     accumulation_steps=1,
     device="cuda",
@@ -55,10 +55,18 @@ def train_one_epoch(
     tk0 = tqdm(train_loader, total=len(train_loader))
     for image_batch, hint_batch, label_batch in tk0:
         out = model(image_batch.float())
-        if use_image_as_input:
-            b_loss = loss_fn(out, label_batch["mask"].to(device), image_batch)
-        else:
-            b_loss = loss_fn(out, label_batch["mask"].to(device))
+        match model_type:
+            case "seg":
+                if use_image_as_input:
+                    b_loss = loss_fn(out, label_batch["mask"].to(device), image_batch)
+                else:
+                    b_loss = loss_fn(out, label_batch["mask"].to(device))
+            case "cls":
+                # Logger.info("out shape: %s", out.shape)
+                # Logger.info("label shape: %s", label_batch["target"].shape)
+                b_loss = loss_fn(
+                    out, label_batch["target"].view(-1, 1).to(device).float()
+                )
         with torch.set_grad_enabled(True):
             b_loss.backward()
             optimizer.step()
@@ -296,6 +304,13 @@ def inference_and_sum_intensity(
                 )
     if out_score.size == 0:
         out_score = np.zeros_like(sum_intensity)
+    if (target_decoy_score.min() < 0) or (target_decoy_score.max() > 1):
+        Logger.info(
+            "target_decoy_score out of bound [0, 1], min: %s, max: %s, applying sigmoid",
+            target_decoy_score.min(),
+            target_decoy_score.max(),
+        )
+        target_decoy_score = 1 / (1 + np.exp(-target_decoy_score))
     result = dict(
         sum_intensity=sum_intensity,
         mz_rank=pept_mz_rank,
@@ -543,19 +558,19 @@ class UNET(nn.Module):
                 nn.AdaptiveAvgPool2d((1, 1)),  # Global Average Pooling
                 nn.Flatten(),  # Flatten the tensor
                 nn.Linear(encoded_channels, 1),  # Binary classification layer
-                #nn.Sigmoid(),  # Sigmoid activation for binary classification
+                # nn.Sigmoid(),  # Sigmoid activation for binary classification
             )
 
     def forward(self, x):
         enc_out, routes = self.encoder(x)
         seg_out, cls_out = None, None
         if self.seg_head:
-            seg_out = self.decoder(enc_out, routes)
+            out = self.decoder(enc_out, routes)
         if self.cls_head:
-            cls_out = self.classifier(enc_out)
+            out = self.classifier(enc_out)
         # # Logger.debug("Routes: %s", routes.shape)
         # seg_out = self.decoder(enc_out, routes)
         # # Classification output
         # cls_out = self.classifier(enc_out)
 
-        return seg_out, cls_out
+        return out

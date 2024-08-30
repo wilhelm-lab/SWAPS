@@ -149,7 +149,7 @@ plot_history(iou_tracking, "iou", save_dir=peak_selection_dir)
 # Plot sample predictions
 plot_sample_predictions(
     test_dataset,
-    model=model,
+    seg_model=model,
     n=10,
     save_dir=os.path.join(peak_selection_dir, "sample_predictions"),
 )

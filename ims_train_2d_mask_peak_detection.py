@@ -235,7 +235,7 @@ plot_per_image_metric_distr(
 # Plot sample predictions
 plot_sample_predictions(
     test_dataset,
-    model=bst_model,
+    seg_model=bst_model,
     n=10,
     metric_list=["mask_wiou", "wdice", "dice"],
     use_hint=False,

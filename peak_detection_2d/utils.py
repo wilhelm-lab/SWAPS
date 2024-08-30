@@ -5,6 +5,7 @@ import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 import os
+import math
 import h5py
 import seaborn as sns
 from matplotlib import patches
@@ -386,7 +387,8 @@ def plot_per_image_metric_distr(
 def plot_sample_predictions(
     dataset,
     save_dir,
-    model,
+    seg_model,
+    cls_model,
     conf_model=None,
     threshold: float = 0.5,
     n: int = 5,
@@ -400,7 +402,7 @@ def plot_sample_predictions(
     channel: int = 0,
     **kwargs,
 ):
-    model.to(device)
+    seg_model.to(device)
     if sample_indices is None:
         sample_indices = np.random.choice(len(dataset), n, replace=False)
         Logger.info("Sample indices: %s", sample_indices)
@@ -410,11 +412,15 @@ def plot_sample_predictions(
             target = target_dict["mask"].to(device)
             ori_image_raw = target_dict["ori_image_raw"].to(device)
             if use_hint:
-                seg_out, cls_out = model(
+                (seg_out,) = seg_model(
+                    image.unsqueeze(0).float(), hint.unsqueeze(0).float()
+                )
+                cls_out = cls_model(
                     image.unsqueeze(0).float(), hint.unsqueeze(0).float()
                 )
             else:
-                seg_out, cls_out = model(image.unsqueeze(0).float())
+                seg_out = seg_model(image.unsqueeze(0).float())
+                cls_out = cls_model(image.unsqueeze(0).float())
                 if conf_model is not None:
                     conf_model.eval()
                     conf_score = conf_model(seg_out)
@@ -738,3 +744,7 @@ def compete_target_decoy_pair(
     fdr_after_tdc = calc_fdr_given_thres(pept_act_sum_ps_full_tdc)
     Logger.info("FDR after TDC: %s", fdr_after_tdc)
     return pept_act_sum_ps_full, pept_act_sum_ps_full_tdc
+
+
+def sigmoid(x):
+    return 1 / (1 + math.exp(-x))
