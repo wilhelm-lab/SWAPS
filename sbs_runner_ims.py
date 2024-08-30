@@ -17,12 +17,14 @@ from optimization.inference import process_ims_frames_parallel, generate_id_part
 from peak_detection_2d.dataset.prepare_dataset import prepare_training_dataset
 from peak_detection_2d.infer_on_pept_act import infer_on_pept_act
 from peak_detection_2d.train import train
+from peak_detection_2d.utils import (
+    compete_target_decoy_pair,
+    plot_target_decoy_distr,
+    plot_roc_auc,
+    calc_fdr_and_thres,
+)
 from result_analysis import result_analysis
-
-# from result_analysis import result_analysis
 from prepare_dict.prepare_dict import construct_dict, get_mzrank_batch_cutoff
-
-# os.environ["NUMEXPR_MAX_THREADS"] = "8"
 
 
 def opt_scan_by_scan(config_path: str):
@@ -58,24 +60,26 @@ def opt_scan_by_scan(config_path: str):
         # Get the lowest level directory name with .d extension
         dir_with_extension = os.path.basename(os.path.normpath(cfg.DATA_PATH))
         if (
-            cfg.FILTER_EXP_BY_RAW_FILE == ""
+            len(cfg.FILTER_EXP_BY_RAW_FILE) == 0
         ):  # if not specified, get the lowest level directory name with .d extension, by default None
-            cfg.FILTER_EXP_BY_RAW_FILE = dir_with_extension.rstrip(".d")
+            cfg.FILTER_EXP_BY_RAW_FILE.append(dir_with_extension.rstrip(".d"))
 
         ms1scans, mobility_values_df = export_im_and_ms1scans(
             data=data, swaps_result_dir=cfg.RESULT_PATH
         )
-        maxquant_result_exp = pd.read_csv(cfg.MQ_EXP_PATH, sep="\t", low_memory=False)
-        maxquant_result_exp = maxquant_result_exp.loc[
-            maxquant_result_exp["Raw file"] == cfg.FILTER_EXP_BY_RAW_FILE,
-            :,
-        ]
+        # maxquant_result_exp = pd.read_csv(cfg.MQ_EXP_PATH, sep="\t", low_memory=False)
+        # maxquant_result_exp = maxquant_result_exp.loc[
+        #     maxquant_result_exp["Raw file"] == cfg.FILTER_EXP_BY_RAW_FILE,
+        #     :,
+        # ]
         maxquant_result_ref = pd.read_csv(cfg.MQ_REF_PATH, sep="\t", low_memory=False)
         # TODO filter ref df if needed
 
         maxquant_result_ref, dict_pickle_path, cfg_prepare_dict = construct_dict(
             cfg_prepare_dict=cfg.PREPARE_DICT,
-            maxquant_exp_df=maxquant_result_exp,
+            filter_exp_by_raw_file=cfg.FILTER_EXP_BY_RAW_FILE,
+            maxquant_exp_path=cfg.MQ_EXP_PATH,
+            # maxquant_exp_df=maxquant_result_exp,
             maxquant_ref_df=maxquant_result_ref,
             result_dir=os.path.join(cfg.RESULT_PATH),
             mobility_values_df=mobility_values_df,
@@ -219,6 +223,7 @@ def opt_scan_by_scan(config_path: str):
             random_state=cfg.RANDOM_SEED,
             maxquant_dict=maxquant_result_ref,
         )
+
         # Inference
         logging.info("Finished training peak selection model, start inference...")
         infer_on_pept_act(
@@ -227,69 +232,124 @@ def opt_scan_by_scan(config_path: str):
             maxquant_dict=maxquant_result_ref,
             ps_exp_dir=ps_exp_dir,
         )
+
+        # Inference eval
+        if cfg.PREPARE_DICT.GENERATE_DECOY:
+            logging.info(
+                "==================Peak Selection and FDR eval on full dataset=================="
+            )
+            pept_act_sum_ps = pd.read_csv(
+                os.path.join(ps_exp_dir, "pept_act_sum_ps.csv")
+            )
+            pept_act_sum_ps_full, pept_act_sum_ps_full_tdc = compete_target_decoy_pair(
+                pept_act_sum_ps,
+                maxquant_result_ref,
+            )
+            ## Full set w/o TDC
+            plot_target_decoy_distr(
+                pept_act_sum_ps_full,
+                threshold=None,
+                save_dir=os.path.join(ps_exp_dir, "results"),
+                dataset_name="fullset",
+                main_plot_type="scatter",
+            )
+            plot_roc_auc(
+                pept_act_sum_ps_full,
+                save_dir=os.path.join(ps_exp_dir, "results"),
+                dataset_name="fullset",
+            )
+            pept_act_sum_ps_full_new = calc_fdr_and_thres(
+                pept_act_sum_ps_full,
+                score_col="target_decoy_score",
+                filter_dict={"log_sum_intensity": [1, 100]},
+                return_plot=True,
+                save_dir=os.path.join(ps_exp_dir, "results"),
+                dataset_name="fullset",
+            )
+            pept_act_sum_ps_full_new.to_csv(
+                os.path.join(ps_exp_dir, "pept_act_sum_ps_full_fdr_thres.csv")
+            )
+
+            ## Full set w TDC
+            plot_target_decoy_distr(
+                pept_act_sum_ps_full_tdc,
+                threshold=None,
+                save_dir=os.path.join(ps_exp_dir, "results"),
+                dataset_name="fullset_tdc",
+                main_plot_type="scatter",
+            )
+            plot_roc_auc(
+                pept_act_sum_ps_full_tdc,
+                save_dir=os.path.join(ps_exp_dir, "results"),
+                dataset_name="fullset_tdc",
+            )
+            pept_act_sum_ps_full_tdc_new = calc_fdr_and_thres(
+                pept_act_sum_ps_full_tdc,
+                score_col="target_decoy_score",
+                filter_dict={"log_sum_intensity": [1, 100]},
+                return_plot=True,
+                save_dir=os.path.join(ps_exp_dir, "results"),
+                dataset_name="fullset_tdc",
+            )
+            pept_act_sum_ps_full_tdc_new.to_csv(
+                os.path.join(ps_exp_dir, "pept_act_sum_ps_full_tdc_fdr_thres.csv")
+            )
+
     if cfg.RESULT_ANALYSIS.ENABLE:  # TODO: haven't cleaned up the code
         logging.info("==================Result Analaysis==================")
-
-        if cfg.RESULT_ANALYSIS.MQ_EXP_PATH == "":
-            maxquant_result_exp = maxquant_result_ref
-            logging.info(
-                "Experiment data not given, using reference intensity as experiment"
-                " data!"
-            )
-        elif cfg.RESULT_ANALYSIS.MQ_EXP_PATH[-4:] == ".txt":
-            maxquant_result_exp = pd.read_csv(cfg.RESULT_ANALYSIS.MQ_EXP_PATH, sep="\t")
-        elif cfg.RESULT_ANALYSIS.MQ_EXP_PATH[-4:] == ".pkl":
-            maxquant_result_exp = pd.read_pickle(cfg.RESULT_ANALYSIS.MQ_EXP_PATH)
-        elif cfg.RESULT_ANALYSIS.MQ_EXP_PATH[-4:] == ".csv":
-            maxquant_result_exp = pd.read_csv(cfg.RESULT_ANALYSIS.MQ_EXP_PATH)
-
-        if cfg.RESULT_ANALYSIS.FILTER_BY_RAW_FILE is not None:
-            if cfg.RESULT_ANALYSIS.FILTER_BY_RAW_FILE == "":
-                cfg.RESULT_ANALYSIS.FILTER_BY_RAW_FILE = dir_with_extension.rstrip(".d")
-            logging.info(
-                "Filtering experiment data by raw file: %s",
-                cfg.RESULT_ANALYSIS.FILTER_BY_RAW_FILE,
-            )
-            maxquant_result_exp = maxquant_result_exp[
-                maxquant_result_exp["Raw file"]
-                == cfg.RESULT_ANALYSIS.FILTER_BY_RAW_FILE
-            ]
-        eval_dir = os.path.join(cfg.RESULT_PATH, "results", "evaluation")
+        if cfg.PEAK_SELECTION.ENABLE:
+            eval_dir = os.path.join(ps_exp_dir, "results", "evaluation")
+        else:
+            eval_dir = os.path.join(cfg.RESULT_PATH, "results", "evaluation")
         os.makedirs(eval_dir, exist_ok=True)
-        # if "predicted_RT" not in maxquant_result_ref.columns:
-        #     maxquant_result_ref["predicted_RT"] = maxquant_result_ref[
-        #         "RT_search_center"
-        #     ]
 
         pept_act_sum_df = pd.read_csv(os.path.join(act_dir, "pept_act_sum.csv"))
-        pept_act_sum_df_list = [pept_act_sum_df]
+        infer_int_col = "pept_act_sum"
+        # TODO: fix im filter config
         if cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM:
             pept_act_sum_filter_by_im_df = pd.read_csv(
                 os.path.join(act_dir, "pept_act_sum_filter_by_im.csv")
             )
-            pept_act_sum_df_list.append(pept_act_sum_filter_by_im_df)
+            pept_act_sum_filter_by_im_df = pept_act_sum_filter_by_im_df.rename(
+                {"sum_intensity": "sum_intensity_filter_by_im"}, axis=1
+            )
+            pept_act_sum_df = pd.merge(
+                left=pept_act_sum_df,
+                right=pept_act_sum_filter_by_im_df,
+                on=["mz_rank"],
+                how="left",
+                suffixes=("", "_filter_by_im"),
+            )
+            infer_int_col = "sum_intensity_filter_by_im"
 
-        sbs_result = result_analysis.SBSResult(
-            maxquant_ref_df=maxquant_result_ref,
-            # maxquant_merge_df=maxquant_result_ref,
-            maxquant_exp_df=maxquant_result_exp,
-            filter_by_rt_ovelap=cfg.RESULT_ANALYSIS.FILTER_BY_RT_OVERLAP,
-            pept_act_sum_df_list=pept_act_sum_df_list,
-            ims=True,
+        if cfg.PEAK_SELECTION.ENABLE:
+            pept_act_sum_ps = pd.read_csv(
+                os.path.join(ps_exp_dir, "pept_act_sum_ps_full_tdc_fdr_thres.csv")
+            )
+            pept_act_sum_ps = pept_act_sum_ps.rename(
+                {"sum_intensity": "sum_intensity_ps"}, axis=1
+            )
+            pept_act_sum_df = pd.merge(
+                left=pept_act_sum_df,
+                right=pept_act_sum_ps,
+                on=["mz_rank"],
+                how="left",
+                suffixes=("", "_ps"),
+            )
+            infer_int_col = "sum_intensity_ps"
+
+        swaps_result = result_analysis.SWAPSResult(
+            maxquant_dict=maxquant_result_ref,
+            pept_act_sum_df=pept_act_sum_df,
+            infer_intensity_col=infer_int_col,
+            fdr_thres=cfg.RESULT_ANALYSIS.FDR_THRESHOLD,
+            log_sum_intensity_thres=1,
             save_dir=eval_dir,
         )
-        for col in sbs_result.sum_cols:
-            if col != "mz_rank":
-                sbs_result.plot_intensity_corr(
-                    ref_col="Intensity",
-                    inf_col=col,
-                    contour=False,
-                    # save_dir=None,
-                    # interactive = True, hover_data = ['Modified sequence', 'Charge', 'mz_rank']
-                )
-
-        # Overlap with MQ
-        sbs_result.plot_overlap_with_MQ(show_ref=True)
+        swaps_result.plot_intensity_corr()
+        swaps_result.plot_overlap_with_MQ(show_ref=False, level="precursor")
+        swaps_result.plot_overlap_with_MQ(show_ref=False, level="peptide")
+        swaps_result.plot_overlap_with_MQ(show_ref=False, level="protein")
 
 
 if __name__ == "__main__":

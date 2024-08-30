@@ -13,8 +13,23 @@ def build_model(model_cfg: CfgNode):
                 exit_channels=model_cfg.PARAMS.EXIT_CHANNELS,
                 downhill=model_cfg.PARAMS.DOWNHILL,
                 padding=model_cfg.PARAMS.PADDING,
+                seg_head=True,
+                cls_head=False,
             )
             return model
+    elif model_cfg.TYPE == "mask_classification":
+        if model_cfg.NAME == "UNET":
+            model = UNET(
+                in_channels=model_cfg.PARAMS.IN_CHANNELS,
+                first_out_channels=model_cfg.PARAMS.FIRST_OUT_CHANNELS,
+                exit_channels=model_cfg.PARAMS.EXIT_CHANNELS,
+                downhill=model_cfg.PARAMS.DOWNHILL,
+                padding=model_cfg.PARAMS.PADDING,
+                seg_head=False,
+                cls_head=True,
+            )
+            return model
+
     elif model_cfg.TYPE == "box_regression":
         if model_cfg.NAME == "PeakDetectionNet":
             model = PeakDetectionNet(

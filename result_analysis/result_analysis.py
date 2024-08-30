@@ -5,6 +5,7 @@ from typing import List, Literal, Union
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from pygam import f
 import seaborn as sns
 from .compare_maxquant import (
     merge_with_maxquant_exp,
@@ -13,7 +14,7 @@ from .compare_maxquant import (
     sum_pcm_intensity_from_exp,
     add_sum_act_cols,
 )
-
+from peak_detection_2d.utils import calc_fdr_and_thres
 from utils.plot import plot_scatter, plot_venn2, plot_venn3, save_plot
 
 Logger = logging.getLogger(__name__)
@@ -126,6 +127,7 @@ def plot_corr_int_ref_and_act(
     save_dir: Union[None, str] = None,
     log_x: bool = True,
     log_y: bool = True,
+    fig_spec_name: str = "",
     title: str | None = None,
 ):
     if hover_data is None:
@@ -153,6 +155,7 @@ def plot_corr_int_ref_and_act(
         save_dir=save_dir,
         x_label="Reference (log)",
         y_label="Infered (log)",
+        fig_spec_name=fig_spec_name,
     )
     return reg_int, abs_residue, valid_idx
 
@@ -218,6 +221,220 @@ def plot_alphas_across_scan(
     plt.ylabel("Alpha (log)")
     plt.title("Best Alpha over " + x)
     save_plot(save_dir=save_dir, fig_type_name="Alpha_along", fig_spec_name=x)
+
+
+class SWAPSResult:
+    """SWAPSResult class for result analysis"""
+
+    def __init__(
+        self,
+        maxquant_dict: pd.DataFrame,
+        pept_act_sum_df: pd.DataFrame,
+        infer_intensity_col: str = "sum_intensity_ps",
+        fdr_thres: float | None = 0.1,
+        log_sum_intensity_thres: float = 1,
+        save_dir: str = None,
+    ):
+        """
+        Initialize SWAPSResult object and intergrate all activation data.
+        :param maxquant_dict: The reference dataframe from MaxQuant, type pd.DataFrame.
+        :param pept_act_sum: The list of activation sum dataframes, each contains columns "mz_rank" and sum of intensity", type List[pd.DataFrame]
+        :param fdr_threshold: The FDR threshold for filtering the data, type float
+        :param log_sum_intensity_thres: The threshold for filtering the data by the sum of intensity, type float
+        :param save_dir: The directory to save the plot. If None, the plot will not be saved.
+        """
+        self.maxquant_dict = maxquant_dict
+        self.pept_act_sum = pept_act_sum_df.copy()
+
+        self.log_sum_intensity_thres = log_sum_intensity_thres
+        self.save_dir = save_dir
+        self.target_decoy_score_thres = None
+        self.infer_intensity_col = infer_intensity_col
+        self.pept_act_sum.dropna(subset=[self.infer_intensity_col], inplace=True)
+        Logger.info(
+            "Drop na values in %s, Pept activation sum entries: %s",
+            self.infer_intensity_col,
+            self.pept_act_sum.shape[0],
+        )
+        if self.log_sum_intensity_thres > 0:
+            Logger.info(
+                "Filtering the data by the sum of intensity threshold %s, number of entries before filtering %s",
+                self.log_sum_intensity_thres,
+                self.pept_act_sum.shape[0],
+            )
+            self.pept_act_sum = self.pept_act_sum.loc[
+                self.pept_act_sum["log_sum_intensity"] > self.log_sum_intensity_thres, :
+            ]
+            Logger.info(
+                "Number of entries after filtering %s", self.pept_act_sum.shape[0]
+            )
+        td_count = self.pept_act_sum["Decoy"].value_counts()
+        self.fdr_max = np.round(td_count[True] / td_count[False], 3)
+        if fdr_thres < self.fdr_max:
+            self.fdr_thres = fdr_thres
+        else:
+            Logger.info(
+                "FDR threshold is larger than the maximum FDR, set to maximum FDR %s",
+                self.fdr_max,
+            )
+            self.fdr_thres = self.fdr_max
+        if self.fdr_thres is not None:
+            Logger.info("Calculating FDR results after filter...")
+            self.pept_act_sum = calc_fdr_and_thres(
+                self.pept_act_sum,
+                score_col="target_decoy_score",
+                filter_dict={"log_sum_intensity": [0, 100]},
+                return_plot=True,
+                save_dir=save_dir,
+                dataset_name="result_analysis",
+            )
+            Logger.info(
+                "Filtering the data by FDR threshold %s, number of entries before filtering %s",
+                self.fdr_thres,
+                self.pept_act_sum.shape[0],
+            )
+            self.target_decoy_score_thres = pept_act_sum_df.loc[
+                pept_act_sum_df["fdr"] <= self.fdr_thres, "target_decoy_score"
+            ].min()
+            self.pept_act_sum = self.pept_act_sum.loc[
+                self.pept_act_sum["target_decoy_score"]
+                >= self.target_decoy_score_thres,
+                :,
+            ]
+            Logger.info(
+                "Score threshold %s, number of entries after filtering %s",
+                self.target_decoy_score_thres,
+                self.pept_act_sum.shape[0],
+            )
+        if "Decoy" in self.pept_act_sum.columns:
+            Logger.info(
+                "Removing decoy entries, number of entries before filtering %s",
+                self.pept_act_sum.shape[0],
+            )
+            self.pept_act_sum = self.pept_act_sum.loc[
+                self.pept_act_sum["Decoy"] == 0, :
+            ]
+            Logger.info(
+                "Number of entries after filtering %s", self.pept_act_sum.shape[0]
+            )
+
+    def calc_protein_level_fdr(self):
+        dict_with_int = pd.merge(
+            self.maxquant_dict, self.pept_act_sum, on="mz_rank", how="inner"
+        )
+        dict_with_int["Leading razor proteins_td_labeled"] = dict_with_int[
+            "Leading razor protein"
+        ].str.cat(dict_with_int["Decoy"].astype(str), sep="_")
+        td_protein_count = dict_with_int.groupby("Leading razor proteins_td_labeled")
+        return td_protein_count
+
+    def plot_intensity_corr(self, **kwargs):
+        """
+        Plot the correlation between the intensity from the experiment file and the activation columns
+        """
+        maxquant_exp = self.maxquant_dict.loc[
+            self.maxquant_dict["source"].isin(["exp", "both"])
+        ]
+        int_compare = pd.merge(
+            maxquant_exp, self.pept_act_sum, on="mz_rank", how="inner"
+        )
+        # plot the correlation between the intensity from the experiment file and the activation columns
+        plot_corr_int_ref_and_act(
+            ref_int=int_compare["Intensity"],
+            sum_act=int_compare[self.infer_intensity_col],
+            save_dir=self.save_dir,
+            title="Corr. of Quant. Results ",
+            fig_spec_name="_fdr_"
+            + str(self.fdr_thres)
+            + "_log_int_"
+            + str(self.log_sum_intensity_thres),
+            **kwargs,
+        )
+
+    def plot_overlap_with_MQ(
+        self,
+        show_ref: bool = False,
+        level: Literal["precursor", "peptide", "protein"] = "peptide",
+    ):
+        """
+        Plot the overlap between the experiment file and the activation columns
+        """
+        maxquant_dict_target = self.maxquant_dict.loc[self.maxquant_dict["Decoy"] == 0]
+        match level:
+            case "precursor":
+                set1 = set(
+                    maxquant_dict_target.loc[
+                        maxquant_dict_target["source"].isin(["exp", "both"]), "mz_rank"
+                    ]
+                )
+                set2 = set(self.pept_act_sum["mz_rank"])
+                set3 = set([])
+                if show_ref:
+                    set3 = set(maxquant_dict_target["mz_rank"])
+            case "peptide":
+                set1 = set(
+                    maxquant_dict_target.loc[
+                        maxquant_dict_target["source"].isin(["exp", "both"]), "Sequence"
+                    ]
+                )
+                set2 = set(
+                    maxquant_dict_target.loc[
+                        maxquant_dict_target["mz_rank"].isin(
+                            self.pept_act_sum["mz_rank"]
+                        ),
+                        "Sequence",
+                    ]
+                )
+                set3 = set([])
+                if show_ref:
+                    set3 = set(maxquant_dict_target["Sequence"])
+            case "protein":
+                list1 = maxquant_dict_target.loc[
+                    maxquant_dict_target["source"].isin(["exp", "both"]), "Proteins"
+                ].str.split(";")
+                set1 = set([item for sublist in list1 for item in sublist])
+                list2 = maxquant_dict_target.loc[
+                    maxquant_dict_target["mz_rank"].isin(self.pept_act_sum["mz_rank"]),
+                    "Proteins",
+                ].str.split(";")
+                set2 = set([item for sublist in list2 for item in sublist])
+                set3 = set([])
+                if show_ref:
+                    list3 = maxquant_dict_target["Proteins"].str.split(";")
+                    set3 = set([item for sublist in list3 for item in sublist])
+
+        if show_ref:
+            plot_venn3(
+                set1=set1,
+                set2=set2,
+                set3=set3,
+                label1="Maxquant",
+                label2="SWAPS",
+                label3="Reference",
+                save_dir=self.save_dir,
+                title="Identification Of Target, "
+                + level
+                + ", fdr="
+                + str(self.fdr_thres),
+                fig_spec_name=level + "_fdr_" + str(self.fdr_thres),
+            )
+        else:
+            plot_venn2(
+                set1=set1,
+                set2=set2,
+                label1="Maxquant",
+                label2="SWAPS",
+                save_dir=self.save_dir,
+                title="Identification Of Target, "
+                + level
+                + ", fdr="
+                + str(self.fdr_thres),
+                fig_spec_name=level
+                + "_fdr_"
+                + str(self.fdr_thres)
+                + "_log_int_"
+                + str(self.log_sum_intensity_thres),
+            )
 
 
 class SBSResult:
@@ -315,10 +532,12 @@ class SBSResult:
 
     def compare_with_maxquant_exp_int(
         self,
-        filter_by_rt_overlap: List[
-            Literal["full_overlap", "partial_overlap", "no_overlap"]
-        ]  # TODO: refactor to the same place as compare_maxquant
-        | None = None,
+        filter_by_rt_overlap: (
+            List[
+                Literal["full_overlap", "partial_overlap", "no_overlap"]
+            ]  # TODO: refactor to the same place as compare_maxquant
+            | None
+        ) = None,
         handle_mul_exp_pcm: Literal["drop", "agg", "preserve"] = "agg",
         # agg_pcm_intensity: bool = True,
         save_dir: str | None = None,

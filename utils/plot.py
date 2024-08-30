@@ -84,6 +84,7 @@ def plot_scatter(
     x_label: Union[None, str] = None,
     y_label: Union[None, str] = None,
     title: Union[None, str] = None,
+    fig_spec_name: str = "",
 ):
     """
     Generate scatter plot with correlation coefficient and number of data points,
@@ -261,7 +262,11 @@ def plot_scatter(
         plt.xlabel(x_label)
         plt.ylabel(y_label)
         plt.suptitle(title + y_name)
-        save_plot(save_dir=save_dir, fig_type_name=fig_type_name, fig_spec_name=y_name)
+        save_plot(
+            save_dir=save_dir,
+            fig_type_name=fig_type_name,
+            fig_spec_name=y_name + fig_spec_name,
+        )
 
     return RegressionY.T, AbsResidue.T, valid_idx
 
@@ -274,6 +279,7 @@ def plot_venn2(
     save_dir: str | None = None,
     save_format: str = "png",
     title: str | None = None,
+    fig_spec_name: str | None = None,
 ):
     venn2([set1, set2], set_labels=(label1, label2))
     if title is not None:
@@ -281,7 +287,7 @@ def plot_venn2(
     save_plot(
         save_dir=save_dir,
         fig_type_name="VennDiag",
-        fig_spec_name=title,
+        fig_spec_name=fig_spec_name,
         fig_format=save_format,
     )
 
@@ -296,6 +302,7 @@ def plot_venn3(
     save_dir: str | None = None,
     save_format: str = "png",
     title: str | None = None,
+    fig_spec_name: str | None = None,
 ):
     venn3([set1, set2, set3], set_labels=(label1, label2, label3))
     if title is not None:
@@ -303,7 +310,7 @@ def plot_venn3(
     save_plot(
         save_dir=save_dir,
         fig_type_name="VennDiag",
-        fig_spec_name=title,
+        fig_spec_name=fig_spec_name,
         fig_format=save_format,
     )
 
@@ -839,7 +846,7 @@ def plot_pept_im_rt_heatmap(
         if maxquant_result_exp_row.shape[0] == 0:
             Logger.warning("No experiment match is found.")
             bbox = None
-        else:       
+        else:
             bbox = get_bbox_from_mq_exp(maxquant_result_exp_row)
             Logger.info(
                 "Experiment result: %s, bounding box available: %s",
@@ -891,10 +898,16 @@ def plot_pept_im_rt_heatmap(
     # sns.color_palette("icefire", as_cmap=True)
     ax = sns.heatmap(data_3d_heatmap, cmap="icefire")
     if bbox is not None:
-        bbox_rt_min_idx = max(np.searchsorted(data_3d_heatmap.index, bbox[0], side="left") - 1, 0)
+        bbox_rt_min_idx = max(
+            np.searchsorted(data_3d_heatmap.index, bbox[0], side="left") - 1, 0
+        )
         bbox_rt_max_idx = np.searchsorted(data_3d_heatmap.index, bbox[1], side="right")
-        bbox_im_min_idx = max(np.searchsorted(data_3d_heatmap.columns, bbox[3], side="left") - 1, 0)
-        bbox_im_max_idx = np.searchsorted(data_3d_heatmap.columns, bbox[4], side="right")
+        bbox_im_min_idx = max(
+            np.searchsorted(data_3d_heatmap.columns, bbox[3], side="left") - 1, 0
+        )
+        bbox_im_max_idx = np.searchsorted(
+            data_3d_heatmap.columns, bbox[4], side="right"
+        )
         Logger.info(
             "Bounding box: %s",
             [
@@ -916,8 +929,19 @@ def plot_pept_im_rt_heatmap(
         )
         plt.show()
     else:
-        ref_rt_idx = np.searchsorted(data_3d_heatmap.index, reference_entry[0], side="left")
-        ref_im_idx = np.searchsorted(data_3d_heatmap.columns, reference_entry[1], side="left")
-        ax.scatter(ref_im_idx, ref_rt_idx, marker='o', color='red', s=50, label='Reference Point')
+        ref_rt_idx = np.searchsorted(
+            data_3d_heatmap.index, reference_entry[0], side="left"
+        )
+        ref_im_idx = np.searchsorted(
+            data_3d_heatmap.columns, reference_entry[1], side="left"
+        )
+        ax.scatter(
+            ref_im_idx,
+            ref_rt_idx,
+            marker="o",
+            color="red",
+            s=50,
+            label="Reference Point",
+        )
         ax.legend()
         plt.show()

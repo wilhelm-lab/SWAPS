@@ -135,6 +135,7 @@ def prepare_2d_act_and_mask_updated(
     """
     pept_mz_rank = int(pept_mz_rank)
     maxquant_row = maxquant_dict[maxquant_dict["mz_rank"] == pept_mz_rank]
+    target = 0 if maxquant_row["Decoy"].values[0] else 1
     # Ensure that there's only one row
     if maxquant_row.shape[0] > 1:
         raise ValueError(
@@ -165,7 +166,6 @@ def prepare_2d_act_and_mask_updated(
                 ),
             ] = 1  # accurate mask
             # mask = mask[rt_left:rt_right, im_left:im_right]
-            Logger.debug("Mask sum %s", mask.sum())
 
     img = sparse.asnumpy(
         peptbatch_act[
@@ -181,8 +181,11 @@ def prepare_2d_act_and_mask_updated(
             pept_mz_rank,
         ]
     )
+    Logger.debug("Peptide mz_rank %s", pept_mz_rank)
+    Logger.debug("Hint sum %s", hint.sum())
+    Logger.debug("Hint non zero %s", np.count_nonzero(hint))
     mask = mask[rt_left:rt_right, im_left:im_right]
-
+    Logger.debug("Mask sum %s", mask.sum())
     # Wrap sample and targets into torchvision tv_tensors:
     img = tv_tensors.Image(img)
     hint = tv_tensors.Image(hint)
@@ -193,6 +196,7 @@ def prepare_2d_act_and_mask_updated(
         "hint_channel": hint,
         "mask": mask,
         "pept_mz_rank": pept_mz_rank,
+        "target": target,
     }
 
 
@@ -403,7 +407,7 @@ def generate_hint_sparse_matrix(maxquant_dict_df: pd.DataFrame, shape: tuple):
 
 def prepare_training_dataset(
     result_dir: str,
-    maxquant_dict=pd.DataFrame,
+    maxquant_dict: pd.DataFrame,
     n_workers: int = 1,
     include_decoys: bool = False,
     chunk_size: int = 5000,
@@ -459,10 +463,12 @@ def prepare_training_dataset(
     pept_batch_indicies = maxquant_dict["pept_batch_idx"].unique()
     Logger.info("Pept batch indices: %s", pept_batch_indicies)
     if include_decoys:
-        maxquant_dict_for_training = maxquant_dict.loc[maxquant_dict["source"] == "exp"]
+        maxquant_dict_for_training = maxquant_dict.loc[
+            maxquant_dict["source"].isin(["both"])
+        ]  # Only use the data points that are from both sources for training and eval
     else:
         maxquant_dict_for_training = maxquant_dict.loc[
-            (maxquant_dict["source"] == "exp") & ~(maxquant_dict["Decoy"])
+            (maxquant_dict["source"].isin(["both"])) & ~(maxquant_dict["Decoy"])
         ]
     Logger.info(
         "Number of training data points: %s", maxquant_dict_for_training.shape[0]
@@ -477,7 +483,7 @@ def prepare_training_dataset(
             "Peptide batch %s, pept_mz_ranks length %s", pept_batch, len(pept_mz_ranks)
         )
         hdf5_file_path = os.path.join(
-            ps_data_dir, f"train_datapoints_peptbatch{pept_batch}.hdf5"
+            ps_data_dir, f"train_datapoints_TD_peptbatch{pept_batch}.hdf5"
         )
         if pept_batch > 0:
             pept_act_batch = sparse.load_npz(
@@ -508,15 +514,6 @@ def prepare_training_dataset(
             del list_of_data_points
         hdf5_file_paths.append(hdf5_file_path)
     return hdf5_file_paths
-
-
-def prepare_target_decoy_dataset(seg_model, maxquant_dict_df, dataset):
-    """
-    Prepare target and decoy dataset for training classification model
-    :param seg_model: nn.Module, segmentation model
-    :param maxquant_dict_df: pd.DataFrame, maxquant results
-    :param dataset: str, dataset name
-    """
 
 
 if __name__ == "__main__":

@@ -143,6 +143,7 @@ class PeptActPeakSelection_Infer_Dataset(torch.utils.data.Dataset):
 
     def _create_data_index(self):
         data_index = self.maxquant_dict["mz_rank"].values
+        Logger.debug("Creating data index %s", data_index)
         return data_index
 
     def __getitem__(self, idx):
@@ -154,23 +155,30 @@ class PeptActPeakSelection_Infer_Dataset(torch.utils.data.Dataset):
             hint_matrix=self.hint_matrix,
             add_label_mask=False,
         )
+        # Logger.debug("datapoint_dict %s", datapoint_dict)
 
         # Wrap sample and targets into torchvision tv_tensors:
-        img = tv_tensors.Image(datapoint_dict["data"])
-        hint = tv_tensors.Image(datapoint_dict["hint_channel"])
-        mask = tv_tensors.Image(datapoint_dict["mask"])
+        img = datapoint_dict["data"]
+        hint = datapoint_dict["hint_channel"]
+        mask = datapoint_dict["mask"]
 
         target = {
             "mask": mask,
-            "pept_mz_rank": idx,
+            "pept_mz_rank": datapoint_dict["pept_mz_rank"],
+            "target": datapoint_dict["target"],
+            "ori_image_raw": img,
+
         }
-        # Logger.debug("Peptide mz rank %s", target["pept_mz_rank"])
+        # Logger.debug("img shape %s", img.shape)
+        # Logger.debug("hint shape %s", hint.shape)
+        # Logger.debug("target %s", target)
         if self.transforms is not None:
             img, hint, target = self.transforms((img, hint, target))
 
         return img.to(device), hint.to(device), target
 
 
+# TODO: stratified spliting of dataset by TD_pair_id, rather than mz_rank
 class MultiHDF5_MaskDataset(torch.utils.data.Dataset):
     """Dataset for training as well as inference with peak selection, \
         target labels can be optionally included. Lazy loading from hdf5 files \
@@ -248,6 +256,8 @@ class MultiHDF5_MaskDataset(torch.utils.data.Dataset):
             "pept_mz_rank": data_point["pept_mz_rank"],
             # "area": area,
             "iscrowd": iscrowd,
+            "target": data_point["target"],
+            "ori_image_raw": img,
         }
         # Logger.debug("Peptide mz rank %s", target["pept_mz_rank"])
         if self.transforms is not None:
@@ -284,7 +294,6 @@ class MultiHDF5_MaskDataset(torch.utils.data.Dataset):
         )
 
         return train_dataset, test_dataset
-
 
 
 class Peak2dDataset(torch.utils.data.Dataset):
@@ -524,33 +533,44 @@ class Mask_Resize:
 
         batch_number, original_rt, original_im = image.size()
         if original_rt == self.new_rt_height and original_im == self.new_im_width:
-            # Logger.debug(
-            #     "Image size %s same as new size, returning image.", image.size()
-            # )
             return image, hint, label
         delta_im_width = self.new_im_width - original_im
         delta_rt_height = self.new_rt_height - original_rt
-        # Logger.debug(
-        #     "delta im width %s, delta rt height %s", delta_im_width, delta_rt_height
-        # )
-        # target["ori_image"] = image
         image_new = F.resize(image, (self.new_im_width, self.new_rt_height))
-        # Logger.debug("image new shape %s", image_new.size())
         label_new = F.resize(label, (self.new_im_width, self.new_rt_height))
+        target["ori_image_raw"] = F.resize(
+            target["ori_image_raw"], (self.new_im_width, self.new_rt_height)
+        )
         target["mask"] = label_new
-        # Logger.debug("label new shape %s", label_new.size())
         if hint.size() == image.size():
+            hint = (
+                hint * 1000
+            )  # !! scale hint to 0-1000 otherwise single hint values in -1 to 1 will all be squeezed to 0
             hint_new = F.resize(hint, (self.new_im_width, self.new_rt_height))
-            # Logger.debug("hitn new shape %s", hint_new.size())
         else:
             hint_rt, hint_im = hint
             hint_new = (hint_rt + delta_rt_height // 2, hint_im + delta_im_width // 2)
-            # Logger.debug("Correct hint coordination %s", hint_new)
         return (
             image_new,
             hint_new,
             target,
         )
+
+
+class Mask_MinMaxScale:
+    def __init__(self, scale_log_channel: bool = True) -> None:
+        self.scale_log_channel = scale_log_channel
+
+    def __call__(self, data_hint_bbox):
+        image = data_hint_bbox[0]
+        target = data_hint_bbox[2]
+        target["ori_image_raw"] = image[0].detach().clone()
+        image[0] = image[0] / image[0].max().item()
+        hint = data_hint_bbox[1]
+        if self.scale_log_channel:
+            image[1] = image[1] / image[1].max().item()
+
+        return image, hint, target
 
 
 class Resize:
@@ -628,13 +648,17 @@ class Mask_ToTensor:
         pass
 
     def __call__(self, data_hint_bbox):
-        # Logger.debug("data_hint_bbox %s", data_hint_bbox)
+        image = data_hint_bbox[0]
         hint = data_hint_bbox[1]
-        hint_x, hint_y = hint
-
-        # label = F.to_tensor(label)
-        hint = torch.tensor([hint_x, hint_y], dtype=torch.float32)
-        return data_hint_bbox[0], hint, data_hint_bbox[2]
+        # label = data_hint_bbox[2]["mask"]
+        label = data_hint_bbox[2]
+        image[0] = F.to_tensor(image[0])
+        hint = F.to_tensor(hint)
+        return (
+            image,
+            hint,
+            label,
+        )
 
 
 class ToPILImage:
@@ -685,8 +709,10 @@ def build_transformation(dataset_cfg: CfgNode):
         # dataset_cfg.USE_HINT_CHANNEL = True
     # else:
     #     #dataset_cfg.USE_HINT_CHANNEL = False
-    if dataset_cfg.TO_TENSOR:
-        transformation.append(Mask_ToTensor())
+    if dataset_cfg.MINMAX_SCALE:
+        # raise NotImplementedError("TO_TENSOR is not implemented yet")
+        transformation.append(Mask_MinMaxScale())
+        # transformation.append(transforms.ToTensor())
     # dataset_cfg.N_CHANNEL = len(dataset_cfg.INPUT_CHANNELS)
     # match dataset_cfg.INPUT_CHANNELS:
     #     case ["normal"]:

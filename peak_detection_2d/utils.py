@@ -1,7 +1,7 @@
 import logging
 from typing import Literal
 import numpy as np
-
+import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 import os
@@ -11,7 +11,7 @@ from matplotlib import patches
 from matplotlib.colors import ListedColormap, BoundaryNorm
 from utils.plot import save_plot
 import torch
-
+from sklearn.metrics import roc_curve, roc_auc_score
 import matplotlib.pyplot as plt
 from peak_detection_2d.loss.custom_loss import (
     metric_iou_batch,
@@ -110,24 +110,44 @@ def plot_data_points(
 ):
     # ax = sns.heatmap(dp_dict["data"], cmap="icefire")
     fig, ax = plt.subplots()
-    if log_data:
-        heatmap = ax.imshow(np.log(dp_dict["data"] + 1), cmap="binary")
-    else:
-        heatmap = ax.imshow(dp_dict["data"], cmap="binary")
-    # Define colors with transparency: -1 is blue, 0 is translucent white, 1 is red
-    colors = [
-        (0, 0, 1, 1),  # Blue for -1
-        (1, 1, 1, 0.5),  # Translucent white for 0
-        (1, 0, 0, 1),
-    ]  # Red for 1
+    if "data" in dp_dict:
+        if log_data:
+            heatmap = ax.imshow(np.log(dp_dict["data"] + 1), cmap="binary")
+        else:
+            heatmap = ax.imshow(dp_dict["data"], cmap="binary")
 
-    # Create a colormap
-    cmap = ListedColormap(colors)
+    if "hint_channel" in dp_dict:
 
-    # Define boundaries for discrete mapping
-    bounds = [-1.5, -0.5, 0.5, 1.5]  # Create boundaries to cover the discrete values
-    norm = BoundaryNorm(bounds, cmap.N)
-    # Logger.info("Peptide mz rank: %s", dp_dict["pept_mz_rank"])
+        # Logger.info("Peptide mz rank: %s", dp_dict["pept_mz_rank"])
+        # Define colors with transparency: -1 is blue, 0 is translucent white, 1 is red
+        colors = [
+            (0, 0, 1, 1),  # Blue for -1
+            (1, 1, 1, 0.5),  # Translucent white for 0
+            (1, 0, 0, 1),
+        ]  # Red for 1
+
+        # Create a colormap
+        cmap = ListedColormap(colors)
+        # Define boundaries for discrete mapping
+        bounds = [
+            -1.5,
+            -0.5,
+            0.5,
+            1.5,
+        ]  # Create boundaries to cover the discrete values
+        norm = BoundaryNorm(bounds, cmap.N)
+        ax.imshow(
+            dp_dict["hint_channel"],
+            cmap=cmap,
+            norm=norm,
+            alpha=0.5,
+            label="hint",
+        )
+        Logger.info("hint channel sum: %s", dp_dict["hint_channel"].sum().item())
+        Logger.info(
+            "hint channel non zero values: %s",
+            dp_dict["hint_channel"][dp_dict["hint_channel"] != 0],
+        )
     match label:
         case "bbox":
             ax.add_patch(
@@ -144,16 +164,6 @@ def plot_data_points(
             )
         case "mask":
             ax.imshow(dp_dict["mask"], cmap="Blues", alpha=0.3, label="true")
-            try:
-                ax.imshow(
-                    dp_dict["hint_channel"],
-                    cmap=cmap,
-                    norm=norm,
-                    alpha=0.5,
-                    label="hint",
-                )
-            except KeyError:
-                pass
         case "hide":
             pass
         case _:
@@ -175,9 +185,116 @@ def plot_data_points(
         ax.imshow(pred_mask, cmap="Reds", alpha=0.3, label="pred")
 
     # ax.plot(dp_dict["hint_idx"][1], dp_dict["hint_idx"][0], "ro", label="Hint")
-    ax.set_xlabel("ion mobility (AU)")
-    ax.set_ylabel("RT (AU)")
+    ax.set_xlabel("Ion Mobility (AU)")
+    ax.set_ylabel("Retention Time (AU)")
     ax.legend()
+    if zoom_in:
+        if pred_bbox is None:
+            pred_bbox = dp_dict["bbox"]
+        x_min = min(dp_dict["bbox"][0], dp_dict["hint_idx"][1], pred_bbox[0]) - 10
+        x_max = max(dp_dict["bbox"][2], dp_dict["hint_idx"][1], pred_bbox[2]) + 10
+        y_min = min(dp_dict["bbox"][1], dp_dict["hint_idx"][0], pred_bbox[1]) - 10
+        y_max = max(dp_dict["bbox"][3], dp_dict["hint_idx"][0], pred_bbox[3]) + 10
+        plt.axis([x_min, x_max, y_max, y_min])
+
+
+def plot_data_points_illustration(
+    dp_dict,
+    log_data: bool = False,
+    pred_bbox: list | None = None,
+    pred_mask: np.ndarray | None = None,
+    zoom_in: bool = False,
+    label: Literal["bbox", "mask", "hide"] = "bbox",
+):
+    # ax = sns.heatmap(dp_dict["data"], cmap="icefire")
+    fig, ax = plt.subplots()
+    if "data" in dp_dict:
+        if log_data:
+            heatmap = ax.imshow(np.log(dp_dict["data"] + 1), cmap="binary")
+        else:
+            heatmap = ax.imshow(dp_dict["data"], cmap="binary")
+
+    if "hint_channel" in dp_dict:
+
+        # Logger.info("Peptide mz rank: %s", dp_dict["pept_mz_rank"])
+        # Define colors with transparency: -1 is blue, 0 is translucent white, 1 is red
+        colors = [
+            (0, 0, 1, 1),  # Blue for -1
+            (1, 1, 1, 0.5),  # Translucent white for 0
+            (1, 0, 0, 1),
+        ]  # Red for 1
+
+        # Create a colormap
+        cmap = ListedColormap(colors)
+        # Define boundaries for discrete mapping
+        bounds = [
+            -1.5,
+            -0.5,
+            0.5,
+            1.5,
+        ]  # Create boundaries to cover the discrete values
+        norm = BoundaryNorm(bounds, cmap.N)
+        ax.imshow(
+            dp_dict["hint_channel"],
+            cmap=cmap,
+            norm=norm,
+            alpha=0.5,
+            label="hint",
+        )
+        Logger.info("hint channel sum: %s", dp_dict["hint_channel"].sum().item())
+        Logger.info(
+            "hint channel non zero values: %s",
+            dp_dict["hint_channel"][dp_dict["hint_channel"] != 0],
+        )
+    match label:
+        case "bbox":
+            ax.add_patch(
+                patches.Rectangle(
+                    xy=(dp_dict["bbox"][0], dp_dict["bbox"][1]),
+                    width=dp_dict["bbox"][2] - dp_dict["bbox"][0],
+                    height=dp_dict["bbox"][3] - dp_dict["bbox"][1],
+                    edgecolor="red",
+                    fill=False,
+                    linestyle="-",
+                    lw=3,
+                    label="True",
+                )
+            )
+        case "mask":
+            ax.imshow(dp_dict["mask"], cmap="Blues", alpha=0.3, label="true")
+        case "hide":
+            pass
+        case _:
+            raise ValueError(f"Unknown option {label}")
+    if pred_bbox is not None:
+        ax.add_patch(
+            patches.Rectangle(
+                xy=(pred_bbox[0], pred_bbox[1]),
+                width=pred_bbox[2] - pred_bbox[0],
+                height=pred_bbox[3] - pred_bbox[1],
+                edgecolor="red",
+                fill=False,
+                linestyle="--",
+                lw=3,
+                label="Pred",
+            )
+        )
+    if pred_mask is not None:
+        ax.imshow(pred_mask, cmap="Reds", alpha=0.3, label="pred")
+
+    # ax.plot(dp_dict["hint_idx"][1], dp_dict["hint_idx"][0], "ro", label="Hint")
+    # ax.set_xlabel("Ion Mobility (AU)")
+    # ax.set_ylabel("Retention Time (AU)")
+    # ax.legend()
+    # plt.axis('off')
+    # Remove the axis labels
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+    # Customize the frame thickness
+    for spine in ax.spines.values():
+        spine.set_linewidth(3)  # Increase the frame (spine) thickness
+
     if zoom_in:
         if pred_bbox is None:
             pred_bbox = dp_dict["bbox"]
@@ -242,7 +359,7 @@ def plot_per_image_metric_distr(
     quantiles = np.percentile(loss_array, show_quantiles)
 
     plt.figure(figsize=(10, 5))
-    plt.hist(loss_array, bins=100, alpha=0.75)
+    plt.hist(loss_array, bins=10, alpha=0.75)
     correction = 0.05
     # Plot quantile lines
     for show_quantile, quantile in zip(show_quantiles, quantiles):
@@ -283,6 +400,7 @@ def plot_sample_predictions(
     channel: int = 0,
     **kwargs,
 ):
+    model.to(device)
     if sample_indices is None:
         sample_indices = np.random.choice(len(dataset), n, replace=False)
         Logger.info("Sample indices: %s", sample_indices)
@@ -290,36 +408,49 @@ def plot_sample_predictions(
         with torch.no_grad():
             image, hint, target_dict = dataset[i]
             target = target_dict["mask"].to(device)
+            ori_image_raw = target_dict["ori_image_raw"].to(device)
             if use_hint:
-                output = model(image.unsqueeze(0).float(), hint.unsqueeze(0).float())
+                seg_out, cls_out = model(
+                    image.unsqueeze(0).float(), hint.unsqueeze(0).float()
+                )
             else:
-                output = model(image.unsqueeze(0).float())
+                seg_out, cls_out = model(image.unsqueeze(0).float())
                 if conf_model is not None:
                     conf_model.eval()
-                    conf_score = conf_model(output)
+                    conf_score = conf_model(seg_out)
                     Logger.info("Confidence score: %s", conf_score.item())
                 # output = (output > threshold).float()
         metric_val_list = []
         for metric in metric_list:
             match metric:
                 case "iou":
-                    metric_val = metric_iou_batch(output, target.unsqueeze(0))
+                    metric_val = metric_iou_batch(seg_out, target.unsqueeze(0))
 
-                case "wiou":
+                case "wiou":  # TODO: deprecated, remove
                     metric_val = metric_wiou_batch(
-                        output, target.unsqueeze(0), image.unsqueeze(0).float()
+                        seg_out, target.unsqueeze(0), image.unsqueeze(0).float()
                     )
                 case "dice":
-                    metric_val = per_image_dice_metric(output, target.unsqueeze(0))
+                    metric_val = per_image_dice_metric(seg_out, target.unsqueeze(0))
                     metric_val = metric_val.item()
-                case "wdice":
+                case "wdice":  # TODO: updated ori image raw input, check if it works
                     metric_val = per_image_weighted_dice_metric(
-                        output, target, image.unsqueeze(0), channel=channel, **kwargs
+                        seg_out,
+                        target,
+                        ori_image_raw,
+                        channel=None,
+                        **kwargs,
                     )
                     metric_val = metric_val.item()
-                case "mask_wiou":
+                case (
+                    "mask_wiou"
+                ):  # TODO: updated ori image raw input, check if it works
                     metric_val = per_image_weighted_iou_metric(
-                        output, target, image.unsqueeze(0), channel=channel, **kwargs
+                        seg_out,
+                        target,
+                        ori_image_raw,
+                        channel=None,
+                        **kwargs,
                     )
                     metric_val = metric_val.item()
             metric_val_list.append(metric_val)
@@ -332,19 +463,23 @@ def plot_sample_predictions(
                     "bbox": target.cpu(),
                 }
                 plot_data_points(
-                    to_plot, pred_bbox=output[0].cpu().detach().numpy(), zoom_in=zoom_in
+                    to_plot,
+                    pred_bbox=seg_out[0].cpu().detach().numpy(),
+                    zoom_in=zoom_in,
                 )
             case "mask":
-                pred = torch.sigmoid(output[0][0])
+                pred = torch.sigmoid(seg_out[0][0])
                 if threshold is not None:
                     pred = torch.where(
                         pred > threshold,
                         torch.tensor(1, device=device),
                         torch.tensor(0, device=device),
                     )
+                Logger.debug("Ori_image_raw shape: %s", ori_image_raw.shape)
                 to_plot = {
-                    "data": image[channel].cpu(),
+                    "data": ori_image_raw.cpu(),
                     "hint_idx": hint.cpu(),
+                    "hint_channel": image[2].cpu(),
                     "mask": target[0].cpu(),
                 }
                 plot_data_points(
@@ -359,7 +494,7 @@ def plot_sample_predictions(
                     "Masked intensity sum %.2f",
                     np.nansum(
                         np.multiply(
-                            image[channel].cpu().numpy(), target[0].cpu().numpy()
+                            ori_image_raw.cpu().numpy(), target[0].cpu().numpy()
                         )
                     ),
                 )
@@ -367,7 +502,7 @@ def plot_sample_predictions(
                     "Pred masked intensity sum %.2f",
                     np.nansum(
                         np.multiply(
-                            image[channel].cpu().numpy(),
+                            ori_image_raw.cpu().numpy(),
                             pred.cpu().numpy(),
                         )
                     ),
@@ -382,7 +517,11 @@ def plot_sample_predictions(
         )
         if conf_model is not None:
             metrics_str += f"\nConf. {conf_score.item():.2f}\n"
-        plt.title(metrics_str + f"pept_mzrank: {int(target_dict['pept_mz_rank'])}")
+        plt.title(
+            metrics_str
+            + f", pept_mzrank: {int(target_dict['pept_mz_rank'])}"
+            + f", target score: {cls_out.cpu().item():.2f}"
+        )
         plt.legend()
         save_plot(
             save_dir=save_dir,
@@ -402,3 +541,200 @@ def plot_confidence_distr(test_df, save_dir):
         fig_type_name="conf_model",
         fig_spec_name="test_confidence_score_distribution",
     )
+
+
+def plot_target_decoy_distr(
+    ps_df,
+    save_dir=None,
+    dataset_name="",
+    threshold: tuple | None = None,
+    main_plot_type: Literal["kde", "scatter"] = "scatter",
+):
+    """
+    Plot target decoy distribution
+    ps_df: pandas dataframe with columns: target_decoy_score, sum_intensity, Decoy
+    threshold: tuple with two values for thresholding target decoy score, (target_decoy_score, log_sum_intensity)
+    """
+    ps_df["log_sum_intensity"] = np.log10(ps_df["sum_intensity"] + 1)
+    sns.jointplot(
+        ps_df,
+        x="target_decoy_score",
+        y="log_sum_intensity",
+        hue="Decoy",
+        kind=main_plot_type,
+        s=13,
+    )
+    # plt.title("Target Decoy Distribution")
+    plt.xlabel("Target Decoy Score")
+    plt.ylabel("Log10(Sum Intensity)")
+    if threshold is not None:
+        plt.axvline(threshold[0], color="r", linestyle="--", linewidth=1)
+        plt.axhline(threshold[1], color="r", linestyle="--", linewidth=1)
+        td_counts = ps_df.loc[
+            (ps_df["target_decoy_score"] > threshold[0])
+            & (ps_df["log_sum_intensity"] > threshold[1]),
+            "Decoy",
+        ].value_counts()
+        fdr = td_counts[True] / td_counts[False]
+        plt.text(x=0.85, y=7.5, s=f"FDR: {fdr:.2f}")
+        plt.text(x=0.85, y=8, s=f"N targets: {td_counts[0]}")
+        logging.info("target decoy counts: %s", td_counts)
+    save_plot(
+        save_dir=save_dir,
+        fig_type_name="target_decoy_distribution",
+        fig_spec_name=dataset_name,
+    )
+
+
+def calc_fdr_and_thres(
+    pred_df,
+    score_col="log_sum_intensity",
+    filter_dict: dict = None,
+    return_plot: bool = False,
+    save_dir=None,
+    dataset_name="",
+    **kwargs,
+):
+    """Calculate FDR and threshold for a given score column
+    Args:
+        pred_df (pd.DataFrame): Dataframe with predictions
+        score_col (str): Column to use for scoring
+        filter_dict (dict): Dictionary with filters, e.g. {"log_sum_intensity": [0, 100]}
+    Returns:
+        pd.DataFrame: Dataframe with FDR and threshold
+    """
+    pred_df_new = pred_df.copy()
+    if score_col not in pred_df_new.columns:
+        if score_col == "log_sum_intensity":
+            pred_df_new["log_sum_intensity"] = np.log10(
+                pred_df_new["sum_intensity"] + 1
+            )
+        else:
+            raise ValueError(f"score_col {score_col} not in pred_df")
+    if filter_dict is not None:
+        pred_df_new = _filter_pred(filter_dict, pred_df_new)
+
+    pred_df_new = pred_df_new.sort_values(score_col, ascending=False)
+    pred_df_new["Target"] = pred_df_new["Decoy"] == 0
+    pred_df_new["fdr"] = (pred_df_new["Decoy"].cumsum()) / np.maximum(
+        pred_df_new["Target"].cumsum(), 1
+    )
+    pred_df_new["N_identified_target"] = pred_df_new["Target"].cumsum()
+    if return_plot:
+        sns.scatterplot(
+            data=pred_df_new,
+            y="N_identified_target",
+            x="fdr",
+            hue="target_decoy_score",
+            edgecolor=None,
+            palette="Spectral",
+            **kwargs,
+        )
+        n_target_max = pred_df_new["N_identified_target"].max()
+        plt.vlines(
+            x=[0.01, 0.05, 0.1],
+            ymin=[0, 0, 0],
+            ymax=[n_target_max, n_target_max, n_target_max],
+            color="r",
+        )
+        # Access the legend and set its title
+        plt.ylabel("Number of Identified Targets")
+        plt.xlabel("FDR")
+        plt.legend(title="Threshold", loc="lower right")
+        save_plot(
+            save_dir=save_dir,
+            fig_type_name="fdr_id_targets",
+            fig_spec_name=dataset_name,
+        )
+    return pred_df_new
+
+
+def _filter_pred(filter_dict, pred_df):
+    pred_df_new = pred_df.copy()
+    for key, value in filter_dict.items():
+        if key not in pred_df_new.columns:
+            if key == "log_sum_intensity":
+                pred_df_new["log_sum_intensity"] = np.log10(
+                    pred_df_new["sum_intensity"] + 1
+                )
+            else:
+                raise ValueError(f"key {key} not in pred_df")
+        Logger.info("Number of entries before filtering: %s", pred_df_new.shape[0])
+        pred_df_new = pred_df_new.loc[
+            (pred_df_new[key] >= value[0]) & (pred_df_new[key] <= value[1])
+        ]
+        Logger.info(
+            "Number of entries after filtering by %s with condition %s: %s",
+            key,
+            value,
+            pred_df_new.shape[0],
+        )
+
+    return pred_df_new
+
+
+def plot_roc_auc(pred_df, save_dir=None, dataset_name="", filter_dict=None):
+    """Plot ROC AUC curve"""
+    if "Target" not in pred_df.columns:
+        pred_df["Target"] = pred_df["Decoy"] == 0
+    if filter_dict is not None:
+        pred_df = _filter_pred(filter_dict, pred_df)
+    fpr, tpr, threshold = roc_curve(pred_df["Target"], pred_df["target_decoy_score"])
+    roc_auc = roc_auc_score(pred_df["Target"], pred_df["target_decoy_score"])
+    plt.figure()
+    lw = 2
+    plt.plot(
+        fpr, tpr, color="darkorange", lw=lw, label="ROC curve (area = %0.2f)" % roc_auc
+    )
+
+    plt.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")  # Diagonal line
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("Target-Decoy ROC Curve")
+    plt.legend(loc="lower right")
+    save_plot(save_dir=save_dir, fig_type_name="roc_auc", fig_spec_name=dataset_name)
+    return roc_auc
+
+
+def calc_fdr_given_thres(
+    data_df, target_decoy_score_thres: float = 0.0, log_sum_intensity_thres: float = 0.0
+):
+    if "log_sum_intensity" not in data_df.columns:
+        data_df["log_sum_intensity"] = np.log10(data_df["sum_intensity"] + 1)
+    td_counts = data_df.loc[
+        (data_df["target_decoy_score"] >= target_decoy_score_thres)
+        & (data_df["log_sum_intensity"] >= log_sum_intensity_thres),
+        "Decoy",
+    ].value_counts()
+    fdr = td_counts[True] / td_counts[False]
+    return td_counts, fdr
+
+
+def compete_target_decoy_pair(
+    pept_act_sum_ps: pd.DataFrame,
+    maxquant_result_ref: pd.DataFrame,
+    filter_dict: dict = None,
+    td_pair_col: str = "TD pair id",
+):
+    for col in ["Decoy", td_pair_col]:
+        if col not in pept_act_sum_ps.columns:
+            pept_act_sum_ps = pd.merge(
+                pept_act_sum_ps,
+                maxquant_result_ref[["mz_rank", col]],
+                on="mz_rank",
+                how="inner",
+            )
+    if filter_dict is not None:
+        pept_act_sum_ps_full = _filter_pred(filter_dict, pept_act_sum_ps)
+    else:
+        pept_act_sum_ps_full = pept_act_sum_ps.copy()
+    pept_act_sum_ps_full_tdc = (
+        pept_act_sum_ps_full.groupby(td_pair_col)
+        .apply(lambda x: x.loc[x["target_decoy_score"].idxmax()])
+        .reset_index(drop=True)
+    )
+    fdr_after_tdc = calc_fdr_given_thres(pept_act_sum_ps_full_tdc)
+    Logger.info("FDR after TDC: %s", fdr_after_tdc)
+    return pept_act_sum_ps_full, pept_act_sum_ps_full_tdc

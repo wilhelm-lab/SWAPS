@@ -1,5 +1,4 @@
-from ast import Call
-from typing import List, Callable
+from typing import List, Callable, Literal
 import logging
 
 import numpy as np
@@ -7,6 +6,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from torchvision.transforms.v2.functional import center_crop
+from torcheval.metrics.functional import binary_auroc
 from tqdm import tqdm
 
 from peak_detection_2d.loss.custom_loss import metric_iou_batch
@@ -39,12 +39,15 @@ def train_one_epoch(
     model,
     optimizer,
     loss_fn,
+    # seg_cls_loss_weight: tuple,
     accumulation_steps=1,
     device="cuda",
     scheduler=None,
     use_image_as_input: bool = False,
 ):
     epoch_losses = AverageMeter()
+    # epoch_seg_losses = AverageMeter()
+    # epoch_cls_losses = AverageMeter()
     model = model.to(device)
     model.train()
     if accumulation_steps > 1:
@@ -61,8 +64,13 @@ def train_one_epoch(
             optimizer.step()
             optimizer.zero_grad()
         epoch_losses.update(b_loss.mean().item(), train_loader.batch_size)
+        # epoch_seg_losses.update(b_loss.mean().item(), train_loader.batch_size)
+        # epoch_cls_losses.update(b_cls_loss.mean().item(), train_loader.batch_size)
         tk0.set_postfix(
-            loss=epoch_losses.avg, learning_rate=optimizer.param_groups[0]["lr"]
+            total_loss=epoch_losses.avg,
+            # seg_loss=epoch_seg_losses.avg,
+            # cls_loss=epoch_cls_losses.avg,
+            learning_rate=optimizer.param_groups[0]["lr"],
         )
         # Update Scheduler at this point only if scheduler_type is 'OneCycleLR'
         if scheduler is not None and scheduler.__class__.__name__ == "OneCycleLR":
@@ -77,41 +85,55 @@ def evaluate(
     device="cuda",
     save_all_loss: bool = False,
     use_image_for_metric: bool = False,
+    model_type: Literal["seg", "cls"] = "seg",
     **kwargs,
 ):
-    epoch_losses = AverageMeter()
+    epoch_loss = AverageMeter()
     model = model.to(device)
     model.eval()
     tk0 = tqdm(valid_loader, total=len(valid_loader))
     if save_all_loss:
+        # seg_losses = np.empty((0))
+        # cls_losses = np.empty((0))
         losses = np.empty((0))
         pept_mz_rank = np.empty((0))
     with torch.no_grad():
         for image_batch, hint_batch, label_batch in tk0:
             out = model(image_batch.float())
-            if use_image_for_metric:
-                b_loss = metric(
-                    out.to(device),
-                    label_batch["mask"].to(device),
-                    image_batch.to(device),
-                    **kwargs,
-                )
-            else:
-                b_loss = metric(
-                    out.to(device), label_batch["mask"].to(device), **kwargs
-                )
-            epoch_losses.update(b_loss.mean().item(), valid_loader.batch_size)
-            tk0.set_postfix(loss=epoch_losses.avg)
+            match model_type:
+                case "seg":
+                    if use_image_for_metric:
+                        b_loss = metric(
+                            out.to(device),
+                            label_batch["mask"].to(device),
+                            image_batch.to(device),
+                            **kwargs,
+                        )
+                    else:
+                        b_loss = metric(
+                            out.to(device), label_batch["mask"].to(device), **kwargs
+                        )
+                    epoch_loss.update(b_loss.mean().item(), valid_loader.batch_size)
+                case "cls":
+                    b_loss = binary_auroc(
+                        out.squeeze(1),
+                        label_batch["target"].to(device).float(),
+                    )
+
+                    epoch_loss.update(b_loss.item(), valid_loader.batch_size)
+            tk0.set_postfix({"loss": epoch_loss.avg})
             if save_all_loss:
                 losses = np.append(losses, b_loss.cpu().numpy())
+                # seg_losses = np.append(seg_losses, b_loss.cpu().numpy())
+                # cls_losses = np.append(cls_losses, b_loss.cpu().numpy())
                 pept_mz_rank = np.append(pept_mz_rank, label_batch["pept_mz_rank"])
             # Logger.info("Loss: %s", b_loss.cpu().numpy())
             # Logger.info("all_losses: %s", all_losses)
     if save_all_loss:
         all_losses = dict(losses=losses, ranks=pept_mz_rank)
-        return epoch_losses.avg, all_losses
+        return epoch_loss.avg, all_losses
     else:
-        return epoch_losses.avg
+        return epoch_loss.avg
 
 
 def inference_flatten_output(
@@ -145,23 +167,22 @@ def inference_flatten_output(
 
 def inference_and_sum_intensity(
     data_loader,
-    model,
+    seg_model,
+    cls_model,
     device="cuda",
     threshold: float = 0.5,
-    int_channel: int = 0,
+    # int_channel: int = 0,
     calc_score: bool = False,
     calib=None,
     per_image_metric: List[Callable] = None,
     use_image_for_metric: List[bool] = None,
-    resize: bool = False,
+    # resize: bool = False,
     **kwargs,
 ):
 
     tk0 = tqdm(data_loader, total=len(data_loader))
 
-    model = model.to(device)
-    model.eval()
-
+    target_decoy_score = np.empty((0))
     sum_intensity = np.empty((0))
     pept_mz_rank = np.empty((0))
     out_score = np.empty((0))
@@ -173,30 +194,38 @@ def inference_and_sum_intensity(
         for metric in per_image_metric:
             epoch_losses[metric.__name__] = AverageMeter()
             losses[metric.__name__] = np.empty((0))
+    seg_model = seg_model.to(device)
+    seg_model.eval()
+    cls_model = cls_model.to(device)
+    cls_model.eval()
     with torch.no_grad():
         for image_batch, hint_batch, label_batch in data_loader:
             batch_size, n_channels = label_batch["mask"].size(0), label_batch[
                 "mask"
             ].size(1)
+            ori_image_raw_batch = label_batch["ori_image_raw"]
             pept_mz_rank = np.append(pept_mz_rank, label_batch["pept_mz_rank"])
-            out = model(image_batch.float())
+            Logger.debug("pept_mz_rank%s", pept_mz_rank)
+            # seg_out, cls_out = seg_model(image_batch.float())
+            seg_out = seg_model(image_batch.float())
+            cls_out = cls_model(image_batch.float())
             Logger.debug(
                 "out non zero value distribution: %s, %s",
-                out.nonzero().min().item(),
-                out.nonzero().max().item(),
+                seg_out.nonzero().min().item(),
+                seg_out.nonzero().max().item(),
             )
             if per_image_metric is not None:
                 for metric, use_image in zip(per_image_metric, use_image_for_metric):
                     if use_image:
                         b_loss = metric(
-                            out.to(device),
+                            seg_out.to(device),
                             label_batch["mask"].to(device),
-                            image_batch.to(device),
+                            ori_image_raw_batch.to(device),
                             **kwargs,
                         )
                     else:
                         b_loss = metric(
-                            out.to(device), label_batch["mask"].to(device), **kwargs
+                            seg_out.to(device), label_batch["mask"].to(device), **kwargs
                         )
                     Logger.debug("b_loss: %s", b_loss)
 
@@ -209,10 +238,10 @@ def inference_and_sum_intensity(
                         losses[metric.__name__], b_loss.cpu().numpy()
                     )
             if calib is not None:
-                out_final = calib.predict(out.contiguous().view(-1).float().cpu())
-                out_final = torch.tensor(out_final).view(out.shape).to(device)
+                out_final = calib.predict(seg_out.contiguous().view(-1).float().cpu())
+                out_final = torch.tensor(out_final).view(seg_out.shape).to(device)
             else:
-                out_final = torch.sigmoid(out)
+                out_final = torch.sigmoid(seg_out)
             if threshold is not None:
                 if calc_score:
                     # out_score = torch.where(out_final > threshold, out_final, torch.zeros_like(out_final))
@@ -245,13 +274,12 @@ def inference_and_sum_intensity(
             )
 
             intensity_reshaped = (
-                image_batch[:, int_channel, :, :]
-                .contiguous()
-                .view(batch_size, -1)
-                .float()
-                .to(device)
+                ori_image_raw_batch.contiguous().view(batch_size, -1).float().to(device)
             )
             Logger.debug("pept_mz_rank shape %s", pept_mz_rank.shape)
+            target_decoy_score = np.append(
+                target_decoy_score, cls_out.squeeze(1).cpu().numpy()
+            )
             try:
                 sum_intensity = np.append(
                     sum_intensity,
@@ -263,13 +291,16 @@ def inference_and_sum_intensity(
             except RuntimeError:
                 Logger.debug(
                     "intensity shape %s, out_final shape %s",
-                    image_batch[:, int_channel, :, :].shape,
+                    ori_image_raw_batch.shape,
                     out_final.shape,
                 )
     if out_score.size == 0:
         out_score = np.zeros_like(sum_intensity)
     result = dict(
-        sum_intensity=sum_intensity, mz_rank=pept_mz_rank, out_score=out_score
+        sum_intensity=sum_intensity,
+        mz_rank=pept_mz_rank,
+        out_score=out_score,
+        target_decoy_score=target_decoy_score,
     )
     if per_image_metric is not None:
         for metric in per_image_metric:
@@ -480,23 +511,51 @@ class Decoder(nn.Module):
 
 class UNET(nn.Module):
     def __init__(
-        self, in_channels, first_out_channels, exit_channels, downhill, padding=0
+        self,
+        in_channels,
+        first_out_channels,
+        exit_channels,
+        downhill,
+        padding=0,
+        seg_head: bool = True,
+        cls_head: bool = True,
     ):
         super(UNET, self).__init__()
         self.encoder = Encoder(
             in_channels, first_out_channels, padding=padding, downhill=downhill
         )
-        self.decoder = Decoder(
-            first_out_channels * (2**downhill),
-            first_out_channels * (2 ** (downhill - 1)),
-            exit_channels,
-            padding=padding,
-            uphill=downhill,
-        )
+        self.seg_head = seg_head
+        self.cls_head = cls_head
+        if seg_head:
+            self.decoder = Decoder(
+                first_out_channels * (2**downhill),
+                first_out_channels * (2 ** (downhill - 1)),
+                exit_channels,
+                padding=padding,
+                uphill=downhill,
+            )
+        if self.cls_head:
+            # Classification head
+            encoded_channels = first_out_channels * (
+                2**downhill
+            )  # Number of channels in the final encoder output
+            self.classifier = nn.Sequential(
+                nn.AdaptiveAvgPool2d((1, 1)),  # Global Average Pooling
+                nn.Flatten(),  # Flatten the tensor
+                nn.Linear(encoded_channels, 1),  # Binary classification layer
+                #nn.Sigmoid(),  # Sigmoid activation for binary classification
+            )
 
     def forward(self, x):
         enc_out, routes = self.encoder(x)
-        # Logger.debug("Routes: %s", routes.shape)
-        out = self.decoder(enc_out, routes)
-        # out = torch.sigmoid(out)
-        return out
+        seg_out, cls_out = None, None
+        if self.seg_head:
+            seg_out = self.decoder(enc_out, routes)
+        if self.cls_head:
+            cls_out = self.classifier(enc_out)
+        # # Logger.debug("Routes: %s", routes.shape)
+        # seg_out = self.decoder(enc_out, routes)
+        # # Classification output
+        # cls_out = self.classifier(enc_out)
+
+        return seg_out, cls_out

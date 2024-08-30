@@ -348,10 +348,14 @@ def inference_and_sum_intensity(
             )
 
             out_final = out_final.contiguous().view(batch_size, -1).float().to(device)
-            if exp:
+            if exp: # TODO: remove this and always use ori_image_raw
+                Logger.warning(
+                    "Exponential transformation is applied on transformed image"
+                )
                 image_batch = torch.exp(image_batch) - 1
             intensity = (
-                image_batch[:, channel, :, :]
+                # image_batch[:, channel, :, :]
+                label_batch["ori_image_raw"]  # TODO: change to ori_image_raw
                 .contiguous()
                 .view(batch_size, -1)
                 .float()
@@ -360,9 +364,10 @@ def inference_and_sum_intensity(
             wiou = per_image_weighted_iou_metric(
                 out.to(device),
                 label_batch["mask"].to(device),
-                image_batch.to(device),
+                # image_batch.to(device),
+                label_batch["ori_image_raw"].to(device),
                 device=device,
-                channel=channel,
+                channel=None,  # TODO: changed to ori_image_raw, channel not considered anymore
             )
             wiou_array = np.append(wiou_array, wiou.cpu().numpy())
             Logger.debug("pept_mz_rank shape %s", pept_mz_rank.shape)

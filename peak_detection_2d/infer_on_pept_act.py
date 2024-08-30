@@ -17,7 +17,7 @@ def infer_on_pept_act(
             cfg.RESULT_PATH, "peak_selection", "training_data", "hint_matrix.npz"
         )
     )
-    transformation = build_transformation(cfg.PEAK_SELECTION.DATASET)
+    transformation, _ = build_transformation(cfg.PEAK_SELECTION.DATASET)
     model = build_model(cfg.PEAK_SELECTION.MODEL)
     checkpoint = torch.load(best_model_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -38,6 +38,7 @@ def infer_on_pept_act(
             hint_matrix=hint_matrix,
             transforms=transformation,
             use_hint_channel=use_hint_channel,
+            data_index=None,
         )
         infer_dataloader = torch.utils.data.DataLoader(
             infer_dataset,
@@ -45,7 +46,7 @@ def infer_on_pept_act(
             shuffle=False,
         )
         pept_act_sum_ps_df = inference_and_sum_intensity(
-            model=model, data_loader=infer_dataloader, device=device
+            seg_model=model, data_loader=infer_dataloader, device=device
         )
         pept_act_sum_ps_df_list.append(pept_act_sum_ps_df)
     pept_act_sum_ps_df = pd.concat(pept_act_sum_ps_df_list, axis=0)
