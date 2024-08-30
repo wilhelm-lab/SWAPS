@@ -807,8 +807,9 @@ def process_one_frame_ims(
     return (
         peaks_df,
         im_pept_act_coo,
-        # candidate_array,
-        # frame_array,
+        #candidate_array,
+        #frame_array,
+        #im_pept_act,
     )  # TODO: remove candidate array
 
 
