@@ -14,3 +14,4 @@ archieved/*
 
 notebooks/*.png
 archieved/ScanByScan.py
+scripts/slurm_job_swaps_gpu.sh
