@@ -29,3 +29,8 @@ __C.FC = ConfigurationNode()
 __C.FC.PLOT_ORGANISMS = ["Homo sapiens", "Saccharomyces cerevisiae", "Escherichia coli"]
 __C.FC.EXPECTATION = [0, 1, -2]
 __C.FC.TITLE = "SWAPS"
+
+
+__C.FILTER = ConfigurationNode()
+__C.LOG_INTENSITY_THRES = 2
+__C.SCORE_THRES = 0

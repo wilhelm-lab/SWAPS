@@ -10,6 +10,7 @@ from .singleton_direct_lfq import direct_lfq_config
 from utils.config import get_cfg_defaults
 import matplotlib.pyplot as plt
 import shutil
+import numpy as np
 
 
 # TODO refactor script
@@ -37,17 +38,41 @@ def direct_lfq(direct_lfq_config_path):
                 os.path.join(swap_dir, "maxquant_result_ref.pkl")
             )
             maxquant_result_ref = maxquant_result_ref.sort_values("mz_rank")
+            # pept_act_sum_df = pd.read_csv(
+            #     os.path.join(
+            #         swap_dir, "results", "activation", cfg.INTENSITY_COLUMN + ".csv"
+            #     )
+            # )
             pept_act_sum_df = pd.read_csv(
                 os.path.join(
-                    swap_dir, "results", "activation", cfg.INTENSITY_COLUMN + ".csv"
+                    swap_dir,
+                    "results",
+                    "peak_selection",
+                    "pept_act_sum_ps_full_tdc_fdr_thres.csv",
                 )
             )
             pept_act_sum_df = pept_act_sum_df.loc[1:]
             maxquant_result_ref["Intensity"] = pept_act_sum_df[
                 cfg.INTENSITY_COLUMN
             ].values
-            evidence_swaps_int = pd.concat(
-                [evidence_swaps_int, maxquant_result_ref], axis=0
+            # evidence_swaps_int = pd.concat(
+            #     [evidence_swaps_int, maxquant_result_ref], axis=0
+            # )
+            logging.info("Filtering activation results")
+            if "log_sum_intensity" in pept_act_sum_df.columns:
+                pept_act_sum_df["log_sum_intensity"] = np.log10(
+                    pept_act_sum_df["log_sum_intensity"] + 1
+                )
+            pept_act_sum_df = pept_act_sum_df.loc[
+                (pept_act_sum_df["log_sum_intensity"] > cfg.FILTER.LOG_INTENSITY_THRES)
+                & (pept_act_sum_df["target_decoy_score"] > cfg.FILTER.SCORE_THRES)
+                & (pept_act_sum_df["Decoy"] == 0)
+            ]
+            evidence_swaps_int = pd.merge(
+                left=maxquant_result_ref,
+                right=pept_act_sum_df,
+                on="mz_rank",
+                how="inner",
             )
             logging.info("evidence_swaps_int shape: %s", evidence_swaps_int.shape)
         if cfg.RAW_FILE_AS_EXPERIMENT:

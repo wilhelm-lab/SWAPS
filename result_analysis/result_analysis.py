@@ -7,6 +7,8 @@ import numpy as np
 import pandas as pd
 from pygam import f
 import seaborn as sns
+
+from postprocessing import fdr
 from .compare_maxquant import (
     merge_with_maxquant_exp,
     evaluate_rt_overlap,
@@ -234,6 +236,7 @@ class SWAPSResult:
         fdr_thres: float | None = 0.1,
         log_sum_intensity_thres: float = 1,
         save_dir: str = None,
+        include_decoys: bool = True,
     ):
         """
         Initialize SWAPSResult object and intergrate all activation data.
@@ -247,6 +250,10 @@ class SWAPSResult:
         self.pept_act_sum = pept_act_sum_df.copy()
 
         self.log_sum_intensity_thres = log_sum_intensity_thres
+        if "log_sum_intensity" not in self.pept_act_sum.columns:
+            self.pept_act_sum["log_sum_intensity"] = np.log10(
+                self.pept_act_sum[infer_intensity_col] + 1
+            )
         self.save_dir = save_dir
         self.target_decoy_score_thres = None
         self.infer_intensity_col = infer_intensity_col
@@ -268,54 +275,65 @@ class SWAPSResult:
             Logger.info(
                 "Number of entries after filtering %s", self.pept_act_sum.shape[0]
             )
-        td_count = self.pept_act_sum["Decoy"].value_counts()
-        self.fdr_max = np.round(td_count[True] / td_count[False], 3)
-        if fdr_thres < self.fdr_max:
-            self.fdr_thres = fdr_thres
+        if include_decoys:
+            td_count = self.pept_act_sum["Decoy"].value_counts()
+            self.fdr_max = np.round(td_count[True] / td_count[False], 3)
+            self.fdr_thres = None
+            if fdr_thres is not None:
+                if fdr_thres < self.fdr_max:
+                    self.fdr_thres = fdr_thres
+                else:
+                    Logger.info(
+                        "FDR threshold is larger than the maximum FDR, set to maximum FDR %s",
+                        self.fdr_max,
+                    )
+                    self.fdr_thres = self.fdr_max
+            if self.fdr_thres is not None:
+                Logger.info("Calculating FDR results after filter...")
+                self.pept_act_sum = calc_fdr_and_thres(
+                    self.pept_act_sum,
+                    score_col="target_decoy_score",
+                    filter_dict={"log_sum_intensity": [0, 100]},
+                    return_plot=True,
+                    save_dir=save_dir,
+                    dataset_name="result_analysis",
+                )
+                Logger.info(
+                    "Filtering the data by FDR threshold %s, number of entries before filtering %s",
+                    self.fdr_thres,
+                    self.pept_act_sum.shape[0],
+                )
+                self.target_decoy_score_thres = pept_act_sum_df.loc[
+                    pept_act_sum_df["fdr"] <= self.fdr_thres, "target_decoy_score"
+                ].min()
+                self.pept_act_sum = self.pept_act_sum.loc[
+                    self.pept_act_sum["target_decoy_score"]
+                    >= self.target_decoy_score_thres,
+                    :,
+                ]
+                Logger.info(
+                    "Score threshold %s, number of entries after filtering %s",
+                    self.target_decoy_score_thres,
+                    self.pept_act_sum.shape[0],
+                )
+            if "Decoy" in self.pept_act_sum.columns:
+                Logger.info(
+                    "Removing decoy entries, number of entries before filtering %s",
+                    self.pept_act_sum.shape[0],
+                )
+                self.pept_act_sum = self.pept_act_sum.loc[
+                    self.pept_act_sum["Decoy"] == 0, :
+                ]
+                Logger.info(
+                    "Number of entries after filtering %s", self.pept_act_sum.shape[0]
+                )
         else:
+            assert fdr_thres is not None
+            self.fdr_thres = fdr_thres
+            self.maxquant_dict["Decoy"] = False
             Logger.info(
-                "FDR threshold is larger than the maximum FDR, set to maximum FDR %s",
-                self.fdr_max,
-            )
-            self.fdr_thres = self.fdr_max
-        if self.fdr_thres is not None:
-            Logger.info("Calculating FDR results after filter...")
-            self.pept_act_sum = calc_fdr_and_thres(
-                self.pept_act_sum,
-                score_col="target_decoy_score",
-                filter_dict={"log_sum_intensity": [0, 100]},
-                return_plot=True,
-                save_dir=save_dir,
-                dataset_name="result_analysis",
-            )
-            Logger.info(
-                "Filtering the data by FDR threshold %s, number of entries before filtering %s",
+                "No decoy entries in the data, using FDR threshold of dictionary %s",
                 self.fdr_thres,
-                self.pept_act_sum.shape[0],
-            )
-            self.target_decoy_score_thres = pept_act_sum_df.loc[
-                pept_act_sum_df["fdr"] <= self.fdr_thres, "target_decoy_score"
-            ].min()
-            self.pept_act_sum = self.pept_act_sum.loc[
-                self.pept_act_sum["target_decoy_score"]
-                >= self.target_decoy_score_thres,
-                :,
-            ]
-            Logger.info(
-                "Score threshold %s, number of entries after filtering %s",
-                self.target_decoy_score_thres,
-                self.pept_act_sum.shape[0],
-            )
-        if "Decoy" in self.pept_act_sum.columns:
-            Logger.info(
-                "Removing decoy entries, number of entries before filtering %s",
-                self.pept_act_sum.shape[0],
-            )
-            self.pept_act_sum = self.pept_act_sum.loc[
-                self.pept_act_sum["Decoy"] == 0, :
-            ]
-            Logger.info(
-                "Number of entries after filtering %s", self.pept_act_sum.shape[0]
             )
 
     def calc_protein_level_fdr(self):
@@ -338,10 +356,16 @@ class SWAPSResult:
         int_compare = pd.merge(
             maxquant_exp, self.pept_act_sum, on="mz_rank", how="inner"
         )
+        Logger.info(
+            "Number of entries after merging %s and columns %s",
+            int_compare.shape[0],
+            int_compare.columns,
+        )
         # plot the correlation between the intensity from the experiment file and the activation columns
         plot_corr_int_ref_and_act(
             ref_int=int_compare["Intensity"],
             sum_act=int_compare[self.infer_intensity_col],
+            data=int_compare,
             save_dir=self.save_dir,
             title="Corr. of Quant. Results ",
             fig_spec_name="_fdr_"
@@ -388,7 +412,7 @@ class SWAPSResult:
                 set3 = set([])
                 if show_ref:
                     set3 = set(maxquant_dict_target["Sequence"])
-            case "protein":
+            case "protein":  # consider protein splitting
                 list1 = maxquant_dict_target.loc[
                     maxquant_dict_target["source"].isin(["exp", "both"]), "Proteins"
                 ].str.split(";")
@@ -398,6 +422,13 @@ class SWAPSResult:
                     "Proteins",
                 ].str.split(";")
                 set2 = set([item for sublist in list2 for item in sublist])
+                Logger.info("Number of proteins in Maxquant %s", len(set1))
+                Logger.info("Number of proteins in SWAPS %s", len(set2))
+                Logger.info(
+                    "Number of proteins in both SWAPS and Maxquant %s",
+                    len(set.intersection(set2)),
+                )
+                Logger.info("Number of proteins only in SWAPS %s", len(set2 - set1))
                 set3 = set([])
                 if show_ref:
                     list3 = maxquant_dict_target["Proteins"].str.split(";")
