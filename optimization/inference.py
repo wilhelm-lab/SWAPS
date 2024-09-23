@@ -579,7 +579,7 @@ def slice_candidate_blocks_by_pept(matrix):
             floor(matrix.shape[0] * 0.8),
             floor(matrix.shape[0] * 0.9),
         ]
-    elif matrix.shape[0] >= 16000:
+    elif matrix.shape[0] >= 16000 and matrix.shape[0] < 24000:
         Logger.info("Divide matrix into 8 blocks.")
         row_cut_indices = [
             floor(matrix.shape[0] * 0.2),
@@ -589,6 +589,42 @@ def slice_candidate_blocks_by_pept(matrix):
             floor(matrix.shape[0] * 0.7),
             floor(matrix.shape[0] * 0.8),
             floor(matrix.shape[0] * 0.9),
+        ]
+    elif matrix.shape[0] >= 24000 and matrix.shape[0] < 30000:
+        Logger.info("Divide matrix into 10 blocks.")
+        row_cut_indices = [
+            floor(matrix.shape[0] * 0.1),
+            floor(matrix.shape[0] * 0.2),
+            floor(matrix.shape[0] * 0.3),
+            floor(matrix.shape[0] * 0.4),
+            floor(matrix.shape[0] * 0.5),
+            floor(matrix.shape[0] * 0.6),
+            floor(matrix.shape[0] * 0.7),
+            floor(matrix.shape[0] * 0.8),
+            floor(matrix.shape[0] * 0.9),
+        ]
+    elif matrix.shape[0] >= 30000:
+        Logger.info("Divide matrix into 20 blocks.")
+        row_cut_indices = [
+            floor(matrix.shape[0] * 0.05),
+            floor(matrix.shape[0] * 0.1),
+            floor(matrix.shape[0] * 0.15),
+            floor(matrix.shape[0] * 0.2),
+            floor(matrix.shape[0] * 0.25),
+            floor(matrix.shape[0] * 0.3),
+            floor(matrix.shape[0] * 0.35),
+            floor(matrix.shape[0] * 0.4),
+            floor(matrix.shape[0] * 0.45),
+            floor(matrix.shape[0] * 0.5),
+            floor(matrix.shape[0] * 0.55),
+            floor(matrix.shape[0] * 0.6),
+            floor(matrix.shape[0] * 0.65),
+            floor(matrix.shape[0] * 0.7),
+            floor(matrix.shape[0] * 0.75),
+            floor(matrix.shape[0] * 0.8),
+            floor(matrix.shape[0] * 0.85),
+            floor(matrix.shape[0] * 0.9),
+            floor(matrix.shape[0] * 0.95),
         ]
 
     if row_cut_indices[-1] != matrix.shape[0] + 1:
@@ -721,11 +757,17 @@ def process_one_frame_ims(
     mz_bin_digits: int = 3,
     process_in_blocks: bool = True,
     extract_im_peak: bool = True,
+    debug: bool = False,
     **kwargs,
 ):
     Logger.debug("Start data preparation.")
     # prepare data
-    frame_data = data[{"frame_indices": [ms1scans.loc[ms1_frame_idx, "Id"]]}]
+    frame_data = data[
+        {
+            "frame_indices": [ms1scans.loc[ms1_frame_idx, "Id"]],
+            "precursor_indices": [0],
+        }
+    ]
     Logger.debug("Frame data shape: %s", frame_data.shape[0])
     peaks_df = pd.DataFrame()
     im_pept_act_coo = {
@@ -803,14 +845,24 @@ def process_one_frame_ims(
             Logger.info("No candidate precursor by RT from frame %s", ms1_frame_idx)
     else:
         Logger.info("No data for frame index %s", ms1_frame_idx)
-
-    return (
-        peaks_df,
-        im_pept_act_coo,
-        #candidate_array,
-        #frame_array,
-        #im_pept_act,
-    )  # TODO: remove candidate array
+    if debug:
+        return (
+            peaks_df,
+            im_pept_act_coo,
+            frame_array,
+            candidate_array,
+            im_pept_act,
+            candidate_precursor_by_rt,
+            all_frame_pept_idx,
+        )
+    else:
+        return (
+            peaks_df,
+            im_pept_act_coo,
+            # candidate_array,
+            # frame_array,
+            # im_pept_act,
+        )  # TODO: remove candidate array
 
 
 def make_coo_from_dict(data_dict, shape: tuple, cutoff: List[int]):
@@ -1187,7 +1239,7 @@ def process_ims_frames_parallel(
     save_dir: str = "",
     return_im_pept_act: bool = False,
     extract_im_peak: bool = True,
-    #n_blocks_by_pept: int = 0,
+    # n_blocks_by_pept: int = 0,
 ):
     list_batch_im_pept_act_coo_dict = Parallel(n_jobs=n_jobs)(
         delayed(process_batch_frame_ims)(
