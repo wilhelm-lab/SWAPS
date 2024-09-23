@@ -1,10 +1,10 @@
-RESULT_PATH: '/cmnfs/proj/ORIGINS/SWAPS_exp/tims_ramp_time/120min_libaray_100ms'
+RESULT_PATH: '/cmnfs/proj/ORIGINS/SWAPS_exp/tims_ramp_time/120min_HYE_libaray_100ms'
 ADD_TIMESTAMP_TO_RESULT_PATH: true
 DATA_PATH: /cmnfs/proj/ORIGINS/data/tims_ramp_time/Hela2ug_lowflow_30min_1to37to42_NCE29to59_100ms7R_RA2_1_2078.d/
 DEBUG: false
 DICT_PICKLE_PATH: ''
 EXPORT_DATA_HDF5_DIR: ''
-MQ_REF_PATH: /cmnfs/proj/ORIGINS/data/tims_ramp_time/HeLa_library/txt_Hela_DDA_120min/evidence.txt
+MQ_REF_PATH: /cmnfs/proj/ORIGINS/data/species_mix/DDA/mq_combined_120min_HYE.txt
 MQ_EXP_PATH: /cmnfs/proj/ORIGINS/data/tims_ramp_time/combined_30min_gradient/txt/evidence.txt
 FILTER_EXP_BY_RAW_FILE: []
 NOTES: ''
@@ -13,18 +13,29 @@ OPTIMIZATION:
   DELTA_MOBILITY_INDEX_THRES: 80
   HOW_BATCH: robin_round
   IM_PEAK_EXTRACTION_WIDTH: 4
-  N_BLOCKS_BY_PEPT: 10
+  N_BLOCKS_BY_PEPT: 15
+  N_BATCH: 10
 PREPARE_DICT:
   ADD_IM_INDEX: true
+  DELTA_IM_95: 0.044
+  DICT_PICKLE_PATH: ''
+  FILTER_PRED_BY_RAW_FILE: ''
+  FILTER_TRAIN_BY_RAW_FILE: ''
   GENERATE_DECOY: true
+  IM_LENGTH: 290
+  IM_REF: pred
+  IM_TRAIN_EPOCHS: 8
   ISO_MIN_AB_THRES: 0.01
   KEEP_MATCHED_PRECURSORS: false
   MZ_BIN_DIGITS: 2
+  RT_MAX: 28.17
   RT_REF: pred
-  IM_REF: ref
-  RT_TOL: -0.1
-  IM_LENGTH: -1
-  DELTA_IM_95: -0.1
+  RT_TOL: 0.8603156694293024
+  RT_TRAIN_EPOCHS: 15
+  REF_TYPE: MQ
+  TRAIN_FRAC: 0.9
+  UPDATED_IM_MODEL_PATH: /cmnfs/proj/ORIGINS/SWAPS_exp/tims_ramp_time/full_pred_libaray_100ms_20240904_155157_142605/construct_dict/IM_transfer_learn/mobility_model
+  UPDATED_RT_MODEL_PATH: /cmnfs/proj/ORIGINS/SWAPS_exp/tims_ramp_time/120min_libaray_100ms_20240826_175342_706954/construct_dict/RT_transfer_learn/rt_model
 RANDOM_SEED: 42
 PEAK_SELECTION:
   EVAL_ON_TEST: true

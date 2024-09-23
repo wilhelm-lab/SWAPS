@@ -5,17 +5,16 @@ DEBUG: false
 DICT_PICKLE_PATH: ''
 EXPORT_DATA_HDF5_DIR: ''
 MQ_REF_PATH: /cmnfs/proj/ORIGINS/data/tims_ramp_time/HeLa_library/txt_Hela_Deep/evidence.txt
-MQ_EXP_PATH: /cmnfs/proj/ORIGINS/data/tims_ramp_time/combined/txt/evidence.txt
-FILTER_EXP_BY_RAW_FILE: ''
+MQ_EXP_PATH: /cmnfs/proj/ORIGINS/data/tims_ramp_time/combined_30min_gradient/txt/evidence.txt
+FILTER_EXP_BY_RAW_FILE: []
 NOTES: ''
 N_CPU: 5
 OPTIMIZATION:
   DELTA_MOBILITY_INDEX_THRES: 80
   HOW_BATCH: robin_round
   IM_PEAK_EXTRACTION_WIDTH: 4
-  N_BLOCKS_BY_PEPT: 10
+  N_BLOCKS_BY_PEPT: 20
 PREPARE_DICT:
-  UPDATED_MODEL_PATH: []
   ADD_IM_INDEX: true
   GENERATE_DECOY: true
   ISO_MIN_AB_THRES: 0.01
@@ -24,7 +23,8 @@ PREPARE_DICT:
   RT_REF: pred
   IM_REF: ref
   RT_TOL: -0.1
-  IM_TOL: -1
+  IM_LENGTH: -1
+  DELTA_IM_95: -0.1
 RANDOM_SEED: 42
 PEAK_SELECTION:
   EVAL_ON_TEST: true
@@ -40,9 +40,10 @@ PEAK_SELECTION:
       - 482
       - 482
       RESIZE_SHAPE:
-      - 226
-      - 226
+      - 258
+      - 258
       TEST_BATCH_SIZE: 512
+      INFER_BATCH_SIZE: 256
       TO_TENSOR: false
       TRAIN_BATCH_SIZE: 256
       TRAIN_SIZE: 0.9
@@ -55,7 +56,7 @@ PEAK_SELECTION:
       THRESHOLD: 0.5
     NAME: UNET
     PARAMS:
-      DOWNHILL: 4
+      DOWNHILL: 6
       EXIT_CHANNELS: 1
       FIRST_OUT_CHANNELS: 32
       IMAGE_SIZE: 258
