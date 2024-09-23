@@ -185,6 +185,7 @@ def inference_and_sum_intensity(
     per_image_metric: List[Callable] = None,
     use_image_for_metric: List[bool] = None,
     # resize: bool = False,
+    sigmoid_cls_score: bool = True,
     **kwargs,
 ):
 
@@ -304,12 +305,13 @@ def inference_and_sum_intensity(
                 )
     if out_score.size == 0:
         out_score = np.zeros_like(sum_intensity)
-    if (target_decoy_score.min() < 0) or (target_decoy_score.max() > 1):
-        Logger.info(
-            "target_decoy_score out of bound [0, 1], min: %s, max: %s, applying sigmoid",
-            target_decoy_score.min(),
-            target_decoy_score.max(),
-        )
+    if sigmoid_cls_score:
+        # Logger.info(
+        #     "target_decoy_score out of bound [0, 1], min: %s, max: %s, applying sigmoid",
+        #     target_decoy_score.min(),
+        #     target_decoy_score.max(),
+        # )
+        Logger.info("Applying sigmoid to target_decoy_score")
         target_decoy_score = 1 / (1 + np.exp(-target_decoy_score))
     result = dict(
         sum_intensity=sum_intensity,
@@ -557,6 +559,7 @@ class UNET(nn.Module):
             self.classifier = nn.Sequential(
                 nn.AdaptiveAvgPool2d((1, 1)),  # Global Average Pooling
                 nn.Flatten(),  # Flatten the tensor
+                # nn.Dropout(p=0.3),  # TODO: set dropout rate as a parameter
                 nn.Linear(encoded_channels, 1),  # Binary classification layer
                 # nn.Sigmoid(),  # Sigmoid activation for binary classification
             )
