@@ -15,17 +15,14 @@ import re
 import os
 import logging
 from typing import Literal
-from docopt import docopt
 from math import ceil
 import pandas as pd
 import matplotlib.pyplot as plt
 import IsoSpecPy as iso
 import torch
-from utils.config import get_cfg_defaults
 from utils.constants import decoy_mutation_rule
-from utils.singleton_swaps_optimization import swaps_optimization_cfg
 from utils.plot import save_plot
-from utils.tools import _perc_fmt, cleanup_maxquant
+from utils.tools import cleanup_maxquant
 from utils.metrics import RT_metrics
 from .predict_rt import dict_add_rt_pred, update_rt_model
 import numpy as np
@@ -38,7 +35,10 @@ Logger = logging.getLogger(__name__)
 
 
 def merge_ref_and_exp(
-    maxquant_ref_df: pd.DataFrame, maxquant_exp_df: pd.DataFrame, save_dir: str
+    maxquant_ref_df: pd.DataFrame,
+    maxquant_exp_df: pd.DataFrame,
+    save_dir: str,
+    ref_type: str = ["MQ", "pred"],
 ):
     """Merge dictionaries from multiple files using Modified sequence and Charge"""
     # evaluate the elution counts of the experiment file
@@ -96,27 +96,31 @@ def merge_ref_and_exp(
     exp_unique_df = maxquant_exp_df.merge(
         exp_unique_rows, on=join_on_columns, how="inner"
     )
-    ref_spec_columns = [
-        # "MS1_frame_idx_left_ref",
-        # "MS1_frame_idx_right_ref",
-        # "MS1_frame_idx_center_ref",
-        # "MS1_frame_idx_left",
-        # "MS1_frame_idx_right",
-        # "MS1_frame_idx_center",
-        "mobility_values_index_left_ref",
-        "mobility_values_index_right_ref",
-        "mobility_values_index_center_ref",
-        #"mobility_values_left_ref",
-        #"mobility_values_right_ref",
-        "mobility_values_center_ref",
-        # "mobility_values_left_ref",
-        # "mobility_values_right_ref",
-        # "mobility_values_center_ref",
-        # "Time_minute_left_ref",
-        # "Time_minute_right_ref",
-        # "Time_minute_center_ref",
-    ]
+    if ref_type == "MQ":
+        ref_spec_columns = [
+            # "MS1_frame_idx_left_ref",
+            # "MS1_frame_idx_right_ref",
+            # "MS1_frame_idx_center_ref",
+            # "MS1_frame_idx_left",
+            # "MS1_frame_idx_right",
+            # "MS1_frame_idx_center",
+            "mobility_values_index_left_ref",
+            "mobility_values_index_right_ref",
+            "mobility_values_index_center_ref",
+            # "mobility_values_left_ref",
+            # "mobility_values_right_ref",
+            "mobility_values_center_ref",
+            # "mobility_values_left_ref",
+            # "mobility_values_right_ref",
+            # "mobility_values_center_ref",
+            # "Time_minute_left_ref",
+            # "Time_minute_right_ref",
+            # "Time_minute_center_ref",
+        ]
+    elif ref_type == "pred":
+        ref_spec_columns = []
     Logger.info("Maxquant_ref_df columns: %s", maxquant_ref_df.columns)
+    Logger.info("Maxquant_exp_df columns: %s", maxquant_exp_df.columns)
     both_unique_df = maxquant_exp_df.merge(
         maxquant_ref_df[join_on_columns + ref_spec_columns],
         on=join_on_columns,
@@ -169,7 +173,19 @@ def _mutate_seq(seq):
     )
 
 
-def generate_decoy_seq(modseq, seq, method: Literal["mutate"] = "mutate"):
+def _mutate_seq_enhance(seq):
+    return (
+        seq[:3]
+        # + decoy_mutation_rule[seq[2]]
+        + seq[3:-3]
+        + decoy_mutation_rule[seq[-3]]
+        + seq[-2:]
+    )
+
+
+def generate_decoy_seq(
+    modseq, seq, method: Literal["mutate", "mutate_enhance"] = "mutate"
+):
     # Track positions and extract content inside parentheses
     special_parts = []
     # cleaned_seq = []
@@ -199,6 +215,9 @@ def generate_decoy_seq(modseq, seq, method: Literal["mutate"] = "mutate"):
         case "mutate":
             # Apply mutation
             mutated_seq = _mutate_seq(seq)
+        case "mutate_enhance":
+            # Apply enhance mutation
+            mutated_seq = _mutate_seq_enhance(seq)
         case _:
             raise ValueError(f"Method {method} not supported")
 
@@ -215,24 +234,42 @@ def generate_decoy_seq(modseq, seq, method: Literal["mutate"] = "mutate"):
     return mutated_seq, mutated_modseq
 
 
-def concat_decoy_and_target(maxquant_df: pd.DataFrame):
+def concat_decoy_and_target(maxquant_df: pd.DataFrame, mutation_method: str = "mutate"):
     """Concatenate target and decoy sequences"""
     maxquant_df["TD pair id"] = (
         maxquant_df["m/z"].rank(axis=0, method="first", ascending=True).astype(int)
     )
-    maxquant_decoy_df = maxquant_df.copy()
-    maxquant_decoy_df.drop("m/z", inplace=True, axis=1)
-    maxquant_df["Decoy"] = False
-    maxquant_decoy_df["Decoy"] = True
-    maxquant_decoy_df[["Sequence", "Modified sequence"]] = maxquant_df.apply(
-        lambda x: generate_decoy_seq(x["Modified sequence"], x["Sequence"]),
-        axis=1,
-        result_type="expand",
+    maxquant_decoy_df = generate_decoy_df(maxquant_df, mutation_method="mutate")
+    similar_td_pair = _eval_target_decoy_pair_mz(
+        pd.concat([maxquant_df, maxquant_decoy_df])
     )
-    maxquant_decoy_df["_merge"] = "decoy"
-    maxquant_decoy_df["Raw file"] = "decoy"
-    maxquant_decoy_df = dict_add_mz_mono(maxquant_decoy_df)
-    n_before = maxquant_df.shape[0]
+    if similar_td_pair["IsoMZ_identical"].sum() > 0:
+        Logger.info("Some TD pairs have identical, mutate with enhanced method")
+        maxquant_decoy_df_enhanced = generate_decoy_df(
+            maxquant_decoy_df.loc[
+                maxquant_decoy_df["TD pair id"].isin(similar_td_pair["TD pair id"])
+            ],
+            mutation_method="mutate_enhance",
+        )
+        similar_td_pair_enhanced = _eval_target_decoy_pair_mz(
+            pd.concat(
+                [
+                    maxquant_df.loc[
+                        maxquant_df["TD pair id"].isin(similar_td_pair["TD pair id"])
+                    ],
+                    maxquant_decoy_df_enhanced,
+                ]
+            )
+        )
+        maxquant_decoy_df = pd.concat(
+            [
+                maxquant_decoy_df.loc[
+                    ~maxquant_decoy_df["TD pair id"].isin(similar_td_pair["TD pair id"])
+                ],
+                maxquant_decoy_df_enhanced,
+            ]
+        )
+    n_before = maxquant_decoy_df.shape[0]
     Logger.info("Number of decoys generated: %s", n_before)
     maxquant_decoy_df = maxquant_decoy_df[
         ~maxquant_decoy_df["Modified sequence"].isin(maxquant_df["Modified sequence"])
@@ -243,6 +280,85 @@ def concat_decoy_and_target(maxquant_df: pd.DataFrame):
         n_before - maxquant_decoy_df.shape[0],
     )
     return pd.concat([maxquant_df, maxquant_decoy_df])
+
+
+def _eval_target_decoy_pair_mz(maxquant_dict: pd.DataFrame):
+    maxquant_dict = maxquant_dict.copy(deep=True)
+    # Assuming maxquant_result_ref is your DataFrame
+    if "IsoMZ" not in maxquant_dict.columns:
+        maxquant_dict = dict_add_iso_pattern(maxquant_dict)
+
+    # Group by 'TD pair id'
+    grouped = maxquant_dict.groupby("TD pair id")
+
+    # Ensure each group has exactly 2 rows
+    # This will return groups with exactly 2 rows
+    filtered_groups = grouped.filter(lambda x: len(x) == 2)
+
+    # Calculate the difference between the two 'mz_bin' values in each group
+    # We can use the diff function to get the difference, then take the absolute value
+    # filtered_groups["mz_bin_difference"] = (
+    #     filtered_groups.groupby("TD pair id")["mz_bin"].diff().abs()
+    # )
+    # Check if 'IsoAbundance' values are identical within each group
+    filtered_groups["IsoMZ_identical"] = filtered_groups.groupby("TD pair id")[
+        "IsoMZ"
+    ].transform(lambda x: np.array_equal(x.iloc[0], x.iloc[1]))
+
+    # Drop the NaN values that arise from the diff (because it shifts the series)
+    result = filtered_groups.dropna(subset=["IsoMZ_identical"])
+
+    # If you want the result as a new DataFrame with 'TD pair id' and the difference
+    result = result[["TD pair id", "IsoMZ_identical"]].drop_duplicates()
+    result = result.loc[result["IsoMZ_identical"] == 1]
+    logging.info("Number of TD pairs with identical iso mz: %s", result.shape[0])
+    return result
+
+
+def generate_decoy_df(maxquant_df, mutation_method):
+    maxquant_decoy_df = maxquant_df.copy()
+    maxquant_decoy_df.drop("m/z", inplace=True, axis=1)
+    maxquant_df["Decoy"] = False
+    maxquant_decoy_df["Decoy"] = True
+    maxquant_decoy_df[["Sequence", "Modified sequence"]] = maxquant_df.apply(
+        lambda x: generate_decoy_seq(
+            x["Modified sequence"], x["Sequence"], mutation_method
+        ),
+        axis=1,
+        result_type="expand",
+    )
+    maxquant_decoy_df["_merge"] = "decoy"
+    maxquant_decoy_df["Raw file"] = "decoy"
+    maxquant_decoy_df = dict_add_mz_mono(maxquant_decoy_df)
+    return maxquant_decoy_df
+
+
+def _check_td_pair_mass(maxquant_result_ref: pd.DataFrame):
+    # Assuming maxquant_result_ref is your DataFrame
+
+    # Group by 'TD pair id'
+    grouped = maxquant_result_ref.groupby("TD pair id")
+
+    # Ensure each group has exactly 2 rows
+    # This will return groups with exactly 2 rows
+    filtered_groups = grouped.filter(lambda x: len(x) == 2)
+
+    # Calculate the difference between the two 'mz_bin' values in each group
+    # We can use the diff function to get the difference, then take the absolute value
+    filtered_groups["mz_bin_difference"] = (
+        filtered_groups.groupby("TD pair id")["mz_bin"].diff().abs()
+    )
+
+    # Drop the NaN values that arise from the diff (because it shifts the series)
+    result = filtered_groups.dropna(subset=["mz_bin_difference"])
+
+    # If you want the result as a new DataFrame with 'TD pair id' and the difference
+    result = result[["TD pair id", "mz_bin_difference"]].drop_duplicates()
+    Logger.info(
+        "TD pair id with mz_bin difference > 0: %s",
+        result.loc[result["mz_bin_difference"] > 0].shape[0],
+    )
+    return result
 
 
 def dict_add_im_index(
@@ -459,6 +575,14 @@ def dict_add_mz_mono(maxquant_dict_df: pd.DataFrame):
     return maxquant_dict_df
 
 
+def dict_add_mass_mono(maxquant_dict_df: pd.DataFrame):
+    maxquant_dict_df["mass"] = maxquant_dict_df.apply(
+        lambda row: calculate_modpept_mz(row["Modified sequence"], 1),
+        axis=1,
+    )
+    return maxquant_dict_df
+
+
 def calculate_modpept_isopattern(
     modpept: str, charge: int, ab_thres: float = 0.005, mod_CAM: bool = True
 ):
@@ -541,7 +665,7 @@ def calculate_modpept_mz(modpept: str, charge: int, mod_CAM: bool = True):
     formula = "".join([f"{key}{value}" for key, value in atom_composition.items()])
     iso_distr = iso.IsoThreshold(formula=formula, threshold=0.1, absolute=True)
     iso_distr.sort_by_prob()
-    mz_mono = iso_distr.np_masses()[0] / charge
+    mz_mono = iso_distr.np_masses()[-1] / charge
 
     return mz_mono
 
@@ -629,12 +753,14 @@ def _define_im_idx_search_range(
     match im_ref:
         case "exp":  # TODO: not checked
             maxquant_df["IM_search_idx_left"] = maxquant_df[
-                "mobility_values_index_left"
+                "mobility_values_index_left_exp"
             ]
             maxquant_df["IM_search_idx_right"] = maxquant_df[
-                "mobility_values_index_right"
+                "mobility_values_index_right_exp"
             ]
-            maxquant_df["IM_search_idx_center"] = maxquant_df["mobility_values_index"]
+            maxquant_df["IM_search_idx_center"] = maxquant_df[
+                "mobility_values_index_center_exp"
+            ]
         case "pred":
             assert "mobility_pred" in maxquant_df.columns
             assert mobility_values_df is not None
@@ -717,13 +843,6 @@ def _define_im_idx_search_range(
                 delta_im_idx_95_left,
                 delta_im_idx_95_right,
             )
-            # assert mobility_values_df is not None
-            # delta_im_idx_95 = _get_im_idx_span_from_values(
-            #     mobility_values_df=mobility_values_df, im_length=delta_im_95
-            # )
-            # Logger.info(
-            #     "From delta_im_95: %s, calculated delta_im_idx_95: %s", delta_im_95, delta_im_idx_95
-            # )
             maxquant_df["IM_search_idx_center"] = maxquant_df[
                 "mobility_values_index_center_ref"
             ]
@@ -877,7 +996,7 @@ def dict_add_alpha_pept_pred(
         predict_df = model.predict(dict_for_pred)
         predict_df["rt_pred_norm"] = predict_df["rt_pred"]
         predict_df["rt_pred"] = predict_df["rt_pred_norm"] * lc_grad
-
+    Logger.info("Columns in predict_df: %s", predict_df.columns)
     # merge
     maxquant_dict_new = pd.merge(
         left=maxquant_dict,
@@ -888,10 +1007,11 @@ def dict_add_alpha_pept_pred(
         right_on=["sequence", "charge", "scan_num", "raw_name"],
         how="left",
     )
-    Logger.info(
-        "Number of entries with empty prediction: %s",
-        maxquant_dict_new[pept_property + "_pred"].isna().sum(),
-    )
+    Logger.info("Columns in predict_df: %s", maxquant_dict_new.columns)
+    # Logger.info(
+    #     "Number of entries with empty prediction: %s",
+    #     maxquant_dict_new[pept_property + "_pred"].isna().sum(),
+    # )
     maxquant_dict_new = maxquant_dict_new.dropna(subset=[pept_property + "_pred"])
     maxquant_dict_new = maxquant_dict_new.drop(
         labels=["scan_num", "raw_name", "sequence", "charge"], axis=1
@@ -908,6 +1028,7 @@ def construct_dict(
     filter_exp_by_raw_file: List[str],
     maxquant_ref_df: pd.DataFrame,
     maxquant_exp_path: str,
+    ref_type: Literal["MQ", "pred"] = "MQ",
     # maxquant_exp_df: pd.DataFrame,
     result_dir: str = None,
     mobility_values_df: pd.DataFrame = None,
@@ -930,9 +1051,15 @@ def construct_dict(
     # device = str("cuda" if torch.cuda.is_available() else "cpu")
     # Logger.info(f"Device: {device}")
     maxquant_exp_df = pd.read_csv(maxquant_exp_path, sep="\t", low_memory=False)
+    Logger.info("maxquant_exp_df size: %s", maxquant_exp_df.shape)
     maxquant_exp_df = maxquant_exp_df.loc[
         maxquant_exp_df["Raw file"].isin(filter_exp_by_raw_file)
     ]
+    Logger.info(
+        "maxquant_exp_df size after filter by raw file %s: %s",
+        filter_exp_by_raw_file,
+        maxquant_exp_df.shape,
+    )
     rt_range = (
         rt_values_df["Time_minute"].min(),
         rt_values_df["Time_minute"].max(),
@@ -1047,34 +1174,23 @@ def construct_dict(
         mq_im_center_col="1/K0",
         idx_suffix="_exp",
     )
-
-    maxquant_ref_df = dict_add_im_index(
-        maxquant_df=maxquant_ref_df,
-        mobility_values_df=mobility_values_df,
-        mq_im_center_col="1/K0",
-        idx_suffix="_ref",
-        im_idx_length=None,
-    )
+    if ref_type == "MQ":
+        maxquant_ref_df = dict_add_im_index(
+            maxquant_df=maxquant_ref_df,
+            mobility_values_df=mobility_values_df,
+            mq_im_center_col="1/K0",
+            idx_suffix="_ref",
+            im_idx_length=None,
+        )
 
     # merge reference and experiment
     maxquant_dict = merge_ref_and_exp(
         maxquant_ref_df=maxquant_ref_df,
         maxquant_exp_df=maxquant_exp_df,
         save_dir=construct_dict_dir,
+        ref_type=ref_type,
     )
 
-    # generate decoy
-    if cfg_prepare_dict.GENERATE_DECOY:
-        Logger.info("Generating decoy")
-        maxquant_dict = concat_decoy_and_target(maxquant_dict)
-
-    # IM/RT prediction for full dictionary, define RT and IM search range
-    dict_path = os.path.join(construct_dict_dir, "maxquant_dict_for_pred.txt")
-    maxquant_dict.to_csv(
-        os.path.join(construct_dict_dir, "maxquant_dict_for_pred.txt"),
-        sep="\t",
-        index=False,
-    )
     # maxquant_dict = dict_add_rt_pred(
     #     updated_models=cfg_prepare_dict.UPDATED_MODEL_PATH,
     #     deeplc_train_path=os.path.join(rt_transfer_dir, "deeplc_train.csv"),
@@ -1084,6 +1200,23 @@ def construct_dict(
     #     filter_by_rt_diff=None,  # TODO: no filter atm
     # )
 
+    # generate decoy first and then predict RT and IM
+    if cfg_prepare_dict.GENERATE_DECOY:
+        Logger.info("Generating decoy")
+        maxquant_dict = concat_decoy_and_target(maxquant_dict)
+
+    # Do prediction first and then concat target and decoys
+    # IM/RT prediction for full dictionary, define RT and IM search range
+    dict_path = os.path.join(construct_dict_dir, "maxquant_dict_for_pred.txt")
+    maxquant_dict_to_pred = maxquant_dict.copy()
+    maxquant_dict_to_pred["Retention time"] = maxquant_dict["Retention time"].fillna(
+        maxquant_dict["Retention time"].mean()
+    )
+    maxquant_dict_to_pred.to_csv(
+        dict_path,
+        sep="\t",
+        index=False,
+    )
     # add rt pred
     if cfg_prepare_dict.RT_REF == "pred":
         maxquant_dict = dict_add_alpha_pept_pred(
@@ -1105,6 +1238,7 @@ def construct_dict(
             lc_grad=cfg_prepare_dict.RT_MAX,
             device=device,
         )
+
     # maxquant_dict = maxquant_dict.sort_values("mobility_pred")
     # maxquant_dict = pd.merge_asof(
     #     left=maxquant_dict,
