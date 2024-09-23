@@ -718,23 +718,37 @@ def plot_activation(
 
 
 def plot_im_mz(
-    sliced_frame: pd.DataFrame, labels: np.ndarray = None, label_name: str = "Label"
+    sliced_frame: pd.DataFrame,
+    labels: np.ndarray = None,
+    label_name: str = "Label",
+    mark_mz: List[float] = None,
+    mark_im: List[float] = None,
+    distr_mz: List[float] = None,
 ):
     fig, ax = plt.subplots()
     if labels is None:
         labels = sliced_frame["intensity_values"]
         label_name = "Intensity"
+    sliced_frame["mz_values"] = np.round(sliced_frame["mz_values"], 2)
     scatter = ax.scatter(
-        sliced_frame["mobility_values"], sliced_frame["mz_values"], c=labels, s=0.5
+        sliced_frame["mobility_values"],
+        sliced_frame["mz_values"],
+        c=labels,
+        cmap='cividis_r',
+        s=0.1,
     )
+    if mark_im is not None:
+        for im in mark_im:
+            ax.axvline(im, color="r", alpha=0.5)
+    if mark_mz is not None:
+        for mz, abu in zip(mark_mz, distr_mz):
+            ax.axhline(mz, color="r", linewidth=abu * 10, alpha=0.5)
     cbar = plt.colorbar(scatter)
     cbar.set_label(label_name, rotation=270)
     ax.set_ylabel("m/z")
-    ax.set_xlabel("mobility")
+    ax.set_xlabel("1/K0")
 
-    plt.title("Ion mobility spectrum frame " + str(sliced_frame["frame_indices"].min()))
-
-    plt.show()
+    plt.title("MS1 Frame " + str(sliced_frame["frame_indices"].unique()))
 
 
 def plot_im_mz_int(sliced_frame: pd.DataFrame):
@@ -744,9 +758,97 @@ def plot_im_mz_int(sliced_frame: pd.DataFrame):
         sliced_frame["mz_values"].values,
         sliced_frame["intensity_values"].values,
     )
+    # ax.bar3d(
+    #     sliced_frame["mobility_values"].index,
+    #     sliced_frame["mz_values"].index,
+    #     sliced_frame["intensity_values"].index,
+    #     sliced_frame["mobility_values"].values,
+    #     sliced_frame["mz_values"].values,
+    #     sliced_frame["intensity_values"].values,
+    # )
     ax.set_ylabel("m/z")
     ax.set_xlabel("mobility")
     ax.set_zlabel("intensity")
+
+
+def plot_im_or_mz_int_reduced(
+    sliced_frame: pd.DataFrame,
+    group_by: str,
+    labels: np.ndarray = None,
+    label_name="Label",
+):
+    assert group_by in [
+        "mz_values",
+        "mobility_values",
+    ], "Please provide either mz_values or mobility_values for group_by"
+    sliced_frame["mz_vales"] = np.round(sliced_frame["mz_values"], 2)
+    sliced_frame_grouped = sliced_frame.groupby(group_by).sum().reset_index()
+    fig, ax = plt.subplots()
+    # if labels is not None:
+    #     scatter = plt.plot(
+    #         sliced_frame_grouped[group_by],
+    #         sliced_frame_grouped["intensity_values"],
+    #         #c=labels,
+    #         #s=0.5,
+    #     )
+    #     cbar = plt.colorbar(scatter)
+    #     cbar.set_label(label_name, rotation=270)
+    # else:
+    #     scatter = plt.plot(
+    #         sliced_frame_grouped[group_by],
+    #         sliced_frame_grouped["intensity_values"],
+    #         #s=10,
+    #     )
+
+    plt.vlines(
+        x=sliced_frame_grouped[group_by],
+        ymin=0,
+        ymax=sliced_frame_grouped["intensity_values"],
+    )
+    ax.set_ylabel("intensity")
+    ax.set_xlabel(group_by)
+    plt.title("Ion mobility spectrum frame " + str(sliced_frame["frame_indices"].min()))
+    # if mz_value is not None:
+    #     sliced_frame_filtered = sliced_frame.loc[sliced_frame["mz_values"] == mz_value]
+    #     x_value = "mobility_values"
+    #     title = (
+    #         "Ion mobility spectrum frame "
+    #         + str(sliced_frame["frame_indices"].min())
+    #         + "m/z "
+    #         + str(mz_value)
+    #     )
+    # else:
+    #     x_value = "mz_values"
+    #     sliced_frame_filtered = sliced_frame.loc[
+    #         sliced_frame["mobility_values"] == im_value
+    #     ]
+    #     title = (
+    #         "Ion mobility spectrum frame "
+    #         + str(sliced_frame["frame_indices"].min())
+    #         + " im "
+    #         + str(im_value)
+    #     )
+    # fig, ax = plt.subplots()
+    # if labels is not None:
+    #     scatter = ax.scatter(
+    #         sliced_frame_filtered[x_value],
+    #         sliced_frame_filtered["intensity_values"],
+    #         c=labels,
+    #         s=0.5,
+    #     )
+    #     cbar = plt.colorbar(scatter)
+    #     cbar.set_label(label_name, rotation=270)
+    # else:
+    #     scatter = ax.scatter(
+    #         sliced_frame_filtered[x_value],
+    #         sliced_frame_filtered["intensity_values"],
+    #         s=10,
+    #     )
+    # ax.set_ylabel("intensity")
+    # ax.set_xlabel(x_value)
+    # plt.title(title)
+
+    # plt.show()
 
 
 def plot_im_or_mz_int(
