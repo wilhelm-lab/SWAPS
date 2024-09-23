@@ -22,6 +22,7 @@ import torch
 import torch.utils
 from torch.utils.tensorboard import SummaryWriter
 from torch import nn
+from torch.utils.data import ConcatDataset
 from optimization.custom_models import Logger
 from result_analysis.result_analysis import SBSResult
 
@@ -104,51 +105,22 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
 
     use_hint_channel = "hint" in cfg_peak_selection.DATASET.INPUT_CHANNELS
     logging.info("Use hint channel: %s", use_hint_channel)
-    dataset = MultiHDF5_MaskDataset(
-        hdf5_files,
-        use_hint_channel=use_hint_channel,
-        transforms=transformation,
-    )
-    # sanity check
-    image, hint, label = dataset[99]
-    logging.info("Image shape in initial dataset: %s", image.shape)
-    # Split the dataset into training and testing sets
-    train_val_dataset, test_dataset = dataset.split_dataset(
-        train_ratio=cfg_peak_selection.DATASET.TRAIN_VAL_SIZE,
-        seed=random_state,
-    )
-    # sanity check
-    image, hint, label = train_val_dataset[99]
-    logging.info("Image shape in train_val_dataset: %s", image.shape)
-    train_dataset, val_dataset = train_val_dataset.split_dataset(
-        train_ratio=cfg_peak_selection.DATASET.TRAIN_SIZE,
-        seed=random_state,
-    )
-    train_dataloader = torch.utils.data.DataLoader(
+    (
         train_dataset,
-        batch_size=cfg_peak_selection.DATASET.TRAIN_BATCH_SIZE,
-        shuffle=False,
-    )
-    _, train_eval_dataset = train_dataset.split_dataset(
-        train_ratio=0.9, seed=random_state
-    )
-    train_eval_dataloader = torch.utils.data.DataLoader(
         train_eval_dataset,
-        batch_size=cfg_peak_selection.DATASET.VAL_BATCH_SIZE,
-        shuffle=False,
-    )
-    val_dataloader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=cfg_peak_selection.DATASET.VAL_BATCH_SIZE, shuffle=False
-    )
-    test_dataloader = torch.utils.data.DataLoader(
+        val_dataset,
         test_dataset,
-        batch_size=cfg_peak_selection.DATASET.TEST_BATCH_SIZE,
-        shuffle=False,
+        train_dataloader,
+        train_eval_dataloader,
+        val_dataloader,
+        test_dataloader,
+    ) = create_dataset_and_loader(
+        cfg_peak_selection.DATASET,
+        random_state,
+        hdf5_files,
+        transformation,
+        use_hint_channel,
     )
-    logging.info("Train dataset size: %d", len(train_dataset))
-    logging.info("Train eval dataset size: %d", len(train_eval_dataset))
-    logging.info("Validation dataset size: %d", len(val_dataset))
-    logging.info("Test dataset size: %d", len(test_dataset))
 
     #############################
     # Segmentation training
@@ -342,6 +314,57 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
     #############################
     # Classification training
     #############################
+    if len(cfg_peak_selection.REF_TRAINING_DATA):
+        Logger.info("Integrating reference data for training")
+        (
+            train_ref_dataset,
+            train_eval_ref_dataset,
+            val_ref_dataset,
+            test_ref_dataset,
+            _,
+            _,
+            _,
+            _,
+        ) = create_dataset_and_loader(
+            cfg_peak_selection.REF_DATASET,
+            random_state,
+            cfg_peak_selection.REF_TRAINING_DATA,
+            transformation,
+            use_hint_channel,
+        )
+        train_exp_dataset, _ = train_dataset.split_dataset(train_ratio=0.05)
+        val_exp_dataset, _ = val_dataset.split_dataset(train_ratio=0.05)
+        test_exp_dataset, _ = test_dataset.split_dataset(train_ratio=0.05)
+        train_eval_dataset = ConcatDataset([train_eval_dataset, train_eval_ref_dataset])
+        train_dataset = ConcatDataset([train_exp_dataset, train_ref_dataset])
+        val_dataset = ConcatDataset([val_exp_dataset, val_ref_dataset])
+        test_dataset = ConcatDataset([test_exp_dataset, test_ref_dataset])
+        Logger.info("Train dataset size: %d", len(train_dataset))
+        Logger.info("Train eval dataset size: %d", len(train_eval_dataset))
+        Logger.info("Validation dataset size: %d", len(val_dataset))
+        Logger.info("Test dataset size: %d", len(test_dataset))
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=cfg_peak_selection.DATASET.TRAIN_BATCH_SIZE,
+            shuffle=True,
+        )
+
+        train_eval_dataloader = torch.utils.data.DataLoader(
+            train_eval_dataset,
+            batch_size=cfg_peak_selection.DATASET.VAL_BATCH_SIZE,
+            shuffle=True,
+        )
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset,
+            batch_size=cfg_peak_selection.DATASET.VAL_BATCH_SIZE,
+            shuffle=True,
+        )
+        test_dataloader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=cfg_peak_selection.DATASET.TEST_BATCH_SIZE,
+            shuffle=True,
+        )
+
     if cfg_peak_selection.CLSMODEL.KEEP_TRAINING:
         # Build model using config dict node
         model = build_model(cfg_peak_selection.CLSMODEL)
@@ -508,25 +531,33 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
         best_cls_model_path = cfg_peak_selection.CLSMODEL.RESUME_PATH
         Logger.info("Using previous model for classification")
     if cfg_peak_selection.EVAL_ON_TEST:
-        testset_eval(
-            best_seg_model_path=best_seg_model_path,
-            best_cls_model_path=best_cls_model_path,
-            cfg_seg_model=cfg_peak_selection.MODEL,
-            cfg_cls_model=cfg_peak_selection.CLSMODEL,
-            test_dataset=test_dataset,
-            test_dataloader=test_dataloader,
-            maxquant_result_ref=maxquant_dict,
-            result_dir=ps_exp_results_dir,
-            device=device,
-            exp=cfg_peak_selection.DATASET.ONLY_LOG_CHANNEL,
-            # threshold=cfg_peak_selection.CLSMODEL.EVALUATION.THRESHOLD,
-        )
-        test_pred_df = pd.read_csv(os.path.join(ps_exp_results_dir, "test_pred_df.csv"))
+        try:
+            test_pred_df = pd.read_csv(
+                os.path.join(ps_exp_results_dir, "test_pred_df.csv")
+            )
+        except FileNotFoundError:
+            testset_eval(
+                best_seg_model_path=best_seg_model_path,
+                best_cls_model_path=best_cls_model_path,
+                cfg_seg_model=cfg_peak_selection.MODEL,
+                cfg_cls_model=cfg_peak_selection.CLSMODEL,
+                test_dataset=test_dataset,
+                test_dataloader=test_dataloader,
+                maxquant_result_ref=maxquant_dict,
+                result_dir=ps_exp_results_dir,
+                device=device,
+                exp=cfg_peak_selection.DATASET.ONLY_LOG_CHANNEL,
+                # threshold=cfg_peak_selection.CLSMODEL.EVALUATION.THRESHOLD,
+            )
+            test_pred_df = pd.read_csv(
+                os.path.join(ps_exp_results_dir, "test_pred_df.csv")
+            )
         test_pred_df_filtered = test_pred_df.loc[
-            (test_pred_df["target_decoy_score"] > 0.33)
-            & (test_pred_df["log_sum_intensity"] > 1)
+            (test_pred_df["target_decoy_score"] > 0.4)
+            & (test_pred_df["log_sum_intensity"] > 2)
             & (test_pred_df["Decoy"] == 0),
         ]
+        Logger.info("test_pred_df columns: %s", test_pred_df.columns)
         sbs_ims_result = SBSResult(
             maxquant_ref_df=maxquant_dict,
             maxquant_merge_df=maxquant_dict,
@@ -547,6 +578,70 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
     #     os.remove(cfg_peak_selection.CONFIG_PATH)
     #     logging.info("Training finished, config file removed.")
     return best_seg_model_path, best_cls_model_path
+
+
+def create_dataset_and_loader(
+    cfg_peak_selection_dataset,
+    random_state,
+    hdf5_files,
+    transformation,
+    use_hint_channel,
+):
+    dataset = MultiHDF5_MaskDataset(
+        hdf5_files,
+        use_hint_channel=use_hint_channel,
+        transforms=transformation,
+    )
+    # sanity check
+    image, hint, label = dataset[99]
+    logging.info("Image shape in initial dataset: %s", image.shape)
+    # Split the dataset into training and testing sets
+    train_val_dataset, test_dataset = dataset.split_dataset(
+        train_ratio=cfg_peak_selection_dataset.TRAIN_VAL_SIZE,
+        seed=random_state,
+    )
+    # sanity check
+    image, hint, label = train_val_dataset[99]
+    logging.info("Image shape in train_val_dataset: %s", image.shape)
+    train_dataset, val_dataset = train_val_dataset.split_dataset(
+        train_ratio=cfg_peak_selection_dataset.TRAIN_SIZE,
+        seed=random_state,
+    )
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=cfg_peak_selection_dataset.TRAIN_BATCH_SIZE,
+        shuffle=True,
+    )
+    _, train_eval_dataset = train_dataset.split_dataset(
+        train_ratio=0.9, seed=random_state
+    )
+    train_eval_dataloader = torch.utils.data.DataLoader(
+        train_eval_dataset,
+        batch_size=cfg_peak_selection_dataset.VAL_BATCH_SIZE,
+        shuffle=True,
+    )
+    val_dataloader = torch.utils.data.DataLoader(
+        val_dataset, batch_size=cfg_peak_selection_dataset.VAL_BATCH_SIZE, shuffle=True
+    )
+    test_dataloader = torch.utils.data.DataLoader(
+        test_dataset,
+        batch_size=cfg_peak_selection_dataset.TEST_BATCH_SIZE,
+        shuffle=True,
+    )
+    logging.info("Train dataset size: %d", len(train_dataset))
+    logging.info("Train eval dataset size: %d", len(train_eval_dataset))
+    logging.info("Validation dataset size: %d", len(val_dataset))
+    logging.info("Test dataset size: %d", len(test_dataset))
+    return (
+        train_dataset,
+        train_eval_dataset,
+        val_dataset,
+        test_dataset,
+        train_dataloader,
+        train_eval_dataloader,
+        val_dataloader,
+        test_dataloader,
+    )
 
 
 def testset_eval(

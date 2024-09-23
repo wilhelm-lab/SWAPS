@@ -1,5 +1,5 @@
 import logging
-from typing import Literal
+from typing import Literal, List
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -359,7 +359,7 @@ def plot_per_image_metric_distr(
     # Calculate quantiles
     quantiles = np.percentile(loss_array, show_quantiles)
 
-    plt.figure(figsize=(10, 5))
+    plt.figure(figsize=(10, 6))
     plt.hist(loss_array, bins=10, alpha=0.75)
     correction = 0.05
     # Plot quantile lines
@@ -403,6 +403,9 @@ def plot_sample_predictions(
     **kwargs,
 ):
     seg_model.to(device)
+    seg_model.eval()
+    cls_model.to(device)
+    cls_model.eval()
     if sample_indices is None:
         sample_indices = np.random.choice(len(dataset), n, replace=False)
         Logger.info("Sample indices: %s", sample_indices)
@@ -412,7 +415,7 @@ def plot_sample_predictions(
             target = target_dict["mask"].to(device)
             ori_image_raw = target_dict["ori_image_raw"].to(device)
             if use_hint:
-                (seg_out,) = seg_model(
+                (seg_out) = seg_model(
                     image.unsqueeze(0).float(), hint.unsqueeze(0).float()
                 )
                 cls_out = cls_model(
@@ -481,9 +484,9 @@ def plot_sample_predictions(
                         torch.tensor(1, device=device),
                         torch.tensor(0, device=device),
                     )
-                Logger.debug("Ori_image_raw shape: %s", ori_image_raw.shape)
+                Logger.info("Ori_image_raw shape: %s", ori_image_raw.shape)
                 to_plot = {
-                    "data": ori_image_raw.cpu(),
+                    "data": ori_image_raw[0].cpu(),
                     "hint_idx": hint.cpu(),
                     "hint_channel": image[2].cpu(),
                     "mask": target[0].cpu(),
@@ -500,7 +503,7 @@ def plot_sample_predictions(
                     "Masked intensity sum %.2f",
                     np.nansum(
                         np.multiply(
-                            ori_image_raw.cpu().numpy(), target[0].cpu().numpy()
+                            ori_image_raw[0].cpu().numpy(), target[0].cpu().numpy()
                         )
                     ),
                 )
@@ -508,7 +511,7 @@ def plot_sample_predictions(
                     "Pred masked intensity sum %.2f",
                     np.nansum(
                         np.multiply(
-                            ori_image_raw.cpu().numpy(),
+                            ori_image_raw[0].cpu().numpy(),
                             pred.cpu().numpy(),
                         )
                     ),
@@ -525,14 +528,17 @@ def plot_sample_predictions(
             metrics_str += f"\nConf. {conf_score.item():.2f}\n"
         plt.title(
             metrics_str
+            + "\n"
             + f", pept_mzrank: {int(target_dict['pept_mz_rank'])}"
             + f", target score: {cls_out.cpu().item():.2f}"
+            + f", IsTarget: {target_dict['target']}"
         )
         plt.legend()
         save_plot(
             save_dir=save_dir,
-            fig_type_name="PS_model_prediction_sample",
-            fig_spec_name=f"sample_{i}",
+            fig_type_name="PS_model_prediction",
+            fig_spec_name=f"sample_{int(target_dict['pept_mz_rank'])}",
+            bbox_inches='tight'
         )
 
 
@@ -594,11 +600,12 @@ def plot_target_decoy_distr(
 
 def calc_fdr_and_thres(
     pred_df,
-    score_col="log_sum_intensity",
-    filter_dict: dict = None,
+    score_col="target_decoy_score",
+    filter_dict: dict | None = None,
     return_plot: bool = False,
     save_dir=None,
     dataset_name="",
+    xlim=None,
     **kwargs,
 ):
     """Calculate FDR and threshold for a given score column
@@ -647,6 +654,18 @@ def calc_fdr_and_thres(
         plt.ylabel("Number of Identified Targets")
         plt.xlabel("FDR")
         plt.legend(title="Threshold", loc="lower right")
+        if filter_dict is None:
+            plt.title("FDR vs Identified Targets, no filter")
+        if filter_dict is not None:
+            plt.title(
+                "FDR vs Identified Targets, filter by:"
+                + "\n"
+                + "<br/>".join(
+                    [f"{key}: {value}" for key, value in filter_dict.items()]
+                )
+            )
+        if xlim is not None:
+            plt.xlim(xlim)
         save_plot(
             save_dir=save_dir,
             fig_type_name="fdr_id_targets",
@@ -679,19 +698,40 @@ def _filter_pred(filter_dict, pred_df):
     return pred_df_new
 
 
-def plot_roc_auc(pred_df, save_dir=None, dataset_name="", filter_dict=None):
+def plot_roc_auc(
+    pred_df: pd.DataFrame | None = None,
+    pred_df_list: List[pd.DataFrame] | None = None,
+    color_list: List[str] | None = None,
+    label_list: List[str] | None = None,
+    save_dir=None,
+    dataset_name="",
+    filter_dict=None,
+):
     """Plot ROC AUC curve"""
-    if "Target" not in pred_df.columns:
-        pred_df["Target"] = pred_df["Decoy"] == 0
-    if filter_dict is not None:
-        pred_df = _filter_pred(filter_dict, pred_df)
-    fpr, tpr, threshold = roc_curve(pred_df["Target"], pred_df["target_decoy_score"])
-    roc_auc = roc_auc_score(pred_df["Target"], pred_df["target_decoy_score"])
+    assert pred_df is not None or pred_df_list is not None
+    if pred_df is not None:
+        pred_df_list = [pred_df]
+        color_list = ["darkorange"]
+        label_list = dataset_name
     plt.figure()
-    lw = 2
-    plt.plot(
-        fpr, tpr, color="darkorange", lw=lw, label="ROC curve (area = %0.2f)" % roc_auc
-    )
+    for pred_df, color, label in zip(pred_df_list, color_list, label_list):
+        if "Target" not in pred_df.columns:
+            pred_df["Target"] = pred_df["Decoy"] == 0
+        if filter_dict is not None:
+            pred_df = _filter_pred(filter_dict, pred_df)
+        fpr, tpr, threshold = roc_curve(
+            pred_df["Target"], pred_df["target_decoy_score"]
+        )
+        roc_auc = roc_auc_score(pred_df["Target"], pred_df["target_decoy_score"])
+
+        lw = 2
+        plt.plot(
+            fpr,
+            tpr,
+            color=color,
+            lw=lw,
+            label=label + " ROC curve (area = %0.2f)" % roc_auc,
+        )
 
     plt.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")  # Diagonal line
     plt.xlim([0.0, 1.0])
@@ -721,7 +761,7 @@ def calc_fdr_given_thres(
 def compete_target_decoy_pair(
     pept_act_sum_ps: pd.DataFrame,
     maxquant_result_ref: pd.DataFrame,
-    filter_dict: dict = None,
+    filter_dict: dict = {"log_sum_intensity": [2, 100]},
     td_pair_col: str = "TD pair id",
 ):
     for col in ["Decoy", td_pair_col]:
