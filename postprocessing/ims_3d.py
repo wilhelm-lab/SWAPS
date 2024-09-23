@@ -106,7 +106,7 @@ def get_ref_rt_im_range(
     else:
         im_center = maxquant_result_dict.loc[
             maxquant_result_dict["mz_rank"] == pept_mz_rank,
-            ["mobility_values"],
+            ["mobility_values_center_exp"],
         ].values[0][0]
         reference_entry.append(im_center)
         im_min, im_max = im_center - delta_im, im_center + delta_im
