@@ -23,7 +23,7 @@ exp_cols = [
     "Score",
 ]
 decoy_mutation_rule = {
-    "G": "L",
+    "G": "L",  #
     "A": "L",
     "V": "L",
     "L": "V",
@@ -44,3 +44,5 @@ decoy_mutation_rule = {
     "N": "Q",
     "D": "E",
 }
+# G and K has same weight
+# I and L has same weight
