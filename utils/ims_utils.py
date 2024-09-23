@@ -248,39 +248,45 @@ def sum_3d_act_filter_by_im_fast(
     :return: pept_act_sum_df: pd.DataFrame, summed activation intensity data filtered by IM dimension according to MaxQuant reference data
     """
     # TODO: what if the peptbatch is also in chunks?
-    assert (
-        "Ion mobility length" in maxquant_result_ref.columns
-        and "mobility_values_index" in maxquant_result_ref.columns
-    )
-    maxquant_result_ref["mobility_values_index_start"] = np.minimum(
-        np.maximum(
-            0,
-            maxquant_result_ref["mobility_values_index"]
-            - maxquant_result_ref["Ion mobility length"] // 2,
-        ),
-        im_rt_pept_act_coo_peptbatch.shape[1],
-    )
-    maxquant_result_ref["mobility_values_index_end"] = np.minimum(
-        np.maximum(
-            0,
-            maxquant_result_ref["mobility_values_index"]
-            + maxquant_result_ref["Ion mobility length"] // 2,
-        )
-        + 1,
-        im_rt_pept_act_coo_peptbatch.shape[1],
-    )
+    # assert (
+    #     "Ion mobility length" in maxquant_result_ref.columns
+    #     and "mobility_values_index" in maxquant_result_ref.columns
+    # )
+    # maxquant_result_ref["mobility_values_index_start"] = np.minimum(
+    #     np.maximum(
+    #         0,
+    #         maxquant_result_ref["mobility_values_index"]
+    #         - maxquant_result_ref["Ion mobility length"] // 2,
+    #     ),
+    #     im_rt_pept_act_coo_peptbatch.shape[1],
+    # )
+    # maxquant_result_ref["mobility_values_index_end"] = np.minimum(
+    #     np.maximum(
+    #         0,
+    #         maxquant_result_ref["mobility_values_index"]
+    #         + maxquant_result_ref["Ion mobility length"] // 2,
+    #     )
+    #     + 1,
+    #     im_rt_pept_act_coo_peptbatch.shape[1],
+    # )
     # Vectorized approach using list comprehension and numpy array
+    maxquant_result_ref["mobility_values_index_left_exp"] = maxquant_result_ref[
+        "mobility_values_index_left_exp"
+    ].astype(int)
+    maxquant_result_ref["mobility_values_index_right_exp"] = maxquant_result_ref[
+        "mobility_values_index_right_exp"
+    ].astype(int)
     maxquant_result_ref["mobility_values_coo"] = [
         np.arange(start, end)
         for start, end in zip(
-            maxquant_result_ref["mobility_values_index_start"],
-            maxquant_result_ref["mobility_values_index_end"],
+            maxquant_result_ref["mobility_values_index_left_exp"],
+            maxquant_result_ref["mobility_values_index_right_exp"],
         )
     ]
     maxquant_result_ref = maxquant_result_ref[
         [
-            "mobility_values_index_start",
-            "mobility_values_index_end",
+            "mobility_values_index_left_exp",
+            "mobility_values_index_right_exp",
             "mobility_values_coo",
             "mz_rank",
         ]
