@@ -99,6 +99,34 @@ class MultiHDF5Dataset(torch.utils.data.Dataset):
 
         return train_dataset, test_dataset
 
+    def merge_datasets(self, other_dataset):
+        """
+        Merges the current dataset with another MultiHDF5Dataset instance.
+        The merged dataset will contain the combined data index of both datasets.
+
+        Args:
+            other_dataset (MultiHDF5Dataset): Another dataset to merge with this one.
+
+        Returns:
+            MultiHDF5Dataset: A new dataset instance containing the merged data.
+        """
+        if not isinstance(other_dataset, MultiHDF5Dataset):
+            raise TypeError("other_dataset must be an instance of MultiHDF5Dataset")
+
+        merged_hdf5_files = self.hdf5_files + other_dataset.hdf5_files
+
+        # Adjust file indices in the other dataset's data index
+        offset = len(self.hdf5_files)
+        adjusted_other_data_index = [
+            (file_idx + offset, name) for file_idx, name in other_dataset.data_index
+        ]
+
+        merged_data_index = self.data_index + adjusted_other_data_index
+
+        return MultiHDF5Dataset(
+            merged_hdf5_files, data_index=merged_data_index, transforms=self.transforms
+        )
+
 
 class PeptActPeakSelection_Infer_Dataset(torch.utils.data.Dataset):
     """Dataset for inference with peak selection, no target labels are included in data points"""
@@ -111,6 +139,7 @@ class PeptActPeakSelection_Infer_Dataset(torch.utils.data.Dataset):
         use_hint_channel: bool = True,
         data_index=None,
         transforms=None,
+        add_label_mask=False,
     ):
         maxquant_dict[
             [
@@ -137,6 +166,7 @@ class PeptActPeakSelection_Infer_Dataset(torch.utils.data.Dataset):
         self.data_index = (
             data_index if data_index is not None else self._create_data_index()
         )
+        self.add_label_mask = add_label_mask
 
     def __len__(self):
         return len(self.data_index)
@@ -153,7 +183,7 @@ class PeptActPeakSelection_Infer_Dataset(torch.utils.data.Dataset):
             peptbatch_act=self.peptbatch_act,
             maxquant_dict=self.maxquant_dict,
             hint_matrix=self.hint_matrix,
-            add_label_mask=False,
+            add_label_mask=self.add_label_mask,
         )
         # Logger.debug("datapoint_dict %s", datapoint_dict)
 
@@ -166,8 +196,7 @@ class PeptActPeakSelection_Infer_Dataset(torch.utils.data.Dataset):
             "mask": mask,
             "pept_mz_rank": datapoint_dict["pept_mz_rank"],
             "target": datapoint_dict["target"],
-            "ori_image_raw": img,
-
+            "ori_image_raw": img.clone(),
         }
         # Logger.debug("img shape %s", img.shape)
         # Logger.debug("hint shape %s", hint.shape)
@@ -257,7 +286,7 @@ class MultiHDF5_MaskDataset(torch.utils.data.Dataset):
             # "area": area,
             "iscrowd": iscrowd,
             "target": data_point["target"],
-            "ori_image_raw": img,
+            "ori_image_raw": img.clone(),
         }
         # Logger.debug("Peptide mz rank %s", target["pept_mz_rank"])
         if self.transforms is not None:
@@ -564,7 +593,7 @@ class Mask_MinMaxScale:
     def __call__(self, data_hint_bbox):
         image = data_hint_bbox[0]
         target = data_hint_bbox[2]
-        target["ori_image_raw"] = image[0].detach().clone()
+        # target["ori_image_raw"] = image[0].detach().clone()
         image[0] = image[0] / image[0].max().item()
         hint = data_hint_bbox[1]
         if self.scale_log_channel:

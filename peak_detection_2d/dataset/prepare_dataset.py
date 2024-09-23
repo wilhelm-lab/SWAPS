@@ -8,7 +8,7 @@ import pandas as pd
 import numpy as np
 
 from tqdm import tqdm
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from torchvision import tv_tensors
 from ..utils import (
     save_data_points_to_hdf5,
@@ -206,6 +206,7 @@ def process_pept_mz_ranks(
     maxquant_dict: pd.DataFrame,
     hint_matrix: sparse.COO,
     num_workers: int = 4,
+    add_label_mask: bool = True,
 ):
     maxquant_dict[
         [
@@ -233,6 +234,7 @@ def process_pept_mz_ranks(
                 peptbatch_act,
                 maxquant_dict,
                 hint_matrix,
+                add_label_mask,
             )
             for pept_mz_rank in tqdm(pept_mz_ranks)
         ]
@@ -411,12 +413,15 @@ def prepare_training_dataset(
     n_workers: int = 1,
     include_decoys: bool = False,
     chunk_size: int = 5000,
+    source: List[str] = ["both"],
 ):
 
     # Create output directory
     ps_dir = os.path.join(result_dir, "peak_selection")
     os.makedirs(ps_dir, exist_ok=True)
     ps_data_dir = os.path.join(ps_dir, "training_data")
+    if source == ["ref"]:
+        ps_data_dir = os.path.join(ps_data_dir, "ref")
     os.makedirs(ps_data_dir, exist_ok=True)
 
     # Load relevant data
@@ -464,15 +469,22 @@ def prepare_training_dataset(
     Logger.info("Pept batch indices: %s", pept_batch_indicies)
     if include_decoys:
         maxquant_dict_for_training = maxquant_dict.loc[
-            maxquant_dict["source"].isin(["both"])
+            maxquant_dict["source"].isin(source)
         ]  # Only use the data points that are from both sources for training and eval
     else:
         maxquant_dict_for_training = maxquant_dict.loc[
-            (maxquant_dict["source"].isin(["both"])) & ~(maxquant_dict["Decoy"])
+            (maxquant_dict["source"].isin(source)) & ~(maxquant_dict["Decoy"])
         ]
     Logger.info(
         "Number of training data points: %s", maxquant_dict_for_training.shape[0]
     )
+    if "ref" not in source:
+        Logger.info("Not using ref data source for training.")
+        add_label_mask = True
+    else:
+        Logger.info("Using ref data source for training.")
+        add_label_mask = False
+
     hdf5_file_paths = []
     for pept_batch in pept_batch_indicies:
 
@@ -509,6 +521,7 @@ def prepare_training_dataset(
                 maxquant_dict=maxquant_dict_for_training,
                 hint_matrix=hint_matrix,
                 num_workers=n_workers,  # Adjust based on your system's capabilities
+                add_label_mask=add_label_mask,
             )
             save_data_points_to_hdf5(list_of_data_points, hdf5_file_path)
             del list_of_data_points
