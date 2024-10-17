@@ -130,7 +130,7 @@ def plot_corr_int_ref_and_act(
     log_x: bool = True,
     log_y: bool = True,
     fig_spec_name: str = "",
-    title: str | None = None,
+    title: str | None = "auto",
 ):
     if hover_data is None:
         hover_data = [
@@ -139,7 +139,7 @@ def plot_corr_int_ref_and_act(
             "Charge",
             "id",
         ]
-    if title is None:
+    if title == "auto":
         title = "Corr. of Quant. Results"
     reg_int, abs_residue, valid_idx = plot_scatter(
         x=ref_int,
@@ -155,8 +155,8 @@ def plot_corr_int_ref_and_act(
         color=color,
         title=title,
         save_dir=save_dir,
-        x_label="Reference (log)",
-        y_label="Infered (log)",
+        x_label="MaxQuant Reference Intensity (Log10)",
+        y_label="SWAPS Inferred Intensity (Log10)",
         fig_spec_name=fig_spec_name,
     )
     return reg_int, abs_residue, valid_idx
@@ -367,7 +367,6 @@ class SWAPSResult:
             sum_act=int_compare[self.infer_intensity_col],
             data=int_compare,
             save_dir=self.save_dir,
-            title="Corr. of Quant. Results ",
             fig_spec_name="_fdr_"
             + str(self.fdr_thres)
             + "_log_int_"
@@ -379,6 +378,7 @@ class SWAPSResult:
         self,
         show_ref: bool = False,
         level: Literal["precursor", "peptide", "protein"] = "peptide",
+        title: str|None = None,
     ):
         """
         Plot the overlap between the experiment file and the activation columns
@@ -433,38 +433,39 @@ class SWAPSResult:
                 if show_ref:
                     list3 = maxquant_dict_target["Proteins"].str.split(";")
                     set3 = set([item for sublist in list3 for item in sublist])
+        if title == "auto":
+            title="Identification Of Target, "+ level+ ", fdr="+ str(self.fdr_thres)+ "_log_int_"+ str(self.log_sum_intensity_thres)
 
         if show_ref:
             plot_venn3(
                 set1=set1,
                 set2=set2,
                 set3=set3,
-                label1="Maxquant",
+                label1="MaxQuant",
                 label2="SWAPS",
-                label3="Reference",
+                label3="Full Library",
                 save_dir=self.save_dir,
-                title="Identification Of Target, "
-                + level
-                + ", fdr="
-                + str(self.fdr_thres),
-                fig_spec_name=level + "_fdr_" + str(self.fdr_thres),
-            )
-        else:
-            plot_venn2(
-                set1=set1,
-                set2=set2,
-                label1="Maxquant",
-                label2="SWAPS",
-                save_dir=self.save_dir,
-                title="Identification Of Target, "
-                + level
-                + ", fdr="
-                + str(self.fdr_thres),
+                title=title,
                 fig_spec_name=level
                 + "_fdr_"
                 + str(self.fdr_thres)
                 + "_log_int_"
                 + str(self.log_sum_intensity_thres),
+            )
+        else:
+            plot_venn2(
+                set1=set1,
+                set2=set2,
+                label1="MaxQuant",
+                label2="SWAPS",
+                title=title,
+                save_dir=self.save_dir,
+                    fig_spec_name=level
+                + "_fdr_"
+                + str(self.fdr_thres)
+                + "_log_int_"
+                + str(self.log_sum_intensity_thres),
+
             )
 
 
