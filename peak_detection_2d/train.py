@@ -26,7 +26,7 @@ from torch.utils.data import ConcatDataset
 from optimization.custom_models import Logger
 from result_analysis.result_analysis import SBSResult
 
-# from .CLSMODEL.conf_model import inference_and_sum_intensity
+
 from .model.build_model import build_model
 from .model.seg_model import train_one_epoch, evaluate, inference_and_sum_intensity
 from .solver.build_optimizer import (
@@ -51,6 +51,10 @@ from .utils import (
 
 
 def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=None):
+    # Logger.info(
+    #     "Memory summary before calling train func: %s", torch.cuda.memory_summary()
+    # )
+    # Logger.info("%s", os.system("nvidia-smi"))
     """Does not use CONFMODEL config"""
     #############################
     # Pre-training
@@ -89,8 +93,15 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
     )
     cfg_peak_selection.CLSMODEL.PARAMS.IN_CHANNELS = len(
         cfg_peak_selection.DATASET.INPUT_CHANNELS
+    ) + int(cfg_peak_selection.CLSMODEL.PARAMS.USE_SEG_OUTPUT)
+    logging.info(
+        "Dataset channels for seg model: %d",
+        cfg_peak_selection.MODEL.PARAMS.IN_CHANNELS,
     )
-    logging.info("Dataset channels: %d", cfg_peak_selection.MODEL.PARAMS.IN_CHANNELS)
+    logging.info(
+        "Dataset channels for cls model: %d",
+        cfg_peak_selection.CLSMODEL.PARAMS.IN_CHANNELS,
+    )
 
     # Save configs
     cfg_peak_selection.dump(
@@ -121,11 +132,13 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
         transformation,
         use_hint_channel,
     )
-
+    # Logger.info("Memory summary after loading data: %s", torch.cuda.memory_summary())
+    # Logger.info("%s", os.system("nvidia-smi"))
     #############################
     # Segmentation training
     #############################
-
+    # torch.cuda.empty_cache()
+    # gc.collect()
     if cfg_peak_selection.MODEL.KEEP_TRAINING:
         # Build model using config dict node
         model = build_model(cfg_peak_selection.MODEL)
@@ -173,8 +186,6 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
         loss_tracking = {"train": [], "val": []}
         metric = {"train": [], "val": []}
         for epoch in range(current_epoch, total_epochs):
-            torch.cuda.empty_cache()
-            gc.collect()
             logging.info("Start epoch %s", epoch)
 
             loss = train_one_epoch(
@@ -412,6 +423,12 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
         # parameters = list(model.parameters())
         loss_tracking = {"train": [], "val": []}
         metric = {"train": [], "val": []}
+        if cfg_peak_selection.CLSMODEL.PARAMS.USE_SEG_OUTPUT:
+            bst_seg_model = build_model(cfg_peak_selection.MODEL)
+            checkpoint = torch.load(best_seg_model_path, map_location=device)
+            bst_seg_model.load_state_dict(checkpoint["model_state_dict"])
+        else:
+            bst_seg_model = None
         for epoch in range(current_epoch, total_epochs):
             torch.cuda.empty_cache()
             gc.collect()
@@ -427,6 +444,8 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
                 use_image_as_input=True,
                 device=device,
                 scheduler=scheduler,
+                add_ps_channel=cfg_peak_selection.CLSMODEL.PARAMS.USE_SEG_OUTPUT,
+                seg_model=bst_seg_model,
             )
 
             ####################
@@ -442,6 +461,8 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
                 exp=cfg_peak_selection.DATASET.ONLY_LOG_CHANNEL,
                 model_type="cls",
                 threshold=cfg_peak_selection.CLSMODEL.EVALUATION.THRESHOLD,
+                add_ps_channel=cfg_peak_selection.CLSMODEL.PARAMS.USE_SEG_OUTPUT,
+                seg_model=bst_seg_model,
             )
 
             val_metric = evaluate(
@@ -454,6 +475,8 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
                 exp=cfg_peak_selection.DATASET.ONLY_LOG_CHANNEL,
                 model_type="cls",
                 threshold=cfg_peak_selection.CLSMODEL.EVALUATION.THRESHOLD,
+                add_ps_channel=cfg_peak_selection.CLSMODEL.PARAMS.USE_SEG_OUTPUT,
+                seg_model=bst_seg_model,
             )
 
             # Store training trace
@@ -558,22 +581,23 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
             & (test_pred_df["Decoy"] == 0),
         ]
         Logger.info("test_pred_df columns: %s", test_pred_df.columns)
-        sbs_ims_result = SBSResult(
-            maxquant_ref_df=maxquant_dict,
-            maxquant_merge_df=maxquant_dict,
-            pept_act_sum_df_list=[test_pred_df_filtered],
-            # sum_raw=test_pred_df,
-            # sum_gaussian=train_label_df,
-            ims=True,
-            # other_cols=other_cols
-        )
-        sbs_ims_result.plot_intensity_corr(
-            ref_col="Intensity",
-            inf_col="sum_intensity",
-            contour=False,
-            save_dir=ps_exp_results_dir,
-            # group_by="Leading razor protein",
-        )
+        # TODO: change to SWAPSResult class
+        # sbs_ims_result = SBSResult(
+        #     maxquant_ref_df=maxquant_dict,
+        #     maxquant_merge_df=maxquant_dict,
+        #     pept_act_sum_df_list=[test_pred_df_filtered],
+        #     # sum_raw=test_pred_df,
+        #     # sum_gaussian=train_label_df,
+        #     ims=True,
+        #     # other_cols=other_cols
+        # )
+        # sbs_ims_result.plot_intensity_corr(
+        #     ref_col="Intensity",
+        #     inf_col="sum_intensity",
+        #     contour=False,
+        #     save_dir=ps_exp_results_dir,
+        #     # group_by="Leading razor protein",
+        # )
     # if cfg_peak_selection.REMOVE_CONFIG_AFTER_RUN:
     #     os.remove(cfg_peak_selection.CONFIG_PATH)
     #     logging.info("Training finished, config file removed.")
@@ -592,9 +616,9 @@ def create_dataset_and_loader(
         use_hint_channel=use_hint_channel,
         transforms=transformation,
     )
-    # sanity check
-    image, hint, label = dataset[99]
-    logging.info("Image shape in initial dataset: %s", image.shape)
+    # # sanity check
+    # image, hint, label = dataset[99]
+    # logging.info("Image shape in initial dataset: %s", image.shape)
     # Split the dataset into training and testing sets
     train_val_dataset, test_dataset = dataset.split_dataset(
         train_ratio=cfg_peak_selection_dataset.TRAIN_VAL_SIZE,
@@ -658,7 +682,8 @@ def testset_eval(
     # threshold: float = 0.5,
 ):
     # Plot history
-
+    # Logger.info("Memory summary before loading models: %s", torch.cuda.memory_summary())
+    # Logger.info("%s", os.system("nvidia-smi"))
     bst_seg_model = build_model(cfg_seg_model)
     checkpoint = torch.load(best_seg_model_path, map_location=device)
     Logger.info("best_seg_model_path: %s", best_seg_model_path)
@@ -666,7 +691,10 @@ def testset_eval(
 
     bst_cls_model = build_model(cfg_cls_model)
     checkpoint = torch.load(best_cls_model_path, map_location=device)
+    Logger.info("best_cls_model_path: %s", best_cls_model_path)
     bst_cls_model.load_state_dict(checkpoint["model_state_dict"])
+    # Logger.info("Memory summary after loading models: %s", torch.cuda.memory_summary())
+    # Logger.info("%s", os.system("nvidia-smi"))
     test_pred_df = inference_and_sum_intensity(
         data_loader=test_dataloader,
         seg_model=bst_seg_model,
@@ -681,6 +709,7 @@ def testset_eval(
         exp=exp,
         threshold=cfg_seg_model.EVALUATION.THRESHOLD,
         calc_score=True,
+        add_ps_channel=cfg_cls_model.PARAMS.USE_SEG_OUTPUT,
     )
 
     test_pred_df_full = pd.merge(
@@ -762,6 +791,7 @@ def testset_eval(
         use_hint=False,
         zoom_in=False,
         label="mask",
+        add_ps_channel=cfg_cls_model.PARAMS.USE_SEG_OUTPUT,
         save_dir=os.path.join(result_dir, "sample_predictions"),
         exp=exp,
     )
@@ -783,6 +813,7 @@ def testset_eval(
         zoom_in=False,
         label="mask",
         device=device,
+        add_ps_channel=cfg_cls_model.PARAMS.USE_SEG_OUTPUT,
         save_dir=os.path.join(result_dir, "sample_predictions_lowest_wiou"),
         exp=exp,
     )

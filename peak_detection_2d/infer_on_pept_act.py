@@ -84,6 +84,7 @@ def infer_on_pept_act(
                 use_hint=False,
                 zoom_in=False,
                 label="mask",
+                add_ps_channel=cfg.PEAK_SELECTION.CLSMODEL.PARAMS.USE_SEG_OUTPUT,
             )
         else:
             pept_act_sum_ps_df = inference_and_sum_intensity(
@@ -92,6 +93,7 @@ def infer_on_pept_act(
                 data_loader=infer_dataloader,
                 device=device,
                 sigmoid_cls_score=sigmoid_cls_score,
+                add_ps_channel=cfg.PEAK_SELECTION.CLSMODEL.PARAMS.USE_SEG_OUTPUT,
             )
             pept_act_sum_ps_df_list.append(pept_act_sum_ps_df)
     if not plot_samples:

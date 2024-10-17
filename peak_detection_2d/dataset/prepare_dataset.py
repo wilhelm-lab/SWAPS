@@ -6,13 +6,10 @@ import fire
 import sparse
 import pandas as pd
 import numpy as np
-
+import h5py
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 from torchvision import tv_tensors
-from ..utils import (
-    save_data_points_to_hdf5,
-)
 from postprocessing.ims_3d import (
     get_ref_rt_im_range,
     slice_pept_act,
@@ -22,6 +19,17 @@ from postprocessing.ims_3d import (
 
 
 Logger = logging.getLogger(__name__)
+
+
+def save_data_points_to_hdf5(futures, output_filename):
+    """save data points to hdf5 file, each data point is a group"""
+    with h5py.File(output_filename, "a") as f:
+        for future in tqdm(futures):
+            result = future.result()
+            # Logger.info("group name: %s", f"pept_mz_rank_{result['pept_mz_rank']}")
+            group = f.create_group(f"pept_mz_rank_{result['pept_mz_rank']}")
+            for key, value in result.items():
+                group.create_dataset(key, data=value)
 
 
 def prepare_2d_act_and_bbox(
@@ -414,6 +422,12 @@ def prepare_training_dataset(
     include_decoys: bool = False,
     chunk_size: int = 5000,
     source: List[str] = ["both"],
+    resample: bool = False,
+    sample_by: str | None = "Taxonomy names",
+    random_state: int = 42,
+    arg_min: str | None = "Escherichia coli K-12",
+    arg_sample: List[str] | None = ["Homo sapiens", "Saccharomyces cerevisiae"],
+    dataset_name: str = "train_datapoints_TD",
 ):
 
     # Create output directory
@@ -475,6 +489,24 @@ def prepare_training_dataset(
         maxquant_dict_for_training = maxquant_dict.loc[
             (maxquant_dict["source"].isin(source)) & ~(maxquant_dict["Decoy"])
         ]
+    if resample:
+        assert sample_by is not None
+        assert arg_min is not None
+        assert arg_sample is not None
+        Logger.info(
+            "Resampling training data by %s, arg_min %s, arg_sample %s",
+            sample_by,
+            arg_min,
+            arg_sample,
+        )
+        maxquant_dict_for_training = resample_training_data(
+            maxquant_dict_for_training,
+            random_state=random_state,
+            sample_by=sample_by,
+            arg_min=arg_min,
+            arg_sample=arg_sample,
+        )
+
     Logger.info(
         "Number of training data points: %s", maxquant_dict_for_training.shape[0]
     )
@@ -495,7 +527,7 @@ def prepare_training_dataset(
             "Peptide batch %s, pept_mz_ranks length %s", pept_batch, len(pept_mz_ranks)
         )
         hdf5_file_path = os.path.join(
-            ps_data_dir, f"train_datapoints_TD_peptbatch{pept_batch}.hdf5"
+            ps_data_dir, f"{dataset_name}_peptbatch{pept_batch}.hdf5"
         )
         if pept_batch > 0:
             pept_act_batch = sparse.load_npz(
@@ -527,6 +559,28 @@ def prepare_training_dataset(
             del list_of_data_points
         hdf5_file_paths.append(hdf5_file_path)
     return hdf5_file_paths
+
+
+def resample_training_data(
+    maxquant_dict: pd.DataFrame,
+    random_state: int = 42,
+    sample_by: str = "Taxonomy names",
+    arg_min: str = "Escherichia coli K-12",
+    arg_sample: List = ["Homo sapiens", "Saccharomyces cerevisiae"],
+):
+    # prepare balanced species training/val/test set
+    n_min = maxquant_dict[sample_by].value_counts()[arg_min]
+    keep_data = maxquant_dict.loc[
+        ~maxquant_dict[sample_by].isin(["Homo sapiens", "Saccharomyces cerevisiae"])
+    ]
+    for arg in arg_sample:
+        sampled_data = maxquant_dict.loc[maxquant_dict[sample_by] == arg].sample(
+            n=n_min, replace=False, random_state=random_state
+        )
+        keep_data = pd.concat([keep_data, sampled_data], axis=0)
+        Logger.info("Sampled and concatenated data from %s", arg)
+    Logger.info("After sampling, %s data points remained.", keep_data.shape[0])
+    return keep_data
 
 
 if __name__ == "__main__":

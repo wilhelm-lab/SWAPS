@@ -1,6 +1,7 @@
+import gc
 from typing import List, Callable, Literal
 import logging
-
+import os
 import numpy as np
 import pandas as pd
 import torch
@@ -8,7 +9,7 @@ import torch.nn as nn
 from torchvision.transforms.v2.functional import center_crop
 from torcheval.metrics.functional import binary_auroc
 from tqdm import tqdm
-
+from ..dataset.dataset import MultiHDF5_MaskDataset
 
 Logger = logging.getLogger(__name__)
 
@@ -44,6 +45,9 @@ def train_one_epoch(
     device="cuda",
     scheduler=None,
     use_image_as_input: bool = False,
+    add_ps_channel: bool = False,
+    seg_model=None,
+    # train_dataset=None,  # remove train_loader and only keep dataset
 ):
     epoch_losses = AverageMeter()
     # epoch_seg_losses = AverageMeter()
@@ -54,6 +58,11 @@ def train_one_epoch(
         optimizer.zero_grad()
     tk0 = tqdm(train_loader, total=len(train_loader))
     for image_batch, hint_batch, label_batch in tk0:
+        if add_ps_channel:
+            assert seg_model is not None
+            image_batch = MultiHDF5_MaskDataset.add_ps_channel_to_batch(
+                image_batch.float(), device=device, seg_model=seg_model
+            )
         out = model(image_batch.float())
         match model_type:
             case "seg":
@@ -94,6 +103,9 @@ def evaluate(
     save_all_loss: bool = False,
     use_image_for_metric: bool = False,
     model_type: Literal["seg", "cls"] = "seg",
+    # val_dataset=None,
+    add_ps_channel: bool = False,
+    seg_model=None,
     **kwargs,
 ):
     epoch_loss = AverageMeter()
@@ -107,6 +119,11 @@ def evaluate(
         pept_mz_rank = np.empty((0))
     with torch.no_grad():
         for image_batch, hint_batch, label_batch in tk0:
+            if add_ps_channel:
+                assert seg_model is not None
+                image_batch = MultiHDF5_MaskDataset.add_ps_channel_to_batch(
+                    image_batch.float(), device=device, seg_model=seg_model
+                )
             out = model(image_batch.float())
             match model_type:
                 case "seg":
@@ -186,6 +203,7 @@ def inference_and_sum_intensity(
     use_image_for_metric: List[bool] = None,
     # resize: bool = False,
     sigmoid_cls_score: bool = True,
+    add_ps_channel: bool = False,
     **kwargs,
 ):
 
@@ -203,11 +221,25 @@ def inference_and_sum_intensity(
         for metric in per_image_metric:
             epoch_losses[metric.__name__] = AverageMeter()
             losses[metric.__name__] = np.empty((0))
+    # Logger.info(
+    #     "Memory summary before moving models to device: %s", torch.cuda.memory_summary()
+    # )
+    # Logger.info("%s", os.system("nvidia-smi"))
     seg_model = seg_model.to(device)
     seg_model.eval()
     cls_model = cls_model.to(device)
     cls_model.eval()
+    Logger.info(
+        "Memory summary after moving models to device: %s", torch.cuda.memory_summary()
+    )
+    # Logger.info("%s", os.system("nvidia-smi"))
     with torch.no_grad():
+        torch.cuda.empty_cache()
+        gc.collect()
+        Logger.info(
+            "Memory summary with no_grad and gc: %s", torch.cuda.memory_summary()
+        )
+        # Logger.info("%s", os.system("nvidia-smi"))
         for image_batch, hint_batch, label_batch in data_loader:
             batch_size, n_channels = label_batch["mask"].size(0), label_batch[
                 "mask"
@@ -217,7 +249,11 @@ def inference_and_sum_intensity(
             Logger.debug("pept_mz_rank%s", pept_mz_rank)
             # seg_out, cls_out = seg_model(image_batch.float())
             seg_out = seg_model(image_batch.float())
-            cls_out = cls_model(image_batch.float())
+            if add_ps_channel:
+                image_batch_cls = MultiHDF5_MaskDataset.add_ps_channel_to_batch(
+                    image_batch.float(), device=device, seg_model=seg_model
+                )
+            cls_out = cls_model(image_batch_cls.float())
             Logger.debug(
                 "out non zero value distribution: %s, %s",
                 seg_out.nonzero().min().item(),
@@ -536,6 +572,7 @@ class UNET(nn.Module):
         padding=0,
         seg_head: bool = True,
         cls_head: bool = True,
+        drop_out: float = 0,
     ):
         super(UNET, self).__init__()
         self.encoder = Encoder(
@@ -543,6 +580,7 @@ class UNET(nn.Module):
         )
         self.seg_head = seg_head
         self.cls_head = cls_head
+        self.drop_out = drop_out
         if seg_head:
             self.decoder = Decoder(
                 first_out_channels * (2**downhill),
@@ -556,13 +594,24 @@ class UNET(nn.Module):
             encoded_channels = first_out_channels * (
                 2**downhill
             )  # Number of channels in the final encoder output
-            self.classifier = nn.Sequential(
-                nn.AdaptiveAvgPool2d((1, 1)),  # Global Average Pooling
-                nn.Flatten(),  # Flatten the tensor
-                # nn.Dropout(p=0.3),  # TODO: set dropout rate as a parameter
-                nn.Linear(encoded_channels, 1),  # Binary classification layer
-                # nn.Sigmoid(),  # Sigmoid activation for binary classification
-            )
+            if self.drop_out > 0:
+                self.classifier = nn.Sequential(
+                    nn.AdaptiveAvgPool2d((1, 1)),  # Global Average Pooling
+                    nn.Flatten(),  # Flatten the tensor
+                    nn.Dropout(p=self.drop_out),
+                    nn.Linear(encoded_channels, 1),  # Binary classification layer
+                    # nn.Sigmoid(),  # Sigmoid activation for binary classification
+                )
+                Logger.info("Dropout applied to classifier with rate %s", self.drop_out)
+            else:
+                self.classifier = nn.Sequential(
+                    nn.AdaptiveAvgPool2d((1, 1)),  # Global Average Pooling
+                    nn.Flatten(),  # Flatten the tensor
+                    # nn.Dropout(p=self.drop_out),
+                    nn.Linear(encoded_channels, 1),  # Binary classification layer
+                    # nn.Sigmoid(),  # Sigmoid activation for binary classification
+                )
+                Logger.info("No dropout applied to classifier")
 
     def forward(self, x):
         enc_out, routes = self.encoder(x)

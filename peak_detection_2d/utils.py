@@ -10,6 +10,7 @@ import h5py
 import seaborn as sns
 from matplotlib import patches
 from matplotlib.colors import ListedColormap, BoundaryNorm
+from peak_detection_2d import dataset
 from utils.plot import save_plot
 import torch
 from sklearn.metrics import roc_curve, roc_auc_score
@@ -21,6 +22,7 @@ from peak_detection_2d.loss.custom_loss import (
     per_image_weighted_dice_metric,
     per_image_weighted_iou_metric,
 )
+from peak_detection_2d.dataset.dataset import MultiHDF5_MaskDataset
 
 Logger = logging.getLogger(__name__)
 
@@ -214,7 +216,9 @@ def plot_data_points_illustration(
             heatmap = ax.imshow(np.log(dp_dict["data"] + 1), cmap="binary")
         else:
             heatmap = ax.imshow(dp_dict["data"], cmap="binary")
-
+    if "seg_out" in dp_dict:
+        Logger.info("seg_out shape: %s", dp_dict["seg_out"].shape)
+        ax.imshow(dp_dict["seg_out"], cmap="Reds", label="pred")
     if "hint_channel" in dp_dict:
 
         # Logger.info("Peptide mz rank: %s", dp_dict["pept_mz_rank"])
@@ -354,7 +358,7 @@ def plot_history(history, title: str = "loss", save_dir=None):
 
 
 def plot_per_image_metric_distr(
-    loss_array, metric_name, save_dir, show_quantiles=[25, 50, 75]
+    loss_array, metric_name, save_dir, show_quantiles=[25, 50, 75], dataset_name=""
 ):
     # Calculate quantiles
     quantiles = np.percentile(loss_array, show_quantiles)
@@ -374,14 +378,43 @@ def plot_per_image_metric_distr(
             ha="center",
         )
         correction *= -1
-    plt.title(f"{metric_name} Distribution")
+    plt.title(f"{dataset_name} {metric_name} Distribution")
     plt.xlabel(metric_name)
     plt.ylabel("Frequency")
     save_plot(
         save_dir=save_dir,
         fig_type_name="PS_model",
-        fig_spec_name=f"test_{metric_name}_distribution",
+        fig_spec_name=f"test_{metric_name}_distribution_{dataset_name}",
     )
+
+
+def single_inference(
+    datapoint,
+    seg_model,
+    cls_model,
+    add_ps_channel: bool = True,
+    device="cuda",
+):
+    seg_model.to(device)
+    seg_model.eval()
+    cls_model.to(device)
+    cls_model.eval()
+    with torch.no_grad():
+        image, hint, target_dict = datapoint
+        if add_ps_channel:
+            image_cls = MultiHDF5_MaskDataset.add_ps_channel_to_batch(
+                image.unsqueeze(0).float(), device=device, seg_model=seg_model
+            )
+            Logger.debug("Image shape: %s", image_cls.shape)
+        else:
+            image_cls = image.unsqueeze(0).float()
+        target = target_dict["mask"].to(device)
+        ori_image_raw = target_dict["ori_image_raw"].to(device)
+
+        seg_out = seg_model(image.unsqueeze(0).float())
+        cls_out = cls_model(image_cls.float())
+        # output = (output > threshold).float()
+        return seg_out, cls_out
 
 
 def plot_sample_predictions(
@@ -400,6 +433,8 @@ def plot_sample_predictions(
     zoom_in: bool = True,
     device="cuda",
     channel: int = 0,
+    sigmoid_cls_score: bool = True,
+    add_ps_channel: bool = False,
     **kwargs,
 ):
     seg_model.to(device)
@@ -412,23 +447,31 @@ def plot_sample_predictions(
     for i in sample_indices:
         with torch.no_grad():
             image, hint, target_dict = dataset[i]
+            if add_ps_channel:
+                image_cls = MultiHDF5_MaskDataset.add_ps_channel_to_batch(
+                    image.unsqueeze(0).float(), device=device, seg_model=seg_model
+                )
+                Logger.debug("Image shape: %s", image_cls.shape)
+            else:
+                image_cls = image.unsqueeze(0).float()
             target = target_dict["mask"].to(device)
             ori_image_raw = target_dict["ori_image_raw"].to(device)
             if use_hint:
                 (seg_out) = seg_model(
                     image.unsqueeze(0).float(), hint.unsqueeze(0).float()
                 )
-                cls_out = cls_model(
-                    image.unsqueeze(0).float(), hint.unsqueeze(0).float()
-                )
+
+                cls_out = cls_model(image_cls.float(), hint.unsqueeze(0).float())
             else:
                 seg_out = seg_model(image.unsqueeze(0).float())
-                cls_out = cls_model(image.unsqueeze(0).float())
+                cls_out = cls_model(image_cls.float())
                 if conf_model is not None:
                     conf_model.eval()
                     conf_score = conf_model(seg_out)
                     Logger.info("Confidence score: %s", conf_score.item())
                 # output = (output > threshold).float()
+        if sigmoid_cls_score:
+            cls_out = torch.sigmoid(cls_out)
         metric_val_list = []
         for metric in metric_list:
             match metric:
@@ -528,9 +571,9 @@ def plot_sample_predictions(
             metrics_str += f"\nConf. {conf_score.item():.2f}\n"
         plt.title(
             metrics_str
-            + "\n"
-            + f", pept_mzrank: {int(target_dict['pept_mz_rank'])}"
             + f", target score: {cls_out.cpu().item():.2f}"
+            + "\n"
+            + f"m/z Rank: {int(target_dict['pept_mz_rank'])}"
             + f", IsTarget: {target_dict['target']}"
         )
         plt.legend()
@@ -538,7 +581,7 @@ def plot_sample_predictions(
             save_dir=save_dir,
             fig_type_name="PS_model_prediction",
             fig_spec_name=f"sample_{int(target_dict['pept_mz_rank'])}",
-            bbox_inches='tight'
+            # bbox_inches="tight",
         )
 
 
@@ -579,6 +622,7 @@ def plot_target_decoy_distr(
     # plt.title("Target Decoy Distribution")
     plt.xlabel("Target Decoy Score")
     plt.ylabel("Log10(Sum Intensity)")
+    plt.suptitle(dataset_name)
     if threshold is not None:
         plt.axvline(threshold[0], color="r", linestyle="--", linewidth=1)
         plt.axhline(threshold[1], color="r", linestyle="--", linewidth=1)
@@ -606,6 +650,7 @@ def calc_fdr_and_thres(
     save_dir=None,
     dataset_name="",
     xlim=None,
+    mark_x=[0.01, 0.05, 0.1],
     **kwargs,
 ):
     """Calculate FDR and threshold for a given score column
@@ -645,7 +690,7 @@ def calc_fdr_and_thres(
         )
         n_target_max = pred_df_new["N_identified_target"].max()
         plt.vlines(
-            x=[0.01, 0.05, 0.1],
+            x=mark_x,
             ymin=[0, 0, 0],
             ymax=[n_target_max, n_target_max, n_target_max],
             color="r",
@@ -655,10 +700,11 @@ def calc_fdr_and_thres(
         plt.xlabel("FDR")
         plt.legend(title="Threshold", loc="lower right")
         if filter_dict is None:
-            plt.title("FDR vs Identified Targets, no filter")
+            plt.title(dataset_name + "FDR vs Identified Targets, no filter")
         if filter_dict is not None:
             plt.title(
-                "FDR vs Identified Targets, filter by:"
+                dataset_name
+                + " FDR vs Identified Targets, filter by:"
                 + "\n"
                 + "<br/>".join(
                     [f"{key}: {value}" for key, value in filter_dict.items()]

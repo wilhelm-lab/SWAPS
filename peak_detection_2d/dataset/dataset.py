@@ -292,7 +292,37 @@ class MultiHDF5_MaskDataset(torch.utils.data.Dataset):
         if self.transforms is not None:
             img, hint, target = self.transforms((img, hint, target))
 
+        # if self.seg_model is not None:
+        #     with torch.no_grad():
+        #         ps_channel = self.seg_model(img)
+        #         ps_channel = ps_channel.squeeze(0)
+        #     img = torch.cat((img, ps_channel), dim=0)
         return img.to(device), hint.to(device), target
+
+    @staticmethod
+    def add_ps_channel_to_batch(batch_images, seg_model, device):
+        assert seg_model is not None, "Segmentation model is not provided"
+        # Assuming batch_images shape: [batch_size, C, H, W]
+        batch_size = batch_images.size(0)
+        seg_model = seg_model.to(device)
+        # Perform segmentation on the entire batch at once (batch inference)
+        with torch.no_grad():
+            segmentation_masks = seg_model(
+                batch_images
+            )  # Output shape [batch_size, 1, H, W]
+
+        # Assuming segmentation output is [batch_size, 1, H, W], squeeze the extra channel dimension
+        segmentation_masks = segmentation_masks.squeeze(
+            1
+        )  # New shape: [batch_size, H, W]
+
+        # Add the segmentation mask as an additional channel to each image
+        # Concatenate the mask to the image along the channel dimension (dim=1)
+        images_with_masks = torch.cat(
+            (batch_images, segmentation_masks.unsqueeze(1)), dim=1
+        )  # Shape: [batch_size, C+1, H, W]
+        Logger.debug("images_with_masks shape %s", images_with_masks.shape)
+        return images_with_masks
 
     def __len__(self):
         return len(self.data_index)
@@ -600,6 +630,21 @@ class Mask_MinMaxScale:
             image[1] = image[1] / image[1].max().item()
 
         return image, hint, target
+
+
+# class Mask_AddPSChannel:
+#     def __init__(self, seg_model, device) -> None:
+
+#         seg_model = seg_model.to(device)
+#         seg_model.eval()
+#         self.seg_model = seg_model
+#     def __call(self, data_hint_bbox):
+#         image = data_hint_bbox[0]
+#         hint = data_hint_bbox[1]
+#         target = data_hint_bbox[2]
+#         ps_channel = self.seg_model(image)
+#         image = torch.cat((image, ps_channel), dim=0)
+#         return image, hint, target
 
 
 class Resize:

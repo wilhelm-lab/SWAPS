@@ -20,7 +20,6 @@ from sklearn.metrics import (
 from math import floor
 from optimization.dictionary import Dict
 from optimization.custom_models import CustomLinearModel, mean_square_root_error
-from postprocessing import peak_selection
 from utils.plot import plot_comparison, plot_isopattern_and_obs
 from utils.config_json import (
     _algo,
