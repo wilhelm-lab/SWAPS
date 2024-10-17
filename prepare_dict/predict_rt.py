@@ -5,9 +5,9 @@ import logging
 import pickle
 
 Logger = logging.getLogger(__name__)
-from deeplc import DeepLC
-from deeplcretrainer import deeplcretrainer
-import tensorflow as tf
+# from deeplc import DeepLC
+# from deeplcretrainer import deeplcretrainer
+# import tensorflow as tf
 
 from psm_utils.io.maxquant import MSMSReader
 from psm_utils.io.peptide_record import to_dataframe
@@ -15,277 +15,277 @@ from utils.metrics import RT_metrics
 from utils.tools import cleanup_maxquant
 
 
-def update_rt_model(
-    train_maxquant_df: pd.DataFrame,
-    # for_train_filepath: str,
-    train_dir: Union[str, None] = None,
-    train_frac: float = 0.9,
-    how_update_model: Literal["calib", "transfer"] = "transfer",
-    seed: Union[int, None] = None,
-    # train_suffix: Union[None, str] = None,
-    # train_raw_file: str = None,
-    keep_matched_precursors: bool = False,
-    save_model_name: Union[str, None] = None,
-):
-    """
-    transfer learn DeepLC model and predict RT
+# def update_rt_model(
+#     train_maxquant_df: pd.DataFrame,
+#     # for_train_filepath: str,
+#     train_dir: Union[str, None] = None,
+#     train_frac: float = 0.9,
+#     how_update_model: Literal["calib", "transfer"] = "transfer",
+#     seed: Union[int, None] = None,
+#     # train_suffix: Union[None, str] = None,
+#     # train_raw_file: str = None,
+#     keep_matched_precursors: bool = False,
+#     save_model_name: Union[str, None] = None,
+# ):
+#     """
+#     transfer learn DeepLC model and predict RT
 
-    :for_train_filepath: file containing data used for the training, calibration or transfer learning,
-                         will be further split into train, val and test
-    :to_pred_filepath: file containing data used for generating prediction, and further SBS analysis,
-                        if None, use train data
-    :save_dir: the directory to save all files generated, if not specified, use the parent dir of train
-                and pred files, respectively
-    :train_frac: the fraction of data used for training
-    :how_update_model: whether to calibrate or transfer learn the model
-    :seed: set random seed
+#     :for_train_filepath: file containing data used for the training, calibration or transfer learning,
+#                          will be further split into train, val and test
+#     :to_pred_filepath: file containing data used for generating prediction, and further SBS analysis,
+#                         if None, use train data
+#     :save_dir: the directory to save all files generated, if not specified, use the parent dir of train
+#                 and pred files, respectively
+#     :train_frac: the fraction of data used for training
+#     :how_update_model: whether to calibrate or transfer learn the model
+#     :seed: set random seed
 
-    """
-    Logger.info("Num GPUs Available: %s ", len(tf.config.list_physical_devices("GPU")))
-    if seed is not None:
-        tf.random.set_seed(seed)
+#     """
+#     Logger.info("Num GPUs Available: %s ", len(tf.config.list_physical_devices("GPU")))
+#     if seed is not None:
+#         tf.random.set_seed(seed)
 
-    if not os.path.exists(train_dir):
-        os.makedirs(train_dir)
+#     if not os.path.exists(train_dir):
+#         os.makedirs(train_dir)
 
-    # Load and prepare training data
-    (train_evidence_tranfer_file, train_evidence_file_transfer_pred) = (
-        prepare_maxquant_evidence(
-            evidence=train_maxquant_df,
-            usage="train",
-            # maxquant_evidence_filepath=for_train_filepath,
-            # suffix=train_suffix,
-            save_dir=train_dir,
-            # filter_raw_file=train_raw_file,
-            keep_matched_precursors=keep_matched_precursors,
-        )
-    )
+#     # Load and prepare training data
+#     (train_evidence_tranfer_file, train_evidence_file_transfer_pred) = (
+#         prepare_maxquant_evidence(
+#             evidence=train_maxquant_df,
+#             usage="train",
+#             # maxquant_evidence_filepath=for_train_filepath,
+#             # suffix=train_suffix,
+#             save_dir=train_dir,
+#             # filter_raw_file=train_raw_file,
+#             keep_matched_precursors=keep_matched_precursors,
+#         )
+#     )
 
-    train_maxquant_peprec, train_peprec_agg = _format_maxquant_as_deeplc_input(
-        train_evidence_tranfer_file
-    )
+#     train_maxquant_peprec, train_peprec_agg = _format_maxquant_as_deeplc_input(
+#         train_evidence_tranfer_file
+#     )
 
-    # models
-    prediction_dir = os.path.dirname(os.path.realpath(__file__))
-    ori_model_paths = [
-        "models/full_hc_train_pxd001468_1fd8363d9af9dcad3be7553c39396960.hdf5",
-        "models/full_hc_train_pxd001468_8c22d89667368f2f02ad996469ba157e.hdf5",
-        "models/full_hc_train_pxd001468_cb975cfdd4105f97efa0b3afffe075cc.hdf5",
-    ]
-    ori_model_paths = [os.path.join(prediction_dir, dm) for dm in ori_model_paths]
+#     # models
+#     prediction_dir = os.path.dirname(os.path.realpath(__file__))
+#     ori_model_paths = [
+#         "models/full_hc_train_pxd001468_1fd8363d9af9dcad3be7553c39396960.hdf5",
+#         "models/full_hc_train_pxd001468_8c22d89667368f2f02ad996469ba157e.hdf5",
+#         "models/full_hc_train_pxd001468_cb975cfdd4105f97efa0b3afffe075cc.hdf5",
+#     ]
+#     ori_model_paths = [os.path.join(prediction_dir, dm) for dm in ori_model_paths]
 
-    # load DDA transfer learning data and split
-    deeplc_train = train_peprec_agg.sample(frac=train_frac, random_state=seed)
-    deeplc_test = train_peprec_agg.loc[
-        train_peprec_agg.index.difference(deeplc_train.index)
-    ]
-    deeplc_train.fillna("", inplace=True)
-    deeplc_test.fillna("", inplace=True)
+#     # load DDA transfer learning data and split
+#     deeplc_train = train_peprec_agg.sample(frac=train_frac, random_state=seed)
+#     deeplc_test = train_peprec_agg.loc[
+#         train_peprec_agg.index.difference(deeplc_train.index)
+#     ]
+#     deeplc_train.fillna("", inplace=True)
+#     deeplc_test.fillna("", inplace=True)
 
-    train_deeplc_file = os.path.join(train_dir, "deeplc_train.csv")
-    deeplc_train.to_csv(
-        train_deeplc_file, index=False
-    )  # For training new models a file is needed
+#     train_deeplc_file = os.path.join(train_dir, "deeplc_train.csv")
+#     deeplc_train.to_csv(
+#         train_deeplc_file, index=False
+#     )  # For training new models a file is needed
 
-    match how_update_model:
-        case "transfer":
-            pred_col = "trans_pred_" + str(train_frac)
+#     match how_update_model:
+#         case "transfer":
+#             pred_col = "trans_pred_" + str(train_frac)
 
-            # apply transfer learning
-            models = deeplcretrainer.retrain(
-                [train_deeplc_file],
-                mods_transfer_learning=ori_model_paths,
-                freeze_layers=True,
-                n_epochs=10,
-                freeze_after_concat=1,
-                outpath=train_dir,
-            )
-            Logger.info("finished transfer learning, models are %s", models)
-            # Make a DeepLC object with the models trained previously
-            dlc = DeepLC(path_model=models, batch_num=1024000, pygam_calibration=False)
-        case "calib":
-            pred_col = "cal_pred_" + str(train_frac)
+#             # apply transfer learning
+#             models = deeplcretrainer.retrain(
+#                 [train_deeplc_file],
+#                 mods_transfer_learning=ori_model_paths,
+#                 freeze_layers=True,
+#                 n_epochs=10,
+#                 freeze_after_concat=1,
+#                 outpath=train_dir,
+#             )
+#             Logger.info("finished transfer learning, models are %s", models)
+#             # Make a DeepLC object with the models trained previously
+#             dlc = DeepLC(path_model=models, batch_num=1024000, pygam_calibration=False)
+#         case "calib":
+#             pred_col = "cal_pred_" + str(train_frac)
 
-            # Call DeepLC with the downloaded models with GAM calibration
-            dlc = DeepLC(
-                path_model=ori_model_paths, batch_num=1024000, pygam_calibration=True
-            )
+#             # Call DeepLC with the downloaded models with GAM calibration
+#             dlc = DeepLC(
+#                 path_model=ori_model_paths, batch_num=1024000, pygam_calibration=True
+#             )
 
-    # Perform calibration, make predictions and calculate metrics
-    dlc.calibrate_preds(seq_df=deeplc_train)
+#     # Perform calibration, make predictions and calculate metrics
+#     dlc.calibrate_preds(seq_df=deeplc_train)
 
-    if save_model_name is not None:
-        model_path = os.path.join(
-            train_dir, save_model_name + "_RT_model_deepLC_" + how_update_model + ".pkl"
-        )
-        with open(model_path, "wb") as outp:
-            pickle.dump(dlc, outp, pickle.HIGHEST_PROTOCOL)
-    deeplc_test[pred_col] = dlc.make_preds(seq_df=deeplc_test)
+#     if save_model_name is not None:
+#         model_path = os.path.join(
+#             train_dir, save_model_name + "_RT_model_deepLC_" + how_update_model + ".pkl"
+#         )
+#         with open(model_path, "wb") as outp:
+#             pickle.dump(dlc, outp, pickle.HIGHEST_PROTOCOL)
+#     deeplc_test[pred_col] = dlc.make_preds(seq_df=deeplc_test)
 
-    rt_metric = RT_metrics(RT_obs=deeplc_test["tr"], RT_pred=deeplc_test[pred_col])
-    Logger.info("MAE: %s", rt_metric.CalcMAE())
-    delta_rt_95 = rt_metric.CalcDeltaRTwidth(95)
-    Logger.info("Delta RT 95 percent: %s", delta_rt_95)
-    Logger.info("Pearson Corr: %s", rt_metric.CalcPrsCorr())
-    return delta_rt_95, models
+#     rt_metric = RT_metrics(RT_obs=deeplc_test["tr"], RT_pred=deeplc_test[pred_col])
+#     Logger.info("MAE: %s", rt_metric.CalcMAE())
+#     delta_rt_95 = rt_metric.CalcDeltaRTwidth(95)
+#     Logger.info("Delta RT 95 percent: %s", delta_rt_95)
+#     Logger.info("Pearson Corr: %s", rt_metric.CalcPrsCorr())
+#     return delta_rt_95, models
 
 
-def dict_add_rt_pred(
-    updated_models,
-    deeplc_train_path: str,
-    maxquant_df: pd.DataFrame,
-    # to_pred_filepath: Union[str, None],  # used for prediction
-    save_dir: Union[str, None] = None,
-    # pred_suffix: Union[None, str] = None,
-    # pred_raw_file: str = None,
-    keep_matched_precursors: bool = False,
-    filter_by_rt_diff: Union[Literal["closest"], float, None] = "closest",
-):
-    """
-    transfer learn DeepLC model and predict RT
+# def dict_add_rt_pred(
+#     updated_models,
+#     deeplc_train_path: str,
+#     maxquant_df: pd.DataFrame,
+#     # to_pred_filepath: Union[str, None],  # used for prediction
+#     save_dir: Union[str, None] = None,
+#     # pred_suffix: Union[None, str] = None,
+#     # pred_raw_file: str = None,
+#     keep_matched_precursors: bool = False,
+#     filter_by_rt_diff: Union[Literal["closest"], float, None] = "closest",
+# ):
+#     """
+#     transfer learn DeepLC model and predict RT
 
-    :for_train_filepath: file containing data used for the training, calibration or transfer learning,
-                         will be further split into train, val and test
-    :to_pred_filepath: file containing data used for generating prediction, and further SBS analysis,
-                        if None, use train data
-    :save_dir: the directory to save all files generated, if not specified, use the parent dir of train
-                and pred files, respectively
-    :train_frac: the fraction of data used for training
-    :how_update_model: whether to calibrate or transfer learn the model
-    :seed: set random seed
+#     :for_train_filepath: file containing data used for the training, calibration or transfer learning,
+#                          will be further split into train, val and test
+#     :to_pred_filepath: file containing data used for generating prediction, and further SBS analysis,
+#                         if None, use train data
+#     :save_dir: the directory to save all files generated, if not specified, use the parent dir of train
+#                 and pred files, respectively
+#     :train_frac: the fraction of data used for training
+#     :how_update_model: whether to calibrate or transfer learn the model
+#     :seed: set random seed
 
-    """
-    deeplc_train = pd.read_csv(deeplc_train_path)
-    dlc = DeepLC(path_model=updated_models, batch_num=1024000, pygam_calibration=False)
+#     """
+#     deeplc_train = pd.read_csv(deeplc_train_path)
+#     dlc = DeepLC(path_model=updated_models, batch_num=1024000, pygam_calibration=False)
 
-    # Perform calibration, make predictions and calculate metrics
-    dlc.calibrate_preds(seq_df=deeplc_train)
+#     # Perform calibration, make predictions and calculate metrics
+#     dlc.calibrate_preds(seq_df=deeplc_train)
 
-    # Logger.info("Num GPUs Available: %s ", len(tf.config.list_physical_devices("GPU")))
-    # if seed is not None:
-    #     tf.random.set_seed(seed)
-    # if save_dir is None:
-    #     train_dir = os.path.dirname(for_train_filepath)
-    # else:
-    #     train_dir = os.path.join(save_dir, "RT_tranfer_learn")
-    #     if not os.path.exists(train_dir):
-    #         os.makedirs(train_dir)
+#     # Logger.info("Num GPUs Available: %s ", len(tf.config.list_physical_devices("GPU")))
+#     # if seed is not None:
+#     #     tf.random.set_seed(seed)
+#     # if save_dir is None:
+#     #     train_dir = os.path.dirname(for_train_filepath)
+#     # else:
+#     #     train_dir = os.path.join(save_dir, "RT_tranfer_learn")
+#     #     if not os.path.exists(train_dir):
+#     #         os.makedirs(train_dir)
 
-    # # Load and prepare training data
-    # (train_evidence_tranfer_file, train_evidence_file_transfer_pred) = (
-    #     prepare_maxquant_evidence(
-    #         maxquant_evidence_filepath=for_train_filepath,
-    #         suffix=train_suffix,
-    #         save_dir=train_dir,
-    #         filter_raw_file=train_raw_file,
-    #         keep_matched_precursors=keep_matched_precursors,
-    #     )
-    # )
+#     # # Load and prepare training data
+#     # (train_evidence_tranfer_file, train_evidence_file_transfer_pred) = (
+#     #     prepare_maxquant_evidence(
+#     #         maxquant_evidence_filepath=for_train_filepath,
+#     #         suffix=train_suffix,
+#     #         save_dir=train_dir,
+#     #         filter_raw_file=train_raw_file,
+#     #         keep_matched_precursors=keep_matched_precursors,
+#     #     )
+#     # )
 
-    # train_maxquant_peprec, train_peprec_agg = _format_maxquant_as_deeplc_input(
-    #     train_evidence_tranfer_file
-    # )
-    # updated_model = pickle.load(open(model_path, "rb"))
-    # dlc = DeepLC(path_model=updated_model, batch_num=1024000, pygam_calibration=False)
-    # Load and prepare prediction data
-    # if to_pred_filepath is None:
-    #     pred_evidence_file_transfer_pred = train_evidence_file_transfer_pred
+#     # train_maxquant_peprec, train_peprec_agg = _format_maxquant_as_deeplc_input(
+#     #     train_evidence_tranfer_file
+#     # )
+#     # updated_model = pickle.load(open(model_path, "rb"))
+#     # dlc = DeepLC(path_model=updated_model, batch_num=1024000, pygam_calibration=False)
+#     # Load and prepare prediction data
+#     # if to_pred_filepath is None:
+#     #     pred_evidence_file_transfer_pred = train_evidence_file_transfer_pred
 
-    #     pred_maxquant_peprec, pred_peprec_modpept_agg = (
-    #         train_maxquant_peprec,
-    #         train_peprec_agg,
-    #     )
-    # else:
-    (
-        pred_evidence_tranfer_file,
-        pred_evidence_file_transfer_pred,
-    ) = prepare_maxquant_evidence(
-        evidence=maxquant_df,
-        # maxquant_evidence_filepath=to_pred_filepath,
-        # suffix=pred_suffix,
-        usage="pred",
-        save_dir=save_dir,
-        # filter_raw_file=pred_raw_file,  # do not filter by raw file in pred
-        keep_matched_precursors=keep_matched_precursors,
-    )
-    Logger.info("pred_evidence_transfer_file is %s", pred_evidence_tranfer_file)
-    pred_maxquant_peprec, pred_peprec_modpept_agg = _format_maxquant_as_deeplc_input(
-        pred_evidence_tranfer_file
-    )
+#     #     pred_maxquant_peprec, pred_peprec_modpept_agg = (
+#     #         train_maxquant_peprec,
+#     #         train_peprec_agg,
+#     #     )
+#     # else:
+#     (
+#         pred_evidence_tranfer_file,
+#         pred_evidence_file_transfer_pred,
+#     ) = prepare_maxquant_evidence(
+#         evidence=maxquant_df,
+#         # maxquant_evidence_filepath=to_pred_filepath,
+#         # suffix=pred_suffix,
+#         usage="pred",
+#         save_dir=save_dir,
+#         # filter_raw_file=pred_raw_file,  # do not filter by raw file in pred
+#         keep_matched_precursors=keep_matched_precursors,
+#     )
+#     Logger.info("pred_evidence_transfer_file is %s", pred_evidence_tranfer_file)
+#     pred_maxquant_peprec, pred_peprec_modpept_agg = _format_maxquant_as_deeplc_input(
+#         pred_evidence_tranfer_file
+#     )
 
-    # # models
-    # prediction_dir = os.path.dirname(os.path.realpath(__file__))
-    # ori_model_paths = [
-    #     "models/full_hc_train_pxd001468_1fd8363d9af9dcad3be7553c39396960.hdf5",
-    #     "models/full_hc_train_pxd001468_8c22d89667368f2f02ad996469ba157e.hdf5",
-    #     "models/full_hc_train_pxd001468_cb975cfdd4105f97efa0b3afffe075cc.hdf5",
-    # ]
-    # ori_model_paths = [os.path.join(prediction_dir, dm) for dm in ori_model_paths]
+#     # # models
+#     # prediction_dir = os.path.dirname(os.path.realpath(__file__))
+#     # ori_model_paths = [
+#     #     "models/full_hc_train_pxd001468_1fd8363d9af9dcad3be7553c39396960.hdf5",
+#     #     "models/full_hc_train_pxd001468_8c22d89667368f2f02ad996469ba157e.hdf5",
+#     #     "models/full_hc_train_pxd001468_cb975cfdd4105f97efa0b3afffe075cc.hdf5",
+#     # ]
+#     # ori_model_paths = [os.path.join(prediction_dir, dm) for dm in ori_model_paths]
 
-    # # load DDA transfer learning data and split
-    # deeplc_train = train_peprec_agg.sample(frac=train_frac, random_state=seed)
-    # deeplc_test = train_peprec_agg.loc[
-    #     train_peprec_agg.index.difference(deeplc_train.index)
-    # ]
-    # deeplc_train.fillna("", inplace=True)
-    # deeplc_test.fillna("", inplace=True)
+#     # # load DDA transfer learning data and split
+#     # deeplc_train = train_peprec_agg.sample(frac=train_frac, random_state=seed)
+#     # deeplc_test = train_peprec_agg.loc[
+#     #     train_peprec_agg.index.difference(deeplc_train.index)
+#     # ]
+#     # deeplc_train.fillna("", inplace=True)
+#     # deeplc_test.fillna("", inplace=True)
 
-    # train_deeplc_file = os.path.join(train_dir, "deeplc_train.csv")
-    # deeplc_train.to_csv(
-    #     train_deeplc_file, index=False
-    # )  # For training new models a file is needed
+#     # train_deeplc_file = os.path.join(train_dir, "deeplc_train.csv")
+#     # deeplc_train.to_csv(
+#     #     train_deeplc_file, index=False
+#     # )  # For training new models a file is needed
 
-    # match how_update_model:
-    #     case "transfer":
-    #         pred_col = "trans_pred_" + str(train_frac)
+#     # match how_update_model:
+#     #     case "transfer":
+#     #         pred_col = "trans_pred_" + str(train_frac)
 
-    #         # apply transfer learning
-    #         models = deeplcretrainer.retrain(
-    #             [train_deeplc_file],
-    #             mods_transfer_learning=ori_model_paths,
-    #             freeze_layers=True,
-    #             n_epochs=10,
-    #             freeze_after_concat=1,
-    #         )
+#     #         # apply transfer learning
+#     #         models = deeplcretrainer.retrain(
+#     #             [train_deeplc_file],
+#     #             mods_transfer_learning=ori_model_paths,
+#     #             freeze_layers=True,
+#     #             n_epochs=10,
+#     #             freeze_after_concat=1,
+#     #         )
 
-    #         # Make a DeepLC object with the models trained previously
-    #         dlc = DeepLC(path_model=models, batch_num=1024000, pygam_calibration=False)
-    #     case "calib":
-    #         pred_col = "cal_pred_" + str(train_frac)
+#     #         # Make a DeepLC object with the models trained previously
+#     #         dlc = DeepLC(path_model=models, batch_num=1024000, pygam_calibration=False)
+#     #     case "calib":
+#     #         pred_col = "cal_pred_" + str(train_frac)
 
-    #         # Call DeepLC with the downloaded models with GAM calibration
-    #         dlc = DeepLC(
-    #             path_model=ori_model_paths, batch_num=1024000, pygam_calibration=True
-    #         )
+#     #         # Call DeepLC with the downloaded models with GAM calibration
+#     #         dlc = DeepLC(
+#     #             path_model=ori_model_paths, batch_num=1024000, pygam_calibration=True
+#     #         )
 
-    # Perform calibration, make predictions and calculate metrics
-    # dlc.calibrate_preds(seq_df=deeplc_train)
+#     # Perform calibration, make predictions and calculate metrics
+#     # dlc.calibrate_preds(seq_df=deeplc_train)
 
-    # if save_model_name is not None:
-    #     model_name = os.path.join(
-    #         train_dir, save_model_name + "_RT_model_deepLC_" + how_update_model + ".pkl"
-    #     )
-    #     with open(model_name, "wb") as outp:
-    #         pickle.dump(dlc, outp, pickle.HIGHEST_PROTOCOL)
-    # deeplc_test[pred_col] = dlc.make_preds(seq_df=deeplc_test)
+#     # if save_model_name is not None:
+#     #     model_name = os.path.join(
+#     #         train_dir, save_model_name + "_RT_model_deepLC_" + how_update_model + ".pkl"
+#     #     )
+#     #     with open(model_name, "wb") as outp:
+#     #         pickle.dump(dlc, outp, pickle.HIGHEST_PROTOCOL)
+#     # deeplc_test[pred_col] = dlc.make_preds(seq_df=deeplc_test)
 
-    # rt_metric = RT_metrics(RT_obs=deeplc_test["tr"], RT_pred=deeplc_test[pred_col])
-    # Logger.info("MAE: %s", rt_metric.CalcMAE())
-    # delta_rt_95 = rt_metric.CalcDeltaRTwidth(95)
-    # Logger.info("Delta RT 95 percent: %s", delta_rt_95)
-    # Logger.info("Pearson Corr: %s", rt_metric.CalcPrsCorr())
+#     # rt_metric = RT_metrics(RT_obs=deeplc_test["tr"], RT_pred=deeplc_test[pred_col])
+#     # Logger.info("MAE: %s", rt_metric.CalcMAE())
+#     # delta_rt_95 = rt_metric.CalcDeltaRTwidth(95)
+#     # Logger.info("Delta RT 95 percent: %s", delta_rt_95)
+#     # Logger.info("Pearson Corr: %s", rt_metric.CalcPrsCorr())
 
-    # prepare final prediction output
-    pred_peprec_modpept_agg["predicted_RT"] = dlc.make_preds(
-        seq_df=pred_peprec_modpept_agg
-    )
-    pred_filtered = match_pred_to_input(
-        MQ_peprec=pred_maxquant_peprec,
-        peprec_RTpred=pred_peprec_modpept_agg,
-        filter_by_RT_diff=filter_by_rt_diff,
-    )
-    pred_filtered.to_csv(pred_evidence_file_transfer_pred, sep="\t")
-    return pred_filtered
+#     # prepare final prediction output
+#     pred_peprec_modpept_agg["predicted_RT"] = dlc.make_preds(
+#         seq_df=pred_peprec_modpept_agg
+#     )
+#     pred_filtered = match_pred_to_input(
+#         MQ_peprec=pred_maxquant_peprec,
+#         peprec_RTpred=pred_peprec_modpept_agg,
+#         filter_by_RT_diff=filter_by_rt_diff,
+#     )
+#     pred_filtered.to_csv(pred_evidence_file_transfer_pred, sep="\t")
+#     return pred_filtered
 
 
 def prepare_maxquant_evidence(

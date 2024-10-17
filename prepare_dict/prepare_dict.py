@@ -14,7 +14,6 @@ from typing import List, Literal
 import re
 import os
 import logging
-from typing import Literal
 from math import ceil
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -24,9 +23,7 @@ from utils.constants import decoy_mutation_rule
 from utils.plot import save_plot
 from utils.tools import cleanup_maxquant
 from utils.metrics import RT_metrics
-from .predict_rt import dict_add_rt_pred, update_rt_model
 import numpy as np
-from typing import Literal
 from alphabase.psm_reader import psm_reader_provider
 from sklearn.model_selection import train_test_split
 from peptdeep.pretrained_models import ModelManager
@@ -838,10 +835,15 @@ def _define_im_idx_search_range(
                 _merge_df["mobility_values_index_right_ref"],
                 _merge_df["mobility_values_index_right_exp"],
             ).CalcDeltaRTwidth()
+            delta_1k0_95 = RT_metrics(
+                _merge_df["mobility_values_index_center_ref"],
+                _merge_df["mobility_values_index_center_exp"],
+            ).CalcDeltaRTwidth()
             Logger.info(
-                "Delta IM index 95 left: %s, right: %s",
+                "Delta IM index 95 left: %s, right: %s, delta_1K0_95: %s",
                 delta_im_idx_95_left,
                 delta_im_idx_95_right,
+                delta_1k0_95,
             )
             maxquant_df["IM_search_idx_center"] = maxquant_df[
                 "mobility_values_index_center_ref"
@@ -1035,6 +1037,7 @@ def construct_dict(
     rt_values_df: pd.DataFrame = None,
     random_seed: int = 42,
     n_blocks_by_pept: int = 1,
+    keep_matched_precursors: bool = False,
     # device: str = "gpu",
 ):
     gpu_count = torch.cuda.device_count()
@@ -1060,6 +1063,14 @@ def construct_dict(
         filter_exp_by_raw_file,
         maxquant_exp_df.shape,
     )
+    if not keep_matched_precursors:
+        maxquant_exp_df = maxquant_exp_df.loc[
+            maxquant_exp_df["Type"].isin(["TIMS-MULTI-MSMS"])
+        ]
+        Logger.info(
+            "maxquant_exp_df size after removing matched precursors: %s",
+            maxquant_exp_df.shape,
+        )
     rt_range = (
         rt_values_df["Time_minute"].min(),
         rt_values_df["Time_minute"].max(),
@@ -1080,6 +1091,10 @@ def construct_dict(
     os.makedirs(construct_dict_dir, exist_ok=True)
     os.makedirs(rt_transfer_dir, exist_ok=True)
     os.makedirs(im_transfer_dir, exist_ok=True)
+    maxquant_exp_filtered_path = os.path.join(
+        construct_dict_dir, "maxquant_exp_filtered.txt"
+    )
+    maxquant_exp_df.to_csv(maxquant_exp_filtered_path, sep="\t")
 
     # # retrain model
     # if len(cfg_prepare_dict.UPDATED_MODEL_PATH) == 0:
@@ -1107,7 +1122,7 @@ def construct_dict(
         if cfg_prepare_dict.UPDATED_RT_MODEL_PATH == "":
             if not _LOADED_ALPHA_DATASET:
                 train_df, test_df, rt_max = prepare_alpha_train_test_df(
-                    maxquant_exp_path,
+                    maxquant_exp_filtered_path,
                     train_frac=cfg_prepare_dict.TRAIN_FRAC,
                     filter_dict={"raw_name": filter_exp_by_raw_file},
                     random_state=random_seed,
@@ -1136,7 +1151,7 @@ def construct_dict(
             Logger.info("Retraining IM model with AlphaPeptDeep")
             if not _LOADED_ALPHA_DATASET:
                 train_df, test_df, rt_max = prepare_alpha_train_test_df(
-                    maxquant_exp_path,
+                    maxquant_exp_filtered_path,
                     train_frac=cfg_prepare_dict.TRAIN_FRAC,
                     filter_dict={"raw_name": filter_exp_by_raw_file},
                     random_state=random_seed,
@@ -1302,7 +1317,7 @@ def construct_dict(
     # save results
     dict_pickle_path = os.path.join(result_dir, "maxquant_result_ref.pkl")
     maxquant_dict.to_pickle(dict_pickle_path)
-    logging.info(
+    Logger.info(
         "Finish. Filtered prediction dataframe dimension: %s, columns: %s",
         maxquant_dict.shape,
         maxquant_dict.columns,
