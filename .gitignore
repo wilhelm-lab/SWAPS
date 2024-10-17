@@ -16,3 +16,5 @@ scripts/slurm_job_swaps_gpu.sh
 _archieved/*
 environment_linux64.yaml
 __pycache__/*
+scripts/*
+slurm_scripts/*
