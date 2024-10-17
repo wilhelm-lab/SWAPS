@@ -27,6 +27,7 @@ def build_model(model_cfg: CfgNode):
                 padding=model_cfg.PARAMS.PADDING,
                 seg_head=False,
                 cls_head=True,
+                drop_out=model_cfg.PARAMS.DROPOUT_RATE,
             )
             return model
 
