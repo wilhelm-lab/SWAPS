@@ -3,8 +3,8 @@
 *.pyc
 notebooks/models/*
 notebooks/wandb/*
-notebooks/dev*
-notebooks/ref*
+notebooks/dev*.ipynb
+notebooks/ref*.ipynb
 wandb/*
 .vscode/*
 notebooks/my_dir/*
