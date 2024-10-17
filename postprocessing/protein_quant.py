@@ -1,6 +1,10 @@
 import os
+from typing import Literal
+import logging
 import pandas as pd
+from triqler.qvality import getQvaluesFromScores
 
+Logger = logging.getLogger(__name__)
 # from peak_detection_2d.utils import calc_fdr_and_thres
 
 
@@ -9,7 +13,8 @@ def prepare_generic_input_from_dict_and_pept_act_sum(
     pept_act_sum_df: pd.DataFrame,
     run_name: str,
     raw_file: str | None = None,
-    agg_col: str = "Proteins",
+    agg_col: Literal["Proteins", "Species"] = "Proteins",
+    score_thres_by_species: dict | None = None,
 ):
     if agg_col == "Species":
         assert raw_file is not None
@@ -32,43 +37,159 @@ def prepare_generic_input_from_dict_and_pept_act_sum(
         maxquant_dict["Modified sequence"] + "_" + maxquant_dict["Charge"].astype(str)
     )
     generic_input = pd.merge(
-        left=maxquant_dict[["mz_rank", "ion", agg_col]],
-        right=pept_act_sum_df[["mz_rank", "sum_intensity"]],
+        left=maxquant_dict[["mz_rank", "ion", agg_col, "Taxonomy names"]],
+        right=pept_act_sum_df[["mz_rank", "sum_intensity", "target_decoy_score"]],
         on="mz_rank",
         how="inner",
     )
-    generic_input.drop(labels=["mz_rank"], axis=1, inplace=True)
-    generic_input.rename(columns={"sum_intensity": run_name}, inplace=True)
+    filtered_rows = pd.DataFrame()
+    for species in score_thres_by_species.keys():
+        tmp = generic_input.loc[
+            (generic_input["Taxonomy names"] == species)
+            & (generic_input["target_decoy_score"] > score_thres_by_species[species])
+        ]
+        filtered_rows = pd.concat([filtered_rows, tmp], axis=0)
+    # generic_input = generic_input[
+    #     generic_input.apply(
+    #         _apply_score_threshold,
+    #         axis=1,
+    #         score_thres_by_species=score_thres_by_species,
+    #     )
+    # ]
+    filtered_rows.drop(
+        labels=["mz_rank", "Taxonomy names", "target_decoy_score"], axis=1, inplace=True
+    )
+    filtered_rows.rename(columns={"sum_intensity": run_name}, inplace=True)
     if agg_col == "Proteins":
-        generic_input.rename(columns={"Proteins": input_to_join}, inplace=True)
+        filtered_rows.rename(columns={"Proteins": input_to_join}, inplace=True)
 
-    return generic_input
+    return filtered_rows
+
+
+# Apply different score thresholds based on Taxonomy names
+def _apply_score_threshold(row, score_thres_by_species):
+    taxonomy_names = row["Taxonomy names"]
+    for name in taxonomy_names:
+        if name in score_thres_by_species:
+            if row["target_decoy_score"] > score_thres_by_species[name]:
+                return True
+    return False
 
 
 def prepare_generic_input_from_result_dir(
     swap_result_dir,
-    run_name: str,
-    raw_file: str | None = None,
-    score_thres=0,
+    # run_name: str,
+    score_thres_by_species: dict,
+    ps_exp_folder: str = "eval_model_transfer",
     log_intensity_thres=2,
     agg_col="Proteins",
 ):
+
+    run_name = os.path.basename(swap_result_dir).split("ref_")[1][0:6]
+    Logger.info("Processing %s", run_name)
     maxquant_dict = pd.read_pickle(
         os.path.join(swap_result_dir, "maxquant_result_ref.pkl")
     )
     pept_act_sum_df = pd.read_csv(
         os.path.join(
-            swap_result_dir, "peak_selection", "pept_act_sum_ps_full_tdc_fdr_thres.csv"
+            swap_result_dir,
+            "peak_selection",
+            ps_exp_folder,
+            "pept_act_sum_ps_full_tdc_fdr_thres.csv",
         )
     )
+
     pept_act_sum_df = pept_act_sum_df.loc[
         (pept_act_sum_df["log_sum_intensity"] > log_intensity_thres)
-        & (pept_act_sum_df["target_decoy_score"] > score_thres)
         & (pept_act_sum_df["Decoy"] == 0)
     ]
+    # pept_act_sum_df = pept_act_sum_df[
+    #     pept_act_sum_df.apply(apply_score_threshold, axis=1)
+    # ]
     return prepare_generic_input_from_dict_and_pept_act_sum(
-        maxquant_dict, pept_act_sum_df, run_name, raw_file=raw_file, agg_col=agg_col
+        maxquant_dict,
+        pept_act_sum_df,
+        run_name,
+        raw_file=run_name,
+        agg_col=agg_col,
+        score_thres_by_species=score_thres_by_species,
     )
+
+
+def prepare_generic_input_from_result_dir_list(
+    swap_result_dir_list: list,
+    result_dir: str,
+    agg_col="Proteins",
+    score_thres_by_species_a={
+        "Homo sapiens": 0.2,
+        "Saccharomyces cerevisiae": 0.4,
+        "Escherichia coli K-12": 0.9,
+    },
+    score_thres_by_species_b={
+        "Homo sapiens": 0.2,
+        "Saccharomyces cerevisiae": 0.9,
+        "Escherichia coli K-12": 0.2,
+    },
+):
+    if agg_col == "Proteins":
+        input_to_join = "protein"
+    else:
+        input_to_join = agg_col
+    generic_input = pd.DataFrame()
+    # Define score thresholds for different taxonomy names
+
+    for swaps_dir in swap_result_dir_list:
+        mixture = os.path.basename(swaps_dir).split("ref_")[1][0]
+
+        if mixture == "A":
+            score_thres_by_species = score_thres_by_species_a
+        elif mixture == "B":
+            score_thres_by_species = score_thres_by_species_b
+        df = prepare_generic_input_from_result_dir(
+            swaps_dir,
+            agg_col=agg_col,
+            score_thres_by_species=score_thres_by_species,
+        )
+        if generic_input.shape[0] == 0:
+            generic_input = df
+        else:
+            generic_input = pd.merge(
+                left=generic_input, right=df, on=["ion", input_to_join], how="outer"
+            )
+
+    # concatenate_proteins groups
+    generic_input_grouped = (
+        generic_input.groupby("ion")
+        .agg(
+            {
+                input_to_join: concatenate_proteins,  # Apply the custom function to 'protein'
+                **{
+                    col: "first"
+                    for col in generic_input.columns
+                    if col != "ion" and col != input_to_join
+                },  # Keep the first value of other columns
+            }
+        )
+        .reset_index()
+    )
+    generic_input_grouped = generic_input_grouped[
+        [input_to_join, "ion"] + generic_input_grouped.columns[2:].tolist()
+    ]
+    generic_input_grouped.fillna(0, inplace=True)
+    # Concatenate key and value in dict score_thres_by_species into a string
+    score_thres_str = "_".join(
+        f"{species}_{thres}" for species, thres in score_thres_by_species.items()
+    )
+    Logger.info("Score thresholds by species: %s", score_thres_str)
+    generic_input_path = os.path.join(
+        result_dir, f"generic_input_{agg_col}_score_{score_thres_str}.aq_reformat.tsv"
+    )
+    generic_input_grouped.to_csv(
+        generic_input_path,
+        sep="\t",
+        index=False,
+    )
+    return generic_input_path
 
 
 def concatenate_proteins(proteins):
@@ -134,7 +255,22 @@ def append_species_from_fasta_header(fasta_header):
     return ";".join(species)
 
 
-def prepare_evidence_for_pickedgroupfdr(swaps_result_dir, run_name, out_dir):
+def add_decoy_prefix(row: pd.Series):
+    proteins = row["Leading proteins"]
+    if row["Reverse"] != "+":
+        return proteins
+
+    return ";".join([f"REV__{p}" for p in proteins.split(";")])
+
+
+def prepare_evidence_for_pickedgroupfdr(
+    swaps_result_dir_list,
+    out_dir,
+    ps_exp_folder: str = "eval_model_transfer",
+    keep_col_for_tmt: bool = False,
+    keep_col_for_silac: bool = False,
+    keep_col_for_directlfq: bool = True,
+):
     col_for_id = [
         "Modified sequence",
         "Leading proteins",
@@ -151,30 +287,69 @@ def prepare_evidence_for_pickedgroupfdr(swaps_result_dir, run_name, out_dir):
         "Reporter intensity count",
     ]
     col_for_silac = ["Intensity L", "Intensity H"]
-    maxquant_dict = pd.read_pickle(
-        os.path.join(swaps_result_dir, "maxquant_result_ref.pkl")
-    )
-    maxquant_dict.loc[maxquant_dict["Decoy"], "Reverse"] = "+"
-    maxquant_dict["Raw file"] = run_name
-    maxquant_dict["Experiment"] = run_name
-    pept_act = pd.read_csv(
-        os.path.join(
-            swaps_result_dir, "peak_selection", "pept_act_sum_ps_full_tdc_fdr_thres.csv"
+    col_for_directlfq = ["Protein group IDs", "Potential contaminant", "Proteins"]
+    col_to_keep = col_for_id + col_for_quant
+    if keep_col_for_tmt:
+        col_to_keep += col_for_tmt
+        Logger.warning("TMT columns updates are not implemented in SWAPS yet")
+    if keep_col_for_silac:
+        col_to_keep += col_for_silac
+        Logger.warning("SILAC columns updates are not implemented in SWAPS yet")
+    if keep_col_for_directlfq:
+        col_to_keep += col_for_directlfq
+        Logger.info("Keep %s for directLFQ", col_for_directlfq)
+    evidence_all = pd.DataFrame()
+    for swaps_result_dir in swaps_result_dir_list:
+        run_name = swaps_result_dir.split("ref_")[1][0:6]
+        Logger.info("Processing %s", run_name)
+        maxquant_dict = pd.read_pickle(
+            os.path.join(swaps_result_dir, "maxquant_result_ref.pkl")
         )
+        maxquant_dict.loc[maxquant_dict["Decoy"], "Reverse"] = "+"
+        maxquant_dict["Raw file"] = run_name
+        maxquant_dict["Experiment"] = run_name
+        pept_act = pd.read_csv(
+            os.path.join(
+                swaps_result_dir,
+                "peak_selection",
+                ps_exp_folder,
+                "pept_act_sum_ps_full_tdc_fdr_thres.csv",
+            )
+        )
+        # pept_act = calc_fdr_given_thres(pept_act)
+        evidence = pd.merge(
+            maxquant_dict,
+            pept_act[["mz_rank", "sum_intensity", "target_decoy_score"]],
+            on="mz_rank",
+            how="inner",
+        )
+        # evidence = calc_fdr_and_thres(evidence)
+        evidence["id"] = evidence["mz_rank"]
+        evidence["Score"] = evidence["target_decoy_score"]
+        evidence["Intensity"] = evidence["sum_intensity"]
+        evidence["Leading proteins"] = evidence[["Leading proteins", "Reverse"]].apply(
+            add_decoy_prefix, axis=1
+        )
+        # evidence["PEP"] = evidence["fdr"]  # Use q-value as PEP
+        evidence = calc_pep_in_evidence(evidence)
+        evidence = evidence[col_to_keep]
+        evidence_all = pd.concat([evidence_all, evidence], axis=0)
+    out_dir = os.path.join(out_dir, "evidence_swaps.txt")
+    evidence_all.to_csv(out_dir, sep="\t")
+    return out_dir, evidence_all
+
+
+def calc_pep_in_evidence(
+    evidence: pd.DataFrame, include_decoys=True, plot_regression_curve: bool = True
+):
+    target_scores = evidence.loc[evidence["Reverse"].isna(), "Score"]
+    decoy_scores = evidence.loc[~evidence["Reverse"].isna(), "Score"]
+    _, evidence["PEP"] = getQvaluesFromScores(
+        target_scores,
+        decoy_scores,
+        includeDecoys=include_decoys,
+        plotRegressionCurve=plot_regression_curve,
+        pi0=len(decoy_scores) / (len(target_scores) + len(decoy_scores)),
+        numBins=1000,
     )
-    # pept_act = calc_fdr_given_thres(pept_act)
-    evidence = pd.merge(
-        maxquant_dict,
-        pept_act[["mz_rank", "sum_intensity", "target_decoy_score"]],
-        on="mz_rank",
-        how="inner",
-    )
-    # evidence = calc_fdr_and_thres(evidence)
-    evidence["id"] = evidence["mz_rank"]
-    evidence["Score"] = evidence["target_decoy_score"]
-    evidence["Intensity"] = evidence["sum_intensity"]
-    # evidence["PEP"] = evidence["fdr"]  # Use q-value as PEP
-    evidence = evidence[col_for_id + col_for_quant]
-    out_dir = os.path.join(out_dir, "evidence_" + run_name + ".txt")
-    evidence.to_csv(out_dir, sep="\t")
-    return out_dir, evidence
+    return evidence
