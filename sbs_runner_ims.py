@@ -94,6 +94,7 @@ def opt_scan_by_scan(config_path: str):
             random_seed=cfg.RANDOM_SEED,
             n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
             ref_type=cfg.PREPARE_DICT.REF_TYPE,
+            keep_matched_precursors=cfg.PREPARE_DICT.KEEP_MATCHED_PRECURSORS,
         )
         logging.info(
             "Peptide batch index: %s", maxquant_result_ref["pept_batch_idx"].unique()
@@ -207,6 +208,11 @@ def opt_scan_by_scan(config_path: str):
                 n_workers=cfg.N_CPU,
                 include_decoys=cfg.PEAK_SELECTION.INCLUDE_DECOYS,
                 source=cfg.PEAK_SELECTION.TRAINING_DATA_SOURCE,
+                resample=cfg.PEAK_SELECTION.TRAINING_DATA_RESAMPLE.ENABLE,
+                sample_by=cfg.PEAK_SELECTION.TRAINING_DATA_RESAMPLE.SAMPLE_BY,
+                random_state=cfg.RANDOM_SEED,
+                arg_min=cfg.PEAK_SELECTION.TRAINING_DATA_RESAMPLE.ARG_MIN,
+                arg_sample=cfg.PEAK_SELECTION.TRAINING_DATA_RESAMPLE.ARG_SAMPLE,
             )
             cfg.PEAK_SELECTION.TRAINING_DATA = training_file_paths
             cfg.dump(
