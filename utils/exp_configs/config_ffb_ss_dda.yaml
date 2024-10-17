@@ -1,0 +1,21 @@
+DATA_PATH: '/cmnfs/proj/ORIGINS/data/brain/FreshFrozenBrain/SingleShot/DDA/ssDDA_P064428_Fresh1_5ug_R1_BD5_1_4921.d'
+RESULT_PATH: '/cmnfs/proj/ORIGINS/SWAPS_exp/ffb_ss_dda/ssDDA_P064428_Fresh1_5ug_R1_BD5_1_4921'
+ADD_TIMESTAMP_TO_RESULT_PATH: True
+MQ_REF_PATH: '/cmnfs/data/proteomics/timstof_hela_fractionation/no_mbr_20180809_120min_200ms_WEHI25_brute20k_timsON_100ng_HYE124A_Slot1-7_1_891.txt'
+EXPORT_DATA_HDF5_DIR: ""
+PREPARE_DICT:
+  RT_PRED:
+    TRAIN_DATA: '/cmnfs/data/proteomics/timstof_hela_fractionation/no_mbr_20180809_120min_200ms_WEHI25_brute20k_timsON_100ng_HYE124A_Slot1-7_1_891.txt'
+    PREDICT_DATA: '/cmnfs/data/proteomics/timstof_hela_fractionation/no_mbr_20180809_120min_200ms_WEHI25_brute20k_timsON_100ng_HYE124A_Slot1-7_1_891.txt'
+DICT_PICKLE_PATH: '/cmnfs/proj/ORIGINS/data/brain/FreshFrozenBrain/SingleShot/DDA/frame0_1830_expAsRef_ssDDA_P064428_Fresh1_5ug_R1_BD5_1_4921_ScanByScan_RTtol0.0_threshold_missabthres0.5_convergence_NoIntercept_exp_mzBinDigits2_imPeakWidth4_deltaMobilityThres200/maxquant_result_ref.pkl'
+OPTIMIZATION:
+  RT_TOL: 0.0
+  N_CPU: 5
+  N_BATCH: 5
+  N_BLOCKS_BY_PEPT: 1
+  MZ_BIN_DIGITS: 2
+  RT_REF: 'exp'
+RESULT_ANALYSIS:
+  ENABLE: True
+  MQ_EXP_PATH: '/cmnfs/proj/ORIGINS/data/brain/txt_ssDDA_LFQ_noMBR/evidence_fresh1.txt'
+  # FILTER_BY_RT_OVERLAP: ['full_overlap', 'partial_overlap', 'no_overlap']

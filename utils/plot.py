@@ -83,7 +83,7 @@ def plot_scatter(
     save_dir: Union[None, str] = None,
     x_label: Union[None, str] = None,
     y_label: Union[None, str] = None,
-    title: Union[None, str] = None,
+    title: Union[None, str] = "auto",
     fig_spec_name: str = "",
 ):
     """
@@ -119,23 +119,19 @@ def plot_scatter(
         x_label = x_name
     if y_label is None:
         y_label = y_name
-    if title is None:
+    if title == "auto":
         title = "Corr. of" + x_name + " and " + y_name
 
     PearsonR = stats.pearsonr(x=x_log, y=y_log)  # w/ log and w/o outliers
     SpearmanR = stats.spearmanr(a=x_log, b=y_log)
     slope, intercept, _, _, _ = stats.linregress(x=x_log, y=y_log)
-    print(
-        "Data: ",
+    Logger.info(
+        "Data: %s, %s, slope = %s, intercept = %s, Pearson's R = %s, Spearman's R = %s",
         x_name,
         y_name,
-        ", slope = ",
         np.round(slope, 3).item(),
-        ", intercept = ",
         np.round(intercept, 3).item(),
-        ", PearsonR = ",
         np.round(PearsonR[0], 3).item(),
-        ", SpearmanR = ",
         np.round(SpearmanR[0], 3).item(),
     )
 
@@ -159,6 +155,11 @@ def plot_scatter(
             title=title,
             labels={x_name: x_label, y_name: y_label},
             trendline="ols",
+        )
+        fig.update_layout(
+            autosize=False,
+            width=800,
+            height=600,
         )
         if show_diag:  # Add a diagonal line y = x
             fig.update_layout(
@@ -218,17 +219,17 @@ def plot_scatter(
                 verticalalignment="top",
                 fontsize=7,
             )
-            ax.annotate(
-                "slp. = "
-                + "{:.3f}".format(slope)
-                + ", intrcpt. = "
-                + "{:.3f}".format(intercept),
-                xy=(0.2, 0.75),
-                xycoords="figure fraction",
-                horizontalalignment="left",
-                verticalalignment="top",
-                fontsize=7,
-            )
+            # ax.annotate(
+            #     "slp. = "
+            #     + "{:.3f}".format(slope)
+            #     + ", intrcpt. = "
+            #     + "{:.3f}".format(intercept),
+            #     xy=(0.2, 0.75),
+            #     xycoords="figure fraction",
+            #     horizontalalignment="left",
+            #     verticalalignment="top",
+            #     fontsize=7,
+            # )
             fig_type_name = "CorrQuantification"
 
         min_val = min(x_log)
@@ -261,7 +262,8 @@ def plot_scatter(
             )
         plt.xlabel(x_label)
         plt.ylabel(y_label)
-        plt.suptitle(title + y_name)
+        if title is not None:
+            plt.title(title)
         save_plot(
             save_dir=save_dir,
             fig_type_name=fig_type_name,
@@ -277,7 +279,7 @@ def plot_venn2(
     label1: str,
     label2: str,
     save_dir: str | None = None,
-    save_format: str = "png",
+    # save_format: str = "png",
     title: str | None = None,
     fig_spec_name: str | None = None,
 ):
@@ -288,7 +290,7 @@ def plot_venn2(
         save_dir=save_dir,
         fig_type_name="VennDiag",
         fig_spec_name=fig_spec_name,
-        fig_format=save_format,
+        # fig_format=save_format,
     )
 
 
@@ -300,7 +302,7 @@ def plot_venn3(
     label2: str,
     label3: str,
     save_dir: str | None = None,
-    save_format: str = "png",
+    # save_format: str = "png",
     title: str | None = None,
     fig_spec_name: str | None = None,
 ):
@@ -311,7 +313,7 @@ def plot_venn3(
         save_dir=save_dir,
         fig_type_name="VennDiag",
         fig_spec_name=fig_spec_name,
-        fig_format=save_format,
+        # fig_format=save_format,
     )
 
 
@@ -339,18 +341,27 @@ def plot_comparison(
     axs[1].set_ylim([-axs[0].get_ylim()[1], 0])
 
 
-def save_plot(save_dir, fig_type_name, fig_spec_name, fig_format="png", **kwargs):
+def save_plot(
+    save_dir, fig_type_name, fig_spec_name, fig_format=["png", "svg"], **kwargs
+):
     if save_dir is not None:
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
-        plt.savefig(
-            fname=os.path.join(
-                save_dir, fig_type_name + "_" + fig_spec_name + "." + fig_format
-            ),
-            dpi=300,
-            format=fig_format,
-            **kwargs,
-        )
+        for fmt in fig_format:
+            plt.savefig(
+                fname=os.path.join(
+                    save_dir, fig_type_name + "_" + fig_spec_name + "." + fmt
+                ),
+                dpi=300,
+                format=fmt,
+                bbox_inches="tight",
+                **kwargs,
+            )
+            Logger.info(
+                "Save plot at %s",
+                os.path.join(save_dir, fig_type_name + "_" + fig_spec_name + "." + fmt),
+            )
+            # plt.show()
         plt.close()
     else:
         plt.show()
@@ -521,9 +532,9 @@ def plot_isopattern_and_obs(
             if mzrange is not None:
                 axs[1].set_xlim(mzrange)
         case "infer":
-            Logger.debug(
-                "infer m/z and intensities: %s, %s", infer_in_range_idx, infer_in_range
-            )
+            # Logger.debug(
+            #     "infer m/z and intensities: %s, %s", infer_in_range_idx, infer_in_range
+            # )
             axs[1].vlines(  # x = infer_intensity.index,
                 x=infer_in_range_idx,
                 ymin=-infer_in_range,
@@ -724,6 +735,9 @@ def plot_im_mz(
     mark_mz: List[float] = None,
     mark_im: List[float] = None,
     distr_mz: List[float] = None,
+    title: str = "MS1 Frame",
+    save_dir: str | None = None,
+    fig_spec_name: str = "",
 ):
     fig, ax = plt.subplots()
     if labels is None:
@@ -734,7 +748,7 @@ def plot_im_mz(
         sliced_frame["mobility_values"],
         sliced_frame["mz_values"],
         c=labels,
-        cmap='cividis_r',
+        cmap="cividis_r",
         s=0.1,
     )
     if mark_im is not None:
@@ -744,11 +758,15 @@ def plot_im_mz(
         for mz, abu in zip(mark_mz, distr_mz):
             ax.axhline(mz, color="r", linewidth=abu * 10, alpha=0.5)
     cbar = plt.colorbar(scatter)
-    cbar.set_label(label_name, rotation=270)
+    cbar.set_label(label_name, rotation=270, labelpad=15)
     ax.set_ylabel("m/z")
     ax.set_xlabel("1/K0")
-
-    plt.title("MS1 Frame " + str(sliced_frame["frame_indices"].unique()))
+    if title == "MS1 Frame":
+        title = title + " " + str(sliced_frame["frame_indices"].unique())
+    plt.title(title)
+    save_plot(
+        save_dir, fig_type_name="precursor_IM_MZ_raw_int", fig_spec_name=fig_spec_name
+    )
 
 
 def plot_im_mz_int(sliced_frame: pd.DataFrame):

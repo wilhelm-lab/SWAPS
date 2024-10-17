@@ -1,0 +1,38 @@
+RESULT_PATH: /cmnfs/proj/ORIGINS/SWAPS_exp/short_gradient/30min_3to45_7R_120min_lib_im_ref
+ADD_TIMESTAMP_TO_RESULT_PATH: true
+DATA_PATH: /cmnfs/proj/ORIGINS/data/HeLa_sample_amount_and_LC_columns/raw_data/Hela_30min_5ug_R2_RA1_1_5163.d/
+DEBUG: false
+DICT_PICKLE_PATH: ''
+EXPORT_DATA_HDF5_DIR: ''
+MQ_REF_PATH: /cmnfs/proj/ORIGINS/data/tims_ramp_time/HeLa_library/txt_Hela_DDA_120min/evidence.txt
+MQ_EXP_PATH: /cmnfs/proj/ORIGINS/data/HeLa_sample_amount_and_LC_columns/MQ_search/txt_30min_sample_amount/evidence.txt
+FILTER_EXP_BY_RAW_FILE: []
+N_CPU: 5
+OPTIMIZATION:
+  N_BLOCKS_BY_PEPT: 15
+  N_BATCH: 10
+PREPARE_DICT:
+  DICT_PICKLE_PATH: ''
+  FILTER_PRED_BY_RAW_FILE: ''
+  FILTER_TRAIN_BY_RAW_FILE: ''
+  GENERATE_DECOY: true
+  IM_REF: ref
+  IM_TRAIN_EPOCHS: 8
+  ISO_MIN_AB_THRES: 0.01
+  KEEP_MATCHED_PRECURSORS: false
+  MZ_BIN_DIGITS: 2
+  RT_REF: pred
+  RT_TRAIN_EPOCHS: 15
+  TRAIN_FRAC: 0.9
+RANDOM_SEED: 42
+PEAK_SELECTION:
+  EVAL_ON_TEST: true
+  INCLUDE_DECOYS: true
+  DEBUG: false
+  ENABLE: true
+  TRAINING_DATA_SOURCE: ['both']
+  CLSMODEL:
+    PARAMS:
+      DROPOUT_RATE: 0.5
+RESULT_ANALYSIS:
+  ENABLE: true

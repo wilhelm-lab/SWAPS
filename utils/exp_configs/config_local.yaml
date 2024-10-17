@@ -1,0 +1,7 @@
+DATA_PATH: '/mnt/cmnfs/proj/ORIGINS/SWAPS_exp/mixture/20180809_120min_200ms_WEHI25_brute20k_timsON_100ng_HYE124A_Slot1-7_1_891/20180809_120min_200ms_WEHI25_brute20k_timsON_100ng_HYE124A_Slot1-7_1_891.hdf'
+RESULT_PATH: '/mnt/cmnfs/proj/ORIGINS/SWAPS_exp/mixture/20180809_120min_200ms_WEHI25_brute20k_timsON_100ng_HYE124A_Slot1-7_1_891'
+MQ_REF_PATH: '/mnt/cmnfs/data/proteomics/timstof_hela_fractionation/no_mbr_20180809_120min_200ms_WEHI25_brute20k_timsON_100ng_HYE124A_Slot1-7_1_891.txt'
+PREPARE_DICT:
+  RT_PRED:
+    TRAIN_DATA: '/mnt/cmnfs/data/proteomics/timstof_hela_fractionation/no_mbr_20180809_120min_200ms_WEHI25_brute20k_timsON_100ng_HYE124A_Slot1-7_1_891.txt'
+    PREDICT_DATA: '/mnt/cmnfs/data/proteomics/timstof_hela_fractionation/no_mbr_20180809_120min_200ms_WEHI25_brute20k_timsON_100ng_HYE124A_Slot1-7_1_891.txt'

@@ -1,5 +1,4 @@
 ._.DS_Store
-
 .DS_Store
 *.pyc
 notebooks/models/*
@@ -10,8 +9,10 @@ notebooks/my_dir/*
 test/test.py
 output.png
 output.svg.png
-archieved/*
-
+array_param/*
 notebooks/*.png
 archieved/ScanByScan.py
 scripts/slurm_job_swaps_gpu.sh
+_archieved/*
+environment_linux64.yaml
+__pycache__/*
