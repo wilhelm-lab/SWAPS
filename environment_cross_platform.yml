@@ -190,4 +190,8 @@ dependencies:
   - pyjanitor
   - statannotations
   - jupyterlab
+  - torchvision
+  - pytorch
+  - torchaudio
+  - pytorch-cuda=11.8
 prefix: /cmnfs/home/z.xiao/miniconda3/envs/sbs
