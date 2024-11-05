@@ -131,6 +131,7 @@ def plot_corr_int_ref_and_act(
     log_y: bool = True,
     fig_spec_name: str = "",
     title: str | None = "auto",
+    **kwargs,
 ):
     if hover_data is None:
         hover_data = [
@@ -158,6 +159,7 @@ def plot_corr_int_ref_and_act(
         x_label="MaxQuant Reference Intensity (Log10)",
         y_label="SWAPS Inferred Intensity (Log10)",
         fig_spec_name=fig_spec_name,
+        **kwargs,
     )
     return reg_int, abs_residue, valid_idx
 
@@ -237,6 +239,7 @@ class SWAPSResult:
         log_sum_intensity_thres: float = 1,
         save_dir: str = None,
         include_decoys: bool = True,
+        **kwargs,
     ):
         """
         Initialize SWAPSResult object and intergrate all activation data.
@@ -297,6 +300,7 @@ class SWAPSResult:
                     return_plot=True,
                     save_dir=save_dir,
                     dataset_name="result_analysis",
+                    **kwargs,
                 )
                 Logger.info(
                     "Filtering the data by FDR threshold %s, number of entries before filtering %s",
@@ -374,15 +378,84 @@ class SWAPSResult:
             **kwargs,
         )
 
+    def plot_intensity_distr(
+        self,
+        title: str = None,
+        font_size: int = 20,
+        line_width: int = 2,
+        fig_size: tuple = (8, 6),
+        x_lim: tuple = None,
+    ):
+        """
+        Plot the distribution of the intensity from the experiment file and the activation columns
+        """
+        filtered_result = self.pept_act_sum
+        filtered_result_with_source = pd.merge(
+            left=self.maxquant_dict[["mz_rank", "source"]],
+            right=filtered_result,
+            on="mz_rank",
+            how="right",
+        )
+        filtered_result_with_source["source"].value_counts()
+        filtered_result_with_source["Identified By"] = "Both"
+        filtered_result_with_source.loc[
+            filtered_result_with_source["source"] == "ref", "Identified By"
+        ] = "SWAPS"
+        filtered_result_with_source["Identified By"].value_counts()
+
+        plt.rc(
+            "font", size=font_size
+        )  # Set the default font size for all text elements
+        plt.figure(figsize=fig_size)
+        ax = sns.histplot(
+            filtered_result_with_source,
+            x="log_sum_intensity",
+            hue="Identified By",
+            # fill=True,
+            common_norm=True,
+            multiple="dodge",
+            bins=30,
+            kde=True,
+            # cumulative=True,
+            palette={"SWAPS": "green", "Both": "tan"},
+            # palette={"120min library": "darkorange", "30min library": "royalblue"},
+        )
+        if x_lim is not None:
+            plt.xlim(x_lim)
+        plt.xlabel("SWAPS Inferred Intensity (Log10)")
+        # Modify the legend to make it smaller
+        legend = ax.get_legend()
+        # legend.set_title(None)  # Remove the legend title if you want
+        plt.setp(
+            legend.get_texts(), fontsize=font_size * 0.9
+        )  # Make legend text 70% of the main font size
+        legend.set_title(
+            "Identified By", prop={"size": font_size * 0.9}
+        )  # Make legend title same size as legend text
+        if title is not None:
+            plt.title(title)
+        # Set the width of all spines (top, right, bottom, left)
+        for spine in ax.spines.values():
+            spine.set_linewidth(line_width)  # Increase this value for thicker lines
+        # Optional: you can also make tick marks thicker
+        ax.tick_params(width=line_width)
+        save_plot(
+            save_dir=self.save_dir,
+            fig_type_name="hist",
+            fig_spec_name="inferred_intensity_30min_120min_library",
+        )
+
     def plot_overlap_with_MQ(
         self,
         show_ref: bool = False,
         level: Literal["precursor", "peptide", "protein"] = "peptide",
-        title: str|None = None,
+        title: str | None = None,
+        font_size: int = 20,
     ):
         """
         Plot the overlap between the experiment file and the activation columns
         """
+        plt.rc("font", size=font_size)  # Set the default font size for all text elements
         maxquant_dict_target = self.maxquant_dict.loc[self.maxquant_dict["Decoy"] == 0]
         match level:
             case "precursor":
@@ -434,7 +507,14 @@ class SWAPSResult:
                     list3 = maxquant_dict_target["Proteins"].str.split(";")
                     set3 = set([item for sublist in list3 for item in sublist])
         if title == "auto":
-            title="Identification Of Target, "+ level+ ", fdr="+ str(self.fdr_thres)+ "_log_int_"+ str(self.log_sum_intensity_thres)
+            title = (
+                "Identification Of Target, "
+                + level
+                + ", fdr="
+                + str(self.fdr_thres)
+                + "_log_int_"
+                + str(self.log_sum_intensity_thres)
+            )
 
         if show_ref:
             plot_venn3(
@@ -460,13 +540,13 @@ class SWAPSResult:
                 label2="SWAPS",
                 title=title,
                 save_dir=self.save_dir,
-                    fig_spec_name=level
+                fig_spec_name=level
                 + "_fdr_"
                 + str(self.fdr_thres)
                 + "_log_int_"
                 + str(self.log_sum_intensity_thres),
-
             )
+        
 
 
 class SBSResult:
@@ -764,7 +844,7 @@ class SBSResult:
                 label1="Maxquant",
                 label2="SBS",
                 save_dir=save_dir,
-                save_format=save_format,
+                # save_format=save_format,
                 title="IdentificationOfTarget",
             )
 
@@ -784,7 +864,7 @@ class SBSResult:
                 label1="Maxquant",
                 label2="SBS",
                 save_dir=save_dir,
-                save_format=save_format,
+                # save_format=save_format,
                 title="QuantificationOfTarget",
             )
 

@@ -85,6 +85,9 @@ def plot_scatter(
     y_label: Union[None, str] = None,
     title: Union[None, str] = "auto",
     fig_spec_name: str = "",
+    line_width: int = 2,
+    font_size: int = 22,
+    fig_size: tuple = (8, 6),
 ):
     """
     Generate scatter plot with correlation coefficient and number of data points,
@@ -120,7 +123,7 @@ def plot_scatter(
     if y_label is None:
         y_label = y_name
     if title == "auto":
-        title = "Corr. of" + x_name + " and " + y_name
+        title = "Corr. of " + x_name + " and " + y_name
 
     PearsonR = stats.pearsonr(x=x_log, y=y_log)  # w/ log and w/o outliers
     SpearmanR = stats.spearmanr(a=x_log, b=y_log)
@@ -190,6 +193,10 @@ def plot_scatter(
         fig.show()
 
     else:
+        plt.rc(
+            "font", size=font_size
+        )  # Set the default font size for all text elements
+        plt.figure(figsize=fig_size)  # Set the size of the figure
         # Plot with correlation
         if contour:
             ax = sns.jointplot(x=x_log, y=y_log, kind="kde")
@@ -206,7 +213,7 @@ def plot_scatter(
                 xycoords="figure fraction",
                 horizontalalignment="left",
                 verticalalignment="top",
-                fontsize=7,
+                fontsize=0.9 * font_size,
             )
             ax.annotate(
                 "Prs.r = "
@@ -217,7 +224,7 @@ def plot_scatter(
                 xycoords="figure fraction",
                 horizontalalignment="left",
                 verticalalignment="top",
-                fontsize=7,
+                fontsize=0.9 * font_size,
             )
             # ax.annotate(
             #     "slp. = "
@@ -231,7 +238,11 @@ def plot_scatter(
             #     fontsize=7,
             # )
             fig_type_name = "CorrQuantification"
-
+        # Set the width of all spines (top, right, bottom, left)
+        for spine in ax.spines.values():
+            spine.set_linewidth(line_width)  # Increase this value for thicker lines
+        # Optional: you can also make tick marks thicker
+        ax.tick_params(width=line_width)
         min_val = min(x_log)
         max_val = max(x_log)
         if show_diag:
@@ -305,6 +316,7 @@ def plot_venn3(
     # save_format: str = "png",
     title: str | None = None,
     fig_spec_name: str | None = None,
+    **kwargs,
 ):
     venn3([set1, set2, set3], set_labels=(label1, label2, label3))
     if title is not None:
@@ -314,6 +326,7 @@ def plot_venn3(
         fig_type_name="VennDiag",
         fig_spec_name=fig_spec_name,
         # fig_format=save_format,
+        **kwargs,
     )
 
 

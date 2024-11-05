@@ -10,7 +10,6 @@ import h5py
 import seaborn as sns
 from matplotlib import patches
 from matplotlib.colors import ListedColormap, BoundaryNorm
-from peak_detection_2d import dataset
 from utils.plot import save_plot
 import torch
 from sklearn.metrics import roc_curve, roc_auc_score
@@ -358,29 +357,70 @@ def plot_history(history, title: str = "loss", save_dir=None):
 
 
 def plot_per_image_metric_distr(
-    loss_array, metric_name, save_dir, show_quantiles=[25, 50, 75], dataset_name=""
+    loss_array,
+    metric_name,
+    save_dir: str = None,
+    hue: str = None,
+    show_quantiles=[25, 50, 75],
+    dataset_name="",
+    fig_size: tuple = (8, 6),
+    font_size: int = 20,
+    line_width: int = 2,
+    title: str = None,
+    xlabel: str = None,
+    ylabel: str = None,
+    multiple="stack",
+    **kwargs,  # additional arguments for histplot
 ):
-    # Calculate quantiles
-    quantiles = np.percentile(loss_array, show_quantiles)
+    if show_quantiles is not None:
+        # Calculate quantiles
+        quantiles = np.percentile(loss_array[metric_name].values, show_quantiles)
 
-    plt.figure(figsize=(10, 6))
-    plt.hist(loss_array, bins=10, alpha=0.75)
-    correction = 0.05
-    # Plot quantile lines
-    for show_quantile, quantile in zip(show_quantiles, quantiles):
-        print(f"{show_quantile}%: {quantile:.2f}")
-        plt.axvline(quantile, color="r", linestyle="dashed", linewidth=1)
-        plt.text(
-            quantile,
-            plt.ylim()[1] * (0.9 + correction),
-            f"{show_quantile}%:{quantile:.2f}",
-            color="r",
-            ha="center",
-        )
-        correction *= -1
-    plt.title(f"{dataset_name} {metric_name} Distribution")
-    plt.xlabel(metric_name)
-    plt.ylabel("Frequency")
+    plt.figure(figsize=fig_size)
+    plt.rcParams.update({"font.size": font_size})
+    ax = sns.histplot(
+        data=loss_array,
+        x=metric_name,
+        hue=hue,
+        # palette={False: "#d8a6a6", True: "#a00000"},
+        # hue_order=[False, True],
+        # color=["olivedrab", "tomato"],
+        multiple=multiple,
+        bins=20,
+        **kwargs,
+    )
+
+    if show_quantiles is not None:
+        correction = 0.05
+        # Plot quantile lines
+        for show_quantile, quantile in zip(show_quantiles, quantiles):
+            print(f"{show_quantile}%: {quantile:.2f}")
+            plt.axvline(
+                quantile, color="black", linestyle="dashed", linewidth=line_width
+            )
+            plt.text(
+                quantile,
+                plt.ylim()[1] * (0.9 + correction),
+                f"{show_quantile}%:{quantile:.2f}",
+                color="black",
+                ha="center",
+                fontsize=font_size * 0.9,
+            )
+            correction *= -1
+    if title is None:
+        title = f"{dataset_name} {metric_name} Distribution"
+    if xlabel is None:
+        xlabel = metric_name
+    if ylabel is None:
+        ylabel = "Frequency"
+    plt.title(title)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    # Set the width of all spines (top, right, bottom, left)
+    for spine in ax.spines.values():
+        spine.set_linewidth(line_width)  # Increase this value for thicker lines
+    # Optional: you can also make tick marks thicker
+    ax.tick_params(width=line_width)
     save_plot(
         save_dir=save_dir,
         fig_type_name="PS_model",
@@ -604,25 +644,31 @@ def plot_target_decoy_distr(
     dataset_name="",
     threshold: tuple | None = None,
     main_plot_type: Literal["kde", "scatter"] = "scatter",
+    fig_size: tuple = (8, 8),
+    font_size: int = 20,
+    line_width: int = 2,
+    title: str = None,
+    xlabel: str = None,
+    ylabel: str = None,
+    **kwargs,  # for jointplot
 ):
     """
     Plot target decoy distribution
     ps_df: pandas dataframe with columns: target_decoy_score, sum_intensity, Decoy
     threshold: tuple with two values for thresholding target decoy score, (target_decoy_score, log_sum_intensity)
     """
+    plt.figure(figsize=fig_size)
+    plt.rcParams.update({"font.size": font_size})
     ps_df["log_sum_intensity"] = np.log10(ps_df["sum_intensity"] + 1)
-    sns.jointplot(
+    ax = sns.jointplot(
         ps_df,
         x="target_decoy_score",
         y="log_sum_intensity",
         hue="Decoy",
         kind=main_plot_type,
         s=13,
+        **kwargs,
     )
-    # plt.title("Target Decoy Distribution")
-    plt.xlabel("Target Decoy Score")
-    plt.ylabel("Log10(Sum Intensity)")
-    plt.suptitle(dataset_name)
     if threshold is not None:
         plt.axvline(threshold[0], color="r", linestyle="--", linewidth=1)
         plt.axhline(threshold[1], color="r", linestyle="--", linewidth=1)
@@ -635,6 +681,26 @@ def plot_target_decoy_distr(
         plt.text(x=0.85, y=7.5, s=f"FDR: {fdr:.2f}")
         plt.text(x=0.85, y=8, s=f"N targets: {td_counts[0]}")
         logging.info("target decoy counts: %s", td_counts)
+    if title is None:
+        title = "Target Decoy Distribution"
+    if xlabel is None:
+        xlabel = "Confidence Score"
+    if ylabel is None:
+        ylabel = "SWAPS Inferred Intensity (Log10)"
+    plt.suptitle(title, y=1.01)
+    plt.xlabel(xlabel)
+    plt.ylabel(ylabel)
+    # Set the width of all spines (top, right, bottom, left)
+    for spine in ax.ax_joint.spines.values():
+        spine.set_linewidth(line_width)  # Increase this value for thicker lines
+    for spine in ax.ax_marg_x.spines.values():
+        spine.set_linewidth(line_width)
+    for spine in ax.ax_marg_y.spines.values():
+        spine.set_linewidth(line_width)
+    # Optional: you can also make tick marks thicker
+    ax.ax_joint.tick_params(width=line_width)
+    ax.ax_marg_x.tick_params(width=line_width)
+    ax.ax_marg_y.tick_params(width=line_width)
     save_plot(
         save_dir=save_dir,
         fig_type_name="target_decoy_distribution",
@@ -651,6 +717,10 @@ def calc_fdr_and_thres(
     dataset_name="",
     xlim=None,
     mark_x=[0.01, 0.05, 0.1],
+    title: str = None,
+    font_size: int = 12,
+    fig_size: tuple = (8, 6),
+    line_width: int = 2,
     **kwargs,
 ):
     """Calculate FDR and threshold for a given score column
@@ -679,30 +749,69 @@ def calc_fdr_and_thres(
     )
     pred_df_new["N_identified_target"] = pred_df_new["Target"].cumsum()
     if return_plot:
-        sns.scatterplot(
-            data=pred_df_new,
-            y="N_identified_target",
-            x="fdr",
-            hue="target_decoy_score",
-            edgecolor=None,
-            palette="Spectral",
+        plot_fdr_and_id(
+            pred_df_new,
+            filter_dict,
+            save_dir,
+            dataset_name,
+            xlim,
+            mark_x,
+            title,
+            font_size,
+            fig_size,
+            line_width,
             **kwargs,
         )
-        n_target_max = pred_df_new["N_identified_target"].max()
-        plt.vlines(
-            x=mark_x,
-            ymin=[0, 0, 0],
-            ymax=[n_target_max, n_target_max, n_target_max],
-            color="r",
-        )
-        # Access the legend and set its title
-        plt.ylabel("Number of Identified Targets")
-        plt.xlabel("FDR")
-        plt.legend(title="Threshold", loc="lower right")
+    return pred_df_new
+
+
+def plot_fdr_and_id(
+    pred_df_new,
+    filter_dict: dict | None = None,
+    save_dir: str = None,
+    dataset_name: str = "",
+    xlim: tuple = None,
+    mark_x: list = [0.01, 0.05, 0.1],
+    title: str = None,
+    font_size: int = 20,
+    fig_size: tuple = (8, 6),
+    line_width: int = 2,
+    **kwargs,
+):
+    if "Conf. Score" not in pred_df_new.columns:
+        pred_df_new["Conf. Score"] = pred_df_new["target_decoy_score"]
+    plt.figure(figsize=fig_size)
+    plt.rcParams.update({"font.size": font_size})
+    ax = sns.scatterplot(
+        data=pred_df_new,
+        y="N_identified_target",
+        x="fdr",
+        hue="Conf. Score",
+        edgecolor=None,
+        palette="Spectral",
+        **kwargs,
+    )
+    # Set the width of all spines (top, right, bottom, left)
+    for spine in ax.spines.values():
+        spine.set_linewidth(line_width)  # Increase this value for thicker lines
+        # Optional: you can also make tick marks thicker
+    ax.tick_params(width=line_width)
+    n_target_max = pred_df_new["N_identified_target"].max()
+    plt.vlines(
+        x=mark_x,
+        ymin=[0, 0, 0],
+        ymax=[n_target_max, n_target_max, n_target_max],
+        color="r",
+    )
+    # Access the legend and set its title
+    plt.ylabel("Identified Targets")
+    plt.xlabel("FDR")
+    plt.legend(title="Threshold", loc="center left", bbox_to_anchor=(1, 0.5))
+    if title is None:
         if filter_dict is None:
-            plt.title(dataset_name + "FDR vs Identified Targets, no filter")
-        if filter_dict is not None:
-            plt.title(
+            title = dataset_name + "FDR vs Identified Targets, no filter"
+        else:
+            title = (
                 dataset_name
                 + " FDR vs Identified Targets, filter by:"
                 + "\n"
@@ -710,14 +819,14 @@ def calc_fdr_and_thres(
                     [f"{key}: {value}" for key, value in filter_dict.items()]
                 )
             )
-        if xlim is not None:
-            plt.xlim(xlim)
-        save_plot(
-            save_dir=save_dir,
-            fig_type_name="fdr_id_targets",
-            fig_spec_name=dataset_name,
-        )
-    return pred_df_new
+    plt.title(title)
+    if xlim is not None:
+        plt.xlim(xlim)
+    save_plot(
+        save_dir=save_dir,
+        fig_type_name="fdr_id_targets",
+        fig_spec_name=dataset_name,
+    )
 
 
 def _filter_pred(filter_dict, pred_df):
@@ -752,14 +861,19 @@ def plot_roc_auc(
     save_dir=None,
     dataset_name="",
     filter_dict=None,
+    line_width: int = 2,
+    font_size: int = 22,
+    fig_size: tuple = (8, 6),
+    title: str = None,
 ):
     """Plot ROC AUC curve"""
     assert pred_df is not None or pred_df_list is not None
     if pred_df is not None:
         pred_df_list = [pred_df]
         color_list = ["darkorange"]
-        label_list = dataset_name
-    plt.figure()
+        label_list = [dataset_name]
+    plt.figure(figsize=fig_size)
+    plt.rcParams.update({"font.size": font_size})
     for pred_df, color, label in zip(pred_df_list, color_list, label_list):
         if "Target" not in pred_df.columns:
             pred_df["Target"] = pred_df["Decoy"] == 0
@@ -769,23 +883,33 @@ def plot_roc_auc(
             pred_df["Target"], pred_df["target_decoy_score"]
         )
         roc_auc = roc_auc_score(pred_df["Target"], pred_df["target_decoy_score"])
-
-        lw = 2
         plt.plot(
             fpr,
             tpr,
             color=color,
-            lw=lw,
-            label=label + " ROC curve (area = %0.2f)" % roc_auc,
+            lw=line_width,
+            label=f"{label} ROC curve (area = {roc_auc:.2f})",
         )
 
-    plt.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")  # Diagonal line
+    plt.plot(
+        [0, 1], [0, 1], color="navy", lw=line_width, linestyle="--"
+    )  # Diagonal line
     plt.xlim([0.0, 1.0])
     plt.ylim([0.0, 1.05])
     plt.xlabel("False Positive Rate")
     plt.ylabel("True Positive Rate")
-    plt.title("Target-Decoy ROC Curve")
-    plt.legend(loc="lower right")
+    if title is None:
+        title = "Target-Decoy Receiver Operating Characteristic"
+    plt.title(title)
+    plt.legend(loc="lower right", fontsize=font_size * 0.7)
+
+    # Set the width of all spines (top, right, bottom, left)
+    ax = plt.gca()
+    for spine in ax.spines.values():
+        spine.set_linewidth(line_width)  # Increase this value for thicker lines
+    # Optional: you can also make tick marks thicker
+    ax.tick_params(width=line_width)
+
     save_plot(save_dir=save_dir, fig_type_name="roc_auc", fig_spec_name=dataset_name)
     return roc_auc
 
