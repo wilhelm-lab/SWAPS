@@ -1,4 +1,12 @@
+from typing import Literal
+
 # relevant columns in exp
+_alpha_opt_metric = Literal["cos_dist", "RMSE"]
+_loss = Literal["lasso", "sqrt_lasso"]
+_algo = Literal["lasso_lars", "lasso_cd", "lars", "omp", "threshold"]
+_alpha_criteria = Literal["min", "convergence"]
+_pp_method = Literal["raw", "sqrt"]
+_AlignMethods = Literal["2stepNN", "peakRange"]
 exp_cols = [
     "Sequence",
     "Modified sequence",

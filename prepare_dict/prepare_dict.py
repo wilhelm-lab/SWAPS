@@ -1071,6 +1071,13 @@ def construct_dict(
             "maxquant_exp_df size after removing matched precursors: %s",
             maxquant_exp_df.shape,
         )
+        maxquant_ref_df = maxquant_ref_df.loc[
+            maxquant_ref_df["Type"].isin(["TIMS-MULTI-MSMS"])
+        ]
+        Logger.info(
+            "maxquant_ref_df size after removing matched precursors: %s",
+            maxquant_ref_df.shape,
+        )
     rt_range = (
         rt_values_df["Time_minute"].min(),
         rt_values_df["Time_minute"].max(),

@@ -81,7 +81,15 @@ def opt_scan_by_scan(config_path: str):
         )
         maxquant_result_ref = pd.read_csv(cfg.MQ_REF_PATH, sep="\t", low_memory=False)
         # TODO filter ref df if needed
-
+        if cfg.FILTER_REF_BY_RAW_FILE:
+            maxquant_result_ref = maxquant_result_ref[
+                maxquant_result_ref["Raw file"].isin([dir_with_extension.rstrip(".d")])
+            ]
+            logging.info(
+                "Filtered maxquant result by raw file: %s, resulting ref rows: %s",
+                dir_with_extension.rstrip(".d"),
+                maxquant_result_ref.shape[0],
+            )
         maxquant_result_ref, dict_pickle_path, cfg_prepare_dict = construct_dict(
             cfg_prepare_dict=cfg.PREPARE_DICT,
             filter_exp_by_raw_file=cfg.FILTER_EXP_BY_RAW_FILE,

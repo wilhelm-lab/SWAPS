@@ -17,6 +17,7 @@ __C.MQ_REF_PATH = ""  # path to MaxQuant reference file, pickle
 __C.FILTER_EXP_BY_RAW_FILE = (
     []
 )  # None for not filtering, "" for filtering by raw file that shares the same name with the data directory
+__C.FILTER_REF_BY_RAW_FILE = False
 # __C.FILTER_REF_BY_RAW_FIEL = ""  # None for not filtering, "" for filtering by raw file that shares the same name with the data directory
 __C.DICT_PICKLE_PATH = ""
 __C.NOTES = ""  # notes for the run
