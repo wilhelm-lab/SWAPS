@@ -14,9 +14,9 @@ conda env create -n SWAPS --file environment_cross_platform.yml
 SWAPS takes a `.yaml` as a configuration argument. Examples can be found at `utils/exp_configs`. Please modify the file path as necessary. Detail documents of config definiation can be found at `utils/singleton_swaps_optimization.py`.
 
 #### Runner
-To run SWAPS, use:
+To run SWAPS, in the repo directory, use:
 ```
-python [path-to-config-file]
+python sbs_runner_ims.py [path-to-config-file]
 ```
 
 ### SWAPS results structure
