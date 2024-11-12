@@ -1,8 +1,12 @@
 import os
 from typing import Literal
+import csv
 import logging
 import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
 from triqler.qvality import getQvaluesFromScores
+from utils.plot import save_plot
 
 Logger = logging.getLogger(__name__)
 # from peak_detection_2d.utils import calc_fdr_and_thres
@@ -141,9 +145,8 @@ def prepare_generic_input_from_result_dir_list(
     for swaps_dir in swap_result_dir_list:
         mixture = os.path.basename(swaps_dir).split("ref_")[1][0]
 
-        if mixture == "A":
-            score_thres_by_species = score_thres_by_species_a
-        elif mixture == "B":
+        score_thres_by_species = score_thres_by_species_a
+        if mixture == "B":
             score_thres_by_species = score_thres_by_species_b
         df = prepare_generic_input_from_result_dir(
             swaps_dir,
@@ -263,7 +266,7 @@ def add_decoy_prefix(row: pd.Series):
     return ";".join([f"REV__{p}" for p in proteins.split(";")])
 
 
-def prepare_evidence_for_pickedgroupfdr(
+def prepare_input_for_pickedgroupfdr(
     swaps_result_dir_list,
     out_dir,
     ps_exp_folder: str = "eval_model_transfer",
@@ -353,3 +356,190 @@ def calc_pep_in_evidence(
         numBins=1000,
     )
     return evidence
+
+
+def prepare_input_for_triqler(
+    swaps_result_dir_list,
+    out_dir,
+    ps_exp_folder: str = "eval_model_transfer",
+    extra_col_to_keep: list = [],
+    remove_shared_proteins: bool = True,
+    remove_shared_peptides: bool = False,
+    filter_species: list = [],
+):
+    col_to_keep = [
+        "run",
+        "condition",
+        "charge",
+        "searchScore",
+        "intensity",
+        "peptide",
+        "proteins",
+    ]
+    if len(extra_col_to_keep) > 0:
+        col_to_keep += extra_col_to_keep
+    evidence_all = pd.DataFrame()
+    for swaps_result_dir in swaps_result_dir_list:
+        run_name = swaps_result_dir.split("ref_")[1][0:6]
+        condition = swaps_result_dir.split("ref_")[1][0]
+        Logger.info("Processing %s", run_name)
+        maxquant_dict = pd.read_pickle(
+            os.path.join(swaps_result_dir, "maxquant_result_ref.pkl")
+        )
+        maxquant_dict.loc[maxquant_dict["Decoy"], "Reverse"] = "+"
+        maxquant_dict["run"] = run_name
+        maxquant_dict["condition"] = condition
+        spec = ""
+        if remove_shared_proteins:
+            Logger.info("Removing missing taxonomy names")
+            maxquant_dict = maxquant_dict[maxquant_dict["Taxonomy names"].notna()]
+            Logger.info(
+                "Removing shared proteins (across species), before removal: %s",
+                maxquant_dict.shape[0],
+            )
+            maxquant_dict = maxquant_dict[
+                ~maxquant_dict["Taxonomy names"].str.contains(";")
+            ]
+            Logger.info(
+                "Removed shared proteins (across species), after removal: %s",
+                maxquant_dict.shape[0],
+            )
+        if len(filter_species) > 0:
+            Logger.info(
+                "Filtering species: %s, before filtering: %s",
+                filter_species,
+                maxquant_dict.shape[0],
+            )
+            maxquant_dict = maxquant_dict[
+                maxquant_dict["Taxonomy names"].isin(filter_species)
+            ]
+            Logger.info(
+                "Filtering species: %s, after filtering: %s",
+                filter_species,
+                maxquant_dict.shape[0],
+            )
+            spec = "_".join(filter_species)
+            spec = "_" + spec.replace(" ", "")
+        if remove_shared_peptides:
+            Logger.info(
+                "Removing shared peptides, before removal: %s", maxquant_dict.shape[0]
+            )
+            maxquant_dict = maxquant_dict[
+                ~maxquant_dict["Modified sequence"].str.contains(";")
+            ]
+            Logger.info(
+                "Removed shared peptides, after removal: %s", maxquant_dict.shape[0]
+            )
+        pept_act = pd.read_csv(
+            os.path.join(
+                swaps_result_dir,
+                "peak_selection",
+                ps_exp_folder,
+                "pept_act_sum_ps_full_tdc_fdr_thres.csv",
+            )
+        )
+
+        # pept_act = calc_fdr_given_thres(pept_act)
+        evidence = pd.merge(
+            maxquant_dict,
+            pept_act[["mz_rank", "sum_intensity", "target_decoy_score"]],
+            on="mz_rank",
+            how="inner",
+        )
+        # evidence = calc_fdr_and_thres(evidence)
+        evidence["id"] = evidence["mz_rank"]
+        evidence["searchScore"] = evidence["target_decoy_score"]
+        evidence["intensity"] = evidence["sum_intensity"]
+        evidence["proteins"] = evidence[["Leading proteins", "Reverse"]].apply(
+            add_decoy_prefix, axis=1
+        )
+        evidence["peptide"] = evidence["Modified sequence"]
+        evidence["charge"] = evidence["Charge"]
+
+        # evidence["PEP"] = evidence["fdr"]  # Use q-value as PEP
+        # evidence = calc_pep_in_evidence(evidence)
+        evidence = evidence[col_to_keep]
+
+        evidence_all = pd.concat([evidence_all, evidence], axis=0)
+    evidence_all["condition"] = evidence_all["condition"].replace({"A": 1, "B": 2})
+    out_dir = os.path.join(out_dir, f"swaps_input_triqler{spec}.tsv")
+    evidence_all.to_csv(out_dir, sep="\t", index=False)
+    return out_dir, evidence_all
+
+
+def read_triqler_output(triqler_output_path):
+    # Open the TSV file
+    with open(
+        triqler_output_path,
+        "r",
+        encoding="utf-8",
+    ) as file:
+        # Create a csv.reader object, specifying the delimiter as tab ('\t')
+        reader = csv.reader(file, delimiter="\t")
+
+        # Get the column names from the first row
+        column_names = next(reader)
+
+        # Initialize an empty list to store the rows
+        data = []
+
+        # Iterate through the remaining rows
+        for row in reader:
+            # Check if the row has more fields than expected
+            if len(row) > len(column_names):
+                # If so, join the extra fields with semicolons and assign to the last column
+                row[len(column_names) - 1] = ";".join(row[len(column_names) :])
+                # print(row[-1])
+                # print(len(row))
+                row = row[: len(column_names)]
+                # print(row)
+            # Convert numeric values to their appropriate types
+            for i, value in enumerate(row):
+                try:
+                    if "." in value:
+                        row[i] = float(value)
+                    else:
+                        row[i] = int(value)
+                except ValueError:
+                    # Keep the value as a string if it can't be converted to a number
+                    pass
+            # Append the row (original or modified) to the data list
+            data.append(row)
+    df = pd.DataFrame(data, columns=column_names)
+    return df
+
+
+def evaluate_triqler_result(
+    triqler_df,
+    remove_decoy: bool = True,
+    filter_dict: dict = {},
+    save_dir: str = None,
+    dataset: str = "",
+    **kwargs,
+):
+    if remove_decoy:
+        triqler_df = triqler_df[~triqler_df["protein"].str.contains("REV__")]
+    if len(filter_dict) > 0:
+        for key, value in filter_dict.items():
+            triqler_df = triqler_df.loc[
+                (triqler_df[key] >= value[0]) & (triqler_df[key] <= value[1])
+            ]
+    sns.histplot(
+        data=triqler_df,
+        x="log2_fold_change",
+        bins=100,
+        **kwargs,
+    )
+    median = triqler_df["log2_fold_change"].median()
+    std = triqler_df["log2_fold_change"].std()
+    count = triqler_df.shape[0]
+    plt.text(
+        0.05,
+        0.95,
+        f"Median: {median:.2f}\nStd: {std:.2f}\nCount: {count}",
+        transform=plt.gca().transAxes,
+        verticalalignment="top",
+    )
+    save_plot(save_dir, fig_type_name="hist", fig_spec_name=dataset)
+    # triqler_df["log2_fold_change"].describe()
+    return triqler_df
