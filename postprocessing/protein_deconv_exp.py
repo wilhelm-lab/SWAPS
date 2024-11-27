@@ -1,5 +1,12 @@
 import numpy as np
+from scipy.linalg import svd
+from scipy.stats import spearmanr, pearsonr
 from sklearn.decomposition import sparse_encode
+import seaborn as sns
+import logging
+import matplotlib.pyplot as plt
+
+Logger = logging.getLogger(__name__)
 
 
 def generate_matrix(n_prot, n_total_pept, p_dense):
@@ -107,10 +114,6 @@ def infer_protein_quant(pept_act, protein_fingerprint, algorithm="lasso_lars"):
     return protein_quant.T
 
 
-import numpy as np
-from scipy.linalg import svd
-
-
 def k_svd(
     pept_act, initial_protein_fingerprint, sparsity_param, max_iterations=100, tol=1e-6
 ):
@@ -203,3 +206,32 @@ def orthogonal_matching_pursuit(dictionary, signal, sparsity_param):
         residual = signal - np.dot(dictionary[:, support], coefs)
 
     return coefficients, support
+
+
+def eval_protein_quant(inferred_protein_quant, true_protein_quant):
+    """
+    Evaluate the inferred protein_quant vector against the true protein_quant vector.
+
+    Parameters:
+    protein_quant (numpy.ndarray): The inferred protein_quant vector, shape (n_prot,)
+    true_protein_quant (numpy.ndarray): The true protein_quant vector, shape (n_prot,)
+
+    Returns:
+    float: The mean squared error between the inferred and true protein_quant vectors
+    """
+    # Convert inputs to shape (x,)
+    if len(inferred_protein_quant.shape) > 1:
+        inferred_protein_quant = inferred_protein_quant.flatten()
+    if len(true_protein_quant.shape) > 1:
+        true_protein_quant = true_protein_quant.flatten()
+    # Calculate Spearman correlation
+    corr, _ = spearmanr(true_protein_quant, inferred_protein_quant)
+    Logger.info("Spearman correlation: %s", corr)
+    pcorr, _ = pearsonr(true_protein_quant, inferred_protein_quant)
+    Logger.info("Pearson correlation: %s", pcorr)
+    sns.scatterplot(
+        x=np.log10(true_protein_quant + 1), y=np.log10(1 + inferred_protein_quant)
+    )
+    # sns.scatterplot(x=protein_quant, y=inferred_protein_quant[:, 0])
+    plt.xlabel("True Quant (log10)")
+    plt.ylabel("Infer Qunat (log10)")
