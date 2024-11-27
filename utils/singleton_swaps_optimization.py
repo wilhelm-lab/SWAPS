@@ -17,8 +17,10 @@ __C.MQ_REF_PATH = ""  # path to MaxQuant reference file, pickle
 __C.FILTER_EXP_BY_RAW_FILE = (
     []
 )  # None for not filtering, "" for filtering by raw file that shares the same name with the data directory
-__C.FILTER_REF_BY_RAW_FILE = False
-# __C.FILTER_REF_BY_RAW_FIEL = ""  # None for not filtering, "" for filtering by raw file that shares the same name with the data directory
+__C.FILTER_REF_BY_RAW_FILE = []
+# empty for not filtering (default),
+# "data" for filtering by raw file that shares the same name with the data directory
+# populated list for filtering by raw file that has a name in the list
 __C.DICT_PICKLE_PATH = ""
 __C.NOTES = ""  # notes for the run
 __C.USE_IMS = True
@@ -34,7 +36,7 @@ __C.PREPARE_DICT.UPDATED_RT_MODEL_PATH = ""
 __C.PREPARE_DICT.UPDATED_IM_MODEL_PATH = ""
 __C.PREPARE_DICT.REF_TYPE = "MQ"  # one of ["MQ", "pred"]
 __C.PREPARE_DICT.TRAIN_FRAC = 0.9
-__C.PREPARE_DICT.RT_TRAIN_EPOCHS = 15
+__C.PREPARE_DICT.RT_TRAIN_EPOCHS = 15  # For nanoflow higher epochs are needed, e.g. 30
 __C.PREPARE_DICT.IM_TRAIN_EPOCHS = 8
 __C.PREPARE_DICT.ADD_IM_INDEX = True
 __C.PREPARE_DICT.KEEP_MATCHED_PRECURSORS = False
