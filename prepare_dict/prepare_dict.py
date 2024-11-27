@@ -931,10 +931,11 @@ def update_alpha_pept_deep_model(
     # init model
     models = ModelManager(device=device)
     models.load_installed_models()
-    if pept_property == "rt":
-        model = models.rt_model
-    elif pept_property == "mobility":
-        model = models.ccs_model
+    match pept_property:
+        case "rt":
+            model = models.rt_model
+        case "mobility":
+            model = models.ccs_model
 
     # train
     model.train(train_df, epoch=epoch, verbose=True, verbose_each_epoch=False)
