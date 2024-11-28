@@ -229,16 +229,16 @@ def inference_and_sum_intensity(
     seg_model.eval()
     cls_model = cls_model.to(device)
     cls_model.eval()
-    Logger.info(
-        "Memory summary after moving models to device: %s", torch.cuda.memory_summary()
-    )
+    # Logger.info(
+    #     "Memory summary after moving models to device: %s", torch.cuda.memory_summary()
+    # )
     # Logger.info("%s", os.system("nvidia-smi"))
     with torch.no_grad():
         torch.cuda.empty_cache()
         gc.collect()
-        Logger.info(
-            "Memory summary with no_grad and gc: %s", torch.cuda.memory_summary()
-        )
+        # Logger.info(
+        #     "Memory summary with no_grad and gc: %s", torch.cuda.memory_summary()
+        # )
         # Logger.info("%s", os.system("nvidia-smi"))
         for image_batch, hint_batch, label_batch in data_loader:
             batch_size, n_channels = label_batch["mask"].size(0), label_batch[
