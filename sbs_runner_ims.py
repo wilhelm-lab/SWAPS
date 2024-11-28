@@ -469,7 +469,7 @@ def opt_scan_by_scan(config_path: str):
             include_decoys=cfg.PREPARE_DICT.GENERATE_DECOY,
         )
         swaps_result.plot_intensity_corr()
-        swaps_result.plot_intensity_corr(contour=True)
+        # swaps_result.plot_intensity_corr(contour=True)
         swaps_result.plot_overlap_with_MQ(show_ref=False, level="precursor")
         swaps_result.plot_overlap_with_MQ(show_ref=False, level="peptide")
         swaps_result.plot_overlap_with_MQ(show_ref=False, level="protein")
