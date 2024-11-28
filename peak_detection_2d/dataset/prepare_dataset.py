@@ -134,6 +134,7 @@ def prepare_2d_act_and_mask_updated(
     maxquant_dict: pd.DataFrame,
     hint_matrix: sparse.SparseArray,
     add_label_mask: bool = True,
+    remove_blank_image: bool = True,
 ):
     """
     Prepare 2D activation and mask for a peptide mz rank
@@ -142,6 +143,9 @@ def prepare_2d_act_and_mask_updated(
     :param maxquant_dict: pd.DataFrame, maxquant results
     :param hint_matrix: SparseArray, hint matrix
     :param add_label_mask: bool, whether to add label mask
+    :param remove_blank_image: bool, whether to keep blank image, \
+        if True blank image get None, suitable for training set preparation;
+        if False, return blank image, suitable for inference set preparation;
     """
     pept_mz_rank = int(pept_mz_rank)
     maxquant_row = maxquant_dict[maxquant_dict["mz_rank"] == pept_mz_rank]
@@ -185,7 +189,7 @@ def prepare_2d_act_and_mask_updated(
         ]
     )
     # only keep the img if not all entries are zero
-    if np.count_nonzero(img) == 0:
+    if remove_blank_image and (np.count_nonzero(img) == 0):
         Logger.warning("Peptide mz rank %s has all zero activation", pept_mz_rank)
         return None
     else:

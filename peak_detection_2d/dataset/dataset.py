@@ -184,6 +184,7 @@ class PeptActPeakSelection_Infer_Dataset(torch.utils.data.Dataset):
             maxquant_dict=self.maxquant_dict,
             hint_matrix=self.hint_matrix,
             add_label_mask=self.add_label_mask,
+            remove_blank_image=False,
         )
         # Logger.debug("datapoint_dict %s", datapoint_dict)
 
