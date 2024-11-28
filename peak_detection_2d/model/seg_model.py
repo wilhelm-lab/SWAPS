@@ -253,7 +253,9 @@ def inference_and_sum_intensity(
                 image_batch_cls = MultiHDF5_MaskDataset.add_ps_channel_to_batch(
                     image_batch.float(), device=device, seg_model=seg_model
                 )
-            cls_out = cls_model(image_batch_cls.float())
+                cls_out = cls_model(image_batch_cls.float())
+            else:
+                cls_out = cls_model(image_batch.float())
             Logger.debug(
                 "out non zero value distribution: %s, %s",
                 seg_out.nonzero().min().item(),
@@ -625,4 +627,4 @@ class UNET(nn.Module):
         # # Classification output
         # cls_out = self.classifier(enc_out)
 
-        return out
+        return out  # TODO: fix this
