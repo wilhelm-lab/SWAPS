@@ -726,33 +726,29 @@ def testset_eval(
 
     # Plot metric distribution
     plot_per_image_metric_distr(
-        test_pred_df_full.loc[
-            ~test_pred_df_full["Decoy"], "per_image_weighted_dice_metric"
-        ],
-        "Target_weighted_dice",
+        test_pred_df_full.loc[~test_pred_df_full["Decoy"]],
+        metric_name="per_image_weighted_dice_metric",
+        dataset_name="Target_weighted_dice",
         save_dir=result_dir,
     )
 
     plot_per_image_metric_distr(
-        test_pred_df_full.loc[
-            test_pred_df_full["Decoy"], "per_image_weighted_dice_metric"
-        ],
-        "Decoy_weighted_dice",
+        test_pred_df_full.loc[test_pred_df_full["Decoy"]],
+        metric_name="per_image_weighted_dice_metric",
+        dataset_name="Decoy_weighted_dice",
         save_dir=result_dir,
     )
     plot_per_image_metric_distr(
-        test_pred_df_full.loc[
-            ~test_pred_df_full["Decoy"], "per_image_weighted_iou_metric"
-        ],
-        "Target_weighted_iou",
+        test_pred_df_full.loc[~test_pred_df_full["Decoy"]],
+        metric_name="per_image_weighted_iou_metric",
+        dataset_name="Target_weighted_iou",
         save_dir=result_dir,
     )
 
     plot_per_image_metric_distr(
-        test_pred_df_full.loc[
-            test_pred_df_full["Decoy"], "per_image_weighted_iou_metric"
-        ],
-        "Decoy_weighted_iou",
+        test_pred_df_full.loc[test_pred_df_full["Decoy"]],
+        metric_name="per_image_weighted_iou_metric",
+        dataset_name="Decoy_weighted_iou",
         save_dir=result_dir,
     )
 
