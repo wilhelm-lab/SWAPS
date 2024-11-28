@@ -17,7 +17,6 @@ from postprocessing.ims_3d import (
     get_bbox_from_mq_exp,
 )
 
-
 Logger = logging.getLogger(__name__)
 
 
@@ -26,6 +25,9 @@ def save_data_points_to_hdf5(futures, output_filename):
     with h5py.File(output_filename, "a") as f:
         for future in tqdm(futures):
             result = future.result()
+            if result is None:
+                Logger.warning("None value detected, skipping.")
+                continue  # skip None values
             # Logger.info("group name: %s", f"pept_mz_rank_{result['pept_mz_rank']}")
             group = f.create_group(f"pept_mz_rank_{result['pept_mz_rank']}")
             for key, value in result.items():
@@ -182,30 +184,35 @@ def prepare_2d_act_and_mask_updated(
             pept_mz_rank,
         ]
     )
-    hint = sparse.asnumpy(
-        hint_matrix[
-            rt_left:rt_right,
-            im_left:im_right,
-            pept_mz_rank,
-        ]
-    )
-    Logger.debug("Peptide mz_rank %s", pept_mz_rank)
-    Logger.debug("Hint sum %s", hint.sum())
-    Logger.debug("Hint non zero %s", np.count_nonzero(hint))
-    mask = mask[rt_left:rt_right, im_left:im_right]
-    Logger.debug("Mask sum %s", mask.sum())
-    # Wrap sample and targets into torchvision tv_tensors:
-    img = tv_tensors.Image(img)
-    hint = tv_tensors.Image(hint)
-    mask = tv_tensors.Image(mask)
-    # Logger.debug("img sum %s", img.sum())
-    return {
-        "data": img,
-        "hint_channel": hint,
-        "mask": mask,
-        "pept_mz_rank": pept_mz_rank,
-        "target": target,
-    }
+    # only keep the img if not all entries are zero
+    if np.count_nonzero(img) == 0:
+        Logger.warning("Peptide mz rank %s has all zero activation", pept_mz_rank)
+        return None
+    else:
+        hint = sparse.asnumpy(
+            hint_matrix[
+                rt_left:rt_right,
+                im_left:im_right,
+                pept_mz_rank,
+            ]
+        )
+        Logger.debug("Peptide mz_rank %s", pept_mz_rank)
+        Logger.debug("Hint sum %s", hint.sum())
+        Logger.debug("Hint non zero %s", np.count_nonzero(hint))
+        mask = mask[rt_left:rt_right, im_left:im_right]
+        Logger.debug("Mask sum %s", mask.sum())
+        # Wrap sample and targets into torchvision tv_tensors:
+        img = tv_tensors.Image(img)
+        hint = tv_tensors.Image(hint)
+        mask = tv_tensors.Image(mask)
+        # Logger.debug("img sum %s", img.sum())
+        return {
+            "data": img,
+            "hint_channel": hint,
+            "mask": mask,
+            "pept_mz_rank": pept_mz_rank,
+            "target": target,
+        }
 
 
 def process_pept_mz_ranks(
@@ -428,6 +435,7 @@ def prepare_training_dataset(
     arg_min: str | None = "Escherichia coli K-12",
     arg_sample: List[str] | None = ["Homo sapiens", "Saccharomyces cerevisiae"],
     dataset_name: str = "train_datapoints_TD",
+    pept_batch_indices_filtered: List[int] = None,
 ):
 
     # Create output directory
@@ -518,6 +526,9 @@ def prepare_training_dataset(
         add_label_mask = False
 
     hdf5_file_paths = []
+    if pept_batch_indices_filtered is not None:
+        pept_batch_indicies = pept_batch_indices_filtered
+        Logger.info("Using filtered pept batch indices: %s", pept_batch_indicies)
     for pept_batch in pept_batch_indicies:
 
         pept_mz_ranks = maxquant_dict_for_training.loc[
@@ -555,6 +566,16 @@ def prepare_training_dataset(
                 num_workers=n_workers,  # Adjust based on your system's capabilities
                 add_label_mask=add_label_mask,
             )
+            # # remove None values --> doesn't work since the list is futures
+            # Logger.info(
+            #     "Removing None values from list of data points, before %s",
+            #     len(list_of_data_points),
+            # )
+            # list_of_data_points = [x for x in list_of_data_points if x is not None]
+            # Logger.info(
+            #     "After removing None values, %s data points remained.",
+            #     len(list_of_data_points),
+            # )
             save_data_points_to_hdf5(list_of_data_points, hdf5_file_path)
             del list_of_data_points
         hdf5_file_paths.append(hdf5_file_path)
