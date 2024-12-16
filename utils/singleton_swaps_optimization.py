@@ -34,7 +34,7 @@ __C.PREPARE_DICT = ConfigurationNode()
 __C.PREPARE_DICT.DICT_PICKLE_PATH = ""
 __C.PREPARE_DICT.UPDATED_RT_MODEL_PATH = ""
 __C.PREPARE_DICT.UPDATED_IM_MODEL_PATH = ""
-__C.PREPARE_DICT.REF_TYPE = "MQ"  # one of ["MQ", "pred"]
+__C.PREPARE_DICT.REF_TYPE = "MQ"  # the source of dictionary / library / reference, shoud be one of ["MQ", "pred"]; "MQ" for MaxQuant search result, "pred" for predicted library
 __C.PREPARE_DICT.TRAIN_FRAC = 0.9
 __C.PREPARE_DICT.RT_TRAIN_EPOCHS = 15  # For nanoflow higher epochs are needed, e.g. 30
 __C.PREPARE_DICT.IM_TRAIN_EPOCHS = 8
@@ -42,7 +42,7 @@ __C.PREPARE_DICT.ADD_IM_INDEX = True
 __C.PREPARE_DICT.KEEP_MATCHED_PRECURSORS = False
 __C.PREPARE_DICT.RT_REF = "pred"  # How to calc ref RT, one of ["pred", "exp", "mix"]
 __C.PREPARE_DICT.IM_REF = (
-    "ref"  # How to calc ref IM, one of ["exp", "pred", "mixs", "ref"]
+    "ref"  # How to calc ref IM, one of ["exp", "pred", "mixs", "ref", "pred_lr"]
 )
 __C.PREPARE_DICT.RT_TOL = (
     -0.1
@@ -84,7 +84,9 @@ __C.PEAK_SELECTION.ENABLE = False
 __C.PEAK_SELECTION.DEBUG = False
 __C.PEAK_SELECTION.TRAINING_DATA = []
 __C.PEAK_SELECTION.REF_TRAINING_DATA = []
-__C.PEAK_SELECTION.TRAINING_DATA_SOURCE = ["both"]
+__C.PEAK_SELECTION.TRAINING_DATA_SOURCE = [
+    "both"
+]  # list with values from ["both", "ref", "exp"]
 __C.PEAK_SELECTION.EVAL_ON_TEST = True
 __C.PEAK_SELECTION.INCLUDE_DECOYS = True
 __C.PEAK_SELECTION.EXP_DIR_NAME = ""

@@ -26,6 +26,7 @@ from utils.metrics import RT_metrics
 import numpy as np
 from alphabase.psm_reader import psm_reader_provider
 from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LinearRegression
 from peptdeep.pretrained_models import ModelManager
 
 Logger = logging.getLogger(__name__)
@@ -114,7 +115,7 @@ def merge_ref_and_exp(
             # "Time_minute_right_ref",
             # "Time_minute_center_ref",
         ]
-    elif ref_type == "pred":
+    elif ref_type in ["pred"]:
         ref_spec_columns = []
     Logger.info("Maxquant_ref_df columns: %s", maxquant_ref_df.columns)
     Logger.info("Maxquant_exp_df columns: %s", maxquant_exp_df.columns)
@@ -733,7 +734,7 @@ def _get_im_idx_span_from_values(mobility_values_df: pd.DataFrame, im_length: fl
 def _define_im_idx_search_range(
     maxquant_df: pd.DataFrame,
     im_length: int,
-    im_ref: Literal["exp", "pred", "mix", "ref"],
+    im_ref: Literal["exp", "pred", "mix", "ref", "pred_lr"],
     im_idx_range: tuple[float, float],
     delta_im_95: float | None = None,
     mobility_values_df: pd.DataFrame | None = None,
@@ -758,7 +759,7 @@ def _define_im_idx_search_range(
             maxquant_df["IM_search_idx_center"] = maxquant_df[
                 "mobility_values_index_center_exp"
             ]
-        case "pred":
+        case "pred" | "pred_lr":  # Use predicted IM, expand with delta_im_95s
             assert "mobility_pred" in maxquant_df.columns
             assert mobility_values_df is not None
             assert delta_im_95 is not None and delta_im_95 > 0
@@ -1026,6 +1027,74 @@ def dict_add_alpha_pept_pred(
     return maxquant_dict_new
 
 
+def dict_add_im_lr_pred(
+    maxquant_dict: pd.DataFrame,
+    train_frac: float,
+    random_state: int,
+):
+    """
+    Add experimental IM prediction from linear regression based
+    on reference IM values.
+
+    When reference IM values are not available,
+    the prediction is inferred using experimental IM values.
+    Which essentially adds noise to the true value.
+
+    Outputs maxquant_dict with additional column 'mobility_pred'
+    """
+
+    # select the precursors appearing in both ref and exp for training and testing
+
+    both = maxquant_dict.loc[
+        (maxquant_dict["source"] == "both") & (~maxquant_dict["Decoy"])
+    ].copy()
+    Logger.info("both dataframe size: %s", both.shape)
+    LR_base = RT_metrics(
+        both["mobility_values_center_ref"], both["mobility_values_center_exp"]
+    )
+    base_delta95 = LR_base.CalcDeltaRTwidth()
+    both_train, both_test = train_test_split(
+        both, test_size=1 - train_frac, random_state=random_state
+    )
+    reg = LinearRegression().fit(
+        both_train["mobility_values_center_ref"].values.reshape(-1, 1),
+        both_train["mobility_values_center_exp"].values.reshape(-1, 1),
+    )
+    both_train["mobility_values_center_pred"] = reg.predict(
+        both_train["mobility_values_center_ref"].values.reshape(-1, 1)
+    )
+    LR_train = RT_metrics(
+        RT_obs=both_train["mobility_values_center_exp"],
+        RT_pred=both_train["mobility_values_center_pred"],
+    )
+    train_delta95 = LR_train.CalcDeltaRTwidth()
+    both_test["mobility_values_center_pred"] = reg.predict(
+        both_test["mobility_values_center_ref"].values.reshape(-1, 1)
+    )
+    LR_test = RT_metrics(
+        RT_obs=both_test["mobility_values_center_exp"],
+        RT_pred=both_test["mobility_values_center_pred"],
+    )
+    test_delta95 = LR_test.CalcDeltaRTwidth()
+    Logger.info(
+        "Delta95 base: %s, for training set: %s, for testing set: %s",
+        base_delta95,
+        train_delta95,
+        test_delta95,
+    )
+    maxquant_dict.loc[maxquant_dict["source"] != "exp", "mobility_pred"] = reg.predict(
+        maxquant_dict.loc[
+            maxquant_dict["source"] != "exp", "mobility_values_center_ref"
+        ].values.reshape(-1, 1)
+    )
+    maxquant_dict.loc[maxquant_dict["source"] == "exp", "mobility_pred"] = reg.predict(
+        maxquant_dict.loc[
+            maxquant_dict["source"] == "exp", "mobility_values_center_exp"
+        ].values.reshape(-1, 1)
+    )
+    return maxquant_dict, test_delta95
+
+
 def construct_dict(
     cfg_prepare_dict,
     filter_exp_by_raw_file: List[str],
@@ -1104,26 +1173,6 @@ def construct_dict(
     )
     maxquant_exp_df.to_csv(maxquant_exp_filtered_path, sep="\t")
 
-    # # retrain model
-    # if len(cfg_prepare_dict.UPDATED_MODEL_PATH) == 0:
-    #     Logger.info("Retraining RT model")
-    #     delta_rt_95, model_path = update_rt_model(
-    #         train_maxquant_df=maxquant_exp_df,
-    #         train_dir=rt_transfer_dir,
-    #         train_frac=cfg_prepare_dict.TRAIN_FRAC,
-    #         seed=random_seed,
-    #         keep_matched_precursors=cfg_prepare_dict.KEEP_MATCHED_PRECURSORS,
-    #         save_model_name="updated",
-    #     )  # delta rt 95 is one side
-    #     cfg_prepare_dict.UPDATED_MODEL_PATH = model_path
-    #     if cfg_prepare_dict.RT_TOL < 0:
-    #         cfg_prepare_dict.RT_TOL = delta_rt_95.item()
-    # else:
-    #     Logger.info("Using existing RT model")
-    #     delta_rt_95 = cfg_prepare_dict.RT_TOL
-
-    # retrain model w/ AlphaPeptDeep
-    # prepare train and test df: from maxquant_exp_df
     _LOADED_ALPHA_DATASET = False
     # RT
     if cfg_prepare_dict.RT_REF == "pred":
@@ -1214,15 +1263,6 @@ def construct_dict(
         ref_type=ref_type,
     )
 
-    # maxquant_dict = dict_add_rt_pred(
-    #     updated_models=cfg_prepare_dict.UPDATED_MODEL_PATH,
-    #     deeplc_train_path=os.path.join(rt_transfer_dir, "deeplc_train.csv"),
-    #     maxquant_df=maxquant_dict,
-    #     save_dir=construct_dict_dir,
-    #     keep_matched_precursors=cfg_prepare_dict.KEEP_MATCHED_PRECURSORS,
-    #     filter_by_rt_diff=None,  # TODO: no filter atm
-    # )
-
     # generate decoy first and then predict RT and IM
     if cfg_prepare_dict.GENERATE_DECOY:
         Logger.info("Generating decoy")
@@ -1252,24 +1292,24 @@ def construct_dict(
         )
 
     # add im pred
-    if cfg_prepare_dict.IM_REF == "pred":
-        maxquant_dict = dict_add_alpha_pept_pred(
-            model_path=cfg_prepare_dict.UPDATED_IM_MODEL_PATH,
-            pept_property="mobility",
-            dict_for_pred_path=dict_path,
-            maxquant_dict=maxquant_dict,
-            lc_grad=cfg_prepare_dict.RT_MAX,
-            device=device,
-        )
+    match cfg_prepare_dict.IM_REF:
+        case "pred":
+            maxquant_dict = dict_add_alpha_pept_pred(
+                model_path=cfg_prepare_dict.UPDATED_IM_MODEL_PATH,
+                pept_property="mobility",
+                dict_for_pred_path=dict_path,
+                maxquant_dict=maxquant_dict,
+                lc_grad=cfg_prepare_dict.RT_MAX,
+                device=device,
+            )
+        case "pred_lr":
+            maxquant_dict, delta_im_95 = dict_add_im_lr_pred(
+                maxquant_dict,
+                train_frac=cfg_prepare_dict.TRAIN_FRAC,
+                random_state=random_seed,
+            )
+            cfg_prepare_dict.DELTA_IM_95 = delta_im_95.item()
 
-    # maxquant_dict = maxquant_dict.sort_values("mobility_pred")
-    # maxquant_dict = pd.merge_asof(
-    #     left=maxquant_dict,
-    #     right=mobility_values_df[["mobility_values_index", "mobility_values"]],
-    #     left_on="mobility_pred",
-    #     right_on="mobility_values",
-    #     direction="nearest",
-    # )
     maxquant_dict = maxquant_dict.rename(
         mapper={"mobility_values_index": "mobility_pred_idx"}, axis=1
     )
@@ -1347,32 +1387,3 @@ def get_mzrank_batch_cutoff(maxquant_dict_df: pd.DataFrame):
         max_min_mz_rank["max"].values[-1] + 1
     )  # end at the last, +1 to include the last
     return cutoff
-
-
-# if __name__ == "__main__":
-#     logging.basicConfig(
-#         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-#         level=logging.INFO,
-#     )
-#     try:
-#         arguments = docopt(
-#             __doc__, argv=None, help=False, version=None, options_first=False
-#         )
-#         print("Arguments parsed:")
-#         print(arguments)
-
-#         # Load config
-#         cfg_path = arguments["--config_path"]
-#         cfg = get_cfg_defaults(swaps_optimization_cfg)
-#         if cfg_path is not None:
-#             cfg.merge_from_file(cfg_path)
-#             print(f"Config file loaded: {cfg_path}")
-
-#         # Prepare dictionary
-#         maxquant_dict_df, delta_rt_95, dict_pickle_path = construct_dict(
-#             cfg.PREPARE_DICT
-#         )
-#     except Exception as e:
-#         print(f"Error: {e}")
-#         print(__doc__)
-#         raise
