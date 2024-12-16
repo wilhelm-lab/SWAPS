@@ -6,6 +6,7 @@ notebooks/wandb/*
 notebooks/dev*.ipynb
 notebooks/ref*.ipynb
 notebooks/exp*.ipynb
+notebooks/*.txt
 wandb/*
 .vscode/*
 notebooks/my_dir/*
