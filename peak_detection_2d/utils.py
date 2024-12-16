@@ -113,13 +113,16 @@ def plot_data_points(
     # ax = sns.heatmap(dp_dict["data"], cmap="icefire")
     fig, ax = plt.subplots()
     if "data" in dp_dict:
+        if len(dp_dict["data"].shape) == 3:
+            dp_dict["data"] = dp_dict["data"][0]
         if log_data:
             heatmap = ax.imshow(np.log(dp_dict["data"] + 1), cmap="binary")
         else:
             heatmap = ax.imshow(dp_dict["data"], cmap="binary")
 
     if "hint_channel" in dp_dict:
-
+        if len(dp_dict["hint_channel"].shape) == 3:
+            dp_dict["hint_channel"] = dp_dict["hint_channel"][0]
         # Logger.info("Peptide mz rank: %s", dp_dict["pept_mz_rank"])
         # Define colors with transparency: -1 is blue, 0 is translucent white, 1 is red
         colors = [
@@ -165,6 +168,9 @@ def plot_data_points(
                 )
             )
         case "mask":
+            if len(dp_dict["mask"].shape) == 3:
+                dp_dict["mask"] = dp_dict["mask"][0]
+            Logger.info("Mask sum: %s", dp_dict["mask"].sum().item())
             ax.imshow(dp_dict["mask"], cmap="Blues", alpha=0.3, label="true")
         case "hide":
             pass
