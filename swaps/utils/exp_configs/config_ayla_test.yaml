@@ -1,0 +1,31 @@
+RESULT_PATH: /cmnfs/proj/ORIGINS/SWAPS_exp/test_thermo/test_ayla
+ADD_TIMESTAMP_TO_RESULT_PATH: true
+DATA_PATH: /cmnfs/data/proteomics/origin/ayla_proteometools_subset/01709a_GB1-TUM_first_pool_100_01_01-DDA-1h-R1.mzML
+DEBUG: false
+DICT_PICKLE_PATH: ''
+EXPORT_DATA_HDF5_DIR: ''
+MQ_REF_PATH: /cmnfs/data/proteomics/origin/ayla_proteometools_subset/TUM_first_pool_100_01_01_DDA-1h-R1-tryptic/evidence.txt
+FILTER_REF_BY_RAW_FILE: ['01709a_GB1-TUM_first_pool_100_01_01-DDA-1h-R1']
+MQ_EXP_PATH: /cmnfs/data/proteomics/origin/ayla_proteometools_subset/TUM_first_pool_100_01_01_DDA-1h-R1-tryptic/evidence.txt
+FILTER_EXP_BY_RAW_FILE: []
+USE_IMS: false
+N_CPU: 5
+OPTIMIZATION:
+  N_BLOCKS_BY_PEPT: 1
+  N_BATCH: 5
+PREPARE_DICT:
+  DICT_PICKLE_PATH: ''
+  FILTER_PRED_BY_RAW_FILE: ''
+  FILTER_TRAIN_BY_RAW_FILE: ''
+  GENERATE_DECOY: false
+  ISO_MIN_AB_THRES: 0.01
+  KEEP_MATCHED_PRECURSORS: false 
+  MZ_BIN_DIGITS: 2
+  RT_REF: exp
+  RT_TOL: 0.01
+RANDOM_SEED: 42
+PEAK_SELECTION:
+  ENABLE: false
+RESULT_ANALYSIS:
+  ENABLE: true
+
