@@ -13,9 +13,10 @@ from utils.ims_utils import (
     export_im_and_ms1scans,
     combine_3d_act_and_sum_int,
 )
+from utils.tools import load_mzml
 from utils.config import get_cfg_defaults
 from utils.singleton_swaps_optimization import swaps_optimization_cfg
-from optimization.inference import process_ims_frames_parallel, generate_id_partitions
+from optimization.inference import process_frames_parallel, generate_id_partitions
 from peak_detection_2d.dataset.prepare_dataset import prepare_training_dataset
 from peak_detection_2d.infer_on_pept_act import infer_on_pept_act
 from peak_detection_2d.train import train
@@ -59,9 +60,12 @@ def opt_scan_by_scan(config_path: str):
     if cfg.OPTIMIZATION.N_BATCH < 0:
         cfg.OPTIMIZATION.N_BATCH = cfg.N_CPU  # set batches as the same as N_CPU
     # Load data
-    data, hdf_file_name = load_dotd_data(
-        cfg.DATA_PATH, swaps_result_dir=cfg.EXPORT_DATA_HDF5_DIR
-    )
+    if cfg.USE_IMS:
+        data, hdf_file_name = load_dotd_data(
+            cfg.DATA_PATH, swaps_result_dir=cfg.EXPORT_DATA_HDF5_DIR
+        )
+    else:
+        data = load_mzml(cfg.DATA_PATH, unify_format=True)
     if cfg.DICT_PICKLE_PATH != "":
         maxquant_result_ref = pd.read_pickle(filepath_or_buffer=cfg.DICT_PICKLE_PATH)
         ms1scans = pd.read_csv(os.path.join(cfg.RESULT_PATH, "ms1scans.csv"))
@@ -71,26 +75,27 @@ def opt_scan_by_scan(config_path: str):
     else:
         # Get the lowest level directory name with .d extension
         dir_with_extension = os.path.basename(os.path.normpath(cfg.DATA_PATH))
+        dir_wo_extension = dir_with_extension.split(".")[0]
         if (
             len(cfg.FILTER_EXP_BY_RAW_FILE) == 0
         ):  # if not specified, get the lowest level directory name with .d extension, by default None
-            cfg.FILTER_EXP_BY_RAW_FILE.append(dir_with_extension.rstrip(".d"))
-
-        ms1scans, mobility_values_df = export_im_and_ms1scans(
-            data=data, swaps_result_dir=cfg.RESULT_PATH
-        )
+            cfg.FILTER_EXP_BY_RAW_FILE.append(dir_wo_extension)
+            if dir_with_extension.endswith(".d"):
+                ms1scans, mobility_values_df = export_im_and_ms1scans(
+                    data=data, swaps_result_dir=cfg.RESULT_PATH
+                )
+            elif dir_with_extension.endswith(".mzML"):
+                ms1scans = data
+                mobility_values_df = None
         maxquant_result_ref = pd.read_csv(cfg.MQ_REF_PATH, sep="\t", low_memory=False)
-        # TODO filter ref df if needed
         if len(cfg.FILTER_REF_BY_RAW_FILE) > 0:
             if cfg.FILTER_REF_BY_RAW_FILE[0] == "data":
                 maxquant_result_ref = maxquant_result_ref[
-                    maxquant_result_ref["Raw file"].isin(
-                        [dir_with_extension.rstrip(".d")]
-                    )
+                    maxquant_result_ref["Raw file"].isin([dir_wo_extension])
                 ]
                 logging.info(
                     "Filtered reference maxquant result by raw file: %s, resulting ref rows: %s",
-                    dir_with_extension.rstrip(".d"),
+                    dir_wo_extension,
                     maxquant_result_ref.shape[0],
                 )
             else:
@@ -107,6 +112,7 @@ def opt_scan_by_scan(config_path: str):
             filter_exp_by_raw_file=cfg.FILTER_EXP_BY_RAW_FILE,
             maxquant_exp_path=cfg.MQ_EXP_PATH,
             # maxquant_exp_df=maxquant_result_exp,
+            use_ims=cfg.USE_IMS,
             maxquant_ref_df=maxquant_result_ref,
             result_dir=os.path.join(cfg.RESULT_PATH),
             mobility_values_df=mobility_values_df,
@@ -119,15 +125,22 @@ def opt_scan_by_scan(config_path: str):
         logging.info(
             "Peptide batch index: %s", maxquant_result_ref["pept_batch_idx"].unique()
         )
-        peptact_shape = (
-            (
-                len(ms1scans.index.values)
-                + 1,  # this index is rank, starting from 1, add 1 for the last frame
-                len(mobility_values_df),
+        if cfg.USE_IMS:
+            peptact_shape = (
+                (
+                    len(ms1scans.index.values)
+                    + 1,  # this index is rank, starting from 1, add 1 for the last frame
+                    len(mobility_values_df),
+                    len(maxquant_result_ref.mz_rank)
+                    + 1,  # this index is rank, starting from 1, add 1 for the last frame
+                ),
+            )
+        else:
+            peptact_shape = (
+                len(ms1scans.index.values) + 1,  # this index is rank, starting from 1
                 len(maxquant_result_ref.mz_rank)
-                + 1,  # this index is rank, starting from 1, add 1 for the last frame
-            ),
-        )
+                + 1,  # this index is rank, starting from 1
+            )
         cfg.PREPARE_DICT = cfg_prepare_dict
         cfg.DICT_PICKLE_PATH = dict_pickle_path
         cfg.OPTIMIZATION.PEPTACT_SHAPE = peptact_shape
@@ -183,7 +196,7 @@ def opt_scan_by_scan(config_path: str):
             logging.info("indices in first batch: %s", batch_scan_indices[0])
             # process scans
             cutoff = get_mzrank_batch_cutoff(maxquant_result_ref)
-            process_ims_frames_parallel(
+            process_frames_parallel(
                 data=data,
                 n_jobs=cfg.N_CPU,
                 ms1scans=ms1scans,
@@ -198,6 +211,7 @@ def opt_scan_by_scan(config_path: str):
                 save_dir=act_dir,
                 return_im_pept_act=True,
                 extract_im_peak=False,
+                use_ims=cfg.USE_IMS,
             )
 
             minutes, seconds = divmod(time.time() - start_time, 60)
@@ -213,9 +227,10 @@ def opt_scan_by_scan(config_path: str):
                 n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
                 n_batch=cfg.OPTIMIZATION.N_BATCH,
                 act_dir=act_dir,
-                remove_batch_file=False,
+                remove_batch_file=True,
                 calc_pept_act_sum_filter_by_im=cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM,
                 maxquant_result_ref=maxquant_result_ref,
+                use_ims=cfg.USE_IMS,
             )
 
     if cfg.PEAK_SELECTION.ENABLE:
