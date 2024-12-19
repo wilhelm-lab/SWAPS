@@ -222,7 +222,7 @@ def match_time_to_scan(
     return df
 
 
-def load_mzml(msconvert_file: str):
+def load_mzml(msconvert_file: str, unify_format: bool = False):
     """
     read data from mzml format
 
@@ -260,10 +260,22 @@ def load_mzml(msconvert_file: str):
         mzarray = [x.tolist() for x in mzarray]
         intarray = [x.tolist() for x in intarray]
         col_set = ["ind", "mslev", "bpmz", "bpint", "starttime", "mzarray", "intarray"]
+
         df_ms1 = pd.DataFrame(
             list(zip(ind, mslev, bpmz, bpint, starttime, mzarray, intarray)),
             columns=col_set,
         )
+        if unify_format:
+            df_ms1.rename(
+                mapper={
+                    "starttime": "Time_minute",
+                    "ind": "Id",
+                    "bpint": "MaxIntensity",
+                },
+                axis=1,
+                inplace=True,
+            )
+            df_ms1["MS1_frame_idx"] = df_ms1["Id"]
         Logger.info("Saving data to pickle file")
         df_ms1.to_pickle(msconvert_file[:-5] + ".pkl")
 

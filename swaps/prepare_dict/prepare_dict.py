@@ -38,6 +38,7 @@ def merge_ref_and_exp(
     maxquant_exp_df: pd.DataFrame,
     save_dir: str,
     ref_type: str = ["MQ", "pred"],
+    use_ims: bool = True,
 ):
     """Merge dictionaries from multiple files using Modified sequence and Charge"""
     # evaluate the elution counts of the experiment file
@@ -174,14 +175,6 @@ def merge_ref_and_exp(
 
 def _mutate_seq(seq):
 
-    # Logger.debug(
-    #     "Mutated sequence: %s, %s, %s, %s, %s",
-    #     seq[0],
-    #     decoy_mutation_rule[seq[1]],
-    #     seq[2:-2],
-    #     decoy_mutation_rule[seq[-2]],
-    #     seq[-1],
-    # )
     return (
         seq[0]
         + decoy_mutation_rule[seq[1]]
@@ -1214,6 +1207,7 @@ def construct_dict(
     # maxquant_exp_df: pd.DataFrame,
     result_dir: str = None,
     mobility_values_df: pd.DataFrame = None,
+    use_ims: bool = True,
     rt_values_df: pd.DataFrame = None,
     random_seed: int = 42,
     n_blocks_by_pept: int = 1,
@@ -1244,16 +1238,25 @@ def construct_dict(
         maxquant_exp_df.shape,
     )
     if not keep_matched_precursors:
-        maxquant_exp_df = maxquant_exp_df.loc[
-            maxquant_exp_df["Type"].isin(["TIMS-MULTI-MSMS"])
-        ]
+        if use_ims:
+            maxquant_exp_df = maxquant_exp_df.loc[
+                maxquant_exp_df["Type"].isin(["TIMS-MULTI-MSMS"])
+            ]
+            maxquant_ref_df = maxquant_ref_df.loc[
+                maxquant_ref_df["Type"].isin(["TIMS-MULTI-MSMS"])
+            ]
+        else:
+            maxquant_exp_df = maxquant_exp_df.loc[
+                maxquant_exp_df["Type"].isin(["MULTI-MSMS", "MSMS"])
+            ]
+            maxquant_ref_df = maxquant_ref_df.loc[
+                maxquant_ref_df["Type"].isin(["MULTI-MSMS", "MSMS"])
+            ]
         Logger.info(
             "maxquant_exp_df size after removing matched precursors: %s",
             maxquant_exp_df.shape,
         )
-        maxquant_ref_df = maxquant_ref_df.loc[
-            maxquant_ref_df["Type"].isin(["TIMS-MULTI-MSMS"])
-        ]
+
         Logger.info(
             "maxquant_ref_df size after removing matched precursors: %s",
             maxquant_ref_df.shape,
@@ -1263,21 +1266,23 @@ def construct_dict(
         rt_values_df["Time_minute"].max(),
     )
     Logger.info("RT index range: %s", rt_range)
-    im_range = (
-        mobility_values_df["mobility_values"].min(),
-        mobility_values_df["mobility_values"].max(),
-    )
-    im_idx_range = (
-        mobility_values_df["mobility_values_index"].min(),
-        mobility_values_df["mobility_values_index"].max(),
-    )
-    Logger.info("IM index range: %s", im_range)
     construct_dict_dir = os.path.join(result_dir, "construct_dict")
     rt_transfer_dir = os.path.join(construct_dict_dir, "RT_transfer_learn")
-    im_transfer_dir = os.path.join(construct_dict_dir, "IM_transfer_learn")
     os.makedirs(construct_dict_dir, exist_ok=True)
     os.makedirs(rt_transfer_dir, exist_ok=True)
-    os.makedirs(im_transfer_dir, exist_ok=True)
+    if use_ims:
+        im_range = (
+            mobility_values_df["mobility_values"].min(),
+            mobility_values_df["mobility_values"].max(),
+        )
+        im_idx_range = (
+            mobility_values_df["mobility_values_index"].min(),
+            mobility_values_df["mobility_values_index"].max(),
+        )
+        Logger.info("IM index range: %s", im_range)
+
+        im_transfer_dir = os.path.join(construct_dict_dir, "IM_transfer_learn")
+        os.makedirs(im_transfer_dir, exist_ok=True)
     maxquant_exp_filtered_path = os.path.join(
         construct_dict_dir, "maxquant_exp_filtered.txt"
     )
@@ -1313,7 +1318,7 @@ def construct_dict(
             Logger.info("Using existing RT model")
             delta_rt_95 = cfg_prepare_dict.RT_TOL
     # IM
-    if cfg_prepare_dict.IM_REF == "pred":
+    if use_ims and cfg_prepare_dict.IM_REF == "pred":
         if cfg_prepare_dict.UPDATED_IM_MODEL_PATH == "":
             Logger.info("Retraining IM model with AlphaPeptDeep")
             if not _LOADED_ALPHA_DATASET:
@@ -1372,6 +1377,7 @@ def construct_dict(
         maxquant_exp_df=maxquant_exp_df,
         save_dir=construct_dict_dir,
         ref_type=ref_type,
+        use_ims=use_ims,
     )
 
     # generate decoy first and then predict RT and IM
@@ -1467,14 +1473,14 @@ def construct_dict(
         )  # TODO: currently using only exp IM length
         cfg_prepare_dict.IM_LENGTH = im_length
 
-    maxquant_dict = _define_im_idx_search_range(
-        maxquant_df=maxquant_dict,
-        im_length=cfg_prepare_dict.IM_LENGTH,
-        im_ref=cfg_prepare_dict.IM_REF,
-        im_idx_range=im_idx_range,
-        delta_im_95=cfg_prepare_dict.DELTA_IM_95,
-        mobility_values_df=mobility_values_df,
-    )
+        maxquant_dict = _define_im_idx_search_range(
+            maxquant_df=maxquant_dict,
+            im_length=cfg_prepare_dict.IM_LENGTH,
+            im_ref=cfg_prepare_dict.IM_REF,
+            im_idx_range=im_idx_range,
+            delta_im_95=cfg_prepare_dict.DELTA_IM_95,
+            mobility_values_df=mobility_values_df,
+        )
     maxquant_dict = _define_rt_search_range(
         maxquant_result_dict=maxquant_dict,
         rt_tol=float(cfg_prepare_dict.RT_TOL),
