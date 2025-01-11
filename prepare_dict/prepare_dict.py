@@ -753,7 +753,7 @@ def _get_im_idx_span_from_values(mobility_values_df: pd.DataFrame, im_length: fl
 def _define_im_idx_search_range(
     maxquant_df: pd.DataFrame,
     im_length: int,
-    im_ref: Literal["exp", "pred", "mix", "ref", "pred_lr"],
+    im_ref: Literal["exp", "pred", "mix", "ref", "align_lr"],
     im_idx_range: tuple[float, float],
     delta_im_95: float | None = None,
     mobility_values_df: pd.DataFrame | None = None,
@@ -778,7 +778,7 @@ def _define_im_idx_search_range(
             maxquant_df["IM_search_idx_center"] = maxquant_df[
                 "mobility_values_index_center_exp"
             ]
-        case "pred" | "pred_lr":  # Use predicted IM, expand with delta_im_95s
+        case "pred" | "align_lr":  # Use predicted IM, expand with delta_im_95s
             assert "mobility_pred" in maxquant_df.columns
             assert mobility_values_df is not None
             assert delta_im_95 is not None and delta_im_95 > 0
@@ -1322,7 +1322,7 @@ def construct_dict(
                 lc_grad=cfg_prepare_dict.RT_MAX,
                 device=device,
             )
-        case "pred_lr":
+        case "align_lr":
             maxquant_dict, delta_im_95 = dict_add_im_lr_pred(
                 maxquant_dict,
                 train_frac=cfg_prepare_dict.TRAIN_FRAC,
