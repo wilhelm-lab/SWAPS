@@ -89,22 +89,74 @@ def merge_ref_and_exp(
     both_unique_rows = both_unique_rows.drop(columns=["_merge"])
 
     # Optionally, you can merge the unique rows back to the original ref dataframe
-    ref_unqiue_df = maxquant_ref_df.merge(
+    ref_unique_df = maxquant_ref_df.merge(
         ref_unique_rows, on=join_on_columns, how="inner"
+    )
+    ref_unique_df = ref_unique_df.rename(
+        columns={
+            "Calibrated retention time start": "Calibrated retention time start_ref",
+            "Calibrated retention time": "Calibrated retention time_ref",
+            "Calibrated retention time finish": "Calibrated retention time finish_ref",
+        }
     )
     exp_unique_df = maxquant_exp_df.merge(
         exp_unique_rows, on=join_on_columns, how="inner"
     )
+    exp_unique_df = exp_unique_df.rename(
+        columns={
+            "Calibrated retention time start": "Calibrated retention time start_exp",
+            "Calibrated retention time": "Calibrated retention time_exp",
+            "Calibrated retention time finish": "Calibrated retention time finish_exp",
+        }
+    )
     if ref_type == "MQ":
+        ref_spec_columns = [  # Not including Time_minute and MS1_frame_idx since ref should be mapped to ref ms1scan, not exp
+            # "Time_minute_left_ref",
+            # "Time_minute_right_ref",
+            # "Time_minute_center_ref",
+            # "MS1_frame_idx_left_ref",
+            # "MS1_frame_idx_right_ref",
+            # "MS1_frame_idx_center_ref",
+            # "MS1_frame_idx_left",
+            # "MS1_frame_idx_right",
+            # "MS1_frame_idx_center",
+            "Calibrated retention time start",
+            "Calibrated retention time",
+            "Calibrated retention time finish",
+            # "mobility_values_left_ref",
+            # "mobility_values_right_ref",
+            # "mobility_values_center_ref",
+        ]
         if use_ims:
-            ref_spec_columns = [
+            ref_spec_columns += [
                 "mobility_values_index_left_ref",
                 "mobility_values_index_right_ref",
                 "mobility_values_index_center_ref",
+                # "mobility_values_left_ref",
+                # "mobility_values_right_ref",
                 "mobility_values_center_ref",
             ]
-        else:
-            ref_spec_columns = []
+        # ref_spec_columns = [
+        #     # "MS1_frame_idx_left_ref",
+        #     # "MS1_frame_idx_right_ref",
+        #     # "MS1_frame_idx_center_ref",
+        #     # "MS1_frame_idx_left",
+        #     # "MS1_frame_idx_right",
+        #     # "MS1_frame_idx_center",
+        #     "mobility_values_index_left_ref",
+        #     "mobility_values_index_right_ref",
+        #     "mobility_values_index_center_ref",
+        #     # "mobility_values_left_ref",
+        #     # "mobility_values_right_ref",
+        #     "mobility_values_center_ref",
+        #     # "mobility_values_left_ref",
+        #     # "mobility_values_right_ref",
+        #     # "mobility_values_center_ref",
+        #     # "Time_minute_left_ref",
+        #     # "Time_minute_right_ref",
+        #     # "Time_minute_center_ref",
+        # ]
+        Logger.info("ref spec columns: %s", ref_spec_columns)
     elif ref_type in ["pred"]:
         ref_spec_columns = []
     Logger.info("Maxquant_ref_df columns: %s", maxquant_ref_df.columns)
@@ -113,12 +165,13 @@ def merge_ref_and_exp(
         maxquant_ref_df[join_on_columns + ref_spec_columns],
         on=join_on_columns,
         how="inner",
+        suffixes=("_exp", "_ref"),
     )
     exp_unique_df["source"] = "exp"
-    ref_unqiue_df["source"] = "ref"
+    ref_unique_df["source"] = "ref"
     both_unique_df["source"] = "both"
     maxquant_merge_df = pd.concat(
-        [ref_unqiue_df, exp_unique_df, both_unique_df],
+        [ref_unique_df, exp_unique_df, both_unique_df],
         ignore_index=True,
         axis=0,
         join="outer",
@@ -1242,6 +1295,7 @@ def construct_dict(
             idx_suffix="_exp",
         )
         if ref_type == "MQ":
+            # dict_add_rt_index doesn't work for ref values
             maxquant_ref_df = dict_add_im_index(
                 maxquant_df=maxquant_ref_df,
                 mobility_values_df=mobility_values_df,
