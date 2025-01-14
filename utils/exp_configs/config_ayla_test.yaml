@@ -1,4 +1,4 @@
-RESULT_PATH: /cmnfs/proj/ORIGINS/SWAPS_exp/test_thermo/test_ayla
+RESULT_PATH: /cmnfs/data/proteomics/origin/ayla_proteometools_subset/test_swaps
 ADD_TIMESTAMP_TO_RESULT_PATH: true
 DATA_PATH: /cmnfs/data/proteomics/origin/ayla_proteometools_subset/01709a_GB1-TUM_first_pool_100_01_01-DDA-1h-R1.mzML
 DEBUG: false
