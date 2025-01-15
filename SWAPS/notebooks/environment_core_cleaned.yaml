@@ -1,0 +1,42 @@
+channels:
+- bioconda
+- pytorch
+- nvidia
+- conda-forge
+- defaults
+dependencies:
+- ipython=8.15.0=py310h06a4308_0
+- matplotlib-base=3.7.2=py310h1128e8f_0
+- matplotlib-inline=0.1.6=py310h06a4308_0
+- numpy-base=1.25.0=py310hb5e798b_0
+- pandas_flavor=0.6.0=pyhd8ed1ab_0
+- python=3.10.12=h955ad1f_0
+- python-dateutil=2.8.2=pyhd3eb1b0_0
+- python-fastjsonschema=2.16.2=py310h06a4308_0
+- python-json-logger=2.0.7=pyhd8ed1ab_0
+- python-tzdata=2023.3=pyhd3eb1b0_0
+- python_abi=3.10=2_cp310
+- pytorch=2.3.0=py3.10_cuda11.8_cudnn8.7.0_0
+- pytorch-cuda=11.8=h7e8668a_5
+- pytorch-mutex=1.0=cuda
+- scikit-learn=1.3.0=py310h1128e8f_0
+- torchaudio=2.3.0=py310_cu118
+- torchtriton=2.3.0=py310
+- torchvision=0.18.0=py310_cu118
+- pip:
+  - biopython
+  - gitpython
+  - matplotlib-venn
+  - numpy
+  - opencv-python
+  - pandas
+  - python-decouple
+  - python-dotenv
+  - python-lzf
+  - python-utils
+  - tensorflow-estimator
+  - torch-tb-profiler
+  - torcheval
+  - torchinfo
+  - torchviz
+name: swaps_core_cleaned

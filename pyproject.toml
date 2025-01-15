@@ -1,0 +1,20 @@
+[project]
+name = "SWAPS_tmp_for_xic"
+description = "Corys SWAPS code temporary restructured to be pip installable"
+version = "0.1.0"
+dynamic = ["readme"]
+
+authors = [
+        {name = "Cory", email = "zixuan.xiao@tum.de" },
+]
+
+classifiers=[
+        'Programming Language :: Python :: 3',
+        'Programming Language :: Python :: 3.6',
+        'Programming Language :: Python :: 3.7',
+        'Programming Language :: Python :: 3.8',
+        ]
+
+
+[tool.setuptools.dynamic]
+readme = {file = ["README.md"]}
