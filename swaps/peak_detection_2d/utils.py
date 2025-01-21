@@ -723,7 +723,7 @@ def calc_fdr_and_thres(
     dataset_name="",
     xlim=None,
     mark_x=[0.01, 0.05, 0.1],
-    title: str = None,
+    title: str = "auto",
     font_size: int = 12,
     fig_size: tuple = (8, 6),
     line_width: int = 2,
@@ -766,6 +766,7 @@ def calc_fdr_and_thres(
             font_size,
             fig_size,
             line_width,
+            y_col="N_identified_target",
             **kwargs,
         )
     return pred_df_new
@@ -778,10 +779,11 @@ def plot_fdr_and_id(
     dataset_name: str = "",
     xlim: tuple = None,
     mark_x: list = [0.01, 0.05, 0.1],
-    title: str = None,
+    title: str = "auto",
     font_size: int = 20,
     fig_size: tuple = (8, 6),
     line_width: int = 2,
+    y_col="N_identified_target",
     **kwargs,
 ):
     if "Conf. Score" not in pred_df_new.columns:
@@ -790,7 +792,7 @@ def plot_fdr_and_id(
     plt.rcParams.update({"font.size": font_size})
     ax = sns.scatterplot(
         data=pred_df_new,
-        y="N_identified_target",
+        y=y_col,
         x="fdr",
         hue="Conf. Score",
         edgecolor=None,
@@ -802,7 +804,7 @@ def plot_fdr_and_id(
         spine.set_linewidth(line_width)  # Increase this value for thicker lines
         # Optional: you can also make tick marks thicker
     ax.tick_params(width=line_width)
-    n_target_max = pred_df_new["N_identified_target"].max()
+    n_target_max = pred_df_new[y_col].max()
     plt.vlines(
         x=mark_x,
         ymin=[0, 0, 0],
@@ -810,10 +812,10 @@ def plot_fdr_and_id(
         color="r",
     )
     # Access the legend and set its title
-    plt.ylabel("Identified Targets")
+    plt.ylabel(y_col)
     plt.xlabel("FDR")
-    plt.legend(title="Threshold", loc="center left", bbox_to_anchor=(1, 0.5))
-    if title is None:
+    plt.legend(title="Threshold", bbox_to_anchor=(1, 0.5))
+    if title == "auto":
         if filter_dict is None:
             title = dataset_name + "FDR vs Identified Targets, no filter"
         else:
@@ -825,7 +827,8 @@ def plot_fdr_and_id(
                     [f"{key}: {value}" for key, value in filter_dict.items()]
                 )
             )
-    plt.title(title)
+    if title is not None:
+        plt.title(title)
     if xlim is not None:
         plt.xlim(xlim)
     save_plot(
