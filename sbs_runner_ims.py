@@ -231,6 +231,7 @@ def opt_scan_by_scan(config_path: str):
                 calc_pept_act_sum_filter_by_im=cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM,
                 maxquant_result_ref=maxquant_result_ref,
                 use_ims=cfg.USE_IMS,
+                im_ref=cfg.PREPARE_DICT.IM_REF,
             )
 
     if cfg.PEAK_SELECTION.ENABLE:
