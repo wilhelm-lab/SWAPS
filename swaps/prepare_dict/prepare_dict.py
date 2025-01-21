@@ -1323,7 +1323,8 @@ def construct_dict(
     if cfg_prepare_dict.GENERATE_DECOY:
         Logger.info("Generating decoy")
         maxquant_dict = concat_decoy_and_target(maxquant_dict)
-
+    else:
+        maxquant_dict["Decoy"] = False
     # Do prediction first and then concat target and decoys
     # IM/RT prediction for full dictionary, define RT and IM search range
     dict_path = os.path.join(construct_dict_dir, "maxquant_dict_for_pred.txt")
@@ -1420,6 +1421,8 @@ def construct_dict(
         maxquant_dict, ab_thres=cfg_prepare_dict.ISO_MIN_AB_THRES
     )
     maxquant_dict = dict_add_mz_rank(maxquant_dict_df=maxquant_dict)
+    if not cfg_prepare_dict.GENERATE_DECOY:
+        maxquant_dict["TD pair id"] = maxquant_dict["mz_rank"]
     maxquant_dict = dict_add_mz_bin(
         maxquant_dict_df=maxquant_dict,
         mz_bin_digits=cfg_prepare_dict.MZ_BIN_DIGITS,
