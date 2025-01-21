@@ -1057,7 +1057,9 @@ def dict_add_alpha_pept_pred(
     )
     Logger.info(f"dict size after dropping empty prediction: {maxquant_dict_new.shape}")
     if pept_property == "rt":  # rename rt_pred to predicted_RT for compatibility
-        maxquant_dict_new["predicted_RT"] = maxquant_dict_new["rt_pred"]
+        maxquant_dict_new["predicted_RT"] = np.minimum(
+            maxquant_dict_new["rt_pred"], lc_grad
+        )
 
     return maxquant_dict_new
 
