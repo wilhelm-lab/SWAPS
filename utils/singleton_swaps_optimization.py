@@ -42,7 +42,7 @@ __C.PREPARE_DICT.ADD_IM_INDEX = True
 __C.PREPARE_DICT.KEEP_MATCHED_PRECURSORS = False
 __C.PREPARE_DICT.RT_REF = "pred"  # How to calc ref RT, one of ["pred", "exp", "mix"]
 __C.PREPARE_DICT.IM_REF = (
-    "ref"  # How to calc ref IM, one of ["exp", "pred", "mixs", "ref", "pred_lr"]
+    "ref"  # How to calc ref IM, one of ["exp", "pred", "mix", "ref", "pred_lr"]
 )
 __C.PREPARE_DICT.RT_TOL = (
     -0.1

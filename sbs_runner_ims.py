@@ -216,6 +216,7 @@ def opt_scan_by_scan(config_path: str):
                 remove_batch_file=False,
                 calc_pept_act_sum_filter_by_im=cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM,
                 maxquant_result_ref=maxquant_result_ref,
+                im_ref=cfg.PREPARE_DICT.IM_REF,
             )
 
     if cfg.PEAK_SELECTION.ENABLE:
