@@ -737,6 +737,8 @@ def _define_rt_search_range(
                 maxquant_result_dict["Calibrated retention time finish_ss"] + rt_tol
             )
             rt_ref_act_peak = "Calibrated retention time_ss"
+        case _:
+            raise ValueError(f"RT reference {rt_ref} not supported")
     maxquant_result_dict["RT_search_center"] = maxquant_result_dict[rt_ref_act_peak]
     maxquant_result_dict[
         ["RT_search_left", "RT_search_center", "RT_search_right"]
@@ -884,6 +886,8 @@ def _define_im_idx_search_range(
                 + half_im_length
                 + delta_im_idx_95_right
             )
+        case _:
+            raise ValueError(f"IM reference {im_ref} not supported")
     maxquant_df.loc[
         :,
         [
@@ -956,6 +960,8 @@ def update_alpha_pept_deep_model(
             model = models.rt_model
         case "mobility":
             model = models.ccs_model
+        case _:
+            raise ValueError(f"pept_property {pept_property} not supported")
 
     # train
     model.train(train_df, epoch=epoch, verbose=True, verbose_each_epoch=False)
@@ -1329,7 +1335,17 @@ def construct_dict(
                 random_state=random_seed,
             )
             cfg_prepare_dict.DELTA_IM_95 = delta_im_95.item()
-
+        case "ref":
+            Logger.info("Using ref IM for IM prediction")
+            pass
+        case "mix":
+            Logger.info("Using mix IM for IM reference/prediction")
+            pass
+        case "exp":
+            Logger.info("Using exp IM for IM reference")
+            pass
+        case _:
+            raise ValueError(f"IM reference {cfg_prepare_dict.IM_REF} not supported")
     maxquant_dict = maxquant_dict.rename(
         mapper={"mobility_values_index": "mobility_pred_idx"}, axis=1
     )
