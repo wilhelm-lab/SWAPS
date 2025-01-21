@@ -1,4 +1,5 @@
 import os
+import glob
 from typing import Literal
 import csv
 import logging
@@ -430,14 +431,29 @@ def prepare_input_for_triqler(
             Logger.info(
                 "Removed shared peptides, after removal: %s", maxquant_dict.shape[0]
             )
-        pept_act = pd.read_csv(
-            os.path.join(
-                swaps_result_dir,
-                "peak_selection",
-                ps_exp_folder,
-                "pept_act_sum_ps_full_tdc_fdr_thres.csv",
+        if ps_exp_folder == "auto":
+            pattern = "exp_*_*_*"
+            ps_auto_exp_folder = glob.glob(
+                pattern, root_dir=os.path.join(swaps_result_dir, "peak_selection")
             )
-        )
+            Logger.info("Auto detected exp folder: %s", ps_auto_exp_folder)
+            pept_act = pd.read_csv(
+                os.path.join(
+                    swaps_result_dir,
+                    "peak_selection",
+                    ps_auto_exp_folder[0],
+                    "pept_act_sum_ps_full_tdc_fdr_thres.csv",
+                )
+            )
+        else:
+            pept_act = pd.read_csv(
+                os.path.join(
+                    swaps_result_dir,
+                    "peak_selection",
+                    ps_exp_folder,
+                    "pept_act_sum_ps_full_tdc_fdr_thres.csv",
+                )
+            )
 
         # pept_act = calc_fdr_given_thres(pept_act)
         evidence = pd.merge(
@@ -462,6 +478,7 @@ def prepare_input_for_triqler(
 
         evidence_all = pd.concat([evidence_all, evidence], axis=0)
     evidence_all["condition"] = evidence_all["condition"].replace({"A": 1, "B": 2})
+    os.makedirs(out_dir, exist_ok=True)
     out_dir = os.path.join(out_dir, f"swaps_input_triqler{spec}.tsv")
     evidence_all.to_csv(out_dir, sep="\t", index=False)
     return out_dir, evidence_all
