@@ -54,8 +54,6 @@ datashader==0.12.1
 datashape==0.5.2
 debugpy==1.8.5
 decorator==5.1.1
-deeplc==2.2.22
-deeplcretrainer==0.2.1
 defusedxml==0.7.1
 dill==0.3.8
 directlfq==0.2.19
