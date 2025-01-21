@@ -267,6 +267,7 @@ def opt_scan_by_scan(config_path: str):
             ps_exp_dir=ps_exp_dir,
             random_state=cfg.RANDOM_SEED,
             maxquant_dict=maxquant_result_ref,
+            show_decoy=cfg.PREPARE_DICT.GENERATE_DECOY,
         )
 
         # Inference
@@ -445,9 +446,14 @@ def opt_scan_by_scan(config_path: str):
             infer_int_col = "pept_act_sum_filter_by_im"
 
         if cfg.PEAK_SELECTION.ENABLE:
-            pept_act_sum_ps = pd.read_csv(
-                os.path.join(ps_exp_dir, "pept_act_sum_ps_full_tdc_fdr_thres.csv")
-            )
+            if cfg.PREPARE_DICT.GENERATE_DECOY:
+                pept_act_sum_ps = pd.read_csv(
+                    os.path.join(ps_exp_dir, "pept_act_sum_ps_full_tdc_fdr_thres.csv")
+                )
+            else:
+                pept_act_sum_ps = pd.read_csv(
+                    os.path.join(ps_exp_dir, "pept_act_sum_ps.csv")
+                )
             pept_act_sum_ps = pept_act_sum_ps.rename(
                 {"sum_intensity": "sum_intensity_ps"}, axis=1
             )
