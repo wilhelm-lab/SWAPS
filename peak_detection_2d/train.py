@@ -50,7 +50,13 @@ from .utils import (
 )
 
 
-def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=None):
+def train(
+    cfg_peak_selection,
+    ps_exp_dir,
+    random_state: int = 42,
+    maxquant_dict=None,
+    show_decoy: bool = True,
+):
     # Logger.info(
     #     "Memory summary before calling train func: %s", torch.cuda.memory_summary()
     # )
@@ -570,6 +576,7 @@ def train(cfg_peak_selection, ps_exp_dir, random_state: int = 42, maxquant_dict=
                 result_dir=ps_exp_results_dir,
                 device=device,
                 exp=cfg_peak_selection.DATASET.ONLY_LOG_CHANNEL,
+                show_decoy=show_decoy,
                 # threshold=cfg_peak_selection.CLSMODEL.EVALUATION.THRESHOLD,
             )
             test_pred_df = pd.read_csv(
@@ -679,6 +686,7 @@ def testset_eval(
     result_dir,
     device,
     exp: bool = False,
+    show_decoy: bool = True,
     # threshold: float = 0.5,
 ):
     # Plot history
@@ -733,49 +741,49 @@ def testset_eval(
     )
 
     plot_per_image_metric_distr(
-        test_pred_df_full.loc[test_pred_df_full["Decoy"]],
-        metric_name="per_image_weighted_dice_metric",
-        dataset_name="Decoy_weighted_dice",
-        save_dir=result_dir,
-    )
-    plot_per_image_metric_distr(
         test_pred_df_full.loc[~test_pred_df_full["Decoy"]],
         metric_name="per_image_weighted_iou_metric",
         dataset_name="Target_weighted_iou",
         save_dir=result_dir,
     )
+    if show_decoy:
+        plot_per_image_metric_distr(
+            test_pred_df_full.loc[test_pred_df_full["Decoy"]],
+            metric_name="per_image_weighted_dice_metric",
+            dataset_name="Decoy_weighted_dice",
+            save_dir=result_dir,
+        )
+        plot_per_image_metric_distr(
+            test_pred_df_full.loc[test_pred_df_full["Decoy"]],
+            metric_name="per_image_weighted_iou_metric",
+            dataset_name="Decoy_weighted_iou",
+            save_dir=result_dir,
+        )
 
-    plot_per_image_metric_distr(
-        test_pred_df_full.loc[test_pred_df_full["Decoy"]],
-        metric_name="per_image_weighted_iou_metric",
-        dataset_name="Decoy_weighted_iou",
-        save_dir=result_dir,
-    )
-
-    # FDR eval
-    plot_target_decoy_distr(
-        test_pred_df_full,
-        save_dir=result_dir,
-        dataset_name="testset",
-        main_plot_type="scatter",
-        threshold=None,  # TODO: make this a parameter, or generate fdr as a func of threshold
-    )
-    plot_roc_auc(
-        test_pred_df_full,
-        save_dir=result_dir,
-        dataset_name="testset",
-    )
-    pred_df_new = calc_fdr_and_thres(
-        test_pred_df_full,
-        score_col="target_decoy_score",
-        filter_dict={"log_sum_intensity": [1, 100]},  # use log int 1 as threshold
-        return_plot=True,
-        save_dir=result_dir,
-        dataset_name="testset",
-    )
-    pred_df_new.to_csv(
-        os.path.join(result_dir, "test_pred_df_fdr_thres.csv"), index=False
-    )
+        # FDR eval
+        plot_target_decoy_distr(
+            test_pred_df_full,
+            save_dir=result_dir,
+            dataset_name="testset",
+            main_plot_type="scatter",
+            threshold=None,  # TODO: make this a parameter, or generate fdr as a func of threshold
+        )
+        plot_roc_auc(
+            test_pred_df_full,
+            save_dir=result_dir,
+            dataset_name="testset",
+        )
+        pred_df_new = calc_fdr_and_thres(
+            test_pred_df_full,
+            score_col="target_decoy_score",
+            filter_dict={"log_sum_intensity": [1, 100]},  # use log int 1 as threshold
+            return_plot=True,
+            save_dir=result_dir,
+            dataset_name="testset",
+        )
+        pred_df_new.to_csv(
+            os.path.join(result_dir, "test_pred_df_fdr_thres.csv"), index=False
+        )
 
     # Plot sample predictions
     plot_sample_predictions(
