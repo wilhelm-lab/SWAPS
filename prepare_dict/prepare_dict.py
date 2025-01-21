@@ -24,6 +24,7 @@ from utils.plot import save_plot
 from utils.tools import cleanup_maxquant
 from utils.metrics import RT_metrics
 import numpy as np
+import statsmodels.api as sm
 from alphabase.psm_reader import psm_reader_provider
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
@@ -694,34 +695,35 @@ def _define_rt_search_range(
     rt_range: tuple[float, float],
 ):
     """Define the search range for the precursor RT."""
+    Logger.info("define_rt_search_range: ", maxquant_result_dict.columns)
     match rt_ref:
         case "exp":
-            maxquant_result_dict["Calibrated retention time start"] = (
-                maxquant_result_dict["Calibrated retention time start"]
-                - maxquant_result_dict["Retention time calibration"]
-            )
-            maxquant_result_dict["Calibrated retention time finish"] = (
-                maxquant_result_dict["Calibrated retention time finish"]
-                - maxquant_result_dict["Retention time calibration"]
-            )
-            maxquant_result_dict["Calibrated retention time start"].fillna(
-                maxquant_result_dict["Retention time"]
-                - 0.5 * maxquant_result_dict["Retention length"],
-                inplace=True,
-            )
-            maxquant_result_dict["Calibrated retention time finish"].fillna(
-                maxquant_result_dict["Retention time"]
-                + 0.5 * maxquant_result_dict["Retention length"],
-                inplace=True,
-            )
+            # maxquant_result_dict["Calibrated retention time start"] = (
+            #     maxquant_result_dict["Calibrated retention time start"]
+            #     - maxquant_result_dict["Retention time calibration"]
+            # )
+            # maxquant_result_dict["Calibrated retention time finish"] = (
+            #     maxquant_result_dict["Calibrated retention time finish"]
+            #     - maxquant_result_dict["Retention time calibration"]
+            # )
+            # maxquant_result_dict["Calibrated retention time start"].fillna(
+            #     maxquant_result_dict["Retention time"]
+            #     - 0.5 * maxquant_result_dict["Retention length"],
+            #     inplace=True,
+            # )
+            # maxquant_result_dict["Calibrated retention time finish"].fillna(
+            #     maxquant_result_dict["Retention time"]
+            #     + 0.5 * maxquant_result_dict["Retention length"],
+            #     inplace=True,
+            # )
             maxquant_result_dict["RT_search_left"] = (
-                maxquant_result_dict["Calibrated retention time start"] - rt_tol
+                maxquant_result_dict["Calibrated retention time start_exp"] - rt_tol
             )
             maxquant_result_dict["RT_search_right"] = (
-                maxquant_result_dict["Calibrated retention time finish"] + rt_tol
+                maxquant_result_dict["Calibrated retention time finish_exp"] + rt_tol
             )
-            rt_ref_act_peak = "Calibrated retention time"
-        case "pred":
+            rt_ref_act_peak = "Calibrated retention time_exp"
+        case "pred" | "align_lowess":
             maxquant_result_dict["RT_search_left"] = (
                 maxquant_result_dict["predicted_RT"] - rt_tol
             )
@@ -729,6 +731,14 @@ def _define_rt_search_range(
                 maxquant_result_dict["predicted_RT"] + rt_tol
             )
             rt_ref_act_peak = "predicted_RT"
+        case "ref":
+            maxquant_result_dict["RT_search_left"] = (
+                maxquant_result_dict["Calibrated retention time start_ref"] - rt_tol
+            )
+            maxquant_result_dict["RT_search_right"] = (
+                maxquant_result_dict["Calibrated retention time finish_ref"] + rt_tol
+            )
+            rt_ref_act_peak = "Calibrated retention time_ref"
         case "mix":
             maxquant_result_dict["RT_search_left"] = (
                 maxquant_result_dict["Calibrated retention time start_ss"] - rt_tol
@@ -1117,6 +1127,78 @@ def dict_add_im_lr_pred(
             maxquant_dict["source"] == "exp", "mobility_values_center_exp"
         ].values.reshape(-1, 1)
     )
+    maxquant_dict["mobility_pred"] = maxquant_dict["mobility_pred"].clip(
+        lower=min_exp_im, upper=max_exp_im
+    )
+    return maxquant_dict, test_delta95
+
+
+def dict_add_rt_align_lowess(
+    maxquant_dict: pd.DataFrame,
+    train_frac: float,
+    random_state: int,
+):
+    """
+    Add experimental RT prediction from LOWESS based
+    on reference RT values.
+
+    When reference RT values are not available,
+    the prediction is inferred using experimental RT values.
+    Which essentially adds noise to the true value.
+
+    Outputs maxquant_dict with additional column 'mobility_pred'
+    """
+
+    # select the precursors appearing in both ref and exp for training and testing
+    Logger.info("aligning RT using LOWESS")
+    min_exp_rt = maxquant_dict["Calibrated retention time_exp"].min()
+    max_exp_rt = maxquant_dict["Calibrated retention time_exp"].max()
+    Logger.info("min_exp_rt: %s, max_exp_rt: %s", min_exp_rt, max_exp_rt)
+    try:
+        both = maxquant_dict.loc[
+            (maxquant_dict["source"] == "both") & (~maxquant_dict["Decoy"])
+        ].copy()
+    except KeyError:
+        both = maxquant_dict.loc[(maxquant_dict["source"] == "both")].copy()
+    Logger.info("both dataframe size: %s", both.shape)
+    both_train, both_test = train_test_split(
+        both, test_size=1 - train_frac, random_state=random_state
+    )
+    lowess = sm.nonparametric.lowess
+    both_test["predicted_RT"] = lowess(
+        endog=both_train["Calibrated retention time_exp"],
+        exog=both_train["Calibrated retention time_ref"],
+        frac=0.05,
+        return_sorted=False,
+        xvals=both_test["Calibrated retention time_ref"],
+    )
+    lowess_eval = RT_metrics(
+        both_test["Calibrated retention time_exp"],
+        both_test["predicted_RT"],
+    )
+
+    test_delta95 = lowess_eval.CalcDeltaRTwidth()
+    Logger.info(
+        "Delta RT 95 for test set: %s",
+        test_delta95,
+    )
+    maxquant_dict.loc[maxquant_dict["source"] != "exp", "predicted_RT"] = lowess(
+        endog=both_train["Calibrated retention time_exp"],
+        exog=both_train["Calibrated retention time_ref"],
+        frac=0.05,
+        return_sorted=False,
+        xvals=maxquant_dict.loc[
+            maxquant_dict["source"] != "exp", "Calibrated retention time_ref"
+        ],
+    )
+    maxquant_dict.loc[maxquant_dict["source"] == "exp", "predicted_RT"] = (
+        maxquant_dict.loc[
+            maxquant_dict["source"] == "exp", "Calibrated retention time_exp"
+        ]
+    )  # Shouldn't apply LOWESS to experimental since the lowess assumption doesn't hold
+    maxquant_dict["predicted_RT"] = maxquant_dict["predicted_RT"].clip(
+        lower=min_exp_rt, upper=max_exp_rt
+    )
     return maxquant_dict, test_delta95
 
 
@@ -1308,15 +1390,37 @@ def construct_dict(
         index=False,
     )
     # add rt pred
-    if cfg_prepare_dict.RT_REF == "pred":
-        maxquant_dict = dict_add_alpha_pept_pred(
-            model_path=cfg_prepare_dict.UPDATED_RT_MODEL_PATH,
-            pept_property="rt",
-            dict_for_pred_path=dict_path,
-            maxquant_dict=maxquant_dict,
-            lc_grad=cfg_prepare_dict.RT_MAX,
-            device=device,
-        )
+    match cfg_prepare_dict.RT_REF:
+        case "pred":
+            maxquant_dict = dict_add_alpha_pept_pred(
+                model_path=cfg_prepare_dict.UPDATED_RT_MODEL_PATH,
+                pept_property="rt",
+                dict_for_pred_path=dict_path,
+                maxquant_dict=maxquant_dict,
+                lc_grad=cfg_prepare_dict.RT_MAX,
+                device=device,
+            )
+        case "align_lr":
+            raise NotImplementedError("RT align_lr not implemented yet")
+        case "align_lowess":
+            maxquant_dict, delta_rt_95 = dict_add_rt_align_lowess(
+                maxquant_dict,
+                train_frac=cfg_prepare_dict.TRAIN_FRAC,
+                random_state=random_seed,
+            )
+            if cfg_prepare_dict.RT_TOL < 0:
+                cfg_prepare_dict.RT_TOL = delta_rt_95.item()
+        case "exp":
+            Logger.info("Using exp RT for RT reference")
+            pass
+        case "ref":
+            Logger.info("Using ref RT for RT reference")
+            pass
+        case "mix":
+            Logger.info("Using mix RT for RT reference/prediction")
+            pass
+        case _:
+            raise ValueError(f"RT reference {cfg_prepare_dict.RT_REF} not supported")
 
     # add im pred
     match cfg_prepare_dict.IM_REF:
