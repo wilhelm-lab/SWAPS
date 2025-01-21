@@ -110,6 +110,7 @@ def combine_3d_act_and_sum_int(
     remove_batch_file: bool = False,
     calc_pept_act_sum_filter_by_im: bool = False,
     maxquant_result_ref: pd.DataFrame = None,
+    im_ref: str = "exp",
 ):
     """
     Combine peptide blocks of 3D activation intensity data.
@@ -176,11 +177,12 @@ def combine_3d_act_and_sum_int(
             cutoff = n_pept_in_blocks * (pept_block_num + 1)
 
             pept_act_sum_filter_by_im = sum_3d_act_filter_by_im_fast(
-                act_3d_all,
-                maxquant_result_ref.loc[
+                im_rt_pept_act_coo_peptbatch=act_3d_all,
+                maxquant_result_ref=maxquant_result_ref.loc[
                     maxquant_result_ref["mz_rank"].isin(range(prev_cutoff, cutoff))
                 ],
                 return_df=False,
+                im_ref=im_ref,
             )
             Logger.debug(
                 "pept_act_sum_filter_by_im sum %s", pept_act_sum_filter_by_im.sum()
@@ -238,6 +240,7 @@ def sum_3d_act_filter_by_im_fast(
     maxquant_result_ref: pd.DataFrame,
     chunk_size: int = 200,
     return_df: bool = True,
+    im_ref: str = "exp",
 ):
     """
     Sum activation intensity for each peptide batch and filter by accurate 1/K0 range.
@@ -270,23 +273,26 @@ def sum_3d_act_filter_by_im_fast(
     #     im_rt_pept_act_coo_peptbatch.shape[1],
     # )
     # Vectorized approach using list comprehension and numpy array
-    maxquant_result_ref["mobility_values_index_left_exp"] = maxquant_result_ref[
-        "mobility_values_index_left_exp"
-    ].astype(int)
-    maxquant_result_ref["mobility_values_index_right_exp"] = maxquant_result_ref[
-        "mobility_values_index_right_exp"
-    ].astype(int)
+    match im_ref:
+        case "exp":
+            left_col = "mobility_values_index_left_exp"
+            right_col = "mobility_values_index_right_exp"
+        case "ref":
+            left_col = "mobility_values_index_left_ref"
+            right_col = "mobility_values_index_right_ref"
+    maxquant_result_ref[left_col] = maxquant_result_ref[left_col].astype(int)
+    maxquant_result_ref[right_col] = maxquant_result_ref[right_col].astype(int)
     maxquant_result_ref["mobility_values_coo"] = [
         np.arange(start, end)
         for start, end in zip(
-            maxquant_result_ref["mobility_values_index_left_exp"],
-            maxquant_result_ref["mobility_values_index_right_exp"],
+            maxquant_result_ref[left_col],
+            maxquant_result_ref[right_col],
         )
     ]
     maxquant_result_ref = maxquant_result_ref[
         [
-            "mobility_values_index_left_exp",
-            "mobility_values_index_right_exp",
+            left_col,
+            right_col,
             "mobility_values_coo",
             "mz_rank",
         ]
