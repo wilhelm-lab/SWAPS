@@ -1062,7 +1062,7 @@ def dict_add_alpha_pept_pred(
     return maxquant_dict_new
 
 
-def dict_add_im_lr_pred(
+def dict_add_im_align_lr(
     maxquant_dict: pd.DataFrame,
     train_frac: float,
     random_state: int,
@@ -1079,7 +1079,8 @@ def dict_add_im_lr_pred(
     """
 
     # select the precursors appearing in both ref and exp for training and testing
-
+    max_exp_im = maxquant_dict["mobility_values_center_exp"].max()
+    min_exp_im = maxquant_dict["mobility_values_center_exp"].min()
     both = maxquant_dict.loc[
         (maxquant_dict["source"] == "both") & (~maxquant_dict["Decoy"])
     ].copy()
@@ -1434,7 +1435,7 @@ def construct_dict(
                 device=device,
             )
         case "align_lr":
-            maxquant_dict, delta_im_95 = dict_add_im_lr_pred(
+            maxquant_dict, delta_im_95 = dict_add_im_align_lr(
                 maxquant_dict,
                 train_frac=cfg_prepare_dict.TRAIN_FRAC,
                 random_state=random_seed,
