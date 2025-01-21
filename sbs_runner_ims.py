@@ -271,15 +271,16 @@ def opt_scan_by_scan(config_path: str):
         )
 
         # Inference
-        logging.info("Finished training peak selection model, start inference...")
-        infer_on_pept_act(
-            cfg=cfg,
-            best_seg_model_path=best_seg_model_path,
-            best_cls_model_path=best_cls_model_path,
-            maxquant_dict=maxquant_result_ref,
-            ps_exp_dir=ps_exp_dir,
-            sigmoid_cls_score=True,
-        )
+        if not os.path.exists(os.path.join(ps_exp_dir, "pept_act_sum_ps.csv")):
+            logging.info("Finished training peak selection model, start inference...")
+            infer_on_pept_act(
+                cfg=cfg,
+                best_seg_model_path=best_seg_model_path,
+                best_cls_model_path=best_cls_model_path,
+                maxquant_dict=maxquant_result_ref,
+                ps_exp_dir=ps_exp_dir,
+                sigmoid_cls_score=True,
+            )
 
         # Inference eval
         if cfg.PREPARE_DICT.GENERATE_DECOY:
