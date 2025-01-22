@@ -22,3 +22,5 @@ environment_linux64.yaml
 __pycache__/*
 scripts/*
 slurm_scripts/*
+build/*
+swaps/peak_detection_2d/config/*
