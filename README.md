@@ -4,19 +4,27 @@
 ![HUPO_abstract](https://github.com/user-attachments/assets/8ba72094-8eb5-4f90-a914-50cdd0c4688b)
 
 ## Usage
-### Environment Setup
-SWAPS is developed with `Python 3.10` with the environment specificied in `environment_cross_platform.yml` (cross-platform) or `environment_explicit.txt`.
+### Installation
+SWAPS requires `Python 3.10`. To have a clean environment, first create a empty environment with the required python version. This can be down for example via conda:
 ```
-conda env create -n SWAPS --file environment_cross_platform.yml
+conda create --name swaps python==3.10.12 --no-default-packages
+```
+enter the environment:
+```
+conda activate swaps
+```
+Then pip install swaps:
+```
+pip install git+https://github.com/wilhelm-lab/SWAPS.git
 ```
 ### Run SWAPS
 #### Configuration
-SWAPS takes a `.yaml` as a configuration argument. Examples can be found at `utils/exp_configs`. Please modify the file path as necessary. Detail documents of config definiation can be found at `utils/singleton_swaps_optimization.py`.
+SWAPS takes a `.yaml` as a configuration argument. Examples can be found at `swaps/utils/exp_configs`. Please modify the file path as necessary. Detail documents of config definiation can be found at `swaps/utils/singleton_swaps_optimization.py`.
 
 #### Runner
-To run SWAPS, in the repo directory, use:
+To run SWAPS, in the created environment, in command line:
 ```
-python sbs_runner_ims.py [path-to-config-file]
+sbs_runner_ims [path-to-config-file]
 ```
 
 ### SWAPS results structure
