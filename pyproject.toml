@@ -47,6 +47,7 @@ dependencies = [
     "tensorboard==2.12.3",
     "tqdm==4.66.5",
     "yacs==0.1.8",
+    "pyteomics==4.6.2"
 ]
 [project.scripts]
 sbs_runner_ims = "sbs_runner_ims:main"
