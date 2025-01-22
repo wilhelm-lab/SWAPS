@@ -18,7 +18,8 @@ from sklearn.metrics import (
     mean_squared_error,
 )
 from math import floor
-from optimization.dictionary import Dict
+
+# from optimization.dictionary import Dict
 from optimization.custom_models import CustomLinearModel, mean_square_root_error
 from utils.plot import plot_comparison, plot_isopattern_and_obs
 from utils.constants import (
@@ -362,175 +363,175 @@ class Quant:
         return self.infer.sum() / self.obs_data_raw.sum()
 
 
-def process_one_scan(
-    scan_idx: int,
-    OneScan: pd.core.series.Series,
-    Maxquant_result: pd.DataFrame,
-    scan_time: Union[float, None] = None,
-    AbundanceMissingThres: float = 0.4,
-    metric: _alpha_opt_metric = "cos_dist",
-    alpha_criteria: _alpha_criteria = "convergence",
-    alphas: Union[List, np.ndarray] = [0.00001, 0.0001, 0.001, 0.01, 0.1, 1, 10, 100],
-    loss: _loss = "lasso",
-    opt_algo: _algo = "lasso_cd",
-    preprocessing_method: _pp_method = "raw",
-    corr_thres: float = 0.9,
-    max_iter: int = 1000,
-    return_interim_results: bool = False,
-    return_precursor_scan_cos_dist: bool = False,
-    return_collinear_candidates: bool = False,
-    plot_alpha_trace: bool = False,
-    plot_obs_and_infer: bool = False,
-):
-    """
-    process one scan using lasso regression, return  alignment, \
-        activation and scan summary
+# def process_one_scan(
+#     scan_idx: int,
+#     OneScan: pd.core.series.Series,
+#     Maxquant_result: pd.DataFrame,
+#     scan_time: Union[float, None] = None,
+#     AbundanceMissingThres: float = 0.4,
+#     metric: _alpha_opt_metric = "cos_dist",
+#     alpha_criteria: _alpha_criteria = "convergence",
+#     alphas: Union[List, np.ndarray] = [0.00001, 0.0001, 0.001, 0.01, 0.1, 1, 10, 100],
+#     loss: _loss = "lasso",
+#     opt_algo: _algo = "lasso_cd",
+#     preprocessing_method: _pp_method = "raw",
+#     corr_thres: float = 0.9,
+#     max_iter: int = 1000,
+#     return_interim_results: bool = False,
+#     return_precursor_scan_cos_dist: bool = False,
+#     return_collinear_candidates: bool = False,
+#     plot_alpha_trace: bool = False,
+#     plot_obs_and_infer: bool = False,
+# ):
+#     """
+#     process one scan using lasso regression, return  alignment, \
+#         activation and scan summary
 
-    :scan_idx:
-    :OneScan: a row in dataframe MS1Scans
-    :
-    """
-    Logger.debug("Start.")
-    if scan_time is None:
-        scan_time = OneScan["starttime"]
-    CandidatePrecursorsByRT = Maxquant_result.loc[
-        (Maxquant_result["RT_search_left"] <= scan_time)
-        & (Maxquant_result["RT_search_right"] >= scan_time)
-    ]
-    Logger.debug("Filter by RT.")
+#     :scan_idx:
+#     :OneScan: a row in dataframe MS1Scans
+#     :
+#     """
+#     Logger.debug("Start.")
+#     if scan_time is None:
+#         scan_time = OneScan["starttime"]
+#     CandidatePrecursorsByRT = Maxquant_result.loc[
+#         (Maxquant_result["RT_search_left"] <= scan_time)
+#         & (Maxquant_result["RT_search_right"] >= scan_time)
+#     ]
+#     Logger.debug("Filter by RT.")
 
-    if CandidatePrecursorsByRT.shape[0] > 0:
-        ScanDict = Dict(
-            candidate_by_rt=CandidatePrecursorsByRT,
-            one_scan=OneScan,
-            abundance_missing_thres=AbundanceMissingThres,
-        )
-        CandidateDict = ScanDict.dict
-        filteredPrecursorIdx = ScanDict.filtered_candidate_idx
-        if CandidateDict is not None:
-            y_true = ScanDict.obs_peak_int
+#     if CandidatePrecursorsByRT.shape[0] > 0:
+#         ScanDict = Dict(
+#             candidate_by_rt=CandidatePrecursorsByRT,
+#             one_scan=OneScan,
+#             abundance_missing_thres=AbundanceMissingThres,
+#         )
+#         CandidateDict = ScanDict.dict
+#         filteredPrecursorIdx = ScanDict.filtered_candidate_idx
+#         if CandidateDict is not None:
+#             y_true = ScanDict.obs_peak_int
 
-            ScanDict.get_feature_corr(
-                cos_sim_thres=corr_thres,
-                calc_jaccard_sim=False,
-                # plot_collinear_hist=False,
-                # plot_hmap=False,
-            )
-            num_corr_dict_candidate = ScanDict.high_corr_sol.shape[0]
-            Logger.debug("Construct dictionary")
+#             ScanDict.get_feature_corr(
+#                 cos_sim_thres=corr_thres,
+#                 calc_jaccard_sim=False,
+#                 # plot_collinear_hist=False,
+#                 # plot_hmap=False,
+#             )
+#             num_corr_dict_candidate = ScanDict.high_corr_sol.shape[0]
+#             Logger.debug("Construct dictionary")
 
-            PrecursorQuant = Quant(
-                candidate_dict=CandidateDict,
-                obs_data=y_true,
-                filtered_precursor_idx=filteredPrecursorIdx,
-                preprocessing_method=preprocessing_method,
-            )
+#             PrecursorQuant = Quant(
+#                 candidate_dict=CandidateDict,
+#                 obs_data=y_true,
+#                 filtered_precursor_idx=filteredPrecursorIdx,
+#                 preprocessing_method=preprocessing_method,
+#             )
 
-            PrecursorQuant.optimizeAlphas(
-                alphas=alphas,
-                loss=loss,
-                metric=metric,
-                algorithm=opt_algo,
-                criteria=alpha_criteria,
-                PlotTrace=plot_alpha_trace,
-                max_iter=max_iter,
-            )
-            Logger.debug("Quant - optimize alphas")
-            if plot_obs_and_infer:
-                PrecursorQuant.PlotObsAndInfer(log_intensity=False)
-                Logger.debug("Quant - Plot")
+#             PrecursorQuant.optimizeAlphas(
+#                 alphas=alphas,
+#                 loss=loss,
+#                 metric=metric,
+#                 algorithm=opt_algo,
+#                 criteria=alpha_criteria,
+#                 PlotTrace=plot_alpha_trace,
+#                 max_iter=max_iter,
+#             )
+#             Logger.debug("Quant - optimize alphas")
+#             if plot_obs_and_infer:
+#                 PrecursorQuant.PlotObsAndInfer(log_intensity=False)
+#                 Logger.debug("Quant - Plot")
 
-            activation = {
-                "precursor": filteredPrecursorIdx,
-                "activation": PrecursorQuant.act,
-            }
-            collinear_candidates = {
-                "precursor": ScanDict.collinear_precursors.index.values,
-                "collinear_candidates": ScanDict.collinear_precursors.values,
-            }
+#             activation = {
+#                 "precursor": filteredPrecursorIdx,
+#                 "activation": PrecursorQuant.act,
+#             }
+#             collinear_candidates = {
+#                 "precursor": ScanDict.collinear_precursors.index.values,
+#                 "collinear_candidates": ScanDict.collinear_precursors.values,
+#             }
 
-            if return_precursor_scan_cos_dist:
-                cos_dist = PrecursorQuant.calc_precursor_reconstruct_cos_dist()
-                precursor_cos_dist = {
-                    "precursor": filteredPrecursorIdx,
-                    "cos_dist": cos_dist,
-                }
-            cos_dist = PrecursorQuant.CalcCosDist()
-            rmse = PrecursorQuant.CalcRMSE()
-            scan_sum = (
-                scan_idx,
-                scan_time,
-                CandidatePrecursorsByRT.index,
-                filteredPrecursorIdx,
-                num_corr_dict_candidate,
-                PrecursorQuant.best_alpha,
-                cos_dist,
-                PrecursorQuant.CalcExplainedInt(),
-            )
-            Logger.info(
-                "scan index %s: activation successfully calculated with cosine distance"
-                " %s, RMSE %s.",
-                scan_idx,
-                cos_dist,
-                rmse,
-            )
-        else:
-            activation = None
-            precursor_cos_dist = None
-            collinear_candidates = None
-            scan_sum = (
-                scan_idx,
-                scan_time,
-                CandidatePrecursorsByRT.index,
-                filteredPrecursorIdx,
-                np.nan,
-                np.nan,
-                np.nan,
-                np.nan,
-            )
-            Logger.info(
-                "scan index %s: less than 2 valid candidates after isotope pattern"
-                " matching.",
-                scan_idx,
-            )
+#             if return_precursor_scan_cos_dist:
+#                 cos_dist = PrecursorQuant.calc_precursor_reconstruct_cos_dist()
+#                 precursor_cos_dist = {
+#                     "precursor": filteredPrecursorIdx,
+#                     "cos_dist": cos_dist,
+#                 }
+#             cos_dist = PrecursorQuant.CalcCosDist()
+#             rmse = PrecursorQuant.CalcRMSE()
+#             scan_sum = (
+#                 scan_idx,
+#                 scan_time,
+#                 CandidatePrecursorsByRT.index,
+#                 filteredPrecursorIdx,
+#                 num_corr_dict_candidate,
+#                 PrecursorQuant.best_alpha,
+#                 cos_dist,
+#                 PrecursorQuant.CalcExplainedInt(),
+#             )
+#             Logger.info(
+#                 "scan index %s: activation successfully calculated with cosine distance"
+#                 " %s, RMSE %s.",
+#                 scan_idx,
+#                 cos_dist,
+#                 rmse,
+#             )
+#         else:
+#             activation = None
+#             precursor_cos_dist = None
+#             collinear_candidates = None
+#             scan_sum = (
+#                 scan_idx,
+#                 scan_time,
+#                 CandidatePrecursorsByRT.index,
+#                 filteredPrecursorIdx,
+#                 np.nan,
+#                 np.nan,
+#                 np.nan,
+#                 np.nan,
+#             )
+#             Logger.info(
+#                 "scan index %s: less than 2 valid candidates after isotope pattern"
+#                 " matching.",
+#                 scan_idx,
+#             )
 
-    else:
-        CandidateDict = None
-        activation = None
-        precursor_cos_dist = None
-        collinear_candidates = None
-        scan_sum = (
-            scan_idx,
-            scan_time,
-            [],
-            [],
-            np.nan,
-            np.nan,
-            np.nan,
-            np.nan,
-        )
-        Logger.info("scan index %s: no valid candidate by RT.", scan_idx)
+#     else:
+#         CandidateDict = None
+#         activation = None
+#         precursor_cos_dist = None
+#         collinear_candidates = None
+#         scan_sum = (
+#             scan_idx,
+#             scan_time,
+#             [],
+#             [],
+#             np.nan,
+#             np.nan,
+#             np.nan,
+#             np.nan,
+#         )
+#         Logger.info("scan index %s: no valid candidate by RT.", scan_idx)
 
-    result_dict_onescan = {}
-    result_dict_onescan[scan_idx] = {
-        "activation": activation,
-        "CandidateDict": CandidateDict,
-        "scans_record": scan_sum,
-        "precursor_collinear_sets": collinear_candidates,
-    }
-    match (return_interim_results, return_precursor_scan_cos_dist):
-        case (True, True):
-            result_dict_onescan[scan_idx]["precursor_cos_dist"] = precursor_cos_dist
-            return result_dict_onescan, ScanDict, PrecursorQuant
-        case (True, False):
-            result_dict_onescan[scan_idx]["precursor_cos_dist"] = None
-            return result_dict_onescan, ScanDict, PrecursorQuant
-        case (False, True):
-            result_dict_onescan[scan_idx]["precursor_cos_dist"] = precursor_cos_dist
-            return result_dict_onescan
-        case (False, False):
-            result_dict_onescan[scan_idx]["precursor_cos_dist"] = None
-            return result_dict_onescan
+#     result_dict_onescan = {}
+#     result_dict_onescan[scan_idx] = {
+#         "activation": activation,
+#         "CandidateDict": CandidateDict,
+#         "scans_record": scan_sum,
+#         "precursor_collinear_sets": collinear_candidates,
+#     }
+#     match (return_interim_results, return_precursor_scan_cos_dist):
+#         case (True, True):
+#             result_dict_onescan[scan_idx]["precursor_cos_dist"] = precursor_cos_dist
+#             return result_dict_onescan, ScanDict, PrecursorQuant
+#         case (True, False):
+#             result_dict_onescan[scan_idx]["precursor_cos_dist"] = None
+#             return result_dict_onescan, ScanDict, PrecursorQuant
+#         case (False, True):
+#             result_dict_onescan[scan_idx]["precursor_cos_dist"] = precursor_cos_dist
+#             return result_dict_onescan
+#         case (False, False):
+#             result_dict_onescan[scan_idx]["precursor_cos_dist"] = None
+#             return result_dict_onescan
 
 
 def sparse_encode_divide_and_conquer(frame_array, candidate_array):
@@ -1265,39 +1266,39 @@ def process_ims_frames_parallel(
     # return frame_results_df
 
 
-def process_scans_parallel(
-    n_jobs: int,
-    ms1scans: pd.DataFrame,
-    maxquant_ref: pd.DataFrame,
-    abundance_missing_threshold: float = 0.4,
-    alpha_criteria: _alpha_criteria = "convergence",
-    alphas: Union[List, np.ndarray] = [0.00001, 0.0001, 0.001, 0.01, 0.1, 1, 10, 100],
-    loss: _loss = "lasso",
-    opt_algo: _algo = "lasso_cd",
-    metric: _alpha_opt_metric = "cos_dist",
-    preprocessing_method: _pp_method = "raw",
-    corr_thres: float = 0.95,
-    max_iter: int = 1000,
-    return_precursor_scan_cos_dist: bool = False,
-):
-    scan_result_list = Parallel(n_jobs=n_jobs)(
-        delayed(process_one_scan)(
-            scan_idx=scan_idx,
-            OneScan=OneScan,
-            Maxquant_result=maxquant_ref,
-            AbundanceMissingThres=abundance_missing_threshold,
-            alpha_criteria=alpha_criteria,
-            alphas=alphas,
-            metric=metric,
-            loss=loss,
-            opt_algo=opt_algo,
-            preprocessing_method=preprocessing_method,
-            corr_thres=corr_thres,
-            max_iter=max_iter,
-            return_interim_results=False,
-            return_precursor_scan_cos_dist=return_precursor_scan_cos_dist,
-        )
-        for scan_idx, OneScan in ms1scans.iterrows()
-    )
-    scan_result_dict = dict(pair for d in scan_result_list for pair in d.items())
-    return scan_result_dict
+# def process_scans_parallel(
+#     n_jobs: int,
+#     ms1scans: pd.DataFrame,
+#     maxquant_ref: pd.DataFrame,
+#     abundance_missing_threshold: float = 0.4,
+#     alpha_criteria: _alpha_criteria = "convergence",
+#     alphas: Union[List, np.ndarray] = [0.00001, 0.0001, 0.001, 0.01, 0.1, 1, 10, 100],
+#     loss: _loss = "lasso",
+#     opt_algo: _algo = "lasso_cd",
+#     metric: _alpha_opt_metric = "cos_dist",
+#     preprocessing_method: _pp_method = "raw",
+#     corr_thres: float = 0.95,
+#     max_iter: int = 1000,
+#     return_precursor_scan_cos_dist: bool = False,
+# ):
+#     scan_result_list = Parallel(n_jobs=n_jobs)(
+#         delayed(process_one_scan)(
+#             scan_idx=scan_idx,
+#             OneScan=OneScan,
+#             Maxquant_result=maxquant_ref,
+#             AbundanceMissingThres=abundance_missing_threshold,
+#             alpha_criteria=alpha_criteria,
+#             alphas=alphas,
+#             metric=metric,
+#             loss=loss,
+#             opt_algo=opt_algo,
+#             preprocessing_method=preprocessing_method,
+#             corr_thres=corr_thres,
+#             max_iter=max_iter,
+#             return_interim_results=False,
+#             return_precursor_scan_cos_dist=return_precursor_scan_cos_dist,
+#         )
+#         for scan_idx, OneScan in ms1scans.iterrows()
+#     )
+#     scan_result_dict = dict(pair for d in scan_result_list for pair in d.items())
+#     return scan_result_dict
