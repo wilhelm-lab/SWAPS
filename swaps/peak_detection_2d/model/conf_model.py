@@ -4,7 +4,6 @@ from re import T
 from typing import Literal
 import matplotlib.pyplot as plt
 import numpy as np
-from sympy import plot
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -348,7 +347,7 @@ def inference_and_sum_intensity(
             )
 
             out_final = out_final.contiguous().view(batch_size, -1).float().to(device)
-            if exp: # TODO: remove this and always use ori_image_raw
+            if exp:  # TODO: remove this and always use ori_image_raw
                 Logger.warning(
                     "Exponential transformation is applied on transformed image"
                 )
