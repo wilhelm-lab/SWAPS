@@ -1,0 +1,29 @@
+RESULT_PATH: /cmnfs/proj/ORIGINS/SWAPS_exp/short_gradient/30min_3to45_7R_30min_exp_library_no_decoy
+ADD_TIMESTAMP_TO_RESULT_PATH: true
+DATA_PATH: /cmnfs/proj/ORIGINS/data/HeLa_sample_amount_and_LC_columns/raw_data/Hela_30min_5ug_R2_RA1_1_5163.d/
+DEBUG: false
+DICT_PICKLE_PATH: ''
+EXPORT_DATA_HDF5_DIR: ''
+MQ_REF_PATH: /cmnfs/proj/ORIGINS/data/HeLa_sample_amount_and_LC_columns/MQ_search/txt_30min_sample_amount/evidence_Hela_30min_5ug_R2_RA1_1_5163.txt
+MQ_EXP_PATH: /cmnfs/proj/ORIGINS/data/HeLa_sample_amount_and_LC_columns/MQ_search/txt_30min_sample_amount/evidence.txt
+FILTER_EXP_BY_RAW_FILE: []
+N_CPU: 10
+OPTIMIZATION:
+  N_BLOCKS_BY_PEPT: 1
+  N_BATCH: 10
+PREPARE_DICT:
+  DICT_PICKLE_PATH: ''
+  FILTER_PRED_BY_RAW_FILE: ''
+  FILTER_TRAIN_BY_RAW_FILE: ''
+  KEEP_MATCHED_PRECURSORS: false
+  GENERATE_DECOY: false
+  IM_REF: exp
+  RT_REF: exp
+  RT_TOL: 0.001
+RANDOM_SEED: 42
+PEAK_SELECTION:
+  ENABLE: false
+RESULT_ANALYSIS:
+  ENABLE: true
+  POST_PROCESSING:
+    FILTER_BY_IM: true

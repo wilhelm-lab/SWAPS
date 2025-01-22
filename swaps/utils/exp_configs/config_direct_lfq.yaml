@@ -1,0 +1,26 @@
+SWAPS_RESULT_DIR_LIST:
+  - /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/MixB_5ug_30min_7R_R3_RA1_1_5138.d_20240725_144805_435386/
+  - /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/MixB_5ug_30min_7R_R4_RA1_1_5140_20240725_144826_275086/
+  - /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/MixA_5ug_30min_7R_R4_RA1_1_5139_20240725_144805_435395/
+  - /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/MixB_5ug_30min_7R_R2_RA1_1_5136_20240725_141943_288875
+  - /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/MixA_5ug_30min_7R_R3_RA1_1_5137_20240725_142025_822484
+  - /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/MixA_5ug_30min_7R_R2_RA1_1_5135_20240725_141912_887206
+  - /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/MixB_5ug_30min_7R_R1_RA1_1_5134_20240725_141850_687674
+  - /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/MixA_5ug_30min_7R_R1_RA1_1_5133_20240725_135724_231724
+RESULT_DIR: '/cmnfs/proj/ORIGINS/SWAPS_exp/mixture/JoT_SWAPS_mzdigits2_protein_quant/'
+REF_RESULT_FILE: '/cmnfs/proj/ORIGINS/data/species_mix/DDA/txt_HYE_5ug/evidence.txt'
+RAW_FILE_AS_EXPERIMENT: False
+MQ_PROTEIN_GROUP_PATH: '/cmnfs/proj/ORIGINS/data/species_mix/DDA/txt_HYE_5ug/proteinGroups.txt'
+SAMPLE_MAP: [
+    ["5ug_MixB_R1", "B"],
+    ["5ug_MixA_R1", "A"],
+    ["5ug_MixA_R2", "A"],
+    ["5ug_MixA_R3", "A"],
+    ["5ug_MixA_R4", "A"],
+    ["5ug_MixB_R2", "B"],
+    ["5ug_MixB_R3", "B"],
+    ["5ug_MixB_R4", "B"],
+]
+CONDITIONS: ['A', 'B']
+FC:
+  TITLE: 'SWAPS Quant, MZ digits=2'

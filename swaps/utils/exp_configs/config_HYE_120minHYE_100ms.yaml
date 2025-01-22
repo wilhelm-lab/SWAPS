@@ -1,0 +1,120 @@
+RESULT_PATH: /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/120min_HYE_libaray_100ms_20240908_105413_616628
+ADD_TIMESTAMP_TO_RESULT_PATH: false
+DATA_PATH: /cmnfs/proj/ORIGINS/data/species_mix/DDA/MixA_5ug_30min_7R_R1_RA1_1_5133.d/
+DEBUG: false
+DICT_PICKLE_PATH: ''
+EXPORT_DATA_HDF5_DIR: ''
+MQ_REF_PATH: /cmnfs/proj/ORIGINS/data/species_mix/DDA/mq_combined_120min_HYE.txt
+MQ_EXP_PATH: /cmnfs/proj/ORIGINS/data/species_mix/DDA/txt_HYE_5ug/evidence.txt
+FILTER_EXP_BY_RAW_FILE: []
+NOTES: ''
+N_CPU: 5
+OPTIMIZATION:
+  DELTA_MOBILITY_INDEX_THRES: 80
+  HOW_BATCH: robin_round
+  IM_PEAK_EXTRACTION_WIDTH: 4
+  N_BLOCKS_BY_PEPT: 15
+  N_BATCH: 10
+PREPARE_DICT:
+  ADD_IM_INDEX: true
+  #DELTA_IM_95: 0.044
+  DICT_PICKLE_PATH: ''
+  FILTER_PRED_BY_RAW_FILE: ''
+  FILTER_TRAIN_BY_RAW_FILE: ''
+  GENERATE_DECOY: true
+  #IM_LENGTH: 290
+  IM_REF: pred
+  IM_TRAIN_EPOCHS: 8
+  ISO_MIN_AB_THRES: 0.01
+  KEEP_MATCHED_PRECURSORS: false
+  MZ_BIN_DIGITS: 2
+  #RT_MAX: 28.17
+  RT_REF: pred
+  #RT_TOL: 0.8603156694293024
+  RT_TRAIN_EPOCHS: 15
+  TRAIN_FRAC: 0.9
+  #UPDATED_IM_MODEL_PATH: /cmnfs/proj/ORIGINS/SWAPS_exp/tims_ramp_time/full_pred_libaray_100ms_20240904_155157_142605/construct_dict/IM_transfer_learn/mobility_model
+  #UPDATED_RT_MODEL_PATH: /cmnfs/proj/ORIGINS/SWAPS_exp/tims_ramp_time/120min_libaray_100ms_20240826_175342_706954/construct_dict/RT_transfer_learn/rt_model
+RANDOM_SEED: 42
+PEAK_SELECTION:
+  EVAL_ON_TEST: true
+  INCLUDE_DECOYS: true
+  DATASET:
+      INPUT_CHANNELS:
+      - normal
+      - log
+      - hint
+      ONLY_LOG_CHANNEL: false
+      RESHAPE_METHOD: resize
+      PADDING_SHAPE:
+      - 482
+      - 482
+      RESIZE_SHAPE:
+      - 258
+      - 258
+      TEST_BATCH_SIZE: 512
+      INFER_BATCH_SIZE: 256
+      TO_TENSOR: false
+      TRAIN_BATCH_SIZE: 128
+      TRAIN_SIZE: 0.9
+      TRAIN_VAL_SIZE: 0.9
+      VAL_BATCH_SIZE: 512
+  DEBUG: false
+  ENABLE: true
+  MODEL:
+    EVALUATION:
+      THRESHOLD: 0.5
+    NAME: UNET
+    PARAMS:
+      DOWNHILL: 5
+      EXIT_CHANNELS: 1
+      FIRST_OUT_CHANNELS: 32
+      IMAGE_SIZE: 258
+      IN_CHANNELS: 2
+      PADDING: 1
+    SOLVER:
+      EARLY_STOPPING:
+        MODE: max
+        PATIENCE: 10
+      LOSS:
+        CHANNEL_WEIGHTS:
+        - 1
+        - 0.5
+        FOCAL_LOSS:
+          ALPHA: -1
+          GAMMA: 1
+        LOSSTYPES:
+        - bce
+        - wdice
+        - dice
+        - focal
+        NAME: ComboLoss
+        PER_IMAGE: true
+        WEIGHTS:
+        - 1
+        - 0
+        - 4
+        - 1
+      OPTIMIZER:
+        BASE_LR: 0.001
+        NAME: adam
+        SGD:
+          MOMENTUM: 0.9
+          NESTEROV: false
+        WEIGHT_DECAY: 0
+      SCHEDULER:
+        ANNEAL_STRATEGY: cos
+        DIV_FACTOR: 25
+        FACTOR: 0.1
+        LR_REDUCE_GAMMA: 0.1
+        MAX_LR: 0.01
+        MIN_LR: 1.0e-08
+        NAME: one_cycle
+        PATIENCE: 3
+        PCT_START: 0.3
+      TOTAL_EPOCHS: 100
+    TYPE: mask_segmentation
+  TRAINING_DATA: []  
+RESULT_ANALYSIS:
+  ENABLE: true
+USE_IMS: true

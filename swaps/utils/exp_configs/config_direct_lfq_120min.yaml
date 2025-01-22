@@ -1,0 +1,27 @@
+SWAPS_RESULT_DIR_LIST:
+  - /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/A_5139_20240912_134700_126900/
+  - /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/A_5137_20240912_134649_883116/
+  - /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/B_5138_20240912_134722_386595/
+  - /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/B_5140_20240912_134730_820676/
+  - /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/B_5136_20240910_142359_508367/
+  #- /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/B_5134_20240910_142359_518485/
+  - /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/A_5135_20240910_142404_677731/
+  #- /cmnfs/proj/ORIGINS/SWAPS_exp/mixture/120min_HYE_libaray_100ms_20240908_105413_616628/
+RESULT_DIR: '/cmnfs/proj/ORIGINS/SWAPS_exp/mixture/JoT_SWAPS_mzdigits2_protein_quant_120min/'
+REF_RESULT_FILE: '/cmnfs/proj/ORIGINS/data/species_mix/DDA/txt_HYE_5ug/evidence.txt'
+RAW_FILE_AS_EXPERIMENT: False
+MQ_PROTEIN_GROUP_PATH: '/cmnfs/proj/ORIGINS/data/species_mix/DDA/proteinGroups_mq_combined_120min_HYE.txt'
+SAMPLE_MAP: [
+    #["5ug_MixB_R1", "B"],
+    #["5ug_MixA_R1", "A"],
+    ["5ug_MixA_R2", "A"],
+    ["5ug_MixA_R3", "A"],
+    ["5ug_MixA_R4", "A"],
+    ["5ug_MixB_R2", "B"],
+    ["5ug_MixB_R3", "B"],
+    ["5ug_MixB_R4", "B"],
+]
+CONDITIONS: ['A', 'B']
+INTENSITY_COLUMN: 'sum_intensity'
+FC:
+  TITLE: 'SWAPS Quant, MZ digits=2'
