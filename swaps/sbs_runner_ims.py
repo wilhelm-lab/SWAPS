@@ -1002,5 +1002,21 @@ def opt_scan_by_scan(config_path: str):
         swaps_result.plot_overlap_with_MQ(show_ref=False, level="protein")
 
 
+def main():
+    """
+    Entry point for the CLI tool. Wraps the opt_scan_by_scan function.
+
+    Args:
+        config_path (str): Path to the configuration YAML file.
+    """
+    parser = argparse.ArgumentParser(description="Run ScanByScan processing.")
+    parser.add_argument("config_path", help="Path to the configuration YAML file")
+    args = parser.parse_args()
+
+    # Call the actual function with the parsed argument
+    opt_scan_by_scan(args.config_path)
+
+
 if __name__ == "__main__":
-    fire.Fire(opt_scan_by_scan)
+    # fire.Fire(main)
+    main()
