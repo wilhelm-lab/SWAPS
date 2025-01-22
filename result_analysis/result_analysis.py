@@ -5,16 +5,13 @@ from typing import List, Literal, Union
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from pygam import f
 import seaborn as sns
 
-from postprocessing import fdr
 from .compare_maxquant import (
     merge_with_maxquant_exp,
     evaluate_rt_overlap,
     filter_merged_by_rt_overlap,
     sum_pcm_intensity_from_exp,
-    add_sum_act_cols,
 )
 from peak_detection_2d.utils import calc_fdr_and_thres
 from utils.plot import plot_scatter, plot_venn2, plot_venn3, save_plot
@@ -455,7 +452,9 @@ class SWAPSResult:
         """
         Plot the overlap between the experiment file and the activation columns
         """
-        plt.rc("font", size=font_size)  # Set the default font size for all text elements
+        plt.rc(
+            "font", size=font_size
+        )  # Set the default font size for all text elements
         maxquant_dict_target = self.maxquant_dict.loc[self.maxquant_dict["Decoy"] == 0]
         match level:
             case "precursor":
@@ -546,7 +545,6 @@ class SWAPSResult:
                 + "_log_int_"
                 + str(self.log_sum_intensity_thres),
             )
-        
 
 
 class SBSResult:

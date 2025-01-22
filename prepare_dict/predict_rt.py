@@ -2,16 +2,8 @@ import os
 import pandas as pd
 from typing import Literal, Union
 import logging
-import pickle
 
 Logger = logging.getLogger(__name__)
-# from deeplc import DeepLC
-# from deeplcretrainer import deeplcretrainer
-# import tensorflow as tf
-
-from psm_utils.io.maxquant import MSMSReader
-from psm_utils.io.peptide_record import to_dataframe
-from utils.metrics import RT_metrics
 from utils.tools import cleanup_maxquant
 
 
@@ -339,59 +331,6 @@ def prepare_maxquant_evidence(
         maxquant_file_transfer_path,
         maxquant_file_transfer_pred_path,
     )
-
-
-def _format_maxquant_as_deeplc_input(maxquant_file: str):
-    maxquant_df = pd.read_csv(maxquant_file, sep="\t")
-    maxquant_msms_df = maxquant_df.copy()
-    # if "Raw file" not in maxquant_df.columns:
-    #     maxquant_msms_df["Raw file"] = "placeholder"
-    # if "Reverse" not in maxquant_df.columns:
-    #     maxquant_msms_df["Reverse"] = "placeholder"
-    # if "Scan number" not in maxquant_df.columns:
-    #     maxquant_msms_df["Scan number"] = "placeholder"
-    for col in [
-        "Raw file",
-        "Reverse",
-        "Proteins",
-    ]:
-        if col not in maxquant_df.columns:
-            maxquant_msms_df[col] = "placeholder"
-    for col in ["Scan number"]:
-        if col not in maxquant_df.columns:
-            maxquant_msms_df[col] = 0
-    for col in ["m/z", "Retention time", "PEP", "Score"]:
-        if col not in maxquant_df.columns:
-            maxquant_msms_df[col] = 0.0
-    msms_reader_path = os.path.join(
-        os.path.dirname(maxquant_file), "for_msms_reader.txt"
-    )
-    maxquant_msms_df.to_csv(msms_reader_path, sep="\t", index=False)
-    reader = MSMSReader(msms_reader_path)
-
-    psm_list = reader.read_file()
-
-    psm_list.add_fixed_modifications([("Carbamidomethyl", ["C"])])
-    psm_list.apply_fixed_modifications()
-    # Modify these to match the modifications in the data and library of deepLC model
-    psm_list.rename_modifications(
-        {"ox": "Oxidation", "ac": "Acetyl", "Oxidation (M)": "Oxidation"}
-    )
-    peprec = to_dataframe(psm_list)  # can be mapped to ori df
-
-    # Only one RT for each (peptide seq, mod)
-    peprec_modpept_agg = (
-        peprec.groupby(by=["peptide", "modifications"])["observed_retention_time"]
-        .median()
-        .reset_index()
-    )
-
-    peprec_modpept_agg = peprec_modpept_agg.rename(
-        columns={"peptide": "seq", "observed_retention_time": "tr"}
-    )
-    peprec_modpept_agg = peprec_modpept_agg[["seq", "modifications", "tr"]]
-    maxquant_peprec = pd.concat([maxquant_df, peprec], axis=1)
-    return maxquant_peprec, peprec_modpept_agg
 
 
 def match_pred_to_input(
