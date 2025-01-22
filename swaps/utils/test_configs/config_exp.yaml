@@ -1,4 +1,4 @@
-RESULT_PATH: /cmnfs/proj/ORIGINS/SWAPS_exp/test/
+RESULT_PATH: /cmnfs/proj/ORIGINS/SWAPS_exp/test/test
 ADD_TIMESTAMP_TO_RESULT_PATH: true
 DATA_PATH: /cmnfs/proj/ORIGINS/data/HeLa_sample_amount_and_LC_columns/7min_1ug_ref/Hela_7min_1ug_R2_RA1_1_5148.d/
 DEBUG: true
@@ -26,4 +26,4 @@ PEAK_SELECTION:
 RESULT_ANALYSIS:
   ENABLE: true
   POST_PROCESSING:
-    FILTER_BY_IM: true
+    FILTER_BY_IM: false
