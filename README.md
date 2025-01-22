@@ -5,7 +5,7 @@
 
 ## Usage
 ### Installation
-SWAPS requires `Python 3.10`. To have a clean environment, first create a empty environment with the required python version. This can be down for example via conda:
+SWAPS requires `Python 3.10`. To have a clean environment, first create an empty environment with the required Python version. This can be done for example via conda:
 ```
 conda create --name swaps python==3.10.12 --no-default-packages
 ```
