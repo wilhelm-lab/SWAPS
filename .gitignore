@@ -16,5 +16,5 @@ environment_linux64.yaml
 __pycache__/*
 scripts/*
 slurm_scripts/*
-utils/exp_configs/*
-!utils/exp_configs/config_ayla_test.yaml
+build/*
+swaps/peak_detection_2d/config/*
