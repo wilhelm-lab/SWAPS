@@ -127,29 +127,41 @@ def merge_ref_and_exp(
         }
     )
     if ref_type == "MQ":
-        ref_spec_columns = [  # Not including Time_minute and MS1_frame_idx since ref should be mapped to ref ms1scan, not exp
-            # "Time_minute_left_ref",
-            # "Time_minute_right_ref",
-            # "Time_minute_center_ref",
-            # "MS1_frame_idx_left_ref",
-            # "MS1_frame_idx_right_ref",
-            # "MS1_frame_idx_center_ref",
-            # "MS1_frame_idx_left",
-            # "MS1_frame_idx_right",
-            # "MS1_frame_idx_center",
+        ref_spec_columns = [
             "Calibrated retention time start",
             "Calibrated retention time",
             "Calibrated retention time finish",
-            "mobility_values_index_left_ref",
-            "mobility_values_index_right_ref",
-            "mobility_values_index_center_ref",
-            # "mobility_values_left_ref",
-            # "mobility_values_right_ref",
-            "mobility_values_center_ref",
-            # "mobility_values_left_ref",
-            # "mobility_values_right_ref",
-            # "mobility_values_center_ref",
         ]
+        if use_ims:
+            ref_spec_columns += [
+                "mobility_values_index_left_ref",
+                "mobility_values_index_right_ref",
+                "mobility_values_index_center_ref",
+                "mobility_values_center_ref",
+            ]
+        # ref_spec_columns = [  # Not including Time_minute and MS1_frame_idx since ref should be mapped to ref ms1scan, not exp
+        #     # "Time_minute_left_ref",
+        #     # "Time_minute_right_ref",
+        #     # "Time_minute_center_ref",
+        #     # "MS1_frame_idx_left_ref",
+        #     # "MS1_frame_idx_right_ref",
+        #     # "MS1_frame_idx_center_ref",
+        #     # "MS1_frame_idx_left",
+        #     # "MS1_frame_idx_right",
+        #     # "MS1_frame_idx_center",
+        #     "Calibrated retention time start",
+        #     "Calibrated retention time",
+        #     "Calibrated retention time finish",
+        #     "mobility_values_index_left_ref",
+        #     "mobility_values_index_right_ref",
+        #     "mobility_values_index_center_ref",
+        #     # "mobility_values_left_ref",
+        #     # "mobility_values_right_ref",
+        #     "mobility_values_center_ref",
+        #     # "mobility_values_left_ref",
+        #     # "mobility_values_right_ref",
+        #     # "mobility_values_center_ref",
+        # ]
         Logger.info("ref spec columns: %s", ref_spec_columns)
     elif ref_type in ["pred"]:
         ref_spec_columns = []
@@ -1393,13 +1405,17 @@ def construct_dict(
         mq_rt_right_col="Calibrated retention time finish",
         idx_suffix="_exp",
     )  # exp values are based on the calibration
-    maxquant_exp_df = dict_add_im_index(
-        maxquant_df=maxquant_exp_df,
-        mobility_values_df=mobility_values_df,
-        mq_im_center_col="1/K0",
-        idx_suffix="_exp",
+    Logger.debug(
+        "maxquant_exp_df shape after adding rt index: %s", maxquant_exp_df.shape
     )
-    if ref_type == "MQ":
+    if use_ims:
+        maxquant_exp_df = dict_add_im_index(
+            maxquant_df=maxquant_exp_df,
+            mobility_values_df=mobility_values_df,
+            mq_im_center_col="1/K0",
+            idx_suffix="_exp",
+        )
+    if ref_type == "MQ" and use_ims:
         # dict_add_rt_index doesn't work for ref values
         maxquant_ref_df = dict_add_im_index(
             maxquant_df=maxquant_ref_df,
@@ -1470,46 +1486,49 @@ def construct_dict(
             raise ValueError(f"RT reference {cfg_prepare_dict.RT_REF} not supported")
 
     # add im pred
-    match cfg_prepare_dict.IM_REF:
-        case "pred":
-            maxquant_dict = dict_add_alpha_pept_pred(
-                model_path=cfg_prepare_dict.UPDATED_IM_MODEL_PATH,
-                pept_property="mobility",
-                dict_for_pred_path=dict_path,
-                maxquant_dict=maxquant_dict,
-                lc_grad=cfg_prepare_dict.RT_MAX,
-                device=device,
-            )
-        case "align_lr":
-            maxquant_dict, delta_im_95 = dict_add_im_align_lr(
-                maxquant_dict,
-                train_frac=cfg_prepare_dict.TRAIN_FRAC,
-                random_state=random_seed,
-            )
-            cfg_prepare_dict.DELTA_IM_95 = delta_im_95.item()
-        case "ref":
-            Logger.info("Using ref IM for IM prediction")
-            pass
-        case "mix":
-            Logger.info("Using mix IM for IM reference/prediction")
-            pass
-        case "exp":
-            Logger.info("Using exp IM for IM reference")
-            pass
-        case _:
-            raise ValueError(f"IM reference {cfg_prepare_dict.IM_REF} not supported")
-    maxquant_dict = maxquant_dict.rename(
-        mapper={"mobility_values_index": "mobility_pred_idx"}, axis=1
-    )
-    # specify im tolerence for search range (expected ion mobility length)
-    if cfg_prepare_dict.IM_LENGTH < 0:
-        Logger.info(
-            "IM tolerance not specified, using 99.9 percentile of experiment IM length"
+    if use_ims:
+        match cfg_prepare_dict.IM_REF:
+            case "pred":
+                maxquant_dict = dict_add_alpha_pept_pred(
+                    model_path=cfg_prepare_dict.UPDATED_IM_MODEL_PATH,
+                    pept_property="mobility",
+                    dict_for_pred_path=dict_path,
+                    maxquant_dict=maxquant_dict,
+                    lc_grad=cfg_prepare_dict.RT_MAX,
+                    device=device,
+                )
+            case "align_lr":
+                maxquant_dict, delta_im_95 = dict_add_im_align_lr(
+                    maxquant_dict,
+                    train_frac=cfg_prepare_dict.TRAIN_FRAC,
+                    random_state=random_seed,
+                )
+                cfg_prepare_dict.DELTA_IM_95 = delta_im_95.item()
+            case "ref":
+                Logger.info("Using ref IM for IM prediction")
+                pass
+            case "mix":
+                Logger.info("Using mix IM for IM reference/prediction")
+                pass
+            case "exp":
+                Logger.info("Using exp IM for IM reference")
+                pass
+            case _:
+                raise ValueError(
+                    f"IM reference {cfg_prepare_dict.IM_REF} not supported"
+                )
+        maxquant_dict = maxquant_dict.rename(
+            mapper={"mobility_values_index": "mobility_pred_idx"}, axis=1
         )
-        im_length = (
-            int(maxquant_exp_df["Ion mobility length"].quantile(0.999) + 2) // 2
-        )  # TODO: currently using only exp IM length
-        cfg_prepare_dict.IM_LENGTH = im_length
+        # specify im tolerence for search range (expected ion mobility length)
+        if cfg_prepare_dict.IM_LENGTH < 0:
+            Logger.info(
+                "IM tolerance not specified, using 99.9 percentile of experiment IM length"
+            )
+            im_length = (
+                int(maxquant_exp_df["Ion mobility length"].quantile(0.999) + 2) // 2
+            )  # TODO: currently using only exp IM length
+            cfg_prepare_dict.IM_LENGTH = im_length
 
         maxquant_dict = _define_im_idx_search_range(
             maxquant_df=maxquant_dict,
