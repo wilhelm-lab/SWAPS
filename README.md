@@ -19,7 +19,7 @@ pip install git+https://github.com/wilhelm-lab/SWAPS.git
 ```
 ### Run SWAPS
 #### Configuration
-SWAPS takes a `.yaml` as a configuration argument. Examples can be found at `swaps/swaps/utils/exp_configs`. Please modify the file path as necessary. Detail documents of config definiation can be found at `swaps/swaps/utils/singleton_swaps_optimization.py`.
+SWAPS takes a `.yaml` as a configuration argument. Examples can be found at `swaps/utils/exp_configs`. Please modify the file path as necessary. Detail documents of config definiation can be found at `swaps/utils/singleton_swaps_optimization.py`.
 
 #### Runner
 To run SWAPS, in the created environment, in command line:
