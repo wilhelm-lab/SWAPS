@@ -686,7 +686,7 @@ def plot_target_decoy_distr(
         fdr = td_counts[True] / td_counts[False]
         plt.text(x=0.85, y=7.5, s=f"FDR: {fdr:.2f}")
         plt.text(x=0.85, y=8, s=f"N targets: {td_counts[0]}")
-        logging.info("target decoy counts: %s", td_counts)
+        Logger.info("target decoy counts: %s", td_counts)
     if title is None:
         title = "Target Decoy Distribution"
     if xlabel is None:

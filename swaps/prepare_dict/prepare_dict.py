@@ -65,10 +65,21 @@ def merge_ref_and_exp(
     maxquant_ref_df = cleanup_maxquant(
         maxquant_ref_df, remove_decoys=True, how_duplicates="keep_highest_int"
     )
+    Logger.debug(
+        "NaN values in ref df Calibrated retentiont time start_exp/exp/finish_exp: %s, %s, %s",
+        maxquant_ref_df["Calibrated retention time start"].isna().sum(),
+        maxquant_ref_df["Calibrated retention time"].isna().sum(),
+        maxquant_ref_df["Calibrated retention time finish"].isna().sum(),
+    )
     maxquant_exp_df = cleanup_maxquant(
         maxquant_exp_df, remove_decoys=True, how_duplicates="keep_highest_int"
     )
-
+    Logger.debug(
+        "NaN values in exp df Calibrated retentiont time start_exp/exp/finish_exp: %s, %s, %s",
+        maxquant_exp_df["Calibrated retention time start"].isna().sum(),
+        maxquant_exp_df["Calibrated retention time"].isna().sum(),
+        maxquant_exp_df["Calibrated retention time finish"].isna().sum(),
+    )
     join_on_columns = ["Modified sequence", "Sequence", "Charge"]
     ref_selected = maxquant_ref_df[join_on_columns]
     Logger.debug("maxquant ref df columns: %s", maxquant_ref_df.columns)
@@ -83,7 +94,12 @@ def merge_ref_and_exp(
     ref_unique_rows = merged_df[merged_df["_merge"] == "left_only"]
     exp_unique_rows = merged_df[merged_df["_merge"] == "right_only"]
     both_unique_rows = merged_df[merged_df["_merge"] == "both"]
-
+    Logger.debug(
+        "ref_unique_rows, exp_unique_rows, both_unique_rows: %s, %s, %s",
+        ref_unique_rows.shape,
+        exp_unique_rows.shape,
+        both_unique_rows.shape,
+    )
     # Drop the indicator column
     ref_unique_rows = ref_unique_rows.drop(columns=["_merge"])
     exp_unique_rows = exp_unique_rows.drop(columns=["_merge"])
@@ -137,13 +153,19 @@ def merge_ref_and_exp(
         Logger.info("ref spec columns: %s", ref_spec_columns)
     elif ref_type in ["pred"]:
         ref_spec_columns = []
-    Logger.info("Maxquant_ref_df columns: %s", maxquant_ref_df.columns)
-    Logger.info("Maxquant_exp_df columns: %s", maxquant_exp_df.columns)
+    Logger.debug("Maxquant_ref_df columns: %s", maxquant_ref_df.columns)
+    Logger.debug("Maxquant_exp_df columns: %s", maxquant_exp_df.columns)
     both_unique_df = maxquant_exp_df.merge(
         maxquant_ref_df[join_on_columns + ref_spec_columns],
         on=join_on_columns,
         how="inner",
         suffixes=("_exp", "_ref"),
+    )
+    Logger.debug(
+        "NaN values in both_unique_df Calibrated retentiont time start_exp/exp/finish_exp: %s, %s, %s",
+        both_unique_df["Calibrated retention time start_exp"].isna().sum(),
+        both_unique_df["Calibrated retention time_exp"].isna().sum(),
+        both_unique_df["Calibrated retention time finish_exp"].isna().sum(),
     )
     exp_unique_df["source"] = "exp"
     ref_unique_df["source"] = "ref"
@@ -153,6 +175,12 @@ def merge_ref_and_exp(
         ignore_index=True,
         axis=0,
         join="outer",
+    )
+    Logger.debug(
+        "NaN values in maxquant_merge_df (concat) Calibrated retentiont time start_exp/exp/finish_exp: %s, %s, %s",
+        maxquant_merge_df["Calibrated retention time start_exp"].isna().sum(),
+        maxquant_merge_df["Calibrated retention time_exp"].isna().sum(),
+        maxquant_merge_df["Calibrated retention time finish_exp"].isna().sum(),
     )
     # evaluate
     plt.bar(
@@ -322,7 +350,7 @@ def _eval_target_decoy_pair_mz(maxquant_dict: pd.DataFrame):
     # If you want the result as a new DataFrame with 'TD pair id' and the difference
     result = result[["TD pair id", "IsoMZ_identical"]].drop_duplicates()
     result = result.loc[result["IsoMZ_identical"] == 1]
-    logging.info("Number of TD pairs with identical iso mz: %s", result.shape[0])
+    Logger.info("Number of TD pairs with identical iso mz: %s", result.shape[0])
     return result
 
 
@@ -407,9 +435,7 @@ def dict_add_im_index(
     ):
         im_idx_length = maxquant_df_with_im_index["Ion mobility length"] // 2 + 1
         Logger.info(
-            "mq_im_left_col or mq_im_right_col not given, \
-                IM index length required but not given, \
-                    using peptide specific im length values"
+            "mq_im_left_col or mq_im_right_col not given, IM index length required but not given, using peptide specific im length values"
         )
     if mq_im_left_col is None:
         maxquant_df_with_im_index["mobility_values_index_left" + idx_suffix] = (
@@ -488,7 +514,7 @@ def dict_add_rt_index(
     as indicated in RT values from .d file for each row in maxquant_dict_df/
     has built-in control of int type for index"""
     Logger.debug("dict_add_rt_index columns: %s", maxquant_df.columns)
-    Logger.debug("mq_rt_center_col columns: %s", mq_rt_center_col)
+    Logger.info("mq_rt_center_col columns: %s", mq_rt_center_col)
     maxquant_df = maxquant_df.sort_values(mq_rt_center_col)
     maxquant_df = pd.merge_asof(
         left=maxquant_df,
@@ -688,7 +714,7 @@ def _define_rt_search_range(
     rt_range: tuple[float, float],
 ):
     """Define the search range for the precursor RT."""
-    Logger.info("define_rt_search_range: ", maxquant_result_dict.columns)
+    Logger.debug("define_rt_search_range: %s", maxquant_result_dict.columns)
     match rt_ref:
         case "exp":
             # maxquant_result_dict["Calibrated retention time start"] = (
@@ -743,9 +769,21 @@ def _define_rt_search_range(
         case _:
             raise ValueError(f"RT reference {rt_ref} not supported")
     maxquant_result_dict["RT_search_center"] = maxquant_result_dict[rt_ref_act_peak]
+    Logger.debug(
+        "NaN values, before clipping, in RT_search_left, right and center: %s, %s, %s",
+        maxquant_result_dict["RT_search_left"].isna().sum(),
+        maxquant_result_dict["RT_search_right"].isna().sum(),
+        maxquant_result_dict["RT_search_center"].isna().sum(),
+    )
     maxquant_result_dict[
         ["RT_search_left", "RT_search_center", "RT_search_right"]
     ].clip(rt_range[0], rt_range[1], inplace=True)
+    Logger.debug(
+        "NaN values, after clipping, in RT_search_left, right and center: %s, %s, %s",
+        maxquant_result_dict["RT_search_left"].isna().sum(),
+        maxquant_result_dict["RT_search_right"].isna().sum(),
+        maxquant_result_dict["RT_search_center"].isna().sum(),
+    )
     return maxquant_result_dict
 
 
@@ -1265,7 +1303,7 @@ def construct_dict(
         rt_values_df["Time_minute"].min(),
         rt_values_df["Time_minute"].max(),
     )
-    Logger.info("RT index range: %s", rt_range)
+    Logger.info("RT range: %s", rt_range)
     construct_dict_dir = os.path.join(result_dir, "construct_dict")
     rt_transfer_dir = os.path.join(construct_dict_dir, "RT_transfer_learn")
     os.makedirs(construct_dict_dir, exist_ok=True)
@@ -1279,7 +1317,7 @@ def construct_dict(
             mobility_values_df["mobility_values_index"].min(),
             mobility_values_df["mobility_values_index"].max(),
         )
-        Logger.info("IM index range: %s", im_range)
+        Logger.info("IM range: %s", im_range)
 
         im_transfer_dir = os.path.join(construct_dict_dir, "IM_transfer_learn")
         os.makedirs(im_transfer_dir, exist_ok=True)
@@ -1518,10 +1556,10 @@ def construct_dict(
     dict_pickle_path = os.path.join(result_dir, "maxquant_result_ref.pkl")
     maxquant_dict.to_pickle(dict_pickle_path)
     Logger.info(
-        "Finish. Filtered prediction dataframe dimension: %s, columns: %s",
+        "Finish dictionary construction. Filtered prediction dataframe dimension: %s.",
         maxquant_dict.shape,
-        maxquant_dict.columns,
     )
+    Logger.debug("Columns in maxquant_dict: %s", maxquant_dict.columns)
     return maxquant_dict, dict_pickle_path, cfg_prepare_dict
 
 

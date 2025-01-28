@@ -294,7 +294,7 @@ def sum_peptbatch_from_act(
                 f"output_im_rt_pept_act_coo_peptbatch{pept_batch_idx}.npz",
             )
         ):
-            logging.info("File exists for peptide batch %s.", pept_batch_idx)
+            Logger.info("File exists for peptide batch %s.", pept_batch_idx)
         else:
             for act_batch_num in range(n_act_batch):
                 act_3d = sparse.load_npz(
@@ -303,9 +303,7 @@ def sum_peptbatch_from_act(
                         f"output_im_rt_pept_act_coo_batch{act_batch_num}.npz",
                     )
                 )
-                logging.info(
-                    "NNZ size of batch %s act_3d %s", act_batch_num, act_3d.nnz
-                )
+                Logger.info("NNZ size of batch %s act_3d %s", act_batch_num, act_3d.nnz)
                 try:
                     pept_batch_slice = act_3d[
                         :,
@@ -326,4 +324,4 @@ def sum_peptbatch_from_act(
                 ),
                 matrix=pept_batch,
             )
-            logging.info("saved pept batch %s", pept_batch_idx)
+            Logger.info("saved pept batch %s", pept_batch_idx)

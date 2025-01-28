@@ -49,6 +49,8 @@ from .utils import (
     calc_fdr_and_thres,
 )
 
+Logger = logging.getLogger(__name__)
+
 
 def train(
     cfg_peak_selection,
@@ -100,11 +102,11 @@ def train(
     cfg_peak_selection.CLSMODEL.PARAMS.IN_CHANNELS = len(
         cfg_peak_selection.DATASET.INPUT_CHANNELS
     ) + int(cfg_peak_selection.CLSMODEL.PARAMS.USE_SEG_OUTPUT)
-    logging.info(
+    Logger.info(
         "Dataset channels for seg model: %d",
         cfg_peak_selection.MODEL.PARAMS.IN_CHANNELS,
     )
-    logging.info(
+    Logger.info(
         "Dataset channels for cls model: %d",
         cfg_peak_selection.CLSMODEL.PARAMS.IN_CHANNELS,
     )
@@ -121,7 +123,7 @@ def train(
     # Create the dataset
 
     use_hint_channel = "hint" in cfg_peak_selection.DATASET.INPUT_CHANNELS
-    logging.info("Use hint channel: %s", use_hint_channel)
+    Logger.info("Use hint channel: %s", use_hint_channel)
     (
         train_dataset,
         train_eval_dataset,
@@ -172,15 +174,15 @@ def train(
             )
             current_epoch = checkpoint["epoch"]
             model.load_state_dict(checkpoint["model_state_dict"])
-            logging.info("Model loaded from %s", cfg_peak_selection.MODEL.RESUME_PATH)
+            Logger.info("Model loaded from %s", cfg_peak_selection.MODEL.RESUME_PATH)
             if "optimizer_state_dict" in checkpoint:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                logging.info(
+                Logger.info(
                     "Optimizer loaded from %s", cfg_peak_selection.MODEL.RESUME_PATH
                 )
             if "scheduler_state_dict" in checkpoint and scheduler is not None:
                 scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-                logging.info(
+                Logger.info(
                     "Scheduler loaded from %s", cfg_peak_selection.MODEL.RESUME_PATH
                 )
         ##########################################
@@ -192,7 +194,7 @@ def train(
         loss_tracking = {"train": [], "val": []}
         metric = {"train": [], "val": []}
         for epoch in range(current_epoch, total_epochs):
-            logging.info("Start epoch %s", epoch)
+            Logger.info("Start epoch %s", epoch)
 
             loss = train_one_epoch(
                 train_loader=train_dataloader,
@@ -408,17 +410,15 @@ def train(
             )
             current_epoch = checkpoint["epoch"]
             model.load_state_dict(checkpoint["model_state_dict"])
-            logging.info(
-                "Model loaded from %s", cfg_peak_selection.CLSMODEL.RESUME_PATH
-            )
+            Logger.info("Model loaded from %s", cfg_peak_selection.CLSMODEL.RESUME_PATH)
             if "optimizer_state_dict" in checkpoint:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-                logging.info(
+                Logger.info(
                     "Optimizer loaded from %s", cfg_peak_selection.CLSMODEL.RESUME_PATH
                 )
             if "scheduler_state_dict" in checkpoint and scheduler is not None:
                 scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-                logging.info(
+                Logger.info(
                     "Scheduler loaded from %s", cfg_peak_selection.CLSMODEL.RESUME_PATH
                 )
         ##########################################
@@ -438,7 +438,7 @@ def train(
         for epoch in range(current_epoch, total_epochs):
             torch.cuda.empty_cache()
             gc.collect()
-            logging.info("Start epoch %s", epoch)
+            Logger.info("Start epoch %s", epoch)
 
             loss = train_one_epoch(
                 train_loader=train_dataloader,
@@ -607,7 +607,7 @@ def train(
         # )
     # if cfg_peak_selection.REMOVE_CONFIG_AFTER_RUN:
     #     os.remove(cfg_peak_selection.CONFIG_PATH)
-    #     logging.info("Training finished, config file removed.")
+    #     Logger.info("Training finished, config file removed.")
     return best_seg_model_path, best_cls_model_path
 
 
@@ -625,7 +625,7 @@ def create_dataset_and_loader(
     )
     # # sanity check
     # image, hint, label = dataset[99]
-    # logging.info("Image shape in initial dataset: %s", image.shape)
+    # Logger.info("Image shape in initial dataset: %s", image.shape)
     # Split the dataset into training and testing sets
     train_val_dataset, test_dataset = dataset.split_dataset(
         train_ratio=cfg_peak_selection_dataset.TRAIN_VAL_SIZE,
@@ -633,7 +633,7 @@ def create_dataset_and_loader(
     )
     # sanity check
     image, hint, label = train_val_dataset[99]
-    logging.info("Image shape in train_val_dataset: %s", image.shape)
+    Logger.info("Image shape in train_val_dataset: %s", image.shape)
     train_dataset, val_dataset = train_val_dataset.split_dataset(
         train_ratio=cfg_peak_selection_dataset.TRAIN_SIZE,
         seed=random_state,
@@ -659,10 +659,10 @@ def create_dataset_and_loader(
         batch_size=cfg_peak_selection_dataset.TEST_BATCH_SIZE,
         shuffle=True,
     )
-    logging.info("Train dataset size: %d", len(train_dataset))
-    logging.info("Train eval dataset size: %d", len(train_eval_dataset))
-    logging.info("Validation dataset size: %d", len(val_dataset))
-    logging.info("Test dataset size: %d", len(test_dataset))
+    Logger.info("Train dataset size: %d", len(train_dataset))
+    Logger.info("Train eval dataset size: %d", len(train_eval_dataset))
+    Logger.info("Validation dataset size: %d", len(val_dataset))
+    Logger.info("Test dataset size: %d", len(test_dataset))
     return (
         train_dataset,
         train_eval_dataset,
@@ -827,7 +827,7 @@ def testset_eval(
 # if __name__ == "__main__":
 #     logging.basicConfig(
 #         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-#         level=logging.INFO,
+#         level=Logger.info,
 #     )
 #     try:
 #         arguments = docopt(

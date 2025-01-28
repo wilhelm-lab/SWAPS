@@ -36,13 +36,17 @@ from postprocessing.fdr import (
 )
 from postprocessing.compete_signal import compete_candidates_for_signal
 
+# Clear existing logging handlers
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+
 
 def opt_scan_by_scan(config_path: str):
     """Scan by scan optimization for joint identification and quantification."""
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.INFO,
-    )
 
     cfg = get_cfg_defaults(swaps_optimization_cfg)
     name_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")

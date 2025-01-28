@@ -1,7 +1,7 @@
+import logging
 import sparse
 import os
 import numpy as np
-import logging
 import pandas as pd
 import alphatims.bruker
 
@@ -155,7 +155,6 @@ def combine_3d_act_and_sum_int(
         # act_3d_all = None
         except FileNotFoundError:
             for batch_num in range(n_batch):
-                # logging.info("Batch %s, output file path %s", batch_num, conf.output_file)
                 act_3d = sparse.load_npz(
                     os.path.join(
                         act_dir,
@@ -166,7 +165,7 @@ def combine_3d_act_and_sum_int(
                     pept_act_sum = act_3d.sum(axis=(0, 1))
                 else:
                     pept_act_sum = act_3d.sum(axis=0)
-                logging.info("NNZ size of batch %s act_3d %s", batch_num, act_3d.nnz)
+                Logger.info("NNZ size of batch %s act_3d %s", batch_num, act_3d.nnz)
                 if batch_num == 0:
                     act_3d_all = act_3d
                     if pept_block_num == 0:
@@ -177,7 +176,7 @@ def combine_3d_act_and_sum_int(
                 else:
                     act_3d_all += act_3d
                     pept_act_sum_all += pept_act_sum
-                    logging.info("NNZ size of act_3d_all %s", act_3d_all.nnz)
+                    Logger.info("NNZ size of act_3d_all %s", act_3d_all.nnz)
                     del act_3d, pept_act_sum
 
             sparse.save_npz(

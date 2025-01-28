@@ -606,11 +606,3 @@ def resample_training_data(
         Logger.info("Sampled and concatenated data from %s", arg)
     Logger.info("After sampling, %s data points remained.", keep_data.shape[0])
     return keep_data
-
-
-if __name__ == "__main__":
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.INFO,
-    )
-    fire.Fire(prepare_training_dataset)

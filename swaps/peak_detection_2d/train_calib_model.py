@@ -10,7 +10,6 @@ Options:
     --version              show version
 """
 
-
 import os
 
 from datetime import datetime
@@ -310,220 +309,220 @@ def image_level_eval(
     plot_confidence_distr(test_df, save_dir=results_dir)
 
 
-if __name__ == "__main__":
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.INFO,
-    )
-    try:
-        arguments = docopt(
-            __doc__, argv=None, help=False, version=None, options_first=False
-        )
-        print("Arguments parsed:")
-        print(arguments)
-        best_seg_model_path = arguments["--best_seg_model_path"]
-        calib_cfg_path = arguments["--path_cfg"]
-        output_parent_path = os.path.dirname(os.path.dirname(best_seg_model_path))
-        # get timestamp as folder name
-        output_folder_name = datetime.now().strftime("%Y%m%d_%H%M%S%f")
-        logging.info("Output folder name: %s", output_folder_name)
-        cfg = get_cfg_defaults(peak_detection_cfg)
-        seg_cfg_path = [
-            os.path.join(output_parent_path, "results", f)
-            for f in os.listdir(os.path.join(output_parent_path, "results"))
-            if f.endswith(".yaml")
-        ]
-        if len(seg_cfg_path) > 0:
-            cfg.merge_from_file(seg_cfg_path[0])
-            print(f"merge with segmentaion model cfg file {seg_cfg_path[0]}")
-        if calib_cfg_path is not None:
-            cfg.merge_from_file(calib_cfg_path)
-            print(f"merge with calibration model cfg file {calib_cfg_path}")
-        cfg.OUTPUT_PARENT_PATH = output_parent_path
-        cfg.OUTPUT_FOLDER_NAME = output_folder_name
-        cfg.CONFIG_PATH = calib_cfg_path
-        if cfg.DATASET.INPUT_CHANNELS == ["log"]:
-            cfg.DATASET.ONLY_LOG_CHANNEL = True
-            cfg.DATASET.N_CHANNEL = len(cfg.DATASET.INPUT_CHANNELS)
-            cfg.MODEL.PARAMS.IN_CHANNELS = cfg.DATASET.N_CHANNEL
-        DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-        calib_exp_dir = os.path.join(cfg.OUTPUT_PARENT_PATH, cfg.OUTPUT_FOLDER_NAME)
-        os.makedirs(calib_exp_dir, exist_ok=True)
-        # Save configs
-        cfg.dump(
-            stream=open(
-                os.path.join(calib_exp_dir, f"config_{output_folder_name}.yaml"),
-                "w",
-                encoding="utf-8",
-            )
-        )
-        # Create dataset if not exist
-        conf_dataset_paths = [
-            os.path.join(
-                cfg.OUTPUT_PARENT_PATH,
-                "confidence_dataset",
-                dataset_name,
-            )
-            for dataset_name in [
-                "train_confidence_dataset.h5",
-                "val_confidence_dataset.h5",
-                "test_confidence_dataset.h5",
-            ]
-        ]
-        if all(list(map(os.path.exists, conf_dataset_paths))):
-            logging.info("All confidence datasets exist, start training")
-            test_image_dataloader = get_image_dataset_and_prepare_conf_dataset(
-                cfg.DATASET,
-                cfg.MODEL,
-                device=DEVICE,
-                best_model_path=best_seg_model_path,
-                peak_selection_dir=output_parent_path,
-                prepare_conf_dataset=False,
-            )
-        else:
-            logging.info("Some confidence datasets do not exist, prepare them")
-            os.makedirs(
-                os.path.join(output_parent_path, "confidence_dataset"), exist_ok=True
-            )
-            test_image_dataloader = get_image_dataset_and_prepare_conf_dataset(
-                cfg.DATASET,
-                cfg.MODEL,
-                device=DEVICE,
-                best_model_path=best_seg_model_path,
-                peak_selection_dir=output_parent_path,
-                prepare_conf_dataset=True,
-            )
-        transformation = None
-        if cfg.CONFMODEL.BINARY_LABEL:
-            transformation = Compose([Conf_AsBinary()])
+# if __name__ == "__main__":
+#     logging.basicConfig(
+#         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+#         level=logging.INFO,
+#     )
+#     try:
+#         arguments = docopt(
+#             __doc__, argv=None, help=False, version=None, options_first=False
+#         )
+#         print("Arguments parsed:")
+#         print(arguments)
+#         best_seg_model_path = arguments["--best_seg_model_path"]
+#         calib_cfg_path = arguments["--path_cfg"]
+#         output_parent_path = os.path.dirname(os.path.dirname(best_seg_model_path))
+#         # get timestamp as folder name
+#         output_folder_name = datetime.now().strftime("%Y%m%d_%H%M%S%f")
+#         logging.info("Output folder name: %s", output_folder_name)
+#         cfg = get_cfg_defaults(peak_detection_cfg)
+#         seg_cfg_path = [
+#             os.path.join(output_parent_path, "results", f)
+#             for f in os.listdir(os.path.join(output_parent_path, "results"))
+#             if f.endswith(".yaml")
+#         ]
+#         if len(seg_cfg_path) > 0:
+#             cfg.merge_from_file(seg_cfg_path[0])
+#             print(f"merge with segmentaion model cfg file {seg_cfg_path[0]}")
+#         if calib_cfg_path is not None:
+#             cfg.merge_from_file(calib_cfg_path)
+#             print(f"merge with calibration model cfg file {calib_cfg_path}")
+#         cfg.OUTPUT_PARENT_PATH = output_parent_path
+#         cfg.OUTPUT_FOLDER_NAME = output_folder_name
+#         cfg.CONFIG_PATH = calib_cfg_path
+#         if cfg.DATASET.INPUT_CHANNELS == ["log"]:
+#             cfg.DATASET.ONLY_LOG_CHANNEL = True
+#             cfg.DATASET.N_CHANNEL = len(cfg.DATASET.INPUT_CHANNELS)
+#             cfg.MODEL.PARAMS.IN_CHANNELS = cfg.DATASET.N_CHANNEL
+#         DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+#         calib_exp_dir = os.path.join(cfg.OUTPUT_PARENT_PATH, cfg.OUTPUT_FOLDER_NAME)
+#         os.makedirs(calib_exp_dir, exist_ok=True)
+#         # Save configs
+#         cfg.dump(
+#             stream=open(
+#                 os.path.join(calib_exp_dir, f"config_{output_folder_name}.yaml"),
+#                 "w",
+#                 encoding="utf-8",
+#             )
+#         )
+#         # Create dataset if not exist
+#         conf_dataset_paths = [
+#             os.path.join(
+#                 cfg.OUTPUT_PARENT_PATH,
+#                 "confidence_dataset",
+#                 dataset_name,
+#             )
+#             for dataset_name in [
+#                 "train_confidence_dataset.h5",
+#                 "val_confidence_dataset.h5",
+#                 "test_confidence_dataset.h5",
+#             ]
+#         ]
+#         if all(list(map(os.path.exists, conf_dataset_paths))):
+#             logging.info("All confidence datasets exist, start training")
+#             test_image_dataloader = get_image_dataset_and_prepare_conf_dataset(
+#                 cfg.DATASET,
+#                 cfg.MODEL,
+#                 device=DEVICE,
+#                 best_model_path=best_seg_model_path,
+#                 peak_selection_dir=output_parent_path,
+#                 prepare_conf_dataset=False,
+#             )
+#         else:
+#             logging.info("Some confidence datasets do not exist, prepare them")
+#             os.makedirs(
+#                 os.path.join(output_parent_path, "confidence_dataset"), exist_ok=True
+#             )
+#             test_image_dataloader = get_image_dataset_and_prepare_conf_dataset(
+#                 cfg.DATASET,
+#                 cfg.MODEL,
+#                 device=DEVICE,
+#                 best_model_path=best_seg_model_path,
+#                 peak_selection_dir=output_parent_path,
+#                 prepare_conf_dataset=True,
+#             )
+#         transformation = None
+#         if cfg.CONFMODEL.BINARY_LABEL:
+#             transformation = Compose([Conf_AsBinary()])
 
-        if cfg.CONFMODEL.DATASET_RESPLIT:
-            try:
-                train_conf_dataset = ConfidenceDataset(
-                    os.path.join(
-                        output_parent_path,
-                        "confidence_dataset",
-                        "newsplit_train_confidence_dataset.h5",
-                    ),
-                    transforms=transformation,
-                )
-                val_conf_dataset = ConfidenceDataset(
-                    os.path.join(
-                        output_parent_path,
-                        "confidence_dataset",
-                        "newsplit_val_confidence_dataset.h5",
-                    ),
-                    transforms=transformation,
-                )
-            except FileNotFoundError:
-                logging.info("Resplit dataset not found, resplitting dataset...")
-                ori_train_conf_dataset = ConfidenceDataset(
-                    os.path.join(
-                        output_parent_path,
-                        "confidence_dataset",
-                        "train_confidence_dataset.h5",
-                    ),
-                    transforms=transformation,
-                )
-                ori_val_conf_dataset = ConfidenceDataset(
-                    os.path.join(
-                        output_parent_path,
-                        "confidence_dataset",
-                        "val_confidence_dataset.h5",
-                    ),
-                    transforms=transformation,
-                )
-                (
-                    train_conf_dataset,
-                    val_conf_dataset,
-                    _,
-                ) = ori_train_conf_dataset.create_splits(
-                    test_size=None,
-                    val_size=(1 - cfg.DATASET.TRAIN_SIZE * cfg.DATASET.TRAIN_VAL_SIZE),
-                )
-                train_conf_dataset = ConfidenceDataset.combine_datasets(
-                    train_conf_dataset,
-                    ori_val_conf_dataset,
-                    os.path.join(
-                        output_parent_path,
-                        "confidence_dataset",
-                        "newsplit_train_confidence_dataset.h5",
-                    ),
-                )
-                ConfidenceDataset.save_dataset_to_hdf5(
-                    val_conf_dataset,
-                    os.path.join(
-                        output_parent_path,
-                        "confidence_dataset",
-                        "newsplit_val_confidence_dataset.h5",
-                    ),
-                )
-                logging.info("Resplit dataset saved.")
-                logging.info("Train dataset size: %d", len(train_conf_dataset))
-                logging.info("Validation dataset size: %d", len(val_conf_dataset))
-        else:
-            train_conf_dataset = ConfidenceDataset(
-                os.path.join(
-                    output_parent_path,
-                    "confidence_dataset",
-                    "train_confidence_dataset.h5",
-                ),
-                transforms=transformation,
-            )
-            val_conf_dataset = ConfidenceDataset(
-                os.path.join(
-                    output_parent_path,
-                    "confidence_dataset",
-                    "val_confidence_dataset.h5",
-                ),
-                transforms=transformation,
-            )
-        # test confidence dataset remain unchanged
-        test_conf_dataset = ConfidenceDataset(
-            os.path.join(
-                output_parent_path, "confidence_dataset", "test_confidence_dataset.h5"
-            ),
-            transforms=transformation,
-        )
-        train_dataloader = torch.utils.data.DataLoader(
-            train_conf_dataset, batch_size=cfg.DATASET.TRAIN_BATCH_SIZE
-        )
-        val_dataloader = torch.utils.data.DataLoader(
-            val_conf_dataset, batch_size=cfg.DATASET.VAL_BATCH_SIZE
-        )
-        test_dataloader = torch.utils.data.DataLoader(
-            test_conf_dataset, batch_size=cfg.DATASET.VAL_BATCH_SIZE
-        )
-        logging.info("Train dataset size: %d", len(train_conf_dataset))
-        logging.info("Validation dataset size: %d", len(val_conf_dataset))
-        logging.info("Test dataset size: %d", len(test_conf_dataset))
+#         if cfg.CONFMODEL.DATASET_RESPLIT:
+#             try:
+#                 train_conf_dataset = ConfidenceDataset(
+#                     os.path.join(
+#                         output_parent_path,
+#                         "confidence_dataset",
+#                         "newsplit_train_confidence_dataset.h5",
+#                     ),
+#                     transforms=transformation,
+#                 )
+#                 val_conf_dataset = ConfidenceDataset(
+#                     os.path.join(
+#                         output_parent_path,
+#                         "confidence_dataset",
+#                         "newsplit_val_confidence_dataset.h5",
+#                     ),
+#                     transforms=transformation,
+#                 )
+#             except FileNotFoundError:
+#                 logging.info("Resplit dataset not found, resplitting dataset...")
+#                 ori_train_conf_dataset = ConfidenceDataset(
+#                     os.path.join(
+#                         output_parent_path,
+#                         "confidence_dataset",
+#                         "train_confidence_dataset.h5",
+#                     ),
+#                     transforms=transformation,
+#                 )
+#                 ori_val_conf_dataset = ConfidenceDataset(
+#                     os.path.join(
+#                         output_parent_path,
+#                         "confidence_dataset",
+#                         "val_confidence_dataset.h5",
+#                     ),
+#                     transforms=transformation,
+#                 )
+#                 (
+#                     train_conf_dataset,
+#                     val_conf_dataset,
+#                     _,
+#                 ) = ori_train_conf_dataset.create_splits(
+#                     test_size=None,
+#                     val_size=(1 - cfg.DATASET.TRAIN_SIZE * cfg.DATASET.TRAIN_VAL_SIZE),
+#                 )
+#                 train_conf_dataset = ConfidenceDataset.combine_datasets(
+#                     train_conf_dataset,
+#                     ori_val_conf_dataset,
+#                     os.path.join(
+#                         output_parent_path,
+#                         "confidence_dataset",
+#                         "newsplit_train_confidence_dataset.h5",
+#                     ),
+#                 )
+#                 ConfidenceDataset.save_dataset_to_hdf5(
+#                     val_conf_dataset,
+#                     os.path.join(
+#                         output_parent_path,
+#                         "confidence_dataset",
+#                         "newsplit_val_confidence_dataset.h5",
+#                     ),
+#                 )
+#                 logging.info("Resplit dataset saved.")
+#                 logging.info("Train dataset size: %d", len(train_conf_dataset))
+#                 logging.info("Validation dataset size: %d", len(val_conf_dataset))
+#         else:
+#             train_conf_dataset = ConfidenceDataset(
+#                 os.path.join(
+#                     output_parent_path,
+#                     "confidence_dataset",
+#                     "train_confidence_dataset.h5",
+#                 ),
+#                 transforms=transformation,
+#             )
+#             val_conf_dataset = ConfidenceDataset(
+#                 os.path.join(
+#                     output_parent_path,
+#                     "confidence_dataset",
+#                     "val_confidence_dataset.h5",
+#                 ),
+#                 transforms=transformation,
+#             )
+#         # test confidence dataset remain unchanged
+#         test_conf_dataset = ConfidenceDataset(
+#             os.path.join(
+#                 output_parent_path, "confidence_dataset", "test_confidence_dataset.h5"
+#             ),
+#             transforms=transformation,
+#         )
+#         train_dataloader = torch.utils.data.DataLoader(
+#             train_conf_dataset, batch_size=cfg.DATASET.TRAIN_BATCH_SIZE
+#         )
+#         val_dataloader = torch.utils.data.DataLoader(
+#             val_conf_dataset, batch_size=cfg.DATASET.VAL_BATCH_SIZE
+#         )
+#         test_dataloader = torch.utils.data.DataLoader(
+#             test_conf_dataset, batch_size=cfg.DATASET.VAL_BATCH_SIZE
+#         )
+#         logging.info("Train dataset size: %d", len(train_conf_dataset))
+#         logging.info("Validation dataset size: %d", len(val_conf_dataset))
+#         logging.info("Test dataset size: %d", len(test_conf_dataset))
 
-        # Train confidence model
-        best_calib_model_path = train_calib_model(
-            cfg_confmodel=cfg.CONFMODEL,
-            train_dataloader=train_dataloader,
-            val_dataloader=val_dataloader,
-            device=DEVICE,
-            peak_selection_dir=calib_exp_dir,
-        )
-        logging.info(
-            "Seg model input channels: %s, first out channel: %s, dataset n"
-            " channel: %s",
-            cfg.MODEL.PARAMS.IN_CHANNELS,
-            cfg.MODEL.PARAMS.FIRST_OUT_CHANNELS,
-            cfg.DATASET.N_CHANNEL,
-        )
-        image_level_eval(
-            best_conf_model_path=best_calib_model_path,
-            cfg_confmodel=cfg.CONFMODEL,
-            best_seg_model_path=best_seg_model_path,
-            cfg_segmodel=cfg.MODEL,
-            test_dataloader=test_image_dataloader,
-            device=DEVICE,
-            exp=cfg.DATASET.ONLY_LOG_CHANNEL,
-            peak_selection_dir=calib_exp_dir,
-        )
-    except Exception as e:
-        print(f"Error: {e}")
-        print(__doc__)
-        raise
+#         # Train confidence model
+#         best_calib_model_path = train_calib_model(
+#             cfg_confmodel=cfg.CONFMODEL,
+#             train_dataloader=train_dataloader,
+#             val_dataloader=val_dataloader,
+#             device=DEVICE,
+#             peak_selection_dir=calib_exp_dir,
+#         )
+#         logging.info(
+#             "Seg model input channels: %s, first out channel: %s, dataset n"
+#             " channel: %s",
+#             cfg.MODEL.PARAMS.IN_CHANNELS,
+#             cfg.MODEL.PARAMS.FIRST_OUT_CHANNELS,
+#             cfg.DATASET.N_CHANNEL,
+#         )
+#         image_level_eval(
+#             best_conf_model_path=best_calib_model_path,
+#             cfg_confmodel=cfg.CONFMODEL,
+#             best_seg_model_path=best_seg_model_path,
+#             cfg_segmodel=cfg.MODEL,
+#             test_dataloader=test_image_dataloader,
+#             device=DEVICE,
+#             exp=cfg.DATASET.ONLY_LOG_CHANNEL,
+#             peak_selection_dir=calib_exp_dir,
+#         )
+#     except Exception as e:
+#         print(f"Error: {e}")
+#         print(__doc__)
+#         raise
