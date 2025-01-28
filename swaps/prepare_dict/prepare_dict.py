@@ -182,8 +182,23 @@ def merge_ref_and_exp(
     exp_unique_df["source"] = "exp"
     ref_unique_df["source"] = "ref"
     both_unique_df["source"] = "both"
+    Logger.debug(
+        "Shape of ref_unique_df, exp_unique_df and both_unique_df: %s, %s, %s",
+        ref_unique_df.shape,
+        exp_unique_df.shape,
+        both_unique_df.shape,
+    )
+    df_to_merge = []
+    for df in [ref_unique_df, exp_unique_df, both_unique_df]:
+        if df.shape[0] > 0:
+            df_to_merge.append(df)
+            Logger.info(
+                "Concatenating %s entries from source %s",
+                df.shape[0],
+                df["source"].values[0],
+            )
     maxquant_merge_df = pd.concat(
-        [ref_unique_df, exp_unique_df, both_unique_df],
+        df_to_merge,
         ignore_index=True,
         axis=0,
         join="outer",
