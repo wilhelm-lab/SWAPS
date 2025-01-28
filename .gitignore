@@ -18,3 +18,4 @@ scripts/*
 slurm_scripts/*
 build/*
 swaps/peak_detection_2d/config/*
+pipreqs.txt
