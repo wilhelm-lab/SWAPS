@@ -1,12 +1,12 @@
-RESULT_PATH: /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/SWAPS_exp/random_15min_3R_60min_im_ref
+RESULT_PATH: /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/SWAPS_exp/random_15min_3R_60min_im_ref_exp_rescore
 ADD_TIMESTAMP_TO_RESULT_PATH: true
 DATA_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/Random_3ramps_200ng_K562_15min_Slot2-2_1_6934.d/
 DEBUG: false
 DICT_PICKLE_PATH: ''
 EXPORT_DATA_HDF5_DIR: ''
-MQ_REF_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/txt/evidence.txt
+MQ_REF_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/txt_001FDR_15min_60min/evidence.txt
 FILTER_REF_BY_RAW_FILE: ['PASEF_7ramps_500ng_K562_60min_Slot2-2_1_6929']
-MQ_EXP_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/txt/evidence.txt
+MQ_EXP_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/txt_100FDR_15min/evidence.txt
 FILTER_EXP_BY_RAW_FILE: []
 N_CPU: 5
 OPTIMIZATION:
@@ -18,13 +18,12 @@ PREPARE_DICT:
   FILTER_TRAIN_BY_RAW_FILE: ''
   GENERATE_DECOY: true
   IM_REF: ref
-  IM_TRAIN_EPOCHS: 8
-  ISO_MIN_AB_THRES: 0.01
   KEEP_MATCHED_PRECURSORS: false
   MZ_BIN_DIGITS: 2
-  RT_REF: pred
-  RT_TRAIN_EPOCHS: 28
+  RT_REF: align_lowess
+  RT_TRAIN_EPOCHS: 50
   TRAIN_FRAC: 0.9
+  EXP_OK_DIR: /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/rescoring/out_no_rl_fix_ce_mokapot_random/
 RANDOM_SEED: 42
 PEAK_SELECTION:
   EVAL_ON_TEST: true
