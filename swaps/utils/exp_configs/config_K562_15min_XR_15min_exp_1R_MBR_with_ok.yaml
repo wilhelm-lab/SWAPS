@@ -1,0 +1,32 @@
+RESULT_PATH: /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/SWAPS_exp/random_15min_XR_15min_exp_library_no_decoy_MBR_1R_with_ok
+ADD_TIMESTAMP_TO_RESULT_PATH: true
+DATA_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/Random_1ramps_200ng_K562_15min_Slot2-2_1_6936.d/
+DEBUG: false
+DICT_PICKLE_PATH: ''5168816179
+EXPORT_DATA_HDF5_DIR: ''
+MQ_REF_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/txt_100FDR_15min/evidence.txt
+MQ_EXP_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/txt_100FDR_15min/evidence.txt
+FILTER_REF_BY_RAW_FILE: ['Random_1ramps_200ng_K562_15min_Slot2-2_1_6936', 'Random_3ramps_200ng_K562_15min_Slot2-2_1_6934', 'Random_6ramps_200ng_K562_15min_Slot2-2_1_6932']
+FILTER_EXP_BY_RAW_FILE: ['Random_1ramps_200ng_K562_15min_Slot2-2_1_6936']
+N_CPU: 10
+OPTIMIZATION:
+  N_BLOCKS_BY_PEPT: 1
+  N_BATCH: 10
+PREPARE_DICT:
+  DICT_PICKLE_PATH: ''
+  FILTER_PRED_BY_RAW_FILE: ''
+  FILTER_TRAIN_BY_RAW_FILE: ''
+  KEEP_MATCHED_PRECURSORS: false
+  GENERATE_DECOY: false
+  IM_REF: ref
+  RT_REF: ref
+  RT_TOL: 0.15 # Use 0.2 as half of MaxQuant MBR default
+  EXP_OK_DIR: /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/rescoring/out_no_rl_fix_ce_mokapot_random/
+  REF_OK_DIR: /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/rescoring/out_no_rl_fix_ce_mokapot_random/
+RANDOM_SEED: 42
+PEAK_SELECTION:
+  ENABLE: false
+RESULT_ANALYSIS:
+  ENABLE: true
+  POST_PROCESSING:
+    FILTER_BY_IM: true
