@@ -59,8 +59,12 @@ __C.PREPARE_DICT.MZ_BIN_DIGITS = 2
 __C.PREPARE_DICT.ISO_MIN_AB_THRES = 0.01
 __C.PREPARE_DICT.GENERATE_DECOY = False
 __C.PREPARE_DICT.RT_MAX = 0.0
-
-
+__C.PREPARE_DICT.EXP_OK_DIR = ""  # path to the oktoberfest output directory for using rescoring output, then MQ evidence should be 100FDR
+__C.PREPARE_DICT.EXP_OK_OUTPUT = "psms"  # one of ["psms", "peptides"], whether use ok psms or peptides table for filtering
+__C.PREPARE_DICT.EXP_OK_FDR = 0.01  # FDR threshold for oktoberfest output
+__C.PREPARE_DICT.REF_OK_DIR = ""  # path to the oktoberfest output directory for using rescoring output, then MQ evidence should be 100FDR
+__C.PREPARE_DICT.REF_OK_OUTPUT = "psms"  # one of ["psms", "peptides"], whether use ok psms or peptides table for filtering
+__C.PREPARE_DICT.REF_OK_FDR = 0.01  # FDR threshold for oktoberfest output
 # optimization
 __C.OPTIMIZATION = ConfigurationNode()
 __C.OPTIMIZATION.N_BLOCKS_BY_PEPT = 4

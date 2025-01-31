@@ -1263,6 +1263,45 @@ def dict_add_rt_align_lowess(
     return maxquant_dict, test_delta95
 
 
+def filter_maxquant_by_ok(
+    evidence_100fdr: pd.DataFrame,
+    ok_dir: str,
+    ok_output_type: str = "psms",
+    rescore_fdr: float = 0.01,
+):
+    """
+    Filter maxquant by Oktoberfest rescoring results.
+    Please ensure the evidence file is at 100% FDR.
+    :param evidence_100fdr: pd.DataFrame, the evidence file at 100% FDR
+    :param ok_dir: str, the directory of Oktoberfest results
+    :param ok_output_type: str, one of "psms" or "peptides"
+    :param rescore_fdr: float, the FDR threshold for rescoring
+    :return: pd.DataFrame, the evidence file at 1% FDR after rescoring
+    """
+    Logger.info(
+        "Filtering maxquant by Oktoberfest rescoring results. Please ensure the evidence file is at 100% FDR."
+    )
+    assert ok_output_type in ["psms", "peptides"]  # one of the oktoberfest output types
+    ok_df = pd.read_csv(
+        os.path.join(
+            ok_dir, "results", "mokapot", f"rescore.mokapot.{ok_output_type}.txt"
+        ),
+        sep="\t",
+    )
+    ok_df_001fdr = ok_df[ok_df["mokapot q-value"] <= rescore_fdr]
+    ok_df_001fdr.rename(
+        {"Peptide": "Peptide_mq", "Proteins": "Proteins_mq"}, axis=1, inplace=True
+    )
+    evidence_rescore_001fdr = pd.merge(
+        evidence_100fdr,
+        ok_df_001fdr,
+        left_on=["Raw file", "MS/MS scan number"],
+        right_on=["filename", "ScanNr"],
+        suffixes=("_mq", "_ok"),
+    )
+    return evidence_rescore_001fdr
+
+
 def construct_dict(
     cfg_prepare_dict,
     filter_exp_by_raw_file: List[str],
@@ -1302,6 +1341,28 @@ def construct_dict(
         filter_exp_by_raw_file,
         maxquant_exp_df.shape,
     )
+    if len(cfg_prepare_dict.EXP_OK_DIR) > 0:
+        maxquant_exp_df = filter_maxquant_by_ok(
+            evidence_100fdr=maxquant_exp_df,
+            ok_dir=cfg_prepare_dict.EXP_OK_DIR,
+            ok_output_type=cfg_prepare_dict.EXP_OK_OUTPUT,
+            rescore_fdr=cfg_prepare_dict.EXP_OK_FDR,
+        )
+        Logger.info(
+            "maxquant_exp_df size after filtering by Oktoberfest: %s",
+            maxquant_exp_df.shape,
+        )
+    if len(cfg_prepare_dict.REF_OK_DIR) > 0:
+        maxquant_ref_df = filter_maxquant_by_ok(
+            evidence_100fdr=maxquant_ref_df,
+            ok_dir=cfg_prepare_dict.REF_OK_DIR,
+            ok_output_type=cfg_prepare_dict.REF_OK_OUTPUT,
+            rescore_fdr=cfg_prepare_dict.REF_OK_FDR,
+        )
+        Logger.info(
+            "maxquant_ref_df size after filtering by Oktoberfest: %s",
+            maxquant_ref_df.shape,
+        )
     if not keep_matched_precursors:
         if use_ims:
             maxquant_exp_df = maxquant_exp_df.loc[
