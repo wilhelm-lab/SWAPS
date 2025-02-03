@@ -771,6 +771,15 @@ def build_transformation(dataset_cfg: CfgNode):
             transformation.append(Mask_Resize(dataset_cfg.RESIZE_SHAPE))
         case "padding":
             transformation.append(Mask_Padding(dataset_cfg.PADDING_SHAPE))
+        case _:
+            raise ValueError(
+                "Invalid reshape method, please use 'resize' or 'padding'."
+            )
+    Logger.info(
+        "Reshape into size %s with method: %s",
+        dataset_cfg.RESIZE_SHAPE,
+        dataset_cfg.RESHAPE_METHOD,
+    )
     # TODO: so far normal is always there
     if (
         "normal" not in dataset_cfg.INPUT_CHANNELS
