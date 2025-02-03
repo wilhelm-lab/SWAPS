@@ -24,7 +24,6 @@ from torch.utils.tensorboard import SummaryWriter
 from torch import nn
 from torch.utils.data import ConcatDataset
 from optimization.custom_models import Logger
-from result_analysis.result_analysis import SBSResult
 
 
 from .model.build_model import build_model
