@@ -1,5 +1,5 @@
 from yacs.config import CfgNode
-from .seg_model import UNET
+from .seg_model import UNET, UNet_rec_input
 from .conf_model import CNNEncoderRegressor, CNNRegression, ConfidenceModel
 from .model import PeakDetectionNet
 
@@ -7,7 +7,7 @@ from .model import PeakDetectionNet
 def build_model(model_cfg: CfgNode):
     if model_cfg.TYPE == "mask_segmentation":
         if model_cfg.NAME == "UNET":
-            model = UNET(
+            model = UNet_rec_input(
                 in_channels=model_cfg.PARAMS.IN_CHANNELS,
                 first_out_channels=model_cfg.PARAMS.FIRST_OUT_CHANNELS,
                 exit_channels=model_cfg.PARAMS.EXIT_CHANNELS,
@@ -19,7 +19,7 @@ def build_model(model_cfg: CfgNode):
             return model
     elif model_cfg.TYPE == "mask_classification":
         if model_cfg.NAME == "UNET":
-            model = UNET(
+            model = UNet_rec_input(
                 in_channels=model_cfg.PARAMS.IN_CHANNELS,
                 first_out_channels=model_cfg.PARAMS.FIRST_OUT_CHANNELS,
                 exit_channels=model_cfg.PARAMS.EXIT_CHANNELS,

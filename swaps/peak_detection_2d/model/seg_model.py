@@ -628,3 +628,115 @@ class UNET(nn.Module):
         # cls_out = self.classifier(enc_out)
 
         return out  # TODO: fix this
+
+
+class UNet_rec_input(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        first_out_channels,
+        exit_channels,
+        downhill,
+        padding=0,
+        seg_head: bool = True,
+        cls_head: bool = False,
+        drop_out: float = 0,
+    ):
+        """
+        :param in_channels: Number of input channels (e.g., 3 for RGB)
+        :param first_out_channels: Number of filters in the first layer
+        :param exit_channels: Number of output channels (e.g., 1 for segmentation mask)
+        :param downhill: Number of encoder/decoder layers
+        :param padding: Convolution padding (default=0)
+        :param seg_head: If True, enables the segmentation head
+        :param cls_head: If True, enables the classification head
+        :param drop_out: Dropout rate for classification head (default=0)
+        """
+        super(UNet_rec_input, self).__init__()
+        self.seg_head = seg_head
+        self.cls_head = cls_head
+        self.drop_out = drop_out
+
+        # Encoder (Downhill)
+        self.encoders = nn.ModuleList()
+        self.pools = nn.ModuleList()
+        filters = first_out_channels
+        for _ in range(downhill):
+            self.encoders.append(self.conv_block(in_channels, filters, padding=padding))
+            in_channels = filters
+            filters *= 2
+            self.pools.append(nn.MaxPool2d(kernel_size=2))
+
+        # Bottleneck
+        self.bottleneck = self.conv_block(in_channels, filters, padding=padding)
+
+        # Decoder (Uphill) - Only if segmentation head is enabled
+        if self.seg_head:
+            self.upconvs = nn.ModuleList()
+            self.decoders = nn.ModuleList()
+            for _ in range(downhill):
+                filters //= 2
+                self.upconvs.append(self.upconv(filters * 2, filters))
+                self.decoders.append(
+                    self.conv_block(filters * 2, filters, padding=padding)
+                )
+            self.final = nn.Conv2d(filters, exit_channels, kernel_size=1)
+
+        # Classification Head (Optional)
+        if self.cls_head:
+            encoded_channels = first_out_channels * (2**downhill)
+            self.classifier = self.create_classifier(encoded_channels)
+
+    def conv_block(self, in_channels, out_channels, padding=0):
+        """Creates a convolutional block with two Conv layers and ReLU activation."""
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=padding),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=padding),
+            nn.ReLU(inplace=True),
+        )
+
+    def upconv(self, in_channels, out_channels):
+        """Upsampling block using bilinear interpolation followed by a Conv layer."""
+        return nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True),
+            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+            nn.ReLU(inplace=True),
+        )
+
+    def create_classifier(self, encoded_channels):
+        """Creates the classification head."""
+        layers = [
+            nn.AdaptiveAvgPool2d((1, 1)),  # Global Average Pooling
+            nn.Flatten(),
+            nn.Linear(encoded_channels, 1),  # Binary classification layer
+        ]
+        if self.drop_out > 0:
+            layers.insert(2, nn.Dropout(p=self.drop_out))  # Apply dropout if specified
+            Logger.info("Dropout applied to classifier with rate %s", self.drop_out)
+        else:
+            Logger.info("No dropout applied to classifier")
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        enc_features = []
+        for encoder, pool in zip(self.encoders, self.pools):
+            x = encoder(x)
+            enc_features.append(x)
+            x = pool(x)
+
+        x = self.bottleneck(x)
+
+        if self.seg_head:
+            for upconv, decoder, enc_feat in zip(
+                self.upconvs, self.decoders, reversed(enc_features)
+            ):
+                x = upconv(x)
+                x = torch.cat((enc_feat, x), dim=1)  # Skip connection
+                x = decoder(x)
+            out = self.final(x)
+
+        if self.cls_head:
+            out = self.classifier(x)
+
+        return out
