@@ -938,9 +938,42 @@ def _define_im_idx_search_range(
             maxquant_df["IM_search_idx_center"] = maxquant_df[
                 "mobility_values_index_center_ref"
             ]
-            maxquant_df["IM_search_idx_center"].fillna(
-                maxquant_df["mobility_values_index_center_exp"], inplace=True
+
+            # If IM_search_idx_center is NaN, fill with exp IM with noise
+            residual = (
+                maxquant_df["mobility_values_index_center_ref"]
+                - maxquant_df["mobility_values_index_center_exp"]
+            ).dropna()
+            noise = np.random.choice(
+                residual, maxquant_df["IM_search_idx_center"].isna().sum()
             )
+            # maxquant_df["IM_search_idx_center"].fillna(
+            #     maxquant_df["mobility_values_index_center_exp"], inplace=True
+            # )
+            Logger.info(
+                "IM Noise size: %s, noise mean: %s, noise std: %s",
+                noise.size,
+                noise.mean(),
+                noise.std(),
+            )
+            maxquant_df.loc[
+                maxquant_df["IM_search_idx_center"].isna(), "IM_search_idx_center"
+            ] = (
+                noise
+                + maxquant_df.loc[
+                    maxquant_df["IM_search_idx_center"].isna(),
+                    "mobility_values_index_center_exp",
+                ]
+            )
+            maxquant_df.loc[
+                :,
+                [
+                    "IM_search_idx_center",
+                ],
+            ] = maxquant_df[["IM_search_idx_center"]].clip(
+                im_idx_range[0] + 1, im_idx_range[1] - 1
+            )  # After adding noise, clip to the range
+
             maxquant_df["IM_search_idx_center"] = maxquant_df[
                 "IM_search_idx_center"
             ].astype(int)
@@ -1252,11 +1285,33 @@ def dict_add_rt_align_lowess(
             maxquant_dict["source"] != "exp", "Calibrated retention time_ref"
         ],
     )
+    # maxquant_dict.loc[maxquant_dict["source"] == "exp", "predicted_RT"] = (
+    #     maxquant_dict.loc[
+    #         maxquant_dict["source"] == "exp", "Calibrated retention time_exp"
+    #     ]
+    # )  # Shouldn't apply LOWESS to experimental since the lowess assumption doesn't hold
+
+    # For the columns where the ref RT is NaN, use the exp RT with additional noise by boostrapping residuals
+    lowess_fit_residuals = (
+        maxquant_dict.loc[maxquant_dict["source"] == "both", "predicted_RT"]
+        - maxquant_dict.loc[
+            maxquant_dict["source"] == "both", "Calibrated retention time_exp"
+        ]
+    )
+    noise = np.random.choice(
+        lowess_fit_residuals,
+        size=len(maxquant_dict.loc[maxquant_dict["source"] == "exp"]),
+    )
+    Logger.info(
+        "RT Noise size: %s, mean: %s, std: %s", len(noise), noise.mean(), noise.std()
+    )
     maxquant_dict.loc[maxquant_dict["source"] == "exp", "predicted_RT"] = (
         maxquant_dict.loc[
             maxquant_dict["source"] == "exp", "Calibrated retention time_exp"
         ]
-    )  # Shouldn't apply LOWESS to experimental since the lowess assumption doesn't hold
+        + noise
+    )
+
     maxquant_dict["predicted_RT"] = maxquant_dict["predicted_RT"].clip(
         lower=min_exp_rt, upper=max_exp_rt
     )
@@ -1299,6 +1354,9 @@ def filter_maxquant_by_ok(
         right_on=["filename", "ScanNr"],
         suffixes=("_mq", "_ok"),
     )
+    evidence_rescore_001fdr["Proteins"] = evidence_rescore_001fdr["Proteins"].fillna(
+        evidence_rescore_001fdr["Proteins_mq"]
+    )  # fill in missing proteins
     return evidence_rescore_001fdr
 
 

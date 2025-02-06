@@ -1,4 +1,4 @@
-RESULT_PATH: /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/SWAPS_exp/random_15min_1R_60min_im_ref_exp_rescore
+RESULT_PATH: /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/SWAPS_exp/random_15min_1R_60min_im_ref_exp_rescore_exp_rt_noise
 ADD_TIMESTAMP_TO_RESULT_PATH: true
 DATA_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/Random_1ramps_200ng_K562_15min_Slot2-2_1_6936.d/
 DEBUG: false
@@ -11,7 +11,7 @@ FILTER_EXP_BY_RAW_FILE: []
 N_CPU: 5
 OPTIMIZATION:
   N_BLOCKS_BY_PEPT: 10
-  N_BATCH: 10
+  N_BATCH: 15
 PREPARE_DICT:
   DICT_PICKLE_PATH: ''
   FILTER_PRED_BY_RAW_FILE: ''
@@ -26,6 +26,11 @@ PREPARE_DICT:
   EXP_OK_DIR: /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/rescoring/out_no_rl_fix_ce_mokapot_random/
 RANDOM_SEED: 42
 PEAK_SELECTION:
+  DATASET:
+    RESIZE_SHAPE: (512, 128)
+    TRAIN_BATCH_SIZE: 128
+    VAL_BATCH_SIZE: 512
+    TEST_BATCH_SIZE: 512
   EVAL_ON_TEST: true
   INCLUDE_DECOYS: true
   DEBUG: false
