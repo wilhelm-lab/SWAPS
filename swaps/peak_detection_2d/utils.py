@@ -757,6 +757,7 @@ def calc_fdr_and_thres(
     if return_plot:
         plot_fdr_and_id(
             pred_df_new,
+            score_col,
             filter_dict,
             save_dir,
             dataset_name,
@@ -774,6 +775,7 @@ def calc_fdr_and_thres(
 
 def plot_fdr_and_id(
     pred_df_new,
+    score_col="target_decoy_score",
     filter_dict: dict | None = None,
     save_dir: str = None,
     dataset_name: str = "",
@@ -787,7 +789,7 @@ def plot_fdr_and_id(
     **kwargs,
 ):
     if "Conf. Score" not in pred_df_new.columns:
-        pred_df_new["Conf. Score"] = pred_df_new["target_decoy_score"]
+        pred_df_new["Conf. Score"] = pred_df_new[score_col]
     plt.figure(figsize=fig_size)
     plt.rcParams.update({"font.size": font_size})
     ax = sns.scatterplot(
