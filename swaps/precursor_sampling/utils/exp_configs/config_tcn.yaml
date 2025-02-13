@@ -1,0 +1,43 @@
+DESCRIPTION: "Experiment with TCN"
+
+PREPARE_DATASET:
+  ENABLE: false
+  INPUT:
+    TIMS_DATA_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/PASEF_6ramps_200ng_K562_15min_Slot2-2_1_6931.d/
+    OK_OUTPUT_DIR: /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/rescoring/out_no_rl_fix_ce_mokapot_pasef/
+    MQ_001_DIR: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/txt_001FDR_15min_60min/
+    MQ_100_DIR: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/txt_100FDR_15min
+  N_DIGITS: 3
+  N_BATCH: 5
+  OUT_FILE_DIR: /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/
+
+MODEL:
+  KEEP_TRAINING: true
+  TYPE: precursor_classification
+  NAME: TCN
+  PARAMS:
+    NUM_CLASSES: 2
+  TRAINING_DATA: 
+  - '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_3ramps_200ng_K562_15min_Slot2-2_1_6933_4.pkl'
+  - '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_3ramps_200ng_K562_15min_Slot2-2_1_6933_3.pkl'
+  - '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_3ramps_200ng_K562_15min_Slot2-2_1_6933_2.pkl'
+  - '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_3ramps_200ng_K562_15min_Slot2-2_1_6933_1.pkl'
+  - '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_3ramps_200ng_K562_15min_Slot2-2_1_6933_0.pkl'
+  - '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_6ramps_200ng_K562_15min_Slot2-2_1_6931_2.pkl'
+  - '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_6ramps_200ng_K562_15min_Slot2-2_1_6931_1.pkl'
+  - '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_6ramps_200ng_K562_15min_Slot2-2_1_6931_4.pkl'
+  VALIDATION_DATA: ['/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_6ramps_200ng_K562_15min_Slot2-2_1_6931_3.pkl']
+  TEST_DATA: ['/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_6ramps_200ng_K562_15min_Slot2-2_1_6931_0.pkl']
+  EXP_DIR: '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/exp_TCN'
+  RESUME_PATH: ""
+  SOLVER:
+    TOTAL_EPOCHS: 100
+    LOSS:
+      NAME: BCEWithLogitsLoss
+      POS_WEIGHT: [1, 2]
+      ALPHA: 0.25
+      GAMMA: 2
+    EARLY_STOPPING:
+      PATIENCE: 10
+      MODE: "min"
+      MONITOR: "val_loss"

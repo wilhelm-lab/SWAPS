@@ -1,0 +1,271 @@
+import logging
+from sqlalchemy import all_
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import numpy as np
+from sklearn.metrics import (
+    roc_auc_score,
+    precision_recall_fscore_support,
+    f1_score,
+    average_precision_score,
+)
+from peak_detection_2d.loss.custom_loss import FocalLoss1D
+
+Logger = logging.getLogger(__name__)
+
+
+class CNN1DModel(nn.Module):
+    def __init__(self):
+        super(CNN1DModel, self).__init__()
+        self.conv1 = nn.Conv1d(
+            in_channels=1, out_channels=16, kernel_size=25, stride=3, padding=2
+        )
+        self.bn1 = nn.BatchNorm1d(16)
+        self.conv2 = nn.Conv1d(
+            in_channels=16, out_channels=32, kernel_size=25, stride=2, padding=1
+        )
+        self.bn2 = nn.BatchNorm1d(32)
+        self.conv3 = nn.Conv1d(
+            in_channels=32, out_channels=64, kernel_size=25, stride=1, padding=1
+        )
+        self.bn3 = nn.BatchNorm1d(64)
+        self.pool = nn.AdaptiveAvgPool1d(1)  # Global Average Pooling
+        self.fc = nn.Linear(32, 2)  # Output 2 units for binary classification (size 2)
+
+    def forward(self, x):
+        x = x.unsqueeze(1)  # Add channel dimension for Conv1D (1 channel)
+        x = torch.relu(self.bn1(self.conv1(x)))
+        x = torch.relu(self.bn2(self.conv2(x)))
+        x = self.pool(x).squeeze(-1)  # Global Average Pooling, squeeze last dimension
+        x = self.fc(x)  # Output logits for both classes (size 2)
+        return x  # Return logits (no sigmoid needed)
+
+
+class ResBlock(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size=5):
+        super(ResBlock, self).__init__()
+        self.conv1 = nn.Conv1d(
+            in_channels, out_channels, kernel_size, padding=kernel_size // 2
+        )
+        self.bn1 = nn.BatchNorm1d(out_channels)
+        self.conv2 = nn.Conv1d(
+            out_channels, out_channels, kernel_size, padding=kernel_size // 2
+        )
+        self.bn2 = nn.BatchNorm1d(out_channels)
+        self.shortcut = (
+            nn.Conv1d(in_channels, out_channels, kernel_size=1)
+            if in_channels != out_channels
+            else nn.Identity()
+        )
+
+    def forward(self, x):
+        out = torch.relu(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        out += self.shortcut(x)  # Residual connection
+        return torch.relu(out)
+
+
+class ResNet1D(nn.Module):
+    def __init__(self, num_classes):
+        super(ResNet1D, self).__init__()
+        self.res1 = ResBlock(1, 32)
+        self.res2 = ResBlock(32, 64)
+        self.res3 = ResBlock(64, 128)
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = self.res1(x)
+        x = self.res2(x)
+        x = self.res3(x)
+        x = self.global_pool(x).squeeze(-1)
+        return self.fc(x)
+
+
+class TCN(nn.Module):
+    def __init__(self, num_classes):
+        super(TCN, self).__init__()
+        self.conv1 = nn.Conv1d(
+            in_channels=1, out_channels=32, kernel_size=5, dilation=1, padding=2
+        )
+        self.conv2 = nn.Conv1d(32, 64, kernel_size=5, dilation=2, padding=4)
+        self.conv3 = nn.Conv1d(64, 128, kernel_size=5, dilation=4, padding=8)
+        self.global_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = torch.relu(self.conv1(x))
+        x = torch.relu(self.conv2(x))
+        x = torch.relu(self.conv3(x))
+        x = self.global_pool(x).squeeze(-1)
+        return self.fc(x)
+
+
+def train_model(
+    model,
+    train_dataloader,
+    val_dataloader=None,
+    epochs=10,
+    lr=0.001,
+    device="cpu",
+    metric="val_loss",  # Metric to monitor for early stopping
+    patience=3,  # Number of epochs to wait before stopping if no improvement
+    pos_weight=None,  # Tensor of size (2,) for handling class imbalance
+    alpha=0.25,  # Focal Loss alpha parameter
+    gamma=2.0,  # Focal Loss gamma parameter
+):
+    # Ensure pos_weight is a tensor of shape (2,) if provided
+    if pos_weight is not None:
+        pos_weight = torch.tensor(pos_weight, device=device)
+
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    # criterion = FocalLoss(alpha=alpha, gamma=gamma)
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    best_metric = (
+        float("inf") if metric == "val_loss" else 0
+    )  # Best val_loss (lower) or val_auc (higher)
+    patience_counter = 0  # Tracks epochs without improvement
+    best_model_state = None  # Stores best model weights
+
+    for epoch in range(epochs):
+        model.train()
+        total_train_loss = 0
+        all_train_labels = []
+        all_train_preds = []
+        all_train_probs = []
+        # Training Loop
+        for features, labels in train_dataloader:
+            features, labels = features.to(device), labels.to(device)
+            labels_one_hot = torch.stack(
+                [(1 - labels), labels], dim=1
+            ).float()  # Convert 0 to [1, 0] and 1 to [0, 1]
+            optimizer.zero_grad()
+            # Logger.debug("Features shape: %s", features.shape)
+            outputs = model(features)  # Output shape: (batch_size, 2)
+            # Logger.debug("Output shape: %s", outputs.shape)
+            loss = criterion(outputs, labels_one_hot)
+            loss.backward()
+            optimizer.step()
+
+            total_train_loss += loss.item()
+            probs = outputs[:, 1].float().cpu().detach().numpy()
+            preds = torch.argmax(outputs, dim=1).float().cpu().numpy()
+            labels_np = labels.cpu().numpy()
+
+            all_train_labels.extend(labels_np)
+            all_train_preds.extend(preds)
+            all_train_probs.extend(probs)
+
+        train_loss = total_train_loss / len(train_dataloader)
+        train_auc = roc_auc_score(all_train_labels, all_train_probs)
+
+        # Validation Loop (if validation data is provided)
+        val_loss, val_auc = None, None
+        if val_dataloader:
+            model.eval()
+            total_val_loss = 0
+            all_val_labels = []
+            all_val_preds = []
+            all_val_probs = []
+            with torch.no_grad():
+                for features, labels in val_dataloader:
+                    features, labels = features.to(device), labels.to(device)
+                    labels_one_hot = torch.stack(
+                        [(1 - labels), labels], dim=1
+                    ).float()  # Convert 0 to [1, 0] and 1 to [0, 1]
+                    outputs = model(features)  # Output shape: (batch_size, 2)
+                    loss = criterion(outputs, labels_one_hot)
+
+                    total_val_loss += loss.item()
+                    preds = torch.argmax(outputs, dim=1).float().cpu().numpy()
+                    probs = outputs[:, 1].float().cpu().detach().numpy()
+                    labels_np = labels.cpu().numpy()
+
+                    all_val_labels.extend(labels_np)
+                    all_val_preds.extend(preds)
+                    all_val_probs.extend(probs)
+
+            val_loss = total_val_loss / len(val_dataloader)
+            val_auc = roc_auc_score(all_val_labels, all_val_probs)
+            val_f1 = f1_score(all_val_labels, all_val_preds, average="micro")
+            val_ap = average_precision_score(
+                all_val_labels, all_val_probs, average="micro"
+            )
+            # Print epoch results
+            print(
+                f"Epoch {epoch+1} | Train Loss: {train_loss:.4f} | Train AUC: {train_auc: .4f} | "
+                f"Val Loss: {val_loss:.4f} | Val AUC: {val_auc:.4f} | Val F1: {val_f1:.4f} | Val AP: {val_ap:.4f}"
+            )
+
+            # Early Stopping Logic
+            match metric:
+                case "val_loss":
+                    current_metric = val_loss
+                case "val_auc":
+                    current_metric = val_auc
+                case "val_f1":
+                    current_metric = val_f1
+                case "val_ap":
+                    current_metric = val_ap
+                case _:
+                    raise ValueError(f"Invalid metric: {metric}")
+            if (metric == "val_loss" and current_metric < best_metric) or (
+                metric in ["val_auc", "val_f1", "val_ap"]
+                and current_metric > best_metric
+            ):
+                best_metric = current_metric
+                patience_counter = 0
+                best_model_state = model.state_dict()  # Save best model state
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    print(
+                        f"Early stopping triggered at epoch {epoch+1}. Restoring best model..."
+                    )
+                    model.load_state_dict(best_model_state)
+                    break
+        else:
+            print(
+                f"Epoch {epoch+1} | Train Loss: {train_loss:.4f} | Train AUC: {train_auc:.4f}"
+            )
+
+    return model
+
+
+def predict(model, dataloader, device="cpu"):
+    """
+    Predicts labels and probabilities using a trained model.
+
+    Args:
+        model (torch.nn.Module): Trained PyTorch model.
+        dataloader (DataLoader): DataLoader containing test samples.
+        device (str): "cpu" or "cuda" to specify where to run inference.
+
+    Returns:
+        probs (list): List of predicted probabilities.
+        preds (list): List of binary predictions (0 or 1).
+    """
+    model.eval()  # Set model to evaluation mode
+    model.to(device)
+
+    probs = []
+    preds = []
+
+    with torch.no_grad():  # Disable gradient computation
+        for features, _ in dataloader:  # Ignore labels if available
+            features = features.to(device)
+
+            outputs = model(features).squeeze()
+
+            # probabilities = torch.sigmoid(outputs)  # Apply sigmoid for probabilities
+            predictions = torch.argmax(
+                outputs, dim=1
+            ).float()  # Convert to binary labels
+            probs.extend(
+                torch.sigmoid(outputs[:, 1]).cpu().numpy()
+            )  # Get sigmoid of second output
+            preds.extend(predictions.cpu().numpy())
+
+    return probs, preds
