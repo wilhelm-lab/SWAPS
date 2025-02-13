@@ -54,7 +54,7 @@ class EarlyStopping:
             )
         elif score < self.best_score + self.delta:
             self.counter += 1
-            print(
+            Logger.info(
                 "EarlyStopping counter: {} out of {}".format(
                     self.counter, self.patience
                 )
@@ -82,7 +82,7 @@ class EarlyStopping:
         parent = model_path.parent
         os.makedirs(parent, exist_ok=True)
         if epoch_score not in [-np.inf, np.inf, -np.nan, np.nan]:
-            print(
+            Logger.info(
                 "Validation score improved ({} --> {}). Model saved at at {}!".format(
                     self.val_score, epoch_score, model_path
                 )
@@ -400,7 +400,7 @@ def plot_per_image_metric_distr(
         correction = 0.05
         # Plot quantile lines
         for show_quantile, quantile in zip(show_quantiles, quantiles):
-            print(f"{show_quantile}%: {quantile:.2f}")
+            Logger.info(f"{show_quantile}%: {quantile:.2f}")
             plt.axvline(
                 quantile, color="black", linestyle="dashed", linewidth=line_width
             )

@@ -37,7 +37,9 @@ from peak_detection_2d.solver.build_optimizer import (
 )
 from peak_detection_2d.loss.build_criterion import build_criterion
 
-
+# Clear existing logging handlers
+for handler in logging.root.handlers[:]:
+    logging.root.removeHandler(handler)
 # Reconfigure logging
 logging.basicConfig(
     level=logging.INFO,  # Set the desired logging level
@@ -140,7 +142,7 @@ def train_and_test_model(cfg_model):
     writer = SummaryWriter(log_dir=os.path.join(cfg_model.EXP_DIR, "logs_tensorflow"))
     # Read test data
     test_data = {}
-    for data in cfg_model.TEST_DATA:
+    for data in cfg_model.DATASET.TEST_DATA:
         with open(data, "rb") as f:
             test_data.update(pickle.load(f))
     # Set Device
@@ -164,24 +166,34 @@ def train_and_test_model(cfg_model):
         # Prepare trainging and validation Dataset and DataLoader
         train_data = {}
         val_data = {}
-        for data in cfg_model.TRAINING_DATA:
+        for data in cfg_model.DATASET.TRAINING_DATA:
             with open(data, "rb") as f:
                 train_data.update(pickle.load(f))
-        for data in cfg_model.VALIDATION_DATA:
+        for data in cfg_model.DATASET.VALIDATION_DATA:
             with open(data, "rb") as f:
                 val_data.update(pickle.load(f))
         train_dataset = PrecursorDataset(
-            train_data, normalize=True, max_len=cfg_model.MAX_LEN
+            train_data,
+            normalize=True,
+            max_len=cfg_model.DATASET.MAX_LEN,
+            sampling_strategy=cfg_model.DATASET.SAMPLING_STRATEGY,
         )
         train_dataloader = DataLoader(
-            train_dataset, batch_size=cfg_model.TRAINING_BATCH_SIZE, shuffle=True
+            train_dataset,
+            batch_size=cfg_model.DATASET.TRAINING_BATCH_SIZE,
+            shuffle=True,
         )
 
         val_dataset = PrecursorDataset(
-            val_data, normalize=True, max_len=cfg_model.MAX_LEN
+            val_data,
+            normalize=True,
+            max_len=cfg_model.DATASET.MAX_LEN,
+            sampling_strategy=cfg_model.DATASET.SAMPLING_STRATEGY,
         )
         val_dataloader = DataLoader(
-            val_dataset, batch_size=cfg_model.VALIDATION_BATCH_SIZE, shuffle=True
+            val_dataset,
+            batch_size=cfg_model.DATASET.VALIDATION_BATCH_SIZE,
+            shuffle=True,
         )
         # Load optimizer, scheduler, criterion, early stopper
         total_epochs = cfg_model.SOLVER.TOTAL_EPOCHS
@@ -236,9 +248,7 @@ def train_and_test_model(cfg_model):
 
             train_loss = total_train_loss / len(train_dataloader)
             train_auc = roc_auc_score(all_train_labels, all_train_probs)
-            print(
-                f"Epoch {epoch+1} | Train Loss: {train_loss:.4f} | Train AUC: {train_auc: .4f} | "
-            )
+
             # Validation Loop (if validation data is provided)
             val_loss, val_auc = None, None
             model.eval()
@@ -271,9 +281,9 @@ def train_and_test_model(cfg_model):
                 all_val_labels, all_val_probs, average="micro"
             )
 
-            # Print epoch results
-            print(
-                f"Epoch {epoch+1} | Val Loss: {val_loss:.4f} | Val AUC: {val_auc:.4f} | Val F1: {val_f1:.4f} | Val AP: {val_ap:.4f}"
+            # log epoch results
+            logging.info(
+                f"Epoch {epoch+1} | Train Loss: {train_loss:.4f} | Train AUC: {train_auc: .4f} | Val Loss: {val_loss:.4f} | Val AUC: {val_auc:.4f} | Val F1: {val_f1:.4f} | Val AP: {val_ap:.4f}"
             )
             writer.add_scalar("Loss/val/", val_loss, epoch)
             writer.add_scalar("Metric/val/auc", val_auc, epoch)
@@ -325,7 +335,7 @@ def train_and_test_model(cfg_model):
             writer.close()
 
             if es.early_stop:
-                print("\n\n -------------- EARLY STOPPING -------------- \n\n")
+                logging.info("\n\n -------------- EARLY STOPPING -------------- \n\n")
                 break
 
         cfg_model.RESUME_PATH = best_seg_model_path
@@ -345,10 +355,10 @@ def train_and_test_model(cfg_model):
     ##########################################
     if len(test_data) > 0:
         test_dataset = PrecursorDataset(
-            test_data, normalize=True, max_len=cfg_model.MAX_LEN
+            test_data, normalize=True, max_len=cfg_model.DATASET.MAX_LEN
         )
         test_dataloader = DataLoader(
-            test_dataset, batch_size=cfg_model.TEST_BATCH_SIZE, shuffle=False
+            test_dataset, batch_size=cfg_model.DATASET.TEST_BATCH_SIZE, shuffle=False
         )
         probs, preds = predict(model, test_dataloader, device)
         labels = np.array([test_data[k]["label"] for k in test_data.keys()])

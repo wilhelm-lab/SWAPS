@@ -256,7 +256,7 @@ def train(
             metric["val"].append(val_metric)
             loss_tracking["train"].append(loss)
 
-            print(
+            Logger.info(
                 f"EPOCH: {epoch}, TRAIN LOSS: {loss}, TRAIN Weighted DICE and AUCROC: {train_metric},"
                 f" VAL Weighted DICE and AUCROC: {val_metric}"
             )
@@ -298,7 +298,7 @@ def train(
             writer.close()
 
             if es.early_stop:
-                print("\n\n -------------- EARLY STOPPING -------------- \n\n")
+                Logger.info("\n\n -------------- EARLY STOPPING -------------- \n\n")
                 break
         with open(
             os.path.join(ps_exp_results_dir, "loss.json"), "w", encoding="utf-8"
@@ -485,7 +485,7 @@ def train(
             metric["val"].append(val_metric)
             loss_tracking["train"].append(loss)
 
-            print(
+            Logger.info(
                 f"EPOCH: {epoch}, TRAIN LOSS: {loss}, TRAIN Weighted DICE and AUCROC: {train_metric},"
                 f" VAL Weighted DICE and AUCROC: {val_metric}"
             )
@@ -527,7 +527,7 @@ def train(
             writer.close()
 
             if es.early_stop:
-                print("\n\n -------------- EARLY STOPPING -------------- \n\n")
+                Logger.info("\n\n -------------- EARLY STOPPING -------------- \n\n")
                 break
         with open(
             os.path.join(ps_exp_results_dir, "loss.json"), "w", encoding="utf-8"

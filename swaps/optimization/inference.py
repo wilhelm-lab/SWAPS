@@ -1271,7 +1271,6 @@ def _select_im_peak_from_frame_act(
     peak_properties_list = _select_peaks_from_im_pept_act(
         im_pept_act, pept_mzrank=all_pept_mzrank, **kwargs
     )
-    # print(len(peak_properties_list))
     if peak_properties_list is None or all(v is None for v in peak_properties_list):
         peaks_df = pd.DataFrame()
         Logger.info("No peaks extracted.")
