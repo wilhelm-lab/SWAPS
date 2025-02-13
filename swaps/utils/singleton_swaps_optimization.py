@@ -196,6 +196,7 @@ __C.PEAK_SELECTION.MODEL.SOLVER.LOSS.NAME = "ComboLoss"
 __C.PEAK_SELECTION.MODEL.SOLVER.LOSS.LOSSTYPES = ["bce", "wdice", "dice", "focal"]
 __C.PEAK_SELECTION.MODEL.SOLVER.LOSS.SEG_CLS_WEIGHTS = [1, 1]
 __C.PEAK_SELECTION.MODEL.SOLVER.LOSS.WEIGHTS = [1, 0, 4, 1]
+__C.PEAK_SELECTION.MODEL.SOLVER.LOSS.POS_WEIGHT = None
 # [normal, log] This is only relevant for per channel loss,
 # i.e. {'dice', 'jaccard', 'lovasz_sigmoid', 'wdice'}
 # therefore hint channel is not included in such per channel losss

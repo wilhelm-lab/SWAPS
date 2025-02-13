@@ -58,10 +58,6 @@ def train(
     maxquant_dict=None,
     show_decoy: bool = True,
 ):
-    # Logger.info(
-    #     "Memory summary before calling train func: %s", torch.cuda.memory_summary()
-    # )
-    # Logger.info("%s", os.system("nvidia-smi"))
     """Does not use CONFMODEL config"""
     #############################
     # Pre-training

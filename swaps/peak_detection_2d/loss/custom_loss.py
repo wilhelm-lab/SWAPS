@@ -7,6 +7,21 @@ from torchvision.ops import complete_box_iou_loss, box_iou
 Logger = logging.getLogger(__name__)
 
 
+class FocalLoss1D(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha  # Adjusts the weight of positive class
+        self.gamma = gamma  # Adjusts difficulty scaling
+
+    def forward(self, logits, targets):
+        BCE_loss = nn.BCEWithLogitsLoss(reduction="none")(logits, targets)
+        probs = torch.sigmoid(logits)
+        pt = torch.where(targets == 1, probs, 1 - probs)  # Get p_t
+        focal_weight = (1 - pt) ** self.gamma
+        loss = focal_weight * BCE_loss
+        return loss.mean()
+
+
 class CIoULoss(nn.Module):
     def __init__(self, reduction: str = "mean"):
         super(CIoULoss, self).__init__()

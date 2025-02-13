@@ -1397,7 +1397,7 @@ def generate_id_partitions(
 ):
     id_partitions = [[] for _ in range(n_batch)]
     if how == "round_robin":
-        Logger.info("Generate id partitions by block.")
+        Logger.info("Generate id partitions by round robin.")
         for i in range(n_batch):
             batch_idx = np.arange(i, len(id_array), n_batch)
             id_partitions[i] = id_array[batch_idx]

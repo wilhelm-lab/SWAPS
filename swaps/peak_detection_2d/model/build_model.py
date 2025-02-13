@@ -2,6 +2,7 @@ from yacs.config import CfgNode
 from .seg_model import UNET, UNet_rec_input
 from .conf_model import CNNEncoderRegressor, CNNRegression, ConfidenceModel
 from .model import PeakDetectionNet
+from precursor_sampling.cls_model.model import CNN1DModel, TCN, ResNet1D
 
 
 def build_model(model_cfg: CfgNode):
@@ -48,4 +49,14 @@ def build_model(model_cfg: CfgNode):
                 dropout_rate=model_cfg.PARAMS.DROPOUT_RATE,
                 sigmoid_output=model_cfg.PARAMS.SIGMOID_OUTPUT,
             )
+            return model
+    elif model_cfg.TYPE == "precursor_classification":
+        if model_cfg.NAME == "CNN":
+            model = CNN1DModel()
+            return model
+        elif model_cfg.NAME == "TCN":
+            model = TCN(num_classes=2)
+            return model
+        elif model_cfg.NAME == "ResNet1D":
+            model = ResNet1D(num_classes=2)
             return model
