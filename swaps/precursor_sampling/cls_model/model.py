@@ -132,6 +132,80 @@ class TCN(nn.Module):
         return self.fc(x)
 
 
+class ConvAutoencoder1D(nn.Module):
+    def __init__(self, input_channels=1, base_channels=16, num_layers=3, kernel_size=3):
+        """
+        A flexible 1D convolutional autoencoder that ensures input and output sizes match.
+
+        Args:
+            input_channels (int): Number of input channels (default: 1).
+            base_channels (int): Number of filters in the first layer (default: 16).
+            num_layers (int): Number of convolutional layers in the encoder (default: 3).
+            kernel_size (int): Kernel size for convolutions (default: 3).
+        """
+        super(ConvAutoencoder1D, self).__init__()
+
+        self.encoder_layers = nn.ModuleList()
+        self.decoder_layers = nn.ModuleList()
+        self.pool = nn.MaxPool1d(kernel_size=2, stride=2, return_indices=True)
+        self.unpool = nn.MaxUnpool1d(kernel_size=2, stride=2)
+
+        in_channels = input_channels
+        out_channels = base_channels
+
+        # Encoder
+        self.enc_indices = []  # Store indices for unpooling
+        for _ in range(num_layers):
+            self.encoder_layers.append(
+                nn.Conv1d(
+                    in_channels, out_channels, kernel_size, padding=kernel_size // 2
+                )
+            )
+            in_channels = out_channels
+            out_channels *= 2  # Double channels at each layer
+
+        # Decoder (reverse process)
+        for _ in range(num_layers):
+            out_channels = in_channels // 2
+            self.decoder_layers.append(
+                nn.ConvTranspose1d(
+                    in_channels, out_channels, kernel_size, padding=kernel_size // 2
+                )
+            )
+            in_channels = out_channels
+
+        # Final layer to reconstruct exact input shape
+        self.final_layer = nn.Conv1d(
+            out_channels, input_channels, kernel_size, padding=kernel_size // 2
+        )
+
+    def forward(self, x):
+        # Encoder
+        encodings = []
+        self.enc_indices = []
+        sizes = []  # Store sizes for unpooling
+
+        for layer in self.encoder_layers:
+            x = F.leaky_relu(layer(x))
+            encodings.append(x)
+            sizes.append(x.shape[-1])  # Store sizes before pooling
+            x, indices = self.pool(x)
+            self.enc_indices.append(indices)
+
+        # Decoder
+        for i, layer in enumerate(self.decoder_layers):
+            x = self.unpool(
+                x, self.enc_indices[-(i + 1)], output_size=[sizes[-(i + 1)]]
+            )
+            x = F.leaky_relu(layer(x))
+
+        # Final reconstruction layer
+        x = self.final_layer(x)
+        # x = torch.sigmoid(self.final_layer(x))
+
+        return x
+
+
 def train_model(
     model,
     train_dataloader,
@@ -299,3 +373,54 @@ def predict(model, dataloader, device="cpu"):
             preds.extend(predictions.cpu().numpy())
 
     return probs, preds
+
+
+def reconstruct(
+    model,
+    dataloader_with_ids,
+    device,
+    scaling_factor: float = 1.0,
+    error_cal: str = "MAE",
+):
+    model.to(device)
+    with torch.no_grad():
+        error = []
+        ids_list = []
+        for features, _, ids in dataloader_with_ids:
+            features = features.to(device)
+            reconstructed = model(features) * scaling_factor
+            match error_cal:
+                case "MAE":
+                    reconstruction_error = (
+                        torch.mean(abs(features - reconstructed), dim=2)
+                        .flatten()
+                        .cpu()
+                        .detach()
+                        .numpy()
+                    )
+                case "MSE":
+                    reconstruction_error = (
+                        torch.mean((features - reconstructed) ** 2, dim=2)
+                        .flatten()
+                        .cpu()
+                        .detach()
+                        .numpy()
+                    )
+                case "MAPE":
+                    reconstruction_error = (
+                        torch.mean(
+                            abs((features - reconstructed) / (features + 1e-6)), dim=2
+                        )
+                        .flatten()
+                        .cpu()
+                        .detach()
+                        .numpy()
+                    )
+                case _:
+                    raise ValueError(f"Invalid error calculation: {error_cal}")
+            error.extend(reconstruction_error)
+            ids_list.extend(ids.flatten().detach().numpy())
+            Logger.info("Reconstruction error length %s", len(error))
+            Logger.info("IDs length %s", len(ids_list))
+    result = pd.DataFrame({"id": ids_list, "error": error})
+    return result
