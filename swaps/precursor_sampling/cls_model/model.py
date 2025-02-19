@@ -33,33 +33,6 @@ class CNNEncoder(nn.Module):
         return F.normalize(x, dim=-1)  # L2 normalization
 
 
-class SupervisedContrastiveLoss(nn.Module):
-    def __init__(self, temperature=0.07):
-        super(SupervisedContrastiveLoss, self).__init__()
-        self.temperature = temperature
-
-    def forward(self, features, labels):
-        """
-        features: [batch_size, embed_dim]
-        labels: [batch_size]
-        """
-        batch_size = features.shape[0]
-        similarity_matrix = (
-            torch.matmul(features, features.T) / self.temperature
-        )  # Cosine similarity
-
-        # Mask for positive pairs
-        labels = labels.view(-1, 1)
-        mask = torch.eq(labels, labels.T).float()  # 1 if same class, 0 otherwise
-
-        # Apply contrastive loss
-        exp_sim = torch.exp(similarity_matrix)
-        log_prob = similarity_matrix - torch.log(exp_sim.sum(dim=1, keepdim=True))
-        loss = -torch.sum(mask * log_prob) / mask.sum()
-
-        return loss
-
-
 class CNN1DModel(nn.Module):
     def __init__(self):
         super(CNN1DModel, self).__init__()
