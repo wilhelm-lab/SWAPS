@@ -727,6 +727,7 @@ def calc_fdr_and_thres(
     font_size: int = 12,
     fig_size: tuple = (8, 6),
     line_width: int = 2,
+    decoy_col="Decoy",
     **kwargs,
 ):
     """Calculate FDR and threshold for a given score column
@@ -749,8 +750,8 @@ def calc_fdr_and_thres(
         pred_df_new = _filter_pred(filter_dict, pred_df_new)
 
     pred_df_new = pred_df_new.sort_values(score_col, ascending=False)
-    pred_df_new["Target"] = pred_df_new["Decoy"] == 0
-    pred_df_new["fdr"] = (pred_df_new["Decoy"].cumsum()) / np.maximum(
+    pred_df_new["Target"] = pred_df_new[decoy_col] == 0
+    pred_df_new["fdr"] = (pred_df_new[decoy_col].cumsum()) / np.maximum(
         pred_df_new["Target"].cumsum(), 1
     )
     pred_df_new["N_identified_target"] = pred_df_new["Target"].cumsum()
