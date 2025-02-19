@@ -18,6 +18,8 @@ def build_criterion(loss_cfg: CfgNode, device=None):
         criterion = WeightedDiceLoss(per_image=loss_cfg.PER_IMAGE, manual_sigmoid=True)
     if loss_cfg.NAME == "L1Loss":
         criterion = nn.L1Loss()
+    if loss_cfg.NAME == "MSELoss":
+        criterion = nn.MSELoss()
     if loss_cfg.NAME == "BCELoss":
         criterion = nn.BCELoss()
     if loss_cfg.NAME == "BCEWithLogitsLoss":
