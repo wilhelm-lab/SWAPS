@@ -1,22 +1,20 @@
 import logging
-from sqlalchemy import all_
+import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
 from sklearn.metrics import (
     roc_auc_score,
-    precision_recall_fscore_support,
     f1_score,
     average_precision_score,
 )
-from peak_detection_2d.loss.custom_loss import FocalLoss1D
+import torch.nn.functional as F
 
 Logger = logging.getLogger(__name__)
 
 
 class CNNEncoder(nn.Module):
-    def __init__(self, input_dim=3001, embed_dim=128):
+    def __init__(self, embed_dim=128):
         super(CNNEncoder, self).__init__()
         self.conv1 = nn.Conv1d(in_channels=1, out_channels=64, kernel_size=5, padding=2)
         self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
