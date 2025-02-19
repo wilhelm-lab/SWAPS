@@ -15,6 +15,51 @@ from peak_detection_2d.loss.custom_loss import FocalLoss1D
 Logger = logging.getLogger(__name__)
 
 
+class CNNEncoder(nn.Module):
+    def __init__(self, input_dim=3001, embed_dim=128):
+        super(CNNEncoder, self).__init__()
+        self.conv1 = nn.Conv1d(in_channels=1, out_channels=64, kernel_size=5, padding=2)
+        self.conv2 = nn.Conv1d(64, 128, kernel_size=5, padding=2)
+        self.conv3 = nn.Conv1d(128, 256, kernel_size=5, padding=2)
+        self.fc = nn.Linear(256, embed_dim)  # Project to embedding space
+
+    def forward(self, x):
+        x = x.unsqueeze(1)  # Add channel dimension
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = torch.mean(x, dim=-1)  # Global average pooling
+        x = self.fc(x)
+        return F.normalize(x, dim=-1)  # L2 normalization
+
+
+class SupervisedContrastiveLoss(nn.Module):
+    def __init__(self, temperature=0.07):
+        super(SupervisedContrastiveLoss, self).__init__()
+        self.temperature = temperature
+
+    def forward(self, features, labels):
+        """
+        features: [batch_size, embed_dim]
+        labels: [batch_size]
+        """
+        batch_size = features.shape[0]
+        similarity_matrix = (
+            torch.matmul(features, features.T) / self.temperature
+        )  # Cosine similarity
+
+        # Mask for positive pairs
+        labels = labels.view(-1, 1)
+        mask = torch.eq(labels, labels.T).float()  # 1 if same class, 0 otherwise
+
+        # Apply contrastive loss
+        exp_sim = torch.exp(similarity_matrix)
+        log_prob = similarity_matrix - torch.log(exp_sim.sum(dim=1, keepdim=True))
+        loss = -torch.sum(mask * log_prob) / mask.sum()
+
+        return loss
+
+
 class CNN1DModel(nn.Module):
     def __init__(self):
         super(CNN1DModel, self).__init__()
@@ -67,19 +112,33 @@ class ResBlock(nn.Module):
 
 
 class ResNet1D(nn.Module):
-    def __init__(self, num_classes):
+    def __init__(
+        self, num_classes, num_blocks=3, initial_channels=32, dropout_rate=0.3
+    ):
         super(ResNet1D, self).__init__()
-        self.res1 = ResBlock(1, 32)
-        self.res2 = ResBlock(32, 64)
-        self.res3 = ResBlock(64, 128)
+        self.layers = nn.ModuleList()
+        self.dropout_rate = dropout_rate  # Store dropout rate
+        in_channels = 1
+        out_channels = initial_channels
+
+        for _ in range(num_blocks):
+            self.layers.append(ResBlock(in_channels, out_channels))
+            in_channels = out_channels
+            out_channels *= 2
+
         self.global_pool = nn.AdaptiveAvgPool1d(1)
-        self.fc = nn.Linear(128, num_classes)
+        self.fc = nn.Linear(initial_channels * (2 ** (num_blocks - 1)), num_classes)
+        self.dropout = nn.Dropout(dropout_rate)  # Dropout before FC layer
 
     def forward(self, x):
-        x = self.res1(x)
-        x = self.res2(x)
-        x = self.res3(x)
+        for layer in self.layers:
+            x = layer(x)
+            x = F.dropout(
+                x, p=self.dropout_rate, training=self.training
+            )  # Apply dropout
+
         x = self.global_pool(x).squeeze(-1)
+        x = self.dropout(x)  # Dropout before final FC layer
         return self.fc(x)
 
 
