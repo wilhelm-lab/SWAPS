@@ -13,12 +13,16 @@ PREPARE_DATASET:
 
 MODEL:
   KEEP_TRAINING: true
-  TYPE: precursor_classification
-  NAME: TCN
-  EXP_DIR: '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/exp_TCN_undersample'
+  TYPE: precursor_reconstruction
+  NAME: CAE
+  EXP_DIR: '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/exp_reconstruct_CAE_val_loss_depth4_MSE_fix_scaling'
   RESUME_PATH: ""
   PARAMS:
     NUM_CLASSES: 2
+    CAE:
+      FIRST_OUT_CHANNELS: 128
+      DEPTH: 4
+      KERNEL_SIZE: 5
   DATASET: 
     TRAINING_DATA: 
     - '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_3ramps_200ng_K562_15min_Slot2-2_1_6933_4.pkl'
@@ -29,17 +33,26 @@ MODEL:
     - '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_6ramps_200ng_K562_15min_Slot2-2_1_6931_2.pkl'
     - '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_6ramps_200ng_K562_15min_Slot2-2_1_6931_1.pkl'
     - '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_6ramps_200ng_K562_15min_Slot2-2_1_6931_4.pkl'
-    VALIDATION_DATA: ['/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_6ramps_200ng_K562_15min_Slot2-2_1_6931_3.pkl']
-    TEST_DATA: ['/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_6ramps_200ng_K562_15min_Slot2-2_1_6931_0.pkl']
-    SAMPLING_STRATEGY: undersample
+    - '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_6ramps_200ng_K562_15min_Slot2-2_1_6931_0.pkl'
+    VALIDATION_DATA: 
+    - '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/data_dict_PASEF_6ramps_200ng_K562_15min_Slot2-2_1_6931_3.pkl'
+    TEST_DATA: 
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_0.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_1.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_2.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_3.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_4.pkl
+    SAMPLING_STRATEGY: null
+    TRAINING_BATCH_SIZE: 1024
+    VALIDATION_BATCH_SIZE: 2048
+    TEST_BATCH_SIZE: 2048
+    SCALE_FACTOR: 1000
+
   SOLVER:
     TOTAL_EPOCHS: 100
     LOSS:
-      NAME: BCEWithLogitsLoss
-      POS_WEIGHT: [1, 1]
-      ALPHA: 0.25
-      GAMMA: 2
+      NAME: MSELoss
     EARLY_STOPPING:
       PATIENCE: 10
       MODE: "min"
-      MONITOR: "val_loss"
+      MONITOR: "val_pos_loss"

@@ -1,0 +1,33 @@
+DESCRIPTION: "Evaluate model on test set"
+
+PREPARE_DATASET:
+  ENABLE: false
+
+MODEL:
+  KEEP_TRAINING: false
+  TYPE: precursor_reconstruction
+  NAME: CAE
+  EXP_DIR: '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/exp_reconstruct_CAE_val_loss_depth5_test_random_MSE_with_ids'
+  RESUME_PATH: '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/exp_reconstruct_CAE_val_loss_depth5_20250214_134734_645011/model_backups/bst_model_0.4246000051498413.pt' #TODO
+  PARAMS:
+    NUM_CLASSES: 2
+    CAE:
+      FIRST_OUT_CHANNELS: 128
+      DEPTH: 5
+      KERNEL_SIZE: 5
+  DATASET: 
+    TRAINING_DATA: []
+    VALIDATION_DATA: []
+    TEST_DATA: 
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random_15min_3r/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_0.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random_15min_3r/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_1.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random_15min_3r/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_2.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random_15min_3r/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_3.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random_15min_3r/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_4.pkl
+    SAMPLING_STRATEGY: null
+    TRAINING_BATCH_SIZE: 512
+    VALIDATION_BATCH_SIZE: 1024
+    TEST_BATCH_SIZE: 1024
+    SCALE_FACTOR: 10000
+  EVAL:
+    ERROR_CAL: "MSE"
