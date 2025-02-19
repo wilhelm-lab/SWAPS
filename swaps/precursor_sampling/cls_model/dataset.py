@@ -628,7 +628,17 @@ def eval_precursor_fit(
 
 
 class PrecursorDataset(Dataset):
-    def __init__(self, data_dict, normalize=True, max_len=None):
+    def __init__(
+        self,
+        data_dict,
+        normalize=True,
+        max_len=None,
+        sampling_strategy=None,
+        filter_class: int = None,
+        scale_factor=1.0,
+        add_channel_dim=True,
+        return_ids=False,
+    ):
         # Filter out entries with zero total intensity
         self.data = [(k, v) for k, v in data_dict.items() if sum(v["features"]) > 0]
 
@@ -636,31 +646,97 @@ class PrecursorDataset(Dataset):
             self.max_len = max(len(v["features"]) for _, v in self.data)
         else:
             self.max_len = max_len
-        self.normalize = normalize
 
-        Logger.debug("Max sequence length: %s", self.max_len)
-        Logger.info(
-            "Filtered dataset size after removing zero-intensity entries: %s",
-            len(self.data),
+        self.normalize = normalize
+        self.scale_factor = scale_factor
+        self.return_ids = return_ids
+        # Extract features and labels
+        X = [v["features"] for _, v in self.data]
+        y = [int(v["label"]) for _, v in self.data]
+        ids = [k for k, _ in self.data]
+        # Convert to numpy array
+        X = np.array(
+            [self._pad_and_normalize(seq, self.scale_factor) for seq in X],
+            dtype=np.float32,
         )
+        y = np.array(y, dtype=np.int64)
+        ids = np.array(ids, dtype=np.int64)
+        if filter_class is not None:
+            filtered_indices = np.where(y == filter_class)[0]
+            X_resampled = X[filtered_indices]
+            y_resampled = y[filtered_indices]
+            ids = ids[filtered_indices]
+            Logger.info(
+                "Dataset class counts after filtering for class %s: %s",
+                filter_class,
+                np.bincount(y_resampled),
+            )
+        # if pos_only:
+        #     pos_indices = np.where(y == 1)[0]
+        #     X_resampled = X[pos_indices]
+        #     y_resampled = y[pos_indices]
+        #     Logger.info(
+        #         "Dataset class counts after filtering: %s", np.bincount(y_resampled)
+        #     )
+        else:
+            # Apply sampling strategy if specified
+            if sampling_strategy == "oversample":
+                Logger.info(
+                    "Dataset class counts before oversampling: %s", np.bincount(y)
+                )
+                sampler = RandomOverSampler(sampling_strategy="auto", random_state=42)
+                # Combine X and ids for resampling
+                X_combined = np.column_stack((X, ids))
+                X_combined_resampled, y_resampled = sampler.fit_resample(X_combined, y)
+                # Split back X and ids
+                X_resampled = X_combined_resampled[:, :-1]
+                ids = X_combined_resampled[:, -1].astype(np.int64)
+                Logger.info(
+                    "Dataset class counts after oversampling: %s",
+                    np.bincount(y_resampled),
+                )
+            elif sampling_strategy == "undersample":
+                Logger.info(
+                    "Dataset class counts before undersampling: %s", np.bincount(y)
+                )
+                sampler = RandomUnderSampler(sampling_strategy="auto", random_state=42)
+                # Combine X and ids for resampling
+                X_combined = np.column_stack((X, ids))
+                X_combined_resampled, y_resampled = sampler.fit_resample(X_combined, y)
+                # Split back X and ids
+                X_resampled = X_combined_resampled[:, :-1]
+                ids = X_combined_resampled[:, -1].astype(np.int64)
+                Logger.info(
+                    "Dataset class counts after undersampling: %s",
+                    np.bincount(y_resampled),
+                )
+            else:
+                X_resampled, y_resampled = X, y  # No resampling
+        if add_channel_dim:
+            self.X = torch.tensor(X_resampled).unsqueeze(1)
+        else:
+            self.X = torch.tensor(X_resampled)
+        self.y = torch.tensor(y_resampled, dtype=torch.float32)
+        self.ids = torch.tensor(ids, dtype=torch.int64)
+        Logger.info(f"Dataset size after preprocessing: {len(self.y)}")
 
     def __len__(self):
-        return len(self.data)
+        return len(self.y)
 
     def __getitem__(self, idx):
-        precursor_id, sample = self.data[idx]
-        intensity_seq = np.array(sample["features"], dtype=np.float32)
+        if self.return_ids:
+            return self.X[idx], self.y[idx], self.ids[idx]
+        else:
+            return self.X[idx], self.y[idx]
 
-        if self.normalize and intensity_seq.max() > 0:
-            intensity_seq = intensity_seq / intensity_seq.max()  # Normalize
+    def _pad_and_normalize(self, intensity_seq, scale_factor=1.0):
+        """Helper function to normalize and pad sequences"""
+        if self.normalize and np.max(intensity_seq) > 0:
+            intensity_seq = (
+                intensity_seq / np.max(intensity_seq) * scale_factor
+            )  # Normalize
 
-        label = int(sample["label"])  # Convert boolean to int
-
-        # Pad sequence to max length
         padded_seq = np.zeros(self.max_len, dtype=np.float32)
         padded_seq[: len(intensity_seq)] = intensity_seq
 
-        # add channel dimension
-        padded_seq = np.expand_dims(padded_seq, axis=0)
-
-        return torch.tensor(padded_seq), torch.tensor(label, dtype=torch.float32)
+        return padded_seq
