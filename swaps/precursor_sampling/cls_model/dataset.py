@@ -19,6 +19,61 @@ from utils.plot import plot_comparison
 Logger = logging.getLogger(__name__)
 
 
+def estimate_theoretical_isotope_pattern(mz_value, charge):
+    """
+    Estimates a theoretical isotope distribution based on the averagine model.
+
+    Parameters:
+        mz_values (np.array): Experimental m/z values.
+        charge (int): Charge state of the peptide.
+
+    Returns:
+        tuple: (theoretical_mz_values, theoretical_intensity_values)
+    """
+    # Estimate the neutral mass of the peptide
+    neutral_mass = mz_value * charge  # Approximate precursor mass
+
+    # Compute averagine-based elemental composition
+    num_averagine_units = neutral_mass / 111.125  # Average mass of one averagine unit
+    avg_composition = {
+        "C": round(num_averagine_units * 4.9384),
+        "N": round(num_averagine_units * 1.3577),
+        "O": round(num_averagine_units * 1.4773),
+        "S": round(num_averagine_units * 0.0417),
+    }
+
+    # Adjust hydrogen count to correct rounding errors
+    corrected_mass = (
+        avg_composition["C"] * 12.0000
+        + avg_composition["N"] * 14.0031
+        + avg_composition["O"] * 15.9949
+        + avg_composition["S"] * 31.9721
+    )
+    avg_composition["H"] = round((neutral_mass - corrected_mass) / 1.0078)
+
+    Logger.info(
+        "Final avg composition %s with %s averagine units",
+        avg_composition,
+        num_averagine_units,
+    )
+
+    # Generate isotopic pattern using IsoSpecPy
+    isotope_pattern = iso.IsoTotalProb(formula=avg_composition, prob_to_cover=0.9999)
+
+    # Extract m/z values and intensities
+    theoretical_mz_values = []
+    theoretical_intensity_values = []
+    for mz, prob in isotope_pattern:
+        theoretical_mz_values.append(mz / charge)  # Convert to m/z space
+        theoretical_intensity_values.append(prob)
+
+    # Normalize intensities
+    theoretical_intensity_values = np.array(theoretical_intensity_values)
+    theoretical_intensity_values /= np.sum(theoretical_intensity_values)
+
+    return np.array(theoretical_mz_values), theoretical_intensity_values
+
+
 def extract_precursor_features(
     precursor_id,
     data,
@@ -141,7 +196,7 @@ def prepare_precursor_dataset(
         precursor_df.iterrows(), total=len(precursor_df), desc="Processing precursors"
     ):
         precursor_id = int(row["Id"])
-        ms1data, quad_high_mz, quad_low_mz = extract_precursor_features(
+        ms1data, quad_high_mz, quad_low_mz, charge = extract_precursor_features(
             precursor_id, data=data, precursor_df=precursor_df
         )
         if ms1data.shape[0] == 0:
@@ -171,6 +226,177 @@ def prepare_precursor_dataset(
             pickle.dump(data_dict, f)
     else:
         return data_dict
+
+
+def calculate_averagine_fit(
+    ms1data,
+    charge,
+    align_by: str = "interpolate",
+    quad_low_mz: float = None,
+    quad_high_mz: float = None,
+    n_digits: int = 3,
+    plot: bool = False,
+):
+    """
+    Computes the averagine fit metrics for an experimental isotopic pattern.
+
+    Parameters:
+        df (pd.DataFrame): DataFrame with columns "mz_values" and "intensity_values".
+        charge (int): Charge state of the peptide.
+
+    Returns:
+        dict: RMS error, m/z bias, and explained intensity fraction.
+    """
+    # Extract experimental values
+    mz_exp = ms1data["mz_values"].values
+    mz_max_int = ms1data.loc[ms1data["intensity_values"].argmax(), "mz_values"]
+    intensity_exp = ms1data["intensity_values"].values.astype(float)
+    intensity_exp /= np.sum(intensity_exp)  # Normalize intensities
+
+    # Estimate theoretical pattern
+    theoretical_mz_values, theoretical_intensity_values = (
+        estimate_theoretical_isotope_pattern(mz_max_int, charge)
+    )
+    wd = wasserstein_distance(
+        mz_exp,
+        theoretical_mz_values,
+        u_weights=intensity_exp,
+        v_weights=theoretical_intensity_values,
+    )
+    if plot:
+        plot_comparison(
+            x_true=mz_exp,
+            y_true=intensity_exp,
+            x_pred=theoretical_mz_values,
+            y_pred=theoretical_intensity_values,
+            # title="Comparison of experimental and theoretical isotopic patterns",
+        )
+
+        plt.suptitle(f"Wasserstein Dist.: {wd:.3f}")
+        # plt.savefig("comparison.png", dpi=300)
+        # plt.close()
+    match align_by:
+        case "interpolate":
+            # Interpolate theoretical intensities at experimental m/z values
+            interp_func = interp1d(
+                theoretical_mz_values,
+                theoretical_intensity_values,
+                kind="linear",
+                fill_value=0,
+                bounds_error=False,
+            )
+            aligned_theoretical_intensities = interp_func(mz_exp)
+            Logger.debug(
+                "Length of exp intensities %s, aligned theoretical intensities: %s",
+                len(intensity_exp),
+                len(aligned_theoretical_intensities),
+            )
+        case "bin":
+            exp_df = pd.DataFrame(
+                {"mz_values": mz_exp, "intensity_values": intensity_exp}
+            )
+            fit_df = pd.DataFrame(
+                {
+                    "mz_values": theoretical_mz_values,
+                    "intensity_values": theoretical_intensity_values,
+                }
+            )
+            intensity_exp, mz_exp = preprocess_mz_intensity(
+                exp_df, min_mz=quad_low_mz, max_mz=quad_high_mz, n_digits=n_digits
+            )
+            aligned_theoretical_intensities, theoretical_mz_values = (
+                preprocess_mz_intensity(
+                    fit_df, min_mz=quad_low_mz, max_mz=quad_high_mz, n_digits=n_digits
+                )
+            )
+            Logger.debug(
+                "Length of exp intensities %s, aligned theoretical intensities: %s",
+                len(intensity_exp),
+                len(aligned_theoretical_intensities),
+            )
+
+    # Compute RMS error
+    rms_error = np.sqrt(np.mean((intensity_exp - aligned_theoretical_intensities) ** 2))
+
+    # Compute m/z bias (weighted mean shift)
+    mz_bias = np.sum((mz_exp - theoretical_mz_values[0]) * intensity_exp)
+
+    theo_non_zero = np.where(
+        (aligned_theoretical_intensities > 0) | (intensity_exp > 0)
+    )[0]
+    Logger.debug("Theoretical non-zero values: %s", theo_non_zero)
+    corr = spearmanr(
+        intensity_exp[theo_non_zero], aligned_theoretical_intensities[theo_non_zero]
+    )
+    Logger.debug("Spearman correlation: %s", corr[0])
+
+    # Compute explained intensity fraction
+    # total_theoretical_intensity = np.sum(theoretical_intensity_values)
+    # total_matched_intensity = np.sum(aligned_theoretical_intensities)
+    # explained_intensity_fraction = (
+    #     total_matched_intensity / total_theoretical_intensity
+    #     if total_theoretical_intensity > 0
+    #     else 0
+    # )
+
+    return {
+        "RMS Error": rms_error,
+        "m/z Bias": mz_bias,
+        "corr": corr[0],
+        "wd": wd,
+        # "Explained Intensity Fraction": explained_intensity_fraction,
+    }
+
+
+def calculate_precursor_averagine_fit(precursor_df, data, n_digits=3, save_path=None):
+    result = {
+        "Precursor ID": [],
+        "Bin RMS Error": [],
+        "Bin m/z Bias": [],
+        "Bin Spearman Corr": [],
+        "Interpolate RMS Error": [],
+        "Interpolate m/z Bias": [],
+        "Interpolate Spearman Corr": [],
+        "Wasserstein Distance": [],
+    }
+    for idx, row in tqdm(
+        precursor_df.iterrows(), total=len(precursor_df), desc="Processing precursors"
+    ):
+        precursor_id = int(row["Id"])
+        # Logger.debug("Processing precursor ID: %s", idx)
+        ms1data, quad_high_mz, quad_low_mz, charge = extract_precursor_features(
+            precursor_id=precursor_id,
+            data=data,
+            precursor_df=precursor_df,
+        )
+        if ms1data.shape[0] == 0:
+            Logger.warning("No MS1 data found for precursor ID: %s", idx)
+            continue
+        bin_fit = calculate_averagine_fit(
+            ms1data=ms1data,
+            charge=charge,
+            align_by="bin",
+            quad_low_mz=quad_low_mz,
+            quad_high_mz=quad_high_mz,
+            n_digits=n_digits,
+        )
+        interpolate_fit = calculate_averagine_fit(
+            ms1data=ms1data,
+            charge=charge,
+            align_by="interpolate",
+        )
+        result["Bin RMS Error"].append(bin_fit["RMS Error"])
+        result["Bin m/z Bias"].append(bin_fit["m/z Bias"])
+        result["Bin Spearman Corr"].append(bin_fit["corr"])
+        result["Interpolate RMS Error"].append(interpolate_fit["RMS Error"])
+        result["Interpolate m/z Bias"].append(interpolate_fit["m/z Bias"])
+        result["Interpolate Spearman Corr"].append(interpolate_fit["corr"])
+        result["Wasserstein Distance"].append(interpolate_fit["wd"])
+        result["Precursor ID"].append(precursor_id)
+    if save_path:
+        pd.DataFrame(result).to_csv(save_path, index=False)
+    else:
+        return pd.DataFrame(result)
 
 
 def get_precursor_intensity_by_category(
@@ -323,6 +549,84 @@ def get_precursor_intensity_by_category(
         plt.title(title)
         plt.xlabel("Precursor Intensity (Log10)")
     return precursors_df
+
+
+def eval_precursor_fit(
+    precursor_df,
+    fit_df,
+    save_dir,
+    hue="Identified",
+    hue_mapping=None,
+    common_norm=True,
+    **kwargs,
+):
+    precursor_with_fit = pd.merge(
+        left=precursor_df,
+        right=fit_df,
+        left_on="Id",
+        right_on="Precursor ID",
+    )
+    # Logger.info(
+    #     "Merged precursor and fit dataframes columns: %s", precursor_with_fit.columns
+    # )
+    precursor_with_fit["log_intensity"] = np.log10(precursor_with_fit["Intensity"] + 1)
+
+    # save the dataframe
+    precursor_with_fit.to_csv(
+        os.path.join(save_dir, "precursor_fit_merged.csv"), index=False
+    )
+    # plot distribution results
+    plt.rcParams.update({"font.size": 14})
+    fig, axes = plt.subplots(3, 3, figsize=(20, 10))
+    axes = axes.flatten()  # Flatten the 2D array of axes into 1D
+
+    for idx, col in enumerate(
+        [
+            "Bin RMS Error",
+            "Bin m/z Bias",
+            "Bin Spearman Corr",
+            "Interpolate RMS Error",
+            "Interpolate m/z Bias",
+            "Interpolate Spearman Corr",
+            "Wasserstein Distance",
+        ]
+    ):
+        sns.kdeplot(
+            data=precursor_with_fit,
+            x=col,
+            hue=hue,
+            ax=axes[idx],
+            common_norm=common_norm,
+            palette=hue_mapping,
+            **kwargs,
+        )
+        # plt.title("Random 15min 3R")
+
+    plt.tight_layout()
+    plt.savefig(
+        os.path.join(
+            save_dir,
+            f"precursor_fit_metrics_hue_{hue}_common_norm_{str(common_norm)}.png",
+        ),
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+    precursor_with_fit["NotIdentified"] = ~precursor_with_fit["Identified"]
+    precursor_with_fit["Wasserstein Similarity"] = (
+        precursor_with_fit["Wasserstein Distance"].max()
+        - precursor_with_fit["Wasserstein Distance"]
+    )
+    # calc_fdr_and_thres(
+    #     pred_df=precursor_with_fit,
+    #     score_col="Wasserstein Similarity",
+    #     return_plot=True,
+    #     save_dir=save_dir,
+    #     decoy_col="NotIdentified",
+    # )
+    return precursor_with_fit
+
+
 class PrecursorDataset(Dataset):
     def __init__(self, data_dict, normalize=True, max_len=None):
         # Filter out entries with zero total intensity
