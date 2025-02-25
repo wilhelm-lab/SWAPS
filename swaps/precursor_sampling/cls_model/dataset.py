@@ -313,6 +313,7 @@ def calculate_averagine_fit(
                 len(intensity_exp),
                 len(aligned_theoretical_intensities),
             )
+            kl = 0
         case "bin":
             exp_df = pd.DataFrame(
                 {"mz_values": mz_exp, "intensity_values": intensity_exp}
@@ -336,6 +337,7 @@ def calculate_averagine_fit(
                 len(intensity_exp),
                 len(aligned_theoretical_intensities),
             )
+            kl = kl_divergence(intensity_exp, aligned_theoretical_intensities)
 
     # Compute RMS error
     rms_error = np.sqrt(np.mean((intensity_exp - aligned_theoretical_intensities) ** 2))
@@ -366,8 +368,30 @@ def calculate_averagine_fit(
         "m/z Bias": mz_bias,
         "corr": corr[0],
         "wd": wd,
+        "kl_divergence": kl,
         # "Explained Intensity Fraction": explained_intensity_fraction,
     }
+
+
+def kl_divergence(P, Q):
+    """
+    Compute the Kullback-Leibler (KL) divergence D_KL(P || Q) using m/z values.
+
+    Parameters:
+        mz_values (np.array): The m/z values corresponding to the isotope distribution.
+        P (list or np.array): First probability distribution.
+        Q (list or np.array): Second probability distribution.
+
+    Returns:
+        float: KL divergence value.
+    """
+    P, Q = np.array(P), np.array(Q)
+
+    # Avoid division by zero by replacing zero values with a small constant (1e-10)
+    P = np.clip(P, 1e-10, None)
+    Q = np.clip(Q, 1e-10, None)
+
+    return np.sum(rel_entr(P, Q))  # Computes x * log(x / y) element-wise
 
 
 def calculate_precursor_averagine_fit(precursor_df, data, n_digits=3, save_path=None):
@@ -376,6 +400,7 @@ def calculate_precursor_averagine_fit(precursor_df, data, n_digits=3, save_path=
         "Bin RMS Error": [],
         "Bin m/z Bias": [],
         "Bin Spearman Corr": [],
+        "Bin KL Divergence": [],
         "Interpolate RMS Error": [],
         "Interpolate m/z Bias": [],
         "Interpolate Spearman Corr": [],
@@ -414,6 +439,7 @@ def calculate_precursor_averagine_fit(precursor_df, data, n_digits=3, save_path=
         result["Bin RMS Error"].append(bin_fit["RMS Error"])
         result["Bin m/z Bias"].append(bin_fit["m/z Bias"])
         result["Bin Spearman Corr"].append(bin_fit["corr"])
+        result["Bin KL Divergence"].append(bin_fit["kl_divergence"])
         result["Interpolate RMS Error"].append(interpolate_fit["RMS Error"])
         result["Interpolate m/z Bias"].append(interpolate_fit["m/z Bias"])
         result["Interpolate Spearman Corr"].append(interpolate_fit["corr"])
