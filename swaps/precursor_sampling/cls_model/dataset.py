@@ -231,6 +231,8 @@ def prepare_precursor_dataset(
 def calculate_averagine_fit(
     ms1data,
     charge,
+    mono_mz: float = None,
+    precursor_id: int = None,
     align_by: str = "interpolate",
     quad_low_mz: float = None,
     quad_high_mz: float = None,
@@ -249,7 +251,12 @@ def calculate_averagine_fit(
     """
     # Extract experimental values
     mz_exp = ms1data["mz_values"].values
-    mz_max_int = ms1data.loc[ms1data["intensity_values"].argmax(), "mz_values"]
+    if (mono_mz is not None) and (mono_mz > 0):
+        mz_max_int = mono_mz
+    else:
+        mz_max_int = ms1data.loc[ms1data["intensity_values"].argmax(), "mz_values"]
+    if precursor_id is None:
+        precursor_id = mz_max_int
     intensity_exp = ms1data["intensity_values"].values.astype(float)
     intensity_exp /= np.sum(intensity_exp)  # Normalize intensities
 
@@ -319,7 +326,7 @@ def calculate_averagine_fit(
     rms_error = np.sqrt(np.mean((intensity_exp - aligned_theoretical_intensities) ** 2))
 
     # Compute m/z bias (weighted mean shift)
-    mz_bias = np.sum((mz_exp - theoretical_mz_values[0]) * intensity_exp)
+    mz_bias = np.sum((mz_exp - mz_max_int) * intensity_exp)
 
     theo_non_zero = np.where(
         (aligned_theoretical_intensities > 0) | (intensity_exp > 0)
@@ -363,6 +370,7 @@ def calculate_precursor_averagine_fit(precursor_df, data, n_digits=3, save_path=
         precursor_df.iterrows(), total=len(precursor_df), desc="Processing precursors"
     ):
         precursor_id = int(row["Id"])
+        mono_mz = row["MonoisotopicMz"]
         # Logger.debug("Processing precursor ID: %s", idx)
         ms1data, quad_high_mz, quad_low_mz, charge = extract_precursor_features(
             precursor_id=precursor_id,
@@ -375,10 +383,13 @@ def calculate_precursor_averagine_fit(precursor_df, data, n_digits=3, save_path=
         bin_fit = calculate_averagine_fit(
             ms1data=ms1data,
             charge=charge,
+            mono_mz=mono_mz,
+            precursor_id=precursor_id,
             align_by="bin",
             quad_low_mz=quad_low_mz,
             quad_high_mz=quad_high_mz,
             n_digits=n_digits,
+            plot=False,
         )
         interpolate_fit = calculate_averagine_fit(
             ms1data=ms1data,
