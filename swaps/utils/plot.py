@@ -336,6 +336,7 @@ def plot_comparison(
     x_true: Union[None, pd.Series] = None,
     x_pred: Union[None, pd.Series] = None,
     log_y: bool = False,
+    align_y: bool = False,
 ):
     fig, axs = plt.subplots(2, 1, sharex=True, sharey=False)
     fig.subplots_adjust(hspace=0)
@@ -348,10 +349,10 @@ def plot_comparison(
         x_pred = np.arange(len(y_pred))
     axs[0].vlines(x=x_true, ymin=0, ymax=y_true)
     axs[1].vlines(x=x_pred, ymin=-y_pred, ymax=0)
-
-    # enforce same y axis limits
-    axs[0].set_ylim([0, max(axs[0].get_ylim()[1], abs(axs[1].get_ylim()[0]))])
-    axs[1].set_ylim([-axs[0].get_ylim()[1], 0])
+    if align_y:
+        # enforce same y axis limits
+        axs[0].set_ylim([0, max(axs[0].get_ylim()[1], abs(axs[1].get_ylim()[0]))])
+        axs[1].set_ylim([-axs[0].get_ylim()[1], 0])
 
 
 def save_plot(

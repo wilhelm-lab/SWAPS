@@ -175,7 +175,13 @@ def plot_binned_intensities(
     xtick_indices = np.linspace(0, len(mz_bins) - 1, num_xticks, dtype=int)
     plt.xticks(xtick_indices, np.round(mz_bins[xtick_indices], 3), rotation=90)
 
-    plt.show()
+    if save_dir is not None:
+        plt.savefig(
+            os.path.join(save_dir, f"{title}.png"), dpi=300, bbox_inches="tight"
+        )
+        plt.close()
+    else:
+        plt.show()
 
 
 def plot_precursor_features(data_dict, precursor_id):
@@ -238,6 +244,7 @@ def calculate_averagine_fit(
     quad_high_mz: float = None,
     n_digits: int = 3,
     plot: bool = False,
+    save_dir: str = None,
 ):
     """
     Computes the averagine fit metrics for an experimental isotopic pattern.
@@ -276,12 +283,20 @@ def calculate_averagine_fit(
             y_true=intensity_exp,
             x_pred=theoretical_mz_values,
             y_pred=theoretical_intensity_values,
+            align_y=False,
             # title="Comparison of experimental and theoretical isotopic patterns",
         )
 
         plt.suptitle(f"Wasserstein Dist.: {wd:.3f}")
-        # plt.savefig("comparison.png", dpi=300)
-        # plt.close()
+        if save_dir is not None:
+            plt.savefig(
+                os.path.join(
+                    save_dir, f"comparison_precursor_with_fit_{precursor_id}.png"
+                ),
+                dpi=300,
+                bbox_inches="tight",
+            )
+            plt.close()
     match align_by:
         case "interpolate":
             # Interpolate theoretical intensities at experimental m/z values
@@ -419,6 +434,7 @@ def get_precursor_intensity_by_category(
     plot_type: str | None = "kde",
     title: str = "Precursor intensity by identification status",
     xlim: tuple = (3, 9),
+    save_dir: str = None,
     **kwargs,
 ):
     """
@@ -559,6 +575,13 @@ def get_precursor_intensity_by_category(
         plt.xlim(xlim[0], xlim[1])
         plt.title(title)
         plt.xlabel("Precursor Intensity (Log10)")
+        if save_dir is not None:
+            plt.savefig(
+                os.path.join(save_dir, "precursor_distr_by_intensity.png"),
+                dpi=300,
+                bbox_inches="tight",
+            )
+            plt.close()
     return precursors_df
 
 
