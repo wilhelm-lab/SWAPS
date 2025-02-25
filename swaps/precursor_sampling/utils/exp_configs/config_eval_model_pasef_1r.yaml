@@ -1,0 +1,39 @@
+DESCRIPTION: "Evaluate model on test set"
+
+PREPARE_DATASET:
+  ENABLE: false
+  INPUT:
+    TIMS_DATA_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/PASEF_1ramps_200ng_K562_15min_Slot2-2_1_6935.d/
+    OK_OUTPUT_DIR: /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/rescoring/out_no_rl_fix_ce_mokapot_pasef/
+    MQ_001_DIR: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/txt_001FDR_15min_60min/
+    MQ_100_DIR: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/txt_100FDR_15min
+  
+
+MODEL:
+  KEEP_TRAINING: false
+  TYPE: precursor_reconstruction
+  NAME: CAE
+  EXP_DIR: '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/exp_reconstruct_CAE_val_loss_depth5_test_random_MSE_with_ids'
+  RESUME_PATH: '/cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/exp_reconstruct_CAE_val_loss_depth5_20250214_134734_645011/model_backups/bst_model_0.4246000051498413.pt' #TODO
+  PARAMS:
+    NUM_CLASSES: 2
+    CAE:
+      FIRST_OUT_CHANNELS: 128
+      DEPTH: 5
+      KERNEL_SIZE: 5
+  DATASET: 
+    TRAINING_DATA: []
+    VALIDATION_DATA: []
+    TEST_DATA: 
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/pasef_15min_1r/data_dict_PASEF_1ramps_200ng_K562_15min_Slot2-2_1_6935_0.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/pasef_15min_1r/data_dict_PASEF_1ramps_200ng_K562_15min_Slot2-2_1_6935_1.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/pasef_15min_1r/data_dict_PASEF_1ramps_200ng_K562_15min_Slot2-2_1_6935_2.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/pasef_15min_1r/data_dict_PASEF_1ramps_200ng_K562_15min_Slot2-2_1_6935_3.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/pasef_15min_1r/data_dict_PASEF_1ramps_200ng_K562_15min_Slot2-2_1_6935_4.pkl
+    SAMPLING_STRATEGY: null
+    TRAINING_BATCH_SIZE: 512
+    VALIDATION_BATCH_SIZE: 1024
+    TEST_BATCH_SIZE: 1024
+    SCALE_FACTOR: 10000
+  EVAL:
+    ERROR_CAL: "MSE"

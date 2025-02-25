@@ -19,11 +19,11 @@ MODEL:
     TRAINING_DATA: []
     VALIDATION_DATA: []
     TEST_DATA: 
-    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random_15min_3r/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_0.pkl
-    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random_15min_3r/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_1.pkl
-    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random_15min_3r/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_2.pkl
-    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random_15min_3r/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_3.pkl
-    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random_15min_3r/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_4.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random_15min_6r/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_0.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random_15min_6r/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_1.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random_15min_6r/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_2.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random_15min_6r/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_3.pkl
+    - /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/predict_identifiability/data/random_15min_6r/data_dict_Random_6ramps_200ng_K562_15min_Slot2-2_1_6932_4.pkl
     SAMPLING_STRATEGY: null
     TRAINING_BATCH_SIZE: 512
     VALIDATION_BATCH_SIZE: 1024
