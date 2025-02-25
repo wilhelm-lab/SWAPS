@@ -524,6 +524,8 @@ def get_precursor_intensity_by_category(
             .tolist()
         )
     else:
+        precursors_id_by_ok = []
+        precursors_id_by_both = []
         scan_number_mq = evidence_001["MS/MS scan number"].tolist()
     precursors_id_by_mq = (
         acc_pasef_msms_scans.loc[
@@ -548,6 +550,10 @@ def get_precursor_intensity_by_category(
         "Identified by both"
     )
     precursors_df["Identified"] = ~precursors_df["status"].str.contains("Not")
+    precursors_df["Identified_or_Unknown"] = precursors_df["Identified"]
+    precursors_df.loc[
+        precursors_df["status"] == "Not in MQ", "Identified_or_Unknown"
+    ] = "Unknown"
     hue_mapping = {
         "Not in MQ": "red",
         "Not identified": "orange",
@@ -600,11 +606,12 @@ def eval_precursor_fit(
         left_on="Id",
         right_on="Precursor ID",
     )
-    # Logger.info(
-    #     "Merged precursor and fit dataframes columns: %s", precursor_with_fit.columns
-    # )
-    precursor_with_fit["log_intensity"] = np.log10(precursor_with_fit["Intensity"] + 1)
 
+    precursor_with_fit["log_intensity"] = np.log10(precursor_with_fit["Intensity"] + 1)
+    precursor_with_fit["Identified_or_Unknown"] = precursor_with_fit["Identified"]
+    precursor_with_fit.loc[
+        precursor_with_fit["status"] == "Not in MQ", "Identified_or_Unknown"
+    ] = "Unknown"
     # save the dataframe
     precursor_with_fit.to_csv(
         os.path.join(save_dir, "precursor_fit_merged.csv"), index=False
