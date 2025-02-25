@@ -4,6 +4,9 @@ import logging
 from tqdm import tqdm
 import numpy as np
 import pandas as pd
+from scipy.interpolate import interp1d
+from scipy.stats import spearmanr, wasserstein_distance
+from scipy.special import rel_entr
 import logging
 import seaborn as sns
 import matplotlib.pyplot as plt
@@ -51,7 +54,7 @@ def estimate_theoretical_isotope_pattern(mz_value, charge):
     )
     avg_composition["H"] = round((neutral_mass - corrected_mass) / 1.0078)
 
-    Logger.info(
+    Logger.debug(
         "Final avg composition %s with %s averagine units",
         avg_composition,
         num_averagine_units,
@@ -63,13 +66,13 @@ def estimate_theoretical_isotope_pattern(mz_value, charge):
     # Extract m/z values and intensities
     theoretical_mz_values = []
     theoretical_intensity_values = []
-    for mz, prob in isotope_pattern:
-        theoretical_mz_values.append(mz / charge)  # Convert to m/z space
+    for mass, prob in isotope_pattern:
+        theoretical_mz_values.append(mass / charge)  # Convert to m/z space
         theoretical_intensity_values.append(prob)
 
     # Normalize intensities
     theoretical_intensity_values = np.array(theoretical_intensity_values)
-    theoretical_intensity_values /= np.sum(theoretical_intensity_values)
+    # theoretical_intensity_values /= np.sum(theoretical_intensity_values)
 
     return np.array(theoretical_mz_values), theoretical_intensity_values
 
@@ -83,7 +86,7 @@ def extract_precursor_features(
     (frame_index_parent, precursor_intensity, charge) = precursor_df.loc[
         precursor_df["Id"] == precursor_id, ["Parent", "Intensity", "Charge"]
     ].values[0]
-    Logger.info(
+    Logger.debug(
         "Checking precursor %s, intensity %s, frag spectra dataframe shape %s",
         precursor_id,
         precursor_intensity,
@@ -107,7 +110,7 @@ def extract_precursor_features(
     ].min()
     rt_values_min = dataframe["rt_values"].min()
     rt_values_max = dataframe["rt_values"].max()
-    Logger.info(
+    Logger.debug(
         "Filter precursor feature with frame (frag) %s, frame (precursor parent) %s, quad mz %s, %s, mobility scans %s, %s, retention time (not used for filtering) %s, %s",
         frame_index,
         frame_index_parent,
@@ -127,7 +130,7 @@ def extract_precursor_features(
         }
     ]
 
-    Logger.info("Filtered dataframe %s", filtered_dataframe.shape)
+    Logger.debug("Filtered dataframe %s", filtered_dataframe.shape)
     return filtered_dataframe, quad_high_mz, quad_low_mz, charge
 
 
@@ -159,7 +162,7 @@ def preprocess_mz_intensity(
 
 
 def plot_binned_intensities(
-    intensities, mz_bins=None, title="Binned Intensities", num_xticks=10
+    intensities, mz_bins=None, title="Binned Intensities", num_xticks=10, save_dir=None
 ):
     plt.figure(figsize=(10, 5))
     if mz_bins is None:
@@ -271,9 +274,17 @@ def calculate_averagine_fit(
     theoretical_mz_values, theoretical_intensity_values = (
         estimate_theoretical_isotope_pattern(mz_max_int, charge)
     )
+    Logger.debug(
+        "Experimental m/z values: %s, and intensities %s", mz_exp, intensity_exp
+    )
+    # Logger.debug(
+    #     "Theoretical m/z values: %s and int %s",
+    #     theoretical_mz_values,
+    #     theoretical_intensity_values,
+    # )
     wd = wasserstein_distance(
-        mz_exp,
-        theoretical_mz_values,
+        u_values=mz_exp,
+        v_values=theoretical_mz_values,
         u_weights=intensity_exp,
         v_weights=theoretical_intensity_values,
     )
