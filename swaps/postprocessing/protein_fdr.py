@@ -14,6 +14,11 @@ def add_decoy_prefix(row: pd.Series):
     return ";".join([f"REV__{p}" for p in proteins.split(";")])
 
 
+def empirical_p_value(score, decoy_scores):
+    """Compute empirical p-value for a given protein score."""
+    return (np.sum(decoy_scores >= score) + 1) / (len(decoy_scores) + 1)
+
+
 def calc_protein_score(
     maxquant_dict: pd.DataFrame,
     ps_result: pd.DataFrame,
