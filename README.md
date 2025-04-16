@@ -70,7 +70,8 @@ sbs_runner_ims [path-to-config-file]
     - `evaluation/` (only exists if peak selection is disabled, evaluation compared to reference (MQ))
       - `CorrQuant.png`
       - `VennDiag.png`
-
+---
+Publication: [SWAPS_JPR](https://pubs.acs.org/doi/10.1021/acs.jproteome.4c00972)
 ---
 For questions, please contact *zixuan.xiao@tum.de*
 
