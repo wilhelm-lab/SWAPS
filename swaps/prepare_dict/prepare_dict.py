@@ -29,6 +29,7 @@ from alphabase.psm_reader import psm_reader_provider
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
 from peptdeep.pretrained_models import ModelManager
+from .search_engine_output_parser import sage_parser
 
 Logger = logging.getLogger(__name__)
 
@@ -1104,7 +1105,7 @@ def dict_add_alpha_pept_pred(
 ):
     Logger.info(f"Device: {device}")
     # load dict
-    # maxquant_dict = pd.read_csv(dict_for_pred_path, sep="\t")
+
     Logger.info(f"dict size: {maxquant_dict.shape}")
     mq_reader = psm_reader_provider.get_reader("maxquant")
     mq_reader.load(dict_for_pred_path)
@@ -1387,9 +1388,13 @@ def construct_dict(
         case _:
             device = "gpu"
             Logger.info("Using multiple GPUs, device is %s", device)
-    # device = str("cuda" if torch.cuda.is_available() else "cpu")
-    # Logger.info(f"Device: {device}")
     maxquant_exp_df = pd.read_csv(maxquant_exp_path, sep="\t", low_memory=False)
+    if (
+        "sage_discriminant_score" in maxquant_exp_df.columns
+    ):  # infer search engine, remap column names
+        Logger.debug("Sage discriminant score found, renaming columns")
+        maxquant_exp_df = sage_parser(maxquant_exp_df)
+        Logger.debug("Renamed columns: %s", maxquant_exp_df.columns)
     Logger.info("maxquant_exp_df size: %s", maxquant_exp_df.shape)
     maxquant_exp_df = maxquant_exp_df.loc[
         maxquant_exp_df["Raw file"].isin(filter_exp_by_raw_file)
