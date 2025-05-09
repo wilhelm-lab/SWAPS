@@ -29,6 +29,7 @@ from peak_detection_2d.utils import (
 )
 from result_analysis import result_analysis
 from prepare_dict.prepare_dict import construct_dict, get_mzrank_batch_cutoff
+from prepare_dict.search_engine_output_parser import sage_parser
 from postprocessing.fdr import (
     generate_signal_compete_pairs,
     get_isolated_decoys_from_pairs,
@@ -111,7 +112,10 @@ def opt_scan_by_scan(config_path: str):
                     "Filtered reference maxquant result by raw file: %s",
                     cfg.FILTER_REF_BY_RAW_FILE,
                 )
-
+        if (
+            "sage_discriminant_score" in maxquant_result_ref.columns
+        ):  # infer search engine, remap column names
+            maxquant_result_ref = sage_parser(maxquant_result_ref)
         maxquant_result_ref, dict_pickle_path, cfg_prepare_dict = construct_dict(
             cfg_prepare_dict=cfg.PREPARE_DICT,
             filter_exp_by_raw_file=cfg.FILTER_EXP_BY_RAW_FILE,

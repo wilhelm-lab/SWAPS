@@ -1,0 +1,29 @@
+RESULT_PATH: /cmnfs/proj/ORIGINS/SWAPS_exp/test/test_sage
+ADD_TIMESTAMP_TO_RESULT_PATH: true
+DATA_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/jigsaw_vs_pasef/Data/R02_50ng_50ms_1200_2ms_Slot2-5_1_7803.d/
+DEBUG: false
+DICT_PICKLE_PATH: ''
+EXPORT_DATA_HDF5_DIR: ''
+MQ_REF_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/jigsaw_vs_pasef/sage/R02/results.sage.tsv
+MQ_EXP_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/jigsaw_vs_pasef/sage/R02/results.sage.tsv
+FILTER_EXP_BY_RAW_FILE: ['R02_50ng_50ms_1200_2ms_Slot2-5_1_7803']
+N_CPU: 5
+OPTIMIZATION:
+  N_BLOCKS_BY_PEPT: 1
+  N_BATCH: 5
+PREPARE_DICT:
+  DICT_PICKLE_PATH: ''
+  FILTER_PRED_BY_RAW_FILE: ''
+  FILTER_TRAIN_BY_RAW_FILE: ''
+  KEEP_MATCHED_PRECURSORS: false
+  GENERATE_DECOY: true
+  IM_REF: ref
+  RT_REF: ref
+  RT_TOL: 0.1
+RANDOM_SEED: 42
+PEAK_SELECTION:
+  ENABLE: false
+RESULT_ANALYSIS:
+  ENABLE: true
+  POST_PROCESSING:
+    FILTER_BY_IM: false
