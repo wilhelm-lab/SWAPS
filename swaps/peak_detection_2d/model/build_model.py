@@ -7,7 +7,7 @@ from .model import PeakDetectionNet
 def build_model(model_cfg: CfgNode):
     if model_cfg.TYPE == "mask_segmentation":
         if model_cfg.NAME == "UNET":
-            model = UNet_rec_input(
+            model = UNET(
                 in_channels=model_cfg.PARAMS.IN_CHANNELS,
                 first_out_channels=model_cfg.PARAMS.FIRST_OUT_CHANNELS,
                 exit_channels=model_cfg.PARAMS.EXIT_CHANNELS,
@@ -19,7 +19,7 @@ def build_model(model_cfg: CfgNode):
             return model
     elif model_cfg.TYPE == "mask_classification":
         if model_cfg.NAME == "UNET":
-            model = UNet_rec_input(
+            model = UNET(
                 in_channels=model_cfg.PARAMS.IN_CHANNELS,
                 first_out_channels=model_cfg.PARAMS.FIRST_OUT_CHANNELS,
                 exit_channels=model_cfg.PARAMS.EXIT_CHANNELS,
