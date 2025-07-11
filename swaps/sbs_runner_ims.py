@@ -9,6 +9,12 @@ import argparse
 import numpy as np
 import pandas as pd
 import pickle
+
+import torch
+
+# Disable cuDNN globally BEFORE anything else
+torch.backends.cudnn.enabled = False
+
 from utils.ims_utils import (
     load_dotd_data,
     export_im_and_ms1scans,

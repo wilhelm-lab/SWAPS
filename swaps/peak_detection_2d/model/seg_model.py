@@ -1,7 +1,6 @@
 import gc
 from typing import List, Callable, Literal
 import logging
-import os
 import numpy as np
 import pandas as pd
 import torch
@@ -63,7 +62,8 @@ def train_one_epoch(
             image_batch = MultiHDF5_MaskDataset.add_ps_channel_to_batch(
                 image_batch.float(), device=device, seg_model=seg_model
             )
-        out = model(image_batch.float())
+        out = model(image_batch.float()).to(device)
+        image_batch = image_batch.to(device)
         match model_type:
             case "seg":
                 if use_image_as_input:
