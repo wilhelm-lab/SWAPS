@@ -71,13 +71,23 @@ def opt_scan_by_scan(config_path: str):
         logging.info("Number of CPUs: %s", cfg.N_CPU)
     if cfg.OPTIMIZATION.N_BATCH < 0:
         cfg.OPTIMIZATION.N_BATCH = cfg.N_CPU  # set batches as the same as N_CPU
-    # Load data
-    if cfg.USE_IMS:
-        data, hdf_file_name = load_dotd_data(
-            cfg.DATA_PATH, swaps_result_dir=cfg.EXPORT_DATA_HDF5_DIR
-        )
+
+    # Check if activation maps already exist
+    activation_file = os.path.join(cfg.RESULT_PATH, "results", "activation", "im_rt_pept_act_coo_peptbatch0.npz")
+
+    if not os.path.exists(activation_file):
+        # Load data
+        logging.info("Activation data not found. Loading raw data to generate activation maps...")
+        if cfg.USE_IMS:
+            data, hdf_file_name = load_dotd_data(
+                cfg.DATA_PATH, swaps_result_dir=cfg.EXPORT_DATA_HDF5_DIR
+            )
+        else:
+            data = load_mzml(cfg.DATA_PATH, unify_format=True)
     else:
-        data = load_mzml(cfg.DATA_PATH, unify_format=True)
+        logging.info("Activation maps found. Skipping raw data loading.")
+        data = None
+
     if cfg.DICT_PICKLE_PATH != "":
         maxquant_result_ref = pd.read_pickle(filepath_or_buffer=cfg.DICT_PICKLE_PATH)
         ms1scans = pd.read_csv(os.path.join(cfg.RESULT_PATH, "ms1scans.csv"))
@@ -280,6 +290,11 @@ def opt_scan_by_scan(config_path: str):
                 "Finished peak selection dataset preparation and saved config to %s",
                 os.path.join(cfg.RESULT_PATH, f"config_{name_timestamp}.yaml"),
             )
+
+        if cfg.PEAK_SELECTION.PREPARE_ONLY:
+            logging.info("PREPARE_ONLY is True. Skipping training and exiting early.")
+            return  # Early exit
+
         if cfg.PEAK_SELECTION.EXP_DIR_NAME != "":
             ps_exp_dir = os.path.join(
                 cfg.RESULT_PATH, "peak_selection", cfg.PEAK_SELECTION.EXP_DIR_NAME
