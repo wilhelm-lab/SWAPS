@@ -75,7 +75,11 @@ def opt_scan_by_scan(config_path: str):
     # Check if activation maps already exist
     activation_file = os.path.join(cfg.RESULT_PATH, "results", "activation", "im_rt_pept_act_coo_peptbatch0.npz")
 
-    if not os.path.exists(activation_file):
+    if str(cfg.RESULT_PATH).endswith("model"):
+        logging.info("Result path for Model Training found. Skipping data loading and generation.")
+        model_training(cfg, None)
+        return
+    elif not os.path.exists(activation_file):
         # Load data
         logging.info("Activation data not found. Loading raw data to generate activation maps...")
         if cfg.USE_IMS:
@@ -526,6 +530,43 @@ def opt_scan_by_scan(config_path: str):
         swaps_result.plot_overlap_with_MQ(show_ref=False, level="precursor")
         swaps_result.plot_overlap_with_MQ(show_ref=False, level="peptide")
         swaps_result.plot_overlap_with_MQ(show_ref=False, level="protein")
+
+
+def model_training(cfg, maxquant_result_ref):
+    if cfg.PEAK_SELECTION.ENABLE:
+        logging.info("==================Peak Selection==================")
+
+        if cfg.PEAK_SELECTION.EXP_DIR_NAME != "":
+            ps_exp_dir = os.path.join(
+                cfg.RESULT_PATH, "peak_selection", cfg.PEAK_SELECTION.EXP_DIR_NAME
+            )
+        else:
+            train_name_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            ps_exp_dir = os.path.join(
+                cfg.RESULT_PATH, "peak_selection", "exp_" + train_name_timestamp
+            )
+            cfg.PEAK_SELECTION.EXP_DIR_NAME = "exp_" + train_name_timestamp
+        if not os.path.exists(ps_exp_dir):
+            os.mkdir(ps_exp_dir)
+        best_seg_model_path, best_cls_model_path = train(
+            cfg_peak_selection=cfg.PEAK_SELECTION,
+            ps_exp_dir=ps_exp_dir,
+            random_state=cfg.RANDOM_SEED,
+            maxquant_dict=maxquant_result_ref,
+            show_decoy=cfg.PREPARE_DICT.GENERATE_DECOY,
+        )
+
+        # Inference
+        if not os.path.exists(os.path.join(ps_exp_dir, "pept_act_sum_ps.csv")):
+            logging.info("Finished training peak selection model, start inference...")
+            infer_on_pept_act(
+                cfg=cfg,
+                best_seg_model_path=best_seg_model_path,
+                best_cls_model_path=best_cls_model_path,
+                maxquant_dict=maxquant_result_ref,
+                ps_exp_dir=ps_exp_dir,
+                sigmoid_cls_score=True,
+            )
 
 
 def main():
