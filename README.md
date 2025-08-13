@@ -19,13 +19,21 @@ pip install git+https://github.com/wilhelm-lab/SWAPS.git
 ```
 ### Run SWAPS
 #### Configuration
-SWAPS takes a `.yaml` as a configuration argument. Examples can be found at `swaps/utils/exp_configs`. Please modify the file path as necessary. Detail documents of config definiation can be found at `swaps/utils/singleton_swaps_optimization.py`.
+SWAPS takes a `.yaml` as a configuration argument.
+Mind that Examples at `swaps/utils/exp_configs` are not compatible with this version of SWAPS.
+Detail documents of config definiation can be found at `swaps/utils/singleton_swaps_optimization.py`.
 
 #### Runner
 To run SWAPS, in the created environment, in command line:
 ```
 sbs_runner_ims [path-to-config-file]
 ```
+
+### Run Multi-file-SWAPS
+You can run and train a model on multiple files at once, by referencing multiple Data paths in 'DATA_PATHS:[]' and corresponding
+'MQ_EXP_PATHS:[]' as well as 'RESULT_PATHS:[]' for each file. (Index of a lists need to correspond to the specific raw file)
+
+The resulting models will be saved at 'RESULT_PATHS[0]' 
 
 ### SWAPS results structure
 - `[RESULT_PATH]/`
