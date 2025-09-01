@@ -221,14 +221,14 @@ def opt_scan_by_scan(config_path: str):
         if cfg.PEAK_SELECTION.PREPARE_ONLY:
             logging.info("PREPARE_ONLY is True. Skipping training and exiting early.")
             return  # Early exit
-        
+
         if cfg.MULTI_TRAIN:
             random.shuffle(cfg.PEAK_SELECTION.TRAINING_DATA)
             test_batch = cfg.PEAK_SELECTION.TRAINING_DATA.pop()     # ToDo For Testing later
-            logging.info("MULTI_TRAIN is TRUE. Multi-file Model Training starts..")
+            logging.info("MULTI_TRAIN is TRUE. Starting multi-file Model Training.")
             ps_exp_dir = model_training(cfg, None)
         else:
-            logging.info("Single-file Model Training starts..")
+            logging.info("Starting single-file Model Training.")
             ps_exp_dir = model_training(cfg, maxquant_result_refs[0])
 
         # Inference eval
