@@ -98,7 +98,7 @@ def opt_scan_by_scan(config_path: str):
 
             if cfg.USE_IMS:
                 data, hdf_file_name = load_dotd_data(                       # Todo hdf_file_name redundant?
-                    cfg.DATA_PATHS[i], swaps_result_dir=cfg.EXPORT_DATA_HDF5_DIR
+                    cfg.DATA_PATHS[i], swaps_result_dir=cfg.EXPORT_DATA_HDF5_DIR[i]
                 )
             else:
                 data = load_mzml(cfg.DATA_PATHS[i], unify_format=True)
@@ -106,7 +106,7 @@ def opt_scan_by_scan(config_path: str):
             logging.info("Activation maps found. Skipping raw data loading.")
             data = None
 
-        if cfg.DICT_PICKLE_PATHS[i]:
+        if cfg.DICT_PICKLE_PATHS:
             maxquant_result_ref = pd.read_pickle(filepath_or_buffer=cfg.DICT_PICKLE_PATHS[i])
             ms1scans = pd.read_csv(os.path.join(cfg.RESULT_PATHS[i], "ms1scans.csv"))
             mobility_values_df = pd.read_csv(
@@ -194,7 +194,7 @@ def opt_scan_by_scan(config_path: str):
                 )
 
             cfg.PREPARE_DICT = cfg_prepare_dict
-            cfg.DICT_PICKLE_PATHS[i] = dict_pickle_path
+            cfg.DICT_PICKLE_PATHS.append(dict_pickle_path)
             cfg.OPTIMIZATION.PEPTACT_SHAPE = peptact_shape
             cfg.dump(
                 stream=open(
