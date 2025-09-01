@@ -8,12 +8,13 @@ swaps_optimization_cfg = __C
 # general setup
 __C.DESCRIPTION = "Default config from the Singleton"
 __C.DEBUG = False
-__C.DATA_PATH = []  # different results depending on data ending with .mzml or .d
-__C.RESULT_PATH = []  # list of paths to save all intermediate and final results
+__C.MULTI_TRAIN = False
+__C.DATA_PATHS = []  # different results depending on data ending with .mzml or .d
+__C.RESULT_PATHS = []  # list of paths to save all intermediate and final results
 __C.ADD_TIMESTAMP_TO_RESULT_PATH = False  # disenble when reusing the same result path
 __C.EXPORT_DATA_HDF5_DIR = ""  # empty string for export to data directory
-__C.MQ_EXP_PATH = []  # list of paths to MaxQuant experiment evidence file
-__C.MQ_REF_PATH_LIST = []  # list of paths to MaxQuant reference file, pickle
+__C.MQ_EXP_PATHS = []  # list of paths to MaxQuant experiment evidence file
+__C.MQ_REF_PATHS = []  # list of paths to MaxQuant reference file, pickle
 __C.FILTER_EXP_BY_RAW_FILE = (
     []
 )  # None for not filtering, "" for filtering by raw file that shares the same name with the data directory
@@ -21,7 +22,7 @@ __C.FILTER_REF_BY_RAW_FILE = []
 # empty for not filtering (default),
 # "data" for filtering by raw file that shares the same name with the data directory
 # populated list for filtering by raw file that has a name in the list
-__C.DICT_PICKLE_PATH = []
+__C.DICT_PICKLE_PATHS = []
 __C.NOTES = ""  # notes for the run
 __C.USE_IMS = True
 __C.RANDOM_SEED = 42  # for reproducibility when splitting train/test in DeepLC retrain

@@ -2,6 +2,7 @@
 
 import logging
 import os
+import random
 from datetime import datetime
 import time
 import fire
@@ -63,13 +64,9 @@ def opt_scan_by_scan(config_path: str):
         logging.info("merge with cfg file %s", config_path)
 
     if cfg.ADD_TIMESTAMP_TO_RESULT_PATH:
-        for i in range(len(cfg.RESULT_PATH)):
-            cfg.RESULT_PATH[i] = cfg.RESULT_PATH[i] + "_" + name_timestamp
+        for i in range(len(cfg.RESULT_PATHS)):
+            cfg.RESULT_PATHS[i] = cfg.RESULT_PATHS[i] + "_" + name_timestamp
         cfg.ADD_TIMESTAMP_TO_RESULT_PATH = False  # in case of reuse of config file
-
-    act_dir = os.path.join(cfg.RESULT_PATH, "results", "activation")
-    logging.info("==================Load data==================")
-    os.makedirs(cfg.RESULT_PATH, exist_ok=True)
 
     if cfg.N_CPU < 0:
         cfg.N_CPU = int(os.getenv("SLURM_CPUS_PER_TASK", 1))
@@ -78,142 +75,162 @@ def opt_scan_by_scan(config_path: str):
     if cfg.OPTIMIZATION.N_BATCH < 0:
         cfg.OPTIMIZATION.N_BATCH = cfg.N_CPU  # set batches as the same as N_CPU
 
-    # Check if activation maps already exist
-    activation_file = os.path.join(cfg.RESULT_PATH, "results", "activation", "im_rt_pept_act_coo_peptbatch0.npz")
+    act_dirs = []
+    maxquant_result_refs = []
 
-    if str(cfg.RESULT_PATH).endswith("model"):
-        logging.info("Result path for Model Training found. Skipping data loading and generation.")
-        model_training(cfg, None)
-        return
-    elif not os.path.exists(activation_file):
-        # Load data
-        logging.info("Activation data not found. Loading raw data to generate activation maps...")
+    for i in range(len(cfg.RESULT_PATHS[i])):
+        act_dir = os.path.join(cfg.RESULT_PATHS[i], "results", "activation")
+        act_dirs.append(act_dir)
 
-        if cfg.USE_IMS:
-            data, hdf_file_name = load_dotd_data(
-                cfg.DATA_PATH, swaps_result_dir=cfg.EXPORT_DATA_HDF5_DIR
-            )
-        else:
-            data = load_mzml(cfg.DATA_PATH, unify_format=True)
-    else:
-        logging.info("Activation maps found. Skipping raw data loading.")
-        data = None
+        logging.info("==================Load data==================")
+        os.makedirs(cfg.RESULT_PATHS[i], exist_ok=True)
 
-    if cfg.DICT_PICKLE_PATH != "":
-        maxquant_result_ref = pd.read_pickle(filepath_or_buffer=cfg.DICT_PICKLE_PATH)
-        ms1scans = pd.read_csv(os.path.join(cfg.RESULT_PATH, "ms1scans.csv"))
-        mobility_values_df = pd.read_csv(
-            os.path.join(cfg.RESULT_PATH, "mobility_values.csv")
-        )
-    else:
-        # Get the lowest level directory name with .d extension
-        dir_with_extension = os.path.basename(os.path.normpath(cfg.DATA_PATH))
-        dir_wo_extension = dir_with_extension.split(".")[0]
+        # Check if activation maps already exist
+        activation_file = os.path.join(cfg.RESULT_PATHS[i], "results", "activation", "im_rt_pept_act_coo_peptbatch0.npz")
 
-        if (
-            len(cfg.FILTER_EXP_BY_RAW_FILE) == 0
-        ):  # if not specified, get the lowest level directory name with .d extension, by default None
-            cfg.FILTER_EXP_BY_RAW_FILE.append(dir_wo_extension)
+        if str(cfg.RESULT_PATHS[i]).endswith("model"): # ToDo
+            logging.info("Result path for Model Training found. Skipping data loading and generation.")
+            model_training(cfg, None)
+            return
+        elif not os.path.exists(activation_file):
+            # Load data
+            logging.info("Activation data not found. Loading raw data to generate activation maps...")
 
-        if dir_with_extension.endswith(".d"):
-            ms1scans, mobility_values_df = export_im_and_ms1scans(
-                data=data, swaps_result_dir=cfg.RESULT_PATH
-            )
-        elif dir_with_extension.endswith(".mzML"):
-            ms1scans = data
-            mobility_values_df = None
-
-        maxquant_result_ref = pd.read_csv(cfg.MQ_REF_PATH, sep="\t", low_memory=False)
-
-        if len(cfg.FILTER_REF_BY_RAW_FILE) > 0:
-            if cfg.FILTER_REF_BY_RAW_FILE[0] == "data":
-                maxquant_result_ref = maxquant_result_ref[
-                    maxquant_result_ref["Raw file"].isin([dir_wo_extension])
-                ]
-                logging.info(
-                    "Filtered reference maxquant result by raw file: %s, resulting ref rows: %s",
-                    dir_wo_extension,
-                    maxquant_result_ref.shape[0],
+            if cfg.USE_IMS:
+                data, hdf_file_name = load_dotd_data(                       # Todo hdf_file_name redundant?
+                    cfg.DATA_PATHS[i], swaps_result_dir=cfg.EXPORT_DATA_HDF5_DIR
                 )
             else:
-                maxquant_result_ref = maxquant_result_ref[
-                    maxquant_result_ref["Raw file"].isin(cfg.FILTER_REF_BY_RAW_FILE)
-                ]
-                logging.info(
-                    "Filtered reference maxquant result by raw file: %s",
-                    cfg.FILTER_REF_BY_RAW_FILE,
-                )
+                data = load_mzml(cfg.DATA_PATHS[i], unify_format=True)
+        else:
+            logging.info("Activation maps found. Skipping raw data loading.")
+            data = None
 
-        if (
-            "sage_discriminant_score" in maxquant_result_ref.columns
-        ):  # infer search engine, remap column names
-            maxquant_result_ref = sage_parser(maxquant_result_ref)
-
-        maxquant_result_ref, dict_pickle_path, cfg_prepare_dict = construct_dict(
-            cfg_prepare_dict=cfg.PREPARE_DICT,
-            filter_exp_by_raw_file=cfg.FILTER_EXP_BY_RAW_FILE,
-            maxquant_exp_path=cfg.MQ_EXP_PATH,
-            # maxquant_exp_df=maxquant_result_exp,
-            use_ims=cfg.USE_IMS,
-            maxquant_ref_df=maxquant_result_ref,
-            result_dir=os.path.join(cfg.RESULT_PATH),
-            mobility_values_df=mobility_values_df,
-            rt_values_df=ms1scans,
-            random_seed=cfg.RANDOM_SEED,
-            n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
-            ref_type=cfg.PREPARE_DICT.REF_TYPE,
-            keep_matched_precursors=cfg.PREPARE_DICT.KEEP_MATCHED_PRECURSORS,
-        )
-
-        logging.info(
-            "Peptide batch index: %s", maxquant_result_ref["pept_batch_idx"].unique()
-        )
-
-        if cfg.USE_IMS:
-            peptact_shape = (
-                (
-                    len(ms1scans.index.values)
-                    + 1,  # this index is rank, starting from 1, add 1 for the last frame
-                    len(mobility_values_df),
-                    len(maxquant_result_ref.mz_rank)
-                    + 1,  # this index is rank, starting from 1, add 1 for the last frame
-                ),
+        if cfg.DICT_PICKLE_PATHS[i]:
+            maxquant_result_ref = pd.read_pickle(filepath_or_buffer=cfg.DICT_PICKLE_PATHS[i])
+            ms1scans = pd.read_csv(os.path.join(cfg.RESULT_PATHS[i], "ms1scans.csv"))
+            mobility_values_df = pd.read_csv(
+                os.path.join(cfg.RESULT_PATHS[i], "mobility_values.csv")
             )
         else:
-            peptact_shape = (
-                len(ms1scans.index.values) + 1,  # this index is rank, starting from 1
-                len(maxquant_result_ref.mz_rank)
-                + 1,  # this index is rank, starting from 1
+            # Get the lowest level directory name with .d extension
+            dir_with_extension = os.path.basename(os.path.normpath(cfg.DATA_PATHS[i]))
+            dir_wo_extension = dir_with_extension.split(".")[0]
+
+            if (
+                len(cfg.FILTER_EXP_BY_RAW_FILE) == 0
+            ):  # if not specified, get the lowest level directory name with .d extension, by default None
+                cfg.FILTER_EXP_BY_RAW_FILE.append(dir_wo_extension)
+
+            if dir_with_extension.endswith(".d"):
+                ms1scans, mobility_values_df = export_im_and_ms1scans(
+                    data=data, swaps_result_dir=cfg.RESULT_PATHS[i]
+                )
+            elif dir_with_extension.endswith(".mzML"):
+                ms1scans = data
+                mobility_values_df = None
+
+            maxquant_result_ref = pd.read_csv(cfg.MQ_REF_PATHS[i], sep="\t", low_memory=False)
+
+            if len(cfg.FILTER_REF_BY_RAW_FILE) > 0:
+                if cfg.FILTER_REF_BY_RAW_FILE[0] == "data":
+                    maxquant_result_ref = maxquant_result_ref[
+                        maxquant_result_ref["Raw file"].isin([dir_wo_extension])
+                    ]
+                    logging.info(
+                        "Filtered reference maxquant result by raw file: %s, resulting ref rows: %s",
+                        dir_wo_extension,
+                        maxquant_result_ref.shape[0],
+                    )
+                else:
+                    maxquant_result_ref = maxquant_result_ref[
+                        maxquant_result_ref["Raw file"].isin(cfg.FILTER_REF_BY_RAW_FILE)
+                    ]
+                    logging.info(
+                        "Filtered reference maxquant result by raw file: %s",
+                        cfg.FILTER_REF_BY_RAW_FILE,
+                    )
+
+            if (
+                "sage_discriminant_score" in maxquant_result_ref.columns
+            ):  # infer search engine, remap column names
+                maxquant_result_ref = sage_parser(maxquant_result_ref)
+
+            maxquant_result_ref, dict_pickle_path, cfg_prepare_dict = construct_dict(
+                cfg_prepare_dict=cfg.PREPARE_DICT,
+                filter_exp_by_raw_file=cfg.FILTER_EXP_BY_RAW_FILE,
+                maxquant_exp_path=cfg.MQ_EXP_PATHS[i],
+                # maxquant_exp_df=maxquant_result_exp,
+                use_ims=cfg.USE_IMS,
+                maxquant_ref_df=maxquant_result_ref,
+                result_dir=os.path.join(cfg.RESULT_PATHS[i]),
+                mobility_values_df=mobility_values_df,
+                rt_values_df=ms1scans,
+                random_seed=cfg.RANDOM_SEED,
+                n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
+                ref_type=cfg.PREPARE_DICT.REF_TYPE,
+                keep_matched_precursors=cfg.PREPARE_DICT.KEEP_MATCHED_PRECURSORS,
             )
 
-        cfg.PREPARE_DICT = cfg_prepare_dict
-        cfg.DICT_PICKLE_PATH = dict_pickle_path
-        cfg.OPTIMIZATION.PEPTACT_SHAPE = peptact_shape
-        cfg.dump(
-            stream=open(
-                os.path.join(cfg.RESULT_PATH, f"config_{name_timestamp}.yaml"),
-                "w",
-                encoding="utf-8",
+            logging.info(
+                "Peptide batch index: %s", maxquant_result_ref["pept_batch_idx"].unique()
             )
-        )
 
-        logging.info(
-            "Finished dictionary preparation and saved config to %s",
-            os.path.join(cfg.RESULT_PATH, f"config_{name_timestamp}.yaml"),
-        )
+            if cfg.USE_IMS:
+                peptact_shape = (
+                    (
+                        len(ms1scans.index.values)
+                        + 1,  # this index is rank, starting from 1, add 1 for the last frame
+                        len(mobility_values_df),
+                        len(maxquant_result_ref.mz_rank)
+                        + 1,  # this index is rank, starting from 1, add 1 for the last frame
+                    ),
+                )
+            else:
+                peptact_shape = (
+                    len(ms1scans.index.values) + 1,  # this index is rank, starting from 1
+                    len(maxquant_result_ref.mz_rank)
+                    + 1,  # this index is rank, starting from 1
+                )
 
-    # SWA
-    scan_wise_activation(cfg, data, maxquant_result_ref, act_dir, ms1scans, mobility_values_df)
+            cfg.PREPARE_DICT = cfg_prepare_dict
+            cfg.DICT_PICKLE_PATHS[i] = dict_pickle_path
+            cfg.OPTIMIZATION.PEPTACT_SHAPE = peptact_shape
+            cfg.dump(
+                stream=open(
+                    os.path.join(cfg.RESULT_PATHS[i], f"config_{name_timestamp}.yaml"),
+                    "w",
+                    encoding="utf-8",
+                )
+            )
+
+            logging.info(
+                "Finished dictionary preparation and saved config to %s",
+                os.path.join(cfg.RESULT_PATHS[i], f"config_{name_timestamp}.yaml"),
+            )
+            # SWA
+            scan_wise_activation(cfg, data, cfg.MQ_REF_PATHS[i], act_dir, ms1scans, mobility_values_df)
+
+        maxquant_result_refs.append(maxquant_result_ref)
 
     if cfg.PEAK_SELECTION.ENABLE:
-        ps_exp_dir = model_training(cfg, maxquant_result_ref)
+        if len(cfg.PEAK_SELECTION.TRAINING_DATA) == 0:
+            for i in range(len(cfg.RESULT_PATHS)):
+                prepare_training_data(cfg, i, maxquant_result_refs[i], name_timestamp)
+
+        if cfg.MULTI_TRAIN:
+            random.shuffle(cfg.PEAK_SELECTION.TRAINING_DATA)
+            test_batch = cfg.PEAK_SELECTION.TRAINING_DATA.pop()     # ToDo Testing later on
+            ps_exp_dir = model_training(cfg, None)
+        else:
+            ps_exp_dir = model_training(cfg, maxquant_result_refs[0])
 
         # Inference eval
         if cfg.PREPARE_DICT.GENERATE_DECOY:
-            inference_evaluation(cfg, ps_exp_dir, maxquant_result_ref)
+            inference_evaluation(cfg, ps_exp_dir, maxquant_result_refs[0])  # ToDo single-file-only
 
     if cfg.RESULT_ANALYSIS.ENABLE:  # TODO: haven't cleaned up the code
-        result_analysis(cfg, ps_exp_dir, maxquant_result_ref, act_dir)
+        result_analysis(cfg, ps_exp_dir, maxquant_result_refs[0], act_dirs[0])  # ToDo single-file-only
 
 
 def scan_wise_activation(cfg, data, maxquant_result_ref, act_dir, ms1scans, mobility_values_df):
@@ -241,7 +258,7 @@ def scan_wise_activation(cfg, data, maxquant_result_ref, act_dir, ms1scans, mobi
             logging.info("Precalculated activation not found, start Scan By Scan.")
 
             logging.info("==================Scan By Scan==================")
-            # act_dir = os.path.join(cfg.RESULT_PATH, "results", "activation")
+            # act_dir = os.path.join(cfg.RESULT_PATHS[i], "results", "activation")
             os.makedirs(act_dir, exist_ok=True)
             # Optimization
             start_time = time.time()
@@ -296,17 +313,47 @@ def scan_wise_activation(cfg, data, maxquant_result_ref, act_dir, ms1scans, mobi
             )
 
 
-def model_training(cfg, maxquant_result_ref):
-    logging.info("==================Peak Selection==================")
+def prepare_training_data(cfg, i, maxquant_result_ref, name_timestamp):
+    logging.info("No training data provided, start preparing training data.")
+    training_file_paths = prepare_training_dataset(
+        result_dir=cfg.RESULT_PATHS[i],
+        maxquant_dict=maxquant_result_ref,
+        n_workers=cfg.N_CPU,
+        include_decoys=cfg.PEAK_SELECTION.INCLUDE_DECOYS,
+        source=cfg.PEAK_SELECTION.TRAINING_DATA_SOURCE,
+        resample=cfg.PEAK_SELECTION.TRAINING_DATA_RESAMPLE.ENABLE,
+        sample_by=cfg.PEAK_SELECTION.TRAINING_DATA_RESAMPLE.SAMPLE_BY,
+        random_state=cfg.RANDOM_SEED,
+        arg_min=cfg.PEAK_SELECTION.TRAINING_DATA_RESAMPLE.ARG_MIN,
+        arg_sample=cfg.PEAK_SELECTION.TRAINING_DATA_RESAMPLE.ARG_SAMPLE,
+    )
+    cfg.PEAK_SELECTION.TRAINING_DATA.append(training_file_paths)
+    
+    cfg.dump(
+        stream=open(
+            os.path.join(
+                cfg.RESULT_PATHS[i],
+                f"config_{name_timestamp}.yaml",
+            ),
+            "w",
+            encoding="utf-8",
+        )
+    )
+    logging.info(
+        "Finished peak selection dataset preparation and saved config to %s",
+        os.path.join(cfg.RESULT_PATHS[i], f"config_{name_timestamp}.yaml"),
+    )
 
+
+def model_training(cfg, i, maxquant_result_ref):
     if cfg.PEAK_SELECTION.EXP_DIR_NAME != "":
         ps_exp_dir = os.path.join(
-            cfg.RESULT_PATH, "peak_selection", cfg.PEAK_SELECTION.EXP_DIR_NAME
+            cfg.RESULT_PATHS[i], "peak_selection", cfg.PEAK_SELECTION.EXP_DIR_NAME
         )
     else:
         train_name_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         ps_exp_dir = os.path.join(
-            cfg.RESULT_PATH, "peak_selection", "exp_" + train_name_timestamp
+            cfg.RESULT_PATHS[i], "peak_selection", "exp_" + train_name_timestamp
         )
         cfg.PEAK_SELECTION.EXP_DIR_NAME = "exp_" + train_name_timestamp
     if not os.path.exists(ps_exp_dir):
@@ -318,10 +365,13 @@ def model_training(cfg, maxquant_result_ref):
         maxquant_dict=maxquant_result_ref,
         show_decoy=cfg.PREPARE_DICT.GENERATE_DECOY,
     )
+    
+    inference(cfg, best_seg_model_path, best_cls_model_path, maxquant_result_ref, ps_exp_dir)
+    
     return ps_exp_dir
 
 
-def inference(cfg, ps_exp_dir, best_seg_model_path, best_cls_model_path, maxquant_result_ref):
+def inference(cfg, best_seg_model_path, best_cls_model_path, maxquant_result_ref, ps_exp_dir):
     # Inference
     if not os.path.exists(os.path.join(ps_exp_dir, "pept_act_sum_ps.csv")):
         logging.info("Finished training peak selection model, start inference...")
@@ -389,7 +439,7 @@ def inference_evaluation(cfg, ps_exp_dir, maxquant_result_ref):
         "isolated_decoys_mzbins_set": isolated_decoys_mzbins_set,
         "isolated_decoys_set_pairs_all": isolated_decoys_set_pairs_all,
     }
-    with open(os.path.join(cfg.RESULT_PATH, "isolated_decoys.pkl"), "wb") as f:
+    with open(os.path.join(cfg.RESULT_PATHS[0], "isolated_decoys.pkl"), "wb") as f: # ToDo single-file-only
         pickle.dump(variables, f)
 
     pept_act_sum_ps_tdc_all_no_loser = pept_act_sum_ps_tdc_all.loc[
@@ -480,7 +530,7 @@ def result_analysis(cfg, ps_exp_dir, maxquant_result_ref, act_dir):
     if cfg.PEAK_SELECTION.ENABLE:
         eval_dir = os.path.join(ps_exp_dir, "results", "evaluation")
     else:
-        eval_dir = os.path.join(cfg.RESULT_PATH, "results", "evaluation")
+        eval_dir = os.path.join(cfg.RESULT_PATHS[i], "results", "evaluation")
     os.makedirs(eval_dir, exist_ok=True)
 
     pept_act_sum_df = pd.read_csv(os.path.join(act_dir, "pept_act_sum.csv"))
