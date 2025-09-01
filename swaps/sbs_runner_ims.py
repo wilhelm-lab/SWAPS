@@ -208,7 +208,7 @@ def opt_scan_by_scan(config_path: str):
                 "Finished dictionary preparation and saved config to %s",
                 os.path.join(cfg.RESULT_PATHS[i], f"config_{name_timestamp}.yaml"),
             )
-            # SWA
+            # SCAN-WISE-ACTIVATION
             scan_wise_activation(cfg, data, cfg.MQ_REF_PATHS[i], act_dir, ms1scans, mobility_values_df)
 
         maxquant_result_refs.append(maxquant_result_ref)
@@ -218,11 +218,17 @@ def opt_scan_by_scan(config_path: str):
             for i in range(len(cfg.RESULT_PATHS)):
                 prepare_training_data(cfg, i, maxquant_result_refs[i], name_timestamp)
 
+        if cfg.PEAK_SELECTION.PREPARE_ONLY:
+            logging.info("PREPARE_ONLY is True. Skipping training and exiting early.")
+            return  # Early exit
+        
         if cfg.MULTI_TRAIN:
             random.shuffle(cfg.PEAK_SELECTION.TRAINING_DATA)
-            test_batch = cfg.PEAK_SELECTION.TRAINING_DATA.pop()     # ToDo Testing later on
+            test_batch = cfg.PEAK_SELECTION.TRAINING_DATA.pop()     # ToDo For Testing later
+            logging.info("MULTI_TRAIN is TRUE. Multi-file Model Training starts..")
             ps_exp_dir = model_training(cfg, None)
         else:
+            logging.info("Single-file Model Training starts..")
             ps_exp_dir = model_training(cfg, maxquant_result_refs[0])
 
         # Inference eval
