@@ -78,7 +78,7 @@ def opt_scan_by_scan(config_path: str):
     act_dirs = []
     maxquant_result_refs = []
 
-    for i in range(len(cfg.RESULT_PATHS[i])):
+    for i in range(len(cfg.RESULT_PATHS)):
         act_dir = os.path.join(cfg.RESULT_PATHS[i], "results", "activation")
         act_dirs.append(act_dir)
 
@@ -88,7 +88,7 @@ def opt_scan_by_scan(config_path: str):
         # Check if activation maps already exist
         activation_file = os.path.join(cfg.RESULT_PATHS[i], "results", "activation", "im_rt_pept_act_coo_peptbatch0.npz")
 
-        if str(cfg.RESULT_PATHS[i]).endswith("model"): # ToDo
+        if str(cfg.RESULT_PATHS[i]).endswith("model"):  # ToDo
             logging.info("Result path for Model Training found. Skipping data loading and generation.")
             model_training(cfg, None)
             return
@@ -104,9 +104,9 @@ def opt_scan_by_scan(config_path: str):
                 data = load_mzml(cfg.DATA_PATHS[i], unify_format=True)
         else:
             logging.info("Activation maps found. Skipping raw data loading.")
-            data = None
+            data = None                                                                    # ToDo how can this be None?
 
-        if cfg.DICT_PICKLE_PATHS:
+        if len(cfg.DICT_PICKLE_PATHS) == len(cfg.RESULT_PATHS):
             maxquant_result_ref = pd.read_pickle(filepath_or_buffer=cfg.DICT_PICKLE_PATHS[i])
             ms1scans = pd.read_csv(os.path.join(cfg.RESULT_PATHS[i], "ms1scans.csv"))
             mobility_values_df = pd.read_csv(
@@ -209,7 +209,7 @@ def opt_scan_by_scan(config_path: str):
                 os.path.join(cfg.RESULT_PATHS[i], f"config_{name_timestamp}.yaml"),
             )
             # SCAN-WISE-ACTIVATION
-            scan_wise_activation(cfg, data, cfg.MQ_REF_PATHS[i], act_dir, ms1scans, mobility_values_df)
+            scan_wise_activation(cfg, data, maxquant_result_ref, act_dir, ms1scans, mobility_values_df)
 
         maxquant_result_refs.append(maxquant_result_ref)
 
@@ -333,7 +333,7 @@ def prepare_training_data(cfg, i, maxquant_result_ref, name_timestamp):
         arg_min=cfg.PEAK_SELECTION.TRAINING_DATA_RESAMPLE.ARG_MIN,
         arg_sample=cfg.PEAK_SELECTION.TRAINING_DATA_RESAMPLE.ARG_SAMPLE,
     )
-    cfg.PEAK_SELECTION.TRAINING_DATA.append(training_file_paths)
+    cfg.PEAK_SELECTION.TRAINING_DATA.extend(training_file_paths)
     
     cfg.dump(
         stream=open(
@@ -351,15 +351,15 @@ def prepare_training_data(cfg, i, maxquant_result_ref, name_timestamp):
     )
 
 
-def model_training(cfg, i, maxquant_result_ref):
+def model_training(cfg, maxquant_result_ref):
     if cfg.PEAK_SELECTION.EXP_DIR_NAME != "":
         ps_exp_dir = os.path.join(
-            cfg.RESULT_PATHS[i], "peak_selection", cfg.PEAK_SELECTION.EXP_DIR_NAME
+            cfg.RESULT_PATHS[0], "peak_selection", cfg.PEAK_SELECTION.EXP_DIR_NAME      # Todo result path for multi-training
         )
     else:
         train_name_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         ps_exp_dir = os.path.join(
-            cfg.RESULT_PATHS[i], "peak_selection", "exp_" + train_name_timestamp
+            cfg.RESULT_PATHS[0], "peak_selection", "exp_" + train_name_timestamp
         )
         cfg.PEAK_SELECTION.EXP_DIR_NAME = "exp_" + train_name_timestamp
     if not os.path.exists(ps_exp_dir):
@@ -445,7 +445,7 @@ def inference_evaluation(cfg, ps_exp_dir, maxquant_result_ref):
         "isolated_decoys_mzbins_set": isolated_decoys_mzbins_set,
         "isolated_decoys_set_pairs_all": isolated_decoys_set_pairs_all,
     }
-    with open(os.path.join(cfg.RESULT_PATHS[0], "isolated_decoys.pkl"), "wb") as f: # ToDo single-file-only
+    with open(os.path.join(cfg.RESULT_PATHS[0], "isolated_decoys.pkl"), "wb") as f:     # ToDo single-file-only
         pickle.dump(variables, f)
 
     pept_act_sum_ps_tdc_all_no_loser = pept_act_sum_ps_tdc_all.loc[
@@ -536,7 +536,7 @@ def result_analysis(cfg, ps_exp_dir, maxquant_result_ref, act_dir):
     if cfg.PEAK_SELECTION.ENABLE:
         eval_dir = os.path.join(ps_exp_dir, "results", "evaluation")
     else:
-        eval_dir = os.path.join(cfg.RESULT_PATHS[i], "results", "evaluation")
+        eval_dir = os.path.join(cfg.RESULT_PATHS[i], "results", "evaluation")       # ToDo iterator
     os.makedirs(eval_dir, exist_ok=True)
 
     pept_act_sum_df = pd.read_csv(os.path.join(act_dir, "pept_act_sum.csv"))
