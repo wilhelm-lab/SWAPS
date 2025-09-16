@@ -236,7 +236,7 @@ def opt_scan_by_scan(config_path: str):
             inference_evaluation(cfg, ps_exp_dir, maxquant_result_refs[0])  # ToDo single-file-only
 
     if cfg.RESULT_ANALYSIS.ENABLE:  # TODO: haven't cleaned up the code
-        result_analysis(cfg, ps_exp_dir, maxquant_result_refs[0], act_dirs[0])  # ToDo single-file-only
+        res_analysis(cfg, 0, ps_exp_dir, maxquant_result_refs[0], act_dirs[0])  # ToDo single-file-only
 
 
 def scan_wise_activation(cfg, data, maxquant_result_ref, act_dir, ms1scans, mobility_values_df):
@@ -531,12 +531,12 @@ def inference_evaluation(cfg, ps_exp_dir, maxquant_result_ref):
     )
 
 
-def result_analysis(cfg, ps_exp_dir, maxquant_result_ref, act_dir):
+def res_analysis(cfg, n, ps_exp_dir, maxquant_result_ref, act_dir):
     logging.info("==================Result Analysis==================")
     if cfg.PEAK_SELECTION.ENABLE:
         eval_dir = os.path.join(ps_exp_dir, "results", "evaluation")
     else:
-        eval_dir = os.path.join(cfg.RESULT_PATHS[i], "results", "evaluation")       # ToDo iterator
+        eval_dir = os.path.join(cfg.RESULT_PATHS[n], "results", "evaluation")       # ToDo iterator
     os.makedirs(eval_dir, exist_ok=True)
 
     pept_act_sum_df = pd.read_csv(os.path.join(act_dir, "pept_act_sum.csv"))
@@ -590,6 +590,7 @@ def result_analysis(cfg, ps_exp_dir, maxquant_result_ref, act_dir):
     swaps_result.plot_overlap_with_MQ(show_ref=False, level="precursor")
     swaps_result.plot_overlap_with_MQ(show_ref=False, level="peptide")
     swaps_result.plot_overlap_with_MQ(show_ref=False, level="protein")
+
 
 def main():
     """
