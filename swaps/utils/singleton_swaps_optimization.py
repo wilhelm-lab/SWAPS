@@ -32,6 +32,7 @@ __C.N_CPU = (
 
 # prepare dictionary
 __C.PREPARE_DICT = ConfigurationNode()
+__C.PREPARE_DICT.ENABLE = True
 __C.PREPARE_DICT.DICT_PICKLE_PATH = ""
 __C.PREPARE_DICT.UPDATED_RT_MODEL_PATH = ""
 __C.PREPARE_DICT.UPDATED_IM_MODEL_PATH = ""
@@ -96,6 +97,8 @@ __C.PEAK_SELECTION.TRAINING_DATA_SOURCE = [
 __C.PEAK_SELECTION.EVAL_ON_TEST = True
 __C.PEAK_SELECTION.INCLUDE_DECOYS = True
 __C.PEAK_SELECTION.EXP_DIR_NAME = ""
+__C.PEAK_SELECTION.BEST_SEG_MODEL_PATH = ""         # Set automatically; Only set manually if only Evaluation is done
+__C.PEAK_SELECTION.BEST_CLS_MODEL_PATH = ""         # Set automatically; Only set manually if only Evaluation is done
 
 ## TRAINING DATA RESAMPLE
 __C.PEAK_SELECTION.TRAINING_DATA_RESAMPLE = ConfigurationNode()
