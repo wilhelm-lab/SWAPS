@@ -218,7 +218,7 @@ def opt_scan_by_scan(config_path: str):
                 n_jobs=cfg.N_CPU,
                 ms1scans=ms1scans,
                 batch_scan_indices=batch_scan_indices,
-                maxquant_ref=maxquant_result_ref,
+                maxquant_result_ref_with_im_index=maxquant_result_ref,
                 mobility_values=mobility_values_df,
                 cutoff=cutoff,
                 delta_mobility_thres=cfg.OPTIMIZATION.DELTA_MOBILITY_INDEX_THRES,

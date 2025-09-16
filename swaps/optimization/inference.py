@@ -949,12 +949,10 @@ def process_batch_frame(
     data: pd.DataFrame,
     ms1scans: pd.DataFrame,
     batch_scan_idx: list,
-    maxquant_result_ref_with_im_index: pd.DataFrame,
-    mobility_values: np.ndarray,
+    maxquant_result_ref_with_im_index_sortmz: pd.DataFrame,
+    mobility_values: Optional[pd.DataFrame],
     cutoff: List[int],
     delta_mobility_thres: int = 100,
-    mz_bin_digits: int = 3,
-    process_in_blocks: bool = True,
     batch_num: int = 0,
     save_dir: str = "",
     return_im_pept_act: bool = False,
@@ -979,17 +977,17 @@ def process_batch_frame(
     for scan_idx in batch_scan_idx:
         Logger.debug("Start processing frame index %s", scan_idx)
         if use_ims:
-            peaks_df, frame_im_pept_act_coo = process_one_frame_ims(
+            assert mobility_values is not None
+            peaks_df, frame_im_pept_act_coo = process_one_frame_ims(  # type: ignore[assignment]
                 data=data,
                 ms1scans=ms1scans,
                 ms1_frame_idx=scan_idx,
-                maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index,
+                maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
                 mobility_values=mobility_values,
                 delta_mobility_thres=delta_mobility_thres,
-                mz_bin_digits=mz_bin_digits,
-                process_in_blocks=process_in_blocks,
                 return_im_pept_act=return_im_pept_act,
                 extract_im_peak=extract_im_peak,
+                debug=False,
                 **kwargs,
             )
             if extract_im_peak:
@@ -1000,13 +998,13 @@ def process_batch_frame(
                         frame_im_pept_act_coo[key]
                     )
         else:
-            peaks_df, frame_im_pept_act_coo = process_one_frame(
+            peaks_df, frame_im_pept_act_coo = process_one_frame(  # type: ignore[assignment]
                 ms1scans=ms1scans,
                 ms1_frame_idx=scan_idx,
-                maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index,
-                mz_bin_digits=mz_bin_digits,
-                process_in_blocks=process_in_blocks,
+                maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
                 return_pept_act=return_im_pept_act,
+                debug=False,
+                **kwargs,
             )
             if return_im_pept_act:
                 for key in batch_rt_pept_act_coo_dict.keys():
@@ -1026,7 +1024,7 @@ def process_batch_frame(
                     len(ms1scans.index.values)
                     + 1,  # this index is rank, starting from 1, add 1 for the last frame
                     len(mobility_values),
-                    len(maxquant_result_ref_with_im_index.mz_rank)
+                    len(maxquant_result_ref_with_im_index_sortmz.mz_rank)
                     + 1,  # this index is rank, starting from 1, add 1 for the last frame
                 ),
                 cutoff=cutoff,
@@ -1037,7 +1035,7 @@ def process_batch_frame(
                 shape=(
                     len(ms1scans.index.values)
                     + 1,  # this index is rank, starting from 1, add 1 for the last frame
-                    len(maxquant_result_ref_with_im_index.mz_rank)
+                    len(maxquant_result_ref_with_im_index_sortmz.mz_rank)
                     + 1,  # this index is rank, starting from 1, add 1 for the last frame
                 ),
                 cutoff=cutoff,
@@ -1314,38 +1312,36 @@ def generate_id_partitions(
 def process_frames_parallel(
     n_jobs: int,
     batch_scan_indices: list,
-    data,
-    ms1scans: pd.DataFrame,
-    maxquant_ref: pd.DataFrame,
-    mobility_values: np.array,
-    cutoff: List[int],
-    delta_mobility_thres: int = 100,
-    mz_bin_digits: int = 3,
-    process_in_blocks: bool = True,
-    width: int = 4,
-    save_dir: str = "",
-    return_im_pept_act: bool = False,
-    extract_im_peak: bool = True,
-    use_ims: bool = True,
-    # n_blocks_by_pept: int = 0,
+    **kwargs,
+    # data,
+    # ms1scans: pd.DataFrame,
+    # maxquant_result_ref_with_im_index: pd.DataFrame,
+    # mobility_values: pd.DataFrame,
+    # cutoff: List[int],
+    # delta_mobility_thres: int = 100,
+    # mz_bin_digits: int = 3,
+    # process_in_blocks: bool = True,
+    # width: int = 4,
+    # save_dir: str = "",
+    # return_im_pept_act: bool = False,
+    # extract_im_peak: bool = True,
+    # use_ims: bool = True,
+    ## n_blocks_by_pept: int = 0,
 ):
+    """
+    Process frames in parallel by splitting frame indices into batches.
+    Parameters
+    ----------
+    n_jobs : int
+        Number of parallel jobs.
+    batch_scan_indices : list
+        List of list of frame indices for each batch.
+    **kwargs : dict
+        Additional arguments for `process_batch_frame` function.
+    """
     list_batch_im_pept_act_coo_dict = Parallel(n_jobs=n_jobs)(
         delayed(process_batch_frame)(
-            data=data,
-            maxquant_result_ref_with_im_index=maxquant_ref,
-            ms1scans=ms1scans,
-            batch_scan_idx=batch,
-            mobility_values=mobility_values,
-            delta_mobility_thres=delta_mobility_thres,
-            mz_bin_digits=mz_bin_digits,
-            process_in_blocks=process_in_blocks,
-            width=width,
-            batch_num=batch[0],
-            save_dir=save_dir,
-            return_im_pept_act=return_im_pept_act,
-            extract_im_peak=extract_im_peak,
-            cutoff=cutoff,
-            use_ims=use_ims,
+            **kwargs,
         )
         for batch in batch_scan_indices
     )
