@@ -283,7 +283,9 @@ def load_mzml(msconvert_file: str, unify_format: bool = False) -> pd.DataFrame:
         raise ValueError("File format not supported")
     if not os.path.isfile(msconvert_file_base + "_MS1Scans_NoArray.csv"):
         ms1cans_no_array = df_ms1.iloc[:, 1:5].copy()
-        ms1cans_no_array.to_csv(msconvert_file_base + "_MS1Scans_NoArray.csv", index=0)
+        ms1cans_no_array.to_csv(
+            path_or_buf=msconvert_file_base + "_MS1Scans_NoArray.csv", index=False
+        )
     return df_ms1
 
 

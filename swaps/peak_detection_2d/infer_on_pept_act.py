@@ -6,9 +6,8 @@ import torch
 
 from peak_detection_2d.utils import plot_sample_predictions
 from .model.build_model import build_model
-from .dataset.dataset import PeptActPeakSelection_Infer_Dataset
+from .dataset.dataset import PeptActPeakSelection_Infer_Dataset, build_transformation
 from .model.seg_model import inference_and_sum_intensity
-from .dataset.dataset import build_transformation
 
 Logger = logging.getLogger(__name__)
 
