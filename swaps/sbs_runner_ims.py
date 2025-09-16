@@ -77,7 +77,7 @@ def opt_scan_by_scan(config_path: str):
             cfg.DATA_PATH, swaps_result_dir=cfg.EXPORT_DATA_HDF5_DIR
         )
     else:
-        data = load_mzml(cfg.DATA_PATH, unify_format=True)
+        mzml_data = load_mzml(cfg.DATA_PATH, unify_format=True)
     if cfg.DICT_PICKLE_PATH != "":
         maxquant_result_ref = pd.read_pickle(filepath_or_buffer=cfg.DICT_PICKLE_PATH)
         ms1scans = pd.read_csv(os.path.join(cfg.RESULT_PATH, "ms1scans.csv"))
@@ -94,10 +94,11 @@ def opt_scan_by_scan(config_path: str):
             cfg.FILTER_EXP_BY_RAW_FILE.append(dir_wo_extension)
         if dir_with_extension.endswith(".d"):
             ms1scans, mobility_values_df = export_im_and_ms1scans(
-                data=data, swaps_result_dir=cfg.RESULT_PATH
+                data=data,  # type: ignore
+                swaps_result_dir=cfg.RESULT_PATH,
             )
         elif dir_with_extension.endswith(".mzML"):
-            ms1scans = data
+            ms1scans = mzml_data
             mobility_values_df = None
         maxquant_result_ref = pd.read_csv(cfg.MQ_REF_PATH, sep="\t", low_memory=False)
         if len(cfg.FILTER_REF_BY_RAW_FILE) > 0:
@@ -141,6 +142,7 @@ def opt_scan_by_scan(config_path: str):
             "Peptide batch index: %s", maxquant_result_ref["pept_batch_idx"].unique()
         )
         if cfg.USE_IMS:
+            assert mobility_values_df is not None
             peptact_shape = (
                 (
                     len(ms1scans.index.values)
@@ -353,7 +355,7 @@ def opt_scan_by_scan(config_path: str):
                 maxquant_result_ref.loc[maxquant_result_ref["Decoy"], "mz_rank"]
             )
             isolated_decoys_set_pairs_all = get_isolated_decoys_from_pairs(
-                result=signal_compete_all, decoy_mz_ranks=decoy_mz_ranks
+                result=signal_compete_all, decoy_mz_ranks=list(decoy_mz_ranks)
             )
             isolated_decoys_mzbins_set = get_isolated_decoy_from_mzbins(
                 maxquant_result_ref=maxquant_result_ref,

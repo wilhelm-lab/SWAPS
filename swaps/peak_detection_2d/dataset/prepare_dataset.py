@@ -1,6 +1,6 @@
 import os
 import logging
-from typing import Literal, List
+from typing import Literal, List, Optional, Dict, Any
 import glob
 import fire
 import sparse
@@ -36,7 +36,7 @@ def save_data_points_to_hdf5(futures, output_filename):
 
 def prepare_2d_act_and_bbox(
     pept_mz_rank: int,
-    act_3d: sparse.SparseArray,
+    act_3d: sparse.COO,
     maxquant_result_dict: pd.DataFrame,
     maxquant_result_exp: pd.DataFrame,
     mobility_values_df: pd.DataFrame,
@@ -130,12 +130,12 @@ def prepare_2d_act_and_bbox(
 
 def prepare_2d_act_and_mask_updated(
     pept_mz_rank: int,
-    peptbatch_act: sparse.SparseArray,
+    peptbatch_act: sparse.COO,  # sparse.COO and sparse.GCXS do support slicing. but not SparseArray in general
     maxquant_dict: pd.DataFrame,
-    hint_matrix: sparse.SparseArray,
+    hint_matrix: sparse.COO,
     add_label_mask: bool = True,
     remove_blank_image: bool = True,
-):
+) -> Optional[Dict[str, Any]]:
     """
     Prepare 2D activation and mask for a peptide mz rank
     :param pept_mz_rank: int, peptide mz rank
@@ -264,7 +264,7 @@ def process_pept_mz_ranks(
 
 def prepare_2d_act_and_mask(
     pept_mz_rank: int,
-    act_3d: sparse.SparseArray,
+    act_3d: sparse.COO,
     maxquant_result_merged: pd.DataFrame,
     mobility_values_df: pd.DataFrame,
     ms1scans: pd.DataFrame,
@@ -272,7 +272,7 @@ def prepare_2d_act_and_mask(
     pept_batch_idx: int = 0,
     pept_batch_size: int = 50000,
     delta_im: float = 0.07,
-    hint_channel: np.array = None,
+    hint_channel: np.ndarray | None = None,
 ):
     maxquant_result_row = maxquant_result_merged.loc[
         maxquant_result_merged["mz_rank"] == pept_mz_rank
@@ -285,16 +285,18 @@ def prepare_2d_act_and_mask(
             "Multiple maxquant results found for peptide mz rank %s", pept_mz_rank
         )
         return None
-
+    maxquant_result_row = maxquant_result_row.iloc[0]
     Logger.info("Prepare data for peptide mz rank %s", pept_mz_rank)
     bbox = get_bbox_from_mq_exp(
         maxquant_result_row
     )  # bbox: [min_rt, max_rt, rt_width, min_im, max_im, im_width]
     Logger.debug("Bbox: %s", bbox)
-    rt_array = ms1scans["Time_minute"].values
+    rt_array = np.asarray(ms1scans["Time_minute"])
+    im_array = np.asarray(mobility_values_df["mobility_values"])
+
     bbox_rt_min_idx = max(np.searchsorted(rt_array, bbox[0], side="right") - 1, 0)
     bbox_rt_max_idx = np.searchsorted(rt_array, bbox[1], side="left")
-    im_array = mobility_values_df["mobility_values"].values
+
     bbox_im_min_idx = max(np.searchsorted(im_array, bbox[3], side="right") - 1, 0)
     bbox_im_max_idx = np.searchsorted(im_array, bbox[4], side="left")
     Logger.debug(
@@ -389,7 +391,9 @@ def _cartesian_product(group):
     )
 
 
-def generate_hint_sparse_matrix(maxquant_dict_df: pd.DataFrame, shape: tuple):
+def generate_hint_sparse_matrix(
+    maxquant_dict_df: pd.DataFrame, shape: tuple
+) -> sparse.COO:
     maxquant_dict_df[
         ["mz_rank", "MS1_frame_idx_center_ref", "IM_search_idx_center"]
     ] = maxquant_dict_df[
@@ -439,7 +443,7 @@ def prepare_training_dataset(
     arg_min: str | None = "Escherichia coli K-12",
     arg_sample: List[str] | None = ["Homo sapiens", "Saccharomyces cerevisiae"],
     dataset_name: str = "train_datapoints_TD",
-    pept_batch_indices_filtered: List[int] = None,
+    pept_batch_indices_filtered: List[int] | None = None,
 ):
 
     # Create output directory
@@ -451,8 +455,11 @@ def prepare_training_dataset(
     os.makedirs(ps_data_dir, exist_ok=True)
 
     # Load relevant data
-    if n_workers <= 0:
-        n_workers = os.cpu_count()
+    n_workers = os.cpu_count() or 1  # fallback to 1 if None
+    Logger.info(
+        "Number of workers not specified, using all available cores: %s.", n_workers
+    )
+
     first_pept_act_batch = sparse.load_npz(
         os.path.join(
             result_dir,
@@ -560,13 +567,13 @@ def prepare_training_dataset(
         for i in tqdm(range(num_chunks)):
             start = i * chunk_size
             end = (i + 1) * chunk_size
-            chunk = pept_mz_ranks[start:end]
+            chunk = pept_mz_ranks[start:end].tolist()
             Logger.info("Processing chunk %s, from index %s to %s", i, start, end)
             list_of_data_points = process_pept_mz_ranks(
                 pept_mz_ranks=chunk,
-                peptbatch_act=pept_act_batch,
+                peptbatch_act=pept_act_batch,  # type: ignore
                 maxquant_dict=maxquant_dict_for_training,
-                hint_matrix=hint_matrix,
+                hint_matrix=hint_matrix,  # type: ignore
                 num_workers=n_workers,  # Adjust based on your system's capabilities
                 add_label_mask=add_label_mask,
             )

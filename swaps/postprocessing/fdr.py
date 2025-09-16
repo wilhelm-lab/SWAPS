@@ -63,7 +63,7 @@ def _generate_signal_compete_pairs_within_group(
 
 def get_isolated_decoys_from_pairs(
     result: pd.DataFrame,
-    decoy_mz_ranks: List,
+    decoy_mz_ranks: List[int],
     delta_rt_95: float = 0.86,
     delta_im_index_95: int = 290,
 ):

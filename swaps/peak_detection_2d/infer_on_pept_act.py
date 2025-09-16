@@ -64,7 +64,7 @@ def infer_on_pept_act(
             data_index=None,
             add_label_mask=add_label_mask,
         )
-        infer_dataloader = torch.utils.data.DataLoader(
+        infer_dataloader = torch.utils.data.DataLoader(  # type: ignore[attr-defined]
             infer_dataset,
             batch_size=cfg.PEAK_SELECTION.DATASET.INFER_BATCH_SIZE,
             shuffle=False,

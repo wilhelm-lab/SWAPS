@@ -10,7 +10,7 @@ Options:
     --version              show version
 """
 
-from typing import List, Literal
+from typing import List, Literal, Optional
 import re
 import os
 import logging
@@ -38,14 +38,14 @@ def merge_ref_and_exp(
     maxquant_ref_df: pd.DataFrame,
     maxquant_exp_df: pd.DataFrame,
     save_dir: str,
-    ref_type: str = ["MQ", "pred"],
+    ref_type: Literal["MQ", "pred"],
     use_ims: bool = True,
 ):
     """Merge dictionaries from multiple files using Modified sequence and Charge"""
     # evaluate the elution counts of the experiment file
     exp_elution_counts = maxquant_exp_df.groupby(["Modified sequence", "Charge"]).size()
     plt.bar(
-        height=exp_elution_counts.value_counts().values,
+        height=exp_elution_counts.value_counts().to_numpy(),
         x=exp_elution_counts.value_counts().index,
     )
     sizes = exp_elution_counts.value_counts().values
@@ -212,7 +212,7 @@ def merge_ref_and_exp(
     )
     # evaluate
     plt.bar(
-        height=maxquant_merge_df["source"].value_counts().values,
+        height=maxquant_merge_df["source"].value_counts().to_numpy(),
         x=maxquant_merge_df["source"].value_counts().index,
     )
     plt.ylabel("Number of Modified Peptides, Charge Combination")
@@ -461,7 +461,7 @@ def dict_add_im_index(
     if (im_idx_length is None) and (
         (mq_im_left_col is None) or (mq_im_right_col is None)
     ):
-        im_idx_length = maxquant_df_with_im_index["Ion mobility length"] // 2 + 1
+        im_idx_length = maxquant_df_with_im_index["Ion mobility length"] // 2 + 1  # type: ignore
         Logger.info(
             "mq_im_left_col or mq_im_right_col not given, IM index length required but not given, using peptide specific im length values"
         )
@@ -473,7 +473,7 @@ def dict_add_im_index(
                     maxquant_df_with_im_index[
                         "mobility_values_index_center" + idx_suffix
                     ]
-                    - im_idx_length
+                    - (im_idx_length or 0)
                 ),
             )
         )
@@ -503,7 +503,7 @@ def dict_add_im_index(
                     maxquant_df_with_im_index[
                         "mobility_values_index_center" + idx_suffix
                     ]
-                    + im_idx_length
+                    + (im_idx_length or 0)
                 ),
             )
         )
@@ -738,7 +738,7 @@ def calculate_modpept_mz(modpept: str, charge: int, mod_CAM: bool = True):
 def _define_rt_search_range(
     maxquant_result_dict: pd.DataFrame,
     rt_tol: float,
-    rt_ref: Literal["exp", "pred", "mix"],
+    rt_ref: Literal["exp", "pred", "mix", "align_lowess", "ref"],
     rt_range: tuple[float, float],
 ):
     """Define the search range for the precursor RT."""
@@ -981,12 +981,12 @@ def _define_im_idx_search_range(
             maxquant_df["IM_search_idx_left"] = (
                 maxquant_df["IM_search_idx_center"]
                 - half_im_length
-                - delta_im_idx_95_left
+                - int(delta_im_idx_95_left)
             )
             maxquant_df["IM_search_idx_right"] = (
                 maxquant_df["IM_search_idx_center"]
                 + half_im_length
-                + delta_im_idx_95_right
+                + int(delta_im_idx_95_right)
             )
         case _:
             raise ValueError(f"IM reference {im_ref} not supported")
@@ -1072,8 +1072,8 @@ def update_alpha_pept_deep_model(
     predict_train_df = model.predict(train_df)
     predict_test_df = model.predict(test_df)
     if pept_property == "mobility":
-        predict_train_df = model.ccs_to_mobility_pred(train_df)
-        predict_test_df = model.ccs_to_mobility_pred(test_df)
+        predict_train_df = model.ccs_to_mobility_pred(train_df)  # type: ignore
+        predict_test_df = model.ccs_to_mobility_pred(test_df)  # type: ignore
 
     delta_95_train = _rescale_and_get_delta95(
         predict_train_df,
@@ -1149,6 +1149,7 @@ def dict_add_alpha_pept_pred(
     )
     Logger.info(f"dict size after dropping empty prediction: {maxquant_dict_new.shape}")
     if pept_property == "rt":  # rename rt_pred to predicted_RT for compatibility
+        assert lc_grad is not None and lc_grad > 0
         maxquant_dict_new["predicted_RT"] = np.minimum(
             maxquant_dict_new["rt_pred"], lc_grad
         )
@@ -1215,12 +1216,16 @@ def dict_add_im_align_lr(
     maxquant_dict.loc[maxquant_dict["source"] != "exp", "mobility_pred"] = reg.predict(
         maxquant_dict.loc[
             maxquant_dict["source"] != "exp", "mobility_values_center_ref"
-        ].values.reshape(-1, 1)
+        ]
+        .to_numpy()
+        .reshape(-1, 1)
     )
     maxquant_dict.loc[maxquant_dict["source"] == "exp", "mobility_pred"] = reg.predict(
         maxquant_dict.loc[
             maxquant_dict["source"] == "exp", "mobility_values_center_exp"
-        ].values.reshape(-1, 1)
+        ]
+        .to_numpy()
+        .reshape(-1, 1)
     )
     maxquant_dict["mobility_pred"] = maxquant_dict["mobility_pred"].clip(
         lower=min_exp_im, upper=max_exp_im
@@ -1366,12 +1371,12 @@ def construct_dict(
     filter_exp_by_raw_file: List[str],
     maxquant_ref_df: pd.DataFrame,
     maxquant_exp_path: str,
+    result_dir: str,
+    rt_values_df: pd.DataFrame,
     ref_type: Literal["MQ", "pred"] = "MQ",
     # maxquant_exp_df: pd.DataFrame,
-    result_dir: str = None,
-    mobility_values_df: pd.DataFrame = None,
+    mobility_values_df: Optional[pd.DataFrame] = None,
     use_ims: bool = True,
-    rt_values_df: pd.DataFrame = None,
     random_seed: int = 42,
     n_blocks_by_pept: int = 1,
     keep_matched_precursors: bool = False,
@@ -1460,6 +1465,7 @@ def construct_dict(
     os.makedirs(construct_dict_dir, exist_ok=True)
     os.makedirs(rt_transfer_dir, exist_ok=True)
     if use_ims:
+        assert mobility_values_df is not None
         im_range = (
             mobility_values_df["mobility_values"].min(),
             mobility_values_df["mobility_values"].max(),
@@ -1548,6 +1554,7 @@ def construct_dict(
         "maxquant_exp_df shape after adding rt index: %s", maxquant_exp_df.shape
     )
     if use_ims:
+        assert mobility_values_df is not None
         maxquant_exp_df = dict_add_im_index(
             maxquant_df=maxquant_exp_df,
             mobility_values_df=mobility_values_df,
@@ -1555,6 +1562,7 @@ def construct_dict(
             idx_suffix="_exp",
         )
     if ref_type == "MQ" and use_ims:
+        assert mobility_values_df is not None
         # dict_add_rt_index doesn't work for ref values
         maxquant_ref_df = dict_add_im_index(
             maxquant_df=maxquant_ref_df,

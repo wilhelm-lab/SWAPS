@@ -222,7 +222,7 @@ def match_time_to_scan(
     return df
 
 
-def load_mzml(msconvert_file: str, unify_format: bool = False):
+def load_mzml(msconvert_file: str, unify_format: bool = False) -> pd.DataFrame:
     """
     read data from mzml format
 

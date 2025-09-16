@@ -1,4 +1,5 @@
 import logging
+from typing import Optional
 import sparse
 import os
 import numpy as np
@@ -37,7 +38,7 @@ def load_dotd_data(dotd_file_path: str, swaps_result_dir: str = ""):
 
 
 def export_im_and_ms1scans(
-    data: alphatims.bruker.TimsTOF, swaps_result_dir: str = None
+    data: alphatims.bruker.TimsTOF, swaps_result_dir: Optional[str] = None
 ):
     """
     Export IM and MS1 scans to csv files.
@@ -72,7 +73,7 @@ def export_im_and_ms1scans(
         mobility_values_df["mobility_values_index"].min(),
         mobility_values_df["mobility_values_index"].max(),
     )
-
+    ms1scans = pd.DataFrame(ms1scans)
     # export if swaps_result_dir is not None
     if swaps_result_dir is not None:
         os.makedirs(os.path.join(swaps_result_dir), exist_ok=True)
@@ -109,7 +110,7 @@ def combine_3d_act_and_sum_int(
     act_dir: str,
     remove_batch_file: bool = False,
     calc_pept_act_sum_filter_by_im: bool = False,
-    maxquant_result_ref: pd.DataFrame = None,
+    maxquant_result_ref: Optional[pd.DataFrame] = None,
     use_ims: bool = True,
     im_ref: str = "exp",
 ):
@@ -186,6 +187,7 @@ def combine_3d_act_and_sum_int(
                 act_3d_all,
             )
         if calc_pept_act_sum_filter_by_im:
+            assert maxquant_result_ref is not None
             shape = act_3d_all.shape
             n_pept_in_blocks = shape[2] // n_blocks_by_pept
             cutoff = n_pept_in_blocks * (pept_block_num + 1)
@@ -325,7 +327,7 @@ def sum_3d_act_filter_by_im_fast(
 
     mobility_lengths = [len(coo) for coo in maxquant_result_ref["mobility_values_coo"]]
     repeated_mz_rank = np.repeat(
-        maxquant_result_ref["mz_rank"].values, mobility_lengths
+        maxquant_result_ref["mz_rank"].to_numpy(), mobility_lengths
     )
 
     # Explode the DataFrame to align repeated mz_rank values with the corresponding mobility values
@@ -434,7 +436,7 @@ def sum_3d_act_filter_by_im_improved(
             - maxquant_result_ref["Ion mobility length"] // 2
         ),
         decimals=0,
-    ).values
+    ).astype(int)
     mobility_end = np.round(
         (
             maxquant_result_ref["mobility_values_index"]
@@ -442,7 +444,7 @@ def sum_3d_act_filter_by_im_improved(
             + 1
         ),
         decimals=0,
-    ).values
+    ).astype(int)
     # mz_rank = maxquant_result_ref["mz_rank"]
     left_minus = im_rt_pept_act_coo_peptbatch[:, :mobility_start, :].sum(axis=(0, 1))
 

@@ -1,5 +1,5 @@
 import gc
-from typing import List, Callable, Literal
+from typing import List, Callable, Literal, Optional
 import logging
 import numpy as np
 import pandas as pd
@@ -199,8 +199,8 @@ def inference_and_sum_intensity(
     # int_channel: int = 0,
     calc_score: bool = False,
     calib=None,
-    per_image_metric: List[Callable] = None,
-    use_image_for_metric: List[bool] = None,
+    per_image_metric: Optional[List[Callable]] = None,
+    use_image_for_metric: Optional[List[bool]] = None,
     # resize: bool = False,
     sigmoid_cls_score: bool = True,
     add_ps_channel: bool = False,
@@ -214,7 +214,7 @@ def inference_and_sum_intensity(
     pept_mz_rank = np.empty((0))
     out_score = np.empty((0))
 
-    if per_image_metric is not None:
+    if per_image_metric is not None and use_image_for_metric is not None:
         assert len(per_image_metric) == len(use_image_for_metric)
         epoch_losses = {}
         losses = {}
@@ -261,7 +261,7 @@ def inference_and_sum_intensity(
                 seg_out.nonzero().min().item(),
                 seg_out.nonzero().max().item(),
             )
-            if per_image_metric is not None:
+            if per_image_metric is not None and use_image_for_metric is not None:
                 for metric, use_image in zip(per_image_metric, use_image_for_metric):
                     if use_image:
                         b_loss = metric(
@@ -364,6 +364,22 @@ def inference_and_sum_intensity(
 
 
 def label_and_sum_intensity(data_loader, channel: int = 0, device="cuda"):
+    """
+    Sum intensity based on provided label mask without using any model
+    Parameters
+    ----------
+    data_loader : torch.utils.data.DataLoader
+        DataLoader providing (image, hint, label) tuples
+    channel : int, optional
+        Channel index to sum intensity from, by default 0
+    device : str, optional
+        Device to perform computation on, by default "cuda"
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame containing sum_intensity and pept_mz_rank
+    """
     sum_intensity = np.empty((0))
     pept_mz_rank = np.empty((0))
     with torch.no_grad():

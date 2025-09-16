@@ -1,8 +1,8 @@
 import os
 import logging
-from typing import Literal, List
+from typing import Literal, List, Sequence
 import sparse
-from sparse import SparseArray, asnumpy
+from sparse import SparseArray, asnumpy, COO
 import pandas as pd
 import numpy as np
 from scipy.ndimage.filters import maximum_filter
@@ -14,14 +14,14 @@ Logger = logging.getLogger(__name__)
 
 def get_peak_sum_from_pept_slice(
     pept_mz_rank: int,
-    pept_act_sparse: SparseArray,
+    pept_act_sparse: COO,
     maxquant_result_dict: pd.DataFrame,
     ms1scans: pd.DataFrame,
     mobility_values_df: pd.DataFrame,
     delta_im: float = 0.04,
     filter_size: tuple = (5, 75),
 ):
-    rt_idx_range, im_idx_range, reference_entry = get_ref_rt_im_range(
+    rt_idx_range, im_idx_range, reference_entry, _ = get_ref_rt_im_range(
         pept_mz_rank=pept_mz_rank,
         maxquant_result_dict=maxquant_result_dict,
         mobility_values_df=mobility_values_df,
@@ -53,7 +53,7 @@ def get_peak_sum_from_pept_slice(
         rt_filtered_range,
         im_filtered_range,
     )
-    rt_filtered_idx, im_filtered_idx, _ = get_ref_rt_im_range(
+    rt_filtered_idx, im_filtered_idx, _, _ = get_ref_rt_im_range(
         pept_mz_rank=pept_mz_rank,
         maxquant_result_dict=maxquant_result_dict,
         mobility_values_df=mobility_values_df,
@@ -117,14 +117,14 @@ def get_ref_rt_im_range(
             im_max,
         )
 
-    rt_array = ms1scans["Time_minute"].values
+    rt_array = ms1scans["Time_minute"].to_numpy()
     rt_min_idx = max(np.searchsorted(rt_array, rt_min, side="left") - 1, 0)
     rt_max_idx = np.searchsorted(rt_array, rt_max, side="right")
-    im_array = mobility_values_df["mobility_values"].values
+    im_array = mobility_values_df["mobility_values"].to_numpy()
     im_min_idx = max(np.searchsorted(im_array, im_min, side="left") - 1, 0)
     im_max_idx = np.searchsorted(im_array, im_max, side="right")
     im_center_idx = np.abs(
-        mobility_values_df["mobility_values"].values - im_center
+        mobility_values_df["mobility_values"].values - im_center[0]
     ).argmin()
     rt_center_idx = np.abs(ms1scans["Time_minute"].values - rt_center).argmin()
 
@@ -137,7 +137,7 @@ def get_ref_rt_im_range(
 
 
 def slice_pept_act(
-    pept_act_sparse: SparseArray,
+    pept_act_sparse: COO,
     plot_range: Literal["nonzero", "custom"] = "nonzero",
     rt_idx_range: list | None = None,
     im_idx_range: list | None = None,
@@ -159,8 +159,8 @@ def slice_pept_act(
 
 def prepare_slice_pept_act_df(
     slice_pept_act_sparse: SparseArray,
-    rt_idx_range: tuple,
-    im_idx_range: tuple,
+    rt_idx_range: Sequence[int],
+    im_idx_range: Sequence[int],
     mobility_values_df: pd.DataFrame,
     ms1scans: pd.DataFrame,
     convert_idx_to_values: bool = True,
@@ -170,9 +170,9 @@ def prepare_slice_pept_act_df(
         slice_pept_act_df.columns = mobility_values_df["mobility_values"].values[
             im_idx_range[0] : im_idx_range[1]
         ]
-        slice_pept_act_df.index = ms1scans["Time_minute"].values[
-            rt_idx_range[0] : rt_idx_range[1]
-        ]
+        slice_pept_act_df.index = pd.Index(
+            ms1scans["Time_minute"].values[rt_idx_range[0] : rt_idx_range[1]]
+        )
     slice_pept_act_df.replace(0, np.nan, inplace=True)
     return slice_pept_act_df
 

@@ -1,10 +1,11 @@
 from yacs.config import CfgNode
+from torch.nn import Module
 from .seg_model import UNET, UNet_rec_input
 from .conf_model import CNNEncoderRegressor, CNNRegression, ConfidenceModel
 from .model import PeakDetectionNet
 
 
-def build_model(model_cfg: CfgNode):
+def build_model(model_cfg: CfgNode) -> Module:
     if model_cfg.TYPE == "mask_segmentation":
         if model_cfg.NAME == "UNET":
             model = UNET(
@@ -49,3 +50,7 @@ def build_model(model_cfg: CfgNode):
                 sigmoid_output=model_cfg.PARAMS.SIGMOID_OUTPUT,
             )
             return model
+    # 🚨 If we reach this point, config is unsupported
+    raise ValueError(
+        f"Unsupported model type '{model_cfg.TYPE}' or name '{model_cfg.NAME}'"
+    )
