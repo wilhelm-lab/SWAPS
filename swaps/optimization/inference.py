@@ -16,7 +16,6 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     mean_squared_error,
-    root_mean_squared_error,
 )
 from math import floor
 from functools import wraps
@@ -1349,6 +1348,58 @@ def process_frames_parallel(
     # if there is multiple values in return
     # frame_results_df = pd.concat(frame_results_list).reset_index(drop=True)
     # return frame_results_df
+
+
+def get_apex_from_im_rt_pept_act_coo(im_rt_pept_act_coo: sparse.COO):
+    """
+    Get RT and IM apex from im_rt_pept_act_coo sparse matrix.
+    Parameters
+    ----------
+    im_rt_pept_act_coo : sparse.COO
+        Sparse COO matrix with shape (n_frames, n_ims, n_peptides).
+    Returns
+    -------
+    apex_df : pd.DataFrame
+        DataFrame with columns 'peptide_idx', 'rt_apex', and 'im_apex'.
+    """
+    N = im_rt_pept_act_coo.shape[2]  # number of peptides
+    coords = im_rt_pept_act_coo.coords
+    data = im_rt_pept_act_coo.data
+
+    # Step 1: sort by peptide index
+    sorted_idx = np.argsort(coords[2])
+    coords_sorted = coords[:, sorted_idx]
+    data_sorted = data[sorted_idx]
+
+    # Step 2: get unique peptide indices and boundaries
+    unique_pept, start_idx, counts = np.unique(
+        coords_sorted[2], return_index=True, return_counts=True
+    )
+
+    # Step 3: initialize arrays
+    rt_apex = np.full(N, -1, dtype=int)
+    im_apex = np.full(N, -1, dtype=int)
+
+    # Step 4: loop only over peptides that have activations
+    for idx, pept_idx in enumerate(unique_pept):
+        start = start_idx[idx]
+        end = start + counts[idx]
+
+        rt_sum = np.bincount(
+            coords_sorted[0, start:end], weights=data_sorted[start:end]
+        )
+        im_sum = np.bincount(
+            coords_sorted[1, start:end], weights=data_sorted[start:end]
+        )
+
+        rt_apex[pept_idx] = np.argmax(rt_sum)
+        im_apex[pept_idx] = np.argmax(im_sum)
+
+    # Step 5: DataFrame
+    apex_df = pd.DataFrame(
+        {"peptide_idx": np.arange(N), "rt_apex": rt_apex, "im_apex": im_apex}
+    )
+    return apex_df
 
 
 # def process_scans_parallel(
