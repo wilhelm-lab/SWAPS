@@ -34,504 +34,375 @@ import sparse
 Logger = logging.getLogger(__name__)
 
 
-class Quant:
-    """
-    Joint identification and quantification of candidates for given MS1 scan
+def requires_infer(func):
+    """Decorator to ensure `self.infer` is available before calling method."""
 
-    :preprocessing: if CandidateDict and obs_data are preprocessed, if 'sqrt' \
-        then act should be squared, and cos_dist calculation should also be \
-            squared
-    """
-
-    def __init__(
-        self,
-        candidate_dict: pd.DataFrame,
-        obs_data: pd.DataFrame,
-        filtered_precursor_idx: Union[np.ndarray, list],
-        preprocessing_method: _pp_method,
-    ) -> None:
-        """
-        Initialize the Inference class.
-
-        :param candidate_dict: DataFrame containing candidate dictionary.
-        :type candidate_dict: pd.DataFrame
-        :param obs_data: DataFrame containing observed data. contains mzarray_obs and intensity.
-        :type obs_data: pd.DataFrame
-        :param filtered_precursor_idx: Filtered precursor indices.
-        :type filtered_precursor_idx: Union[np.ndarray, list]
-        :param preprocessing_method: Preprocessing method to be used.
-        :type preprocessing_method: _pp_method
-
-        :return: None
-        """
-        self.filter_precursor_idx = filtered_precursor_idx
-        self.obs_data_raw = self.obs_data = obs_data[["intensity"]].values
-        self.obs_mz = obs_data[["mzarray_obs"]].values[:, 0]
-        Logger.debug("obs mz (index) dimension: %s", self.obs_mz.shape)
-        if preprocessing_method == "raw":
-            self.dictionary = candidate_dict[filtered_precursor_idx].values
-            self.obs_data = obs_data[["intensity"]].values  # shape (n_mzvalues, 1)
-        elif preprocessing_method == "sqrt":
-            self.dictionary = np.sqrt(candidate_dict[filtered_precursor_idx].values)
-            self.obs_data = np.sqrt(
-                obs_data[["intensity"]].values
-            )  # shape (n_mzvalues, 1)
-        self.preprocessing = preprocessing_method
-        self.alphas = []
-        self.acts = []
-        self.inferences = []
-        self.nonzeros = []
-        self.metric = []
-        self.infer = None
-        self.best_alpha = None
-        self.act = None
-        self.confusion_matrix = None
-        self.metric_used = None
-        self.id_result = None
-        self.cls_report = None
-        self.reconstruc_cos_dist = None
-
-    def optimize(
-        self,
-        alpha: float,
-        loss: _loss = "lasso",
-        algorithm: _algo = "lasso_lars",
-        max_iter: int = 1000,
-        metric: _alpha_opt_metric = "RMSE",
-    ):
-        self.alphas.append(alpha)
-        match loss:
-            case "lasso":
-                act = sparse_encode(
-                    X=self.obs_data.T,
-                    dictionary=self.dictionary.T,
-                    algorithm=algorithm,
-                    positive=True,
-                    alpha=alpha,
-                    max_iter=max_iter,
-                    verbose=50,
-                    # n_jobs=-1
-                )
-                Logger.debug("dimension of act: %s", act.shape)
-            case "sqrt_lasso":
-                sol = CustomLinearModel(
-                    residue_loss=mean_square_root_error,
-                    X=self.dictionary,
-                    Y=self.obs_data,
-                    reg_norm="l1",
-                    reg_param=alpha,
-                )
-                sol.fit(method=algorithm)  # maxiter=max_iter,
-                Logger.debug("dimension of sol.beta: %s", sol.beta.shape)
-                act = sol.beta.reshape(1, -1)
-                Logger.debug("dimension of act: %s", act.shape)
-        if self.preprocessing == "raw":
-            self.acts.append(act[0])
-            self.infer = np.matmul(act, self.dictionary.T)
-        elif self.preprocessing == "sqrt":
-            self.acts.append(np.square(act[0]))
-            self.infer = np.square(np.matmul(act[0], self.dictionary.T))
-
-        self.inferences.append(self.infer)
-        self.nonzeros.append(np.count_nonzero(act[0] > 1))
-
-        self.metric_used = metric
-        if metric == "cos_dist":
-            self.metric.append(self.CalcCosDist())
-        elif metric == "RMSE":
-            self.metric.append(self.CalcRMSE())
-
-    def optimizeAlphas(
-        self,
-        alphas: Union[List, np.ndarray],
-        loss: _loss = "lasso",
-        algorithm: _algo = "lasso_lars",
-        criteria: _alpha_criteria = "min",
-        metric: _alpha_opt_metric = "cos_dist",
-        eps: Union[None, float] = None,
-        max_iter: int = 1000,
-        PlotTrace: bool = False,
-        save_dir: Union[str, None] = None,
-    ):
-        """
-        iterate through different alphas and algorithm,
-        for ols, set algo = 'threshold' and alpha = 0.
-
-        :alphas: if
-        :algorithms:
-        """
-
-        if criteria == "convergence" and eps is None:
-            eps = 0.0001
-        if loss == "lasso":
-            self.optimize(alpha=0, algorithm="threshold", metric=metric)
-        else:
-            self.optimize(
-                alpha=0,
-                loss=loss,
-                algorithm=algorithm,
-                metric=metric,
-                max_iter=max_iter,
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        if getattr(self, "infer", None) is None:
+            raise RuntimeError(
+                "Inference result 'infer' is not set. Call 'optimize' or 'optimizeAlphas' first."
             )
-        if len(alphas) > 0:
-            match criteria:
-                case "min":
-                    for a in alphas:
-                        self.optimize(
-                            alpha=a,
-                            loss=loss,
-                            algorithm=algorithm,
-                            metric=metric,
-                            max_iter=max_iter,
-                        )
-                    BestAlphaIdx = int(np.array(self.metric).argmin())
-                    self.best_alpha = self.alphas[int(BestAlphaIdx)]
-                    Logger.info(
-                        "Minimal distance reached at alpha = %s", self.best_alpha
-                    )
-                case "convergence":
-                    BestAlphaIdx = None
-                    for a in alphas:
-                        Logger.debug("Current alpha = %s", a)
-                        self.optimize(
-                            alpha=a,
-                            loss=loss,
-                            metric=metric,
-                            algorithm=algorithm,
-                            max_iter=max_iter,
-                        )
-                        Logger.debug("Alpha list %s", self.alphas)
-                        diff = self.metric[-2] - self.metric[-1]
-                        Logger.debug("Alpha = %s, tol = %s", a, diff)
-                        if diff <= eps and diff > 0:
-                            BestAlphaIdx = self.alphas.index(a)
-                            self.best_alpha = self.alphas[BestAlphaIdx]
-                            Logger.info(
-                                "Reached convergence criteria at alpha = %s",
-                                self.best_alpha,
-                            )
-                            break
-                        if diff < 0:
-                            BestAlphaIdx = alphas.index(a) - 1
-                            self.best_alpha = self.alphas[BestAlphaIdx]
-                            Logger.warning(
-                                "Increasing %s! Using previous alpha = %s as best"
-                                " candidate!",
-                                self.metric_used,
-                                self.best_alpha,
-                            )
-                            break
-                    if BestAlphaIdx is None:
-                        BestAlphaIdx = int(np.array(self.metric).argmin())
-                        self.best_alpha = self.alphas[int(BestAlphaIdx)]
-                        Logger.warning(
-                            "Convergence not reached! Using alpha = %s with minimal"
-                            " distance as candidate!",
-                            self.best_alpha,
-                        )
-        else:
-            BestAlphaIdx = 0
-            self.best_alpha = self.alphas[BestAlphaIdx]
-            Logger.info("Alpha not specified, using alpha = %s", self.best_alpha)
-        self.infer = self.inferences[BestAlphaIdx]
-        self.act = self.acts[BestAlphaIdx]
+        return func(self, *args, **kwargs)
 
-        if PlotTrace:  # plot trace with 2 y-axis: metric and count_nonzeors
-            fig, ax1 = plt.subplots()
-            ax1.set_xlabel("log10(alpha+1)")
+    return wrapper
 
-            color = "tab:red"
-            ax1.set_ylabel(self.metric_used, color=color)
-            ax1.plot(np.log10(np.array(self.alphas) + 1), self.metric, color=color)
-            ax1.tick_params(axis="y", labelcolor=color)
-            ax1.plot(
-                np.log10(self.best_alpha + 1), self.metric[BestAlphaIdx], "x", color="r"
+
+def requires_act(func):
+    """Decorator to ensure `self.act` is available before calling method."""
+
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        if getattr(self, "act", None) is None:
+            raise RuntimeError(
+                "Activation 'act' is not set. Call 'optimize' or 'optimizeAlphas' first."
             )
-            ax2 = ax1.twinx()  # instantiate a second axes that shares the same x-axis
+        return func(self, *args, **kwargs)
 
-            color = "tab:blue"
-            ax2.set_ylabel(
-                "Num of Non-zero Act.", color=color
-            )  # we already handled the x-label with ax1
-            ax2.plot(np.log10(np.array(self.alphas) + 1), self.nonzeros, color=color)
-            ax2.tick_params(axis="y", labelcolor=color)
-
-            ax1.annotate(
-                "N0 = " + str(self.dictionary.shape[1]),
-                xy=(0.1, 0.9),
-                xycoords="axes fraction",
-            )
-
-            fig.tight_layout()  # otherwise the right y-label is slightly clipped
-            plt.show()
-
-            if save_dir is not None:
-                if not os.path.exists(save_dir):
-                    os.makedirs(save_dir)
-                plt.savefig(fname=os.path.join(save_dir, "alphaTrace.png"), dpi=300)
-                plt.close()
-            else:
-                plt.show()
-
-    def analyzeID(self, trueIDidx: List, alpha: Union[float, None] = None):
-        if alpha is None:
-            Logger.warning(
-                "Alpha not specified, using best alpha value = %s", self.best_alpha
-            )
-            alpha = self.best_alpha
-
-        result_idx = self.alphas.index(alpha)
-        inferIDidx = self.filter_precursor_idx[self.acts[result_idx] > 1]
-        Logger.info("Number of non-zero actiavation = %s", len(inferIDidx))
-        y_pred = [element in set(inferIDidx) for element in self.filter_precursor_idx]
-        y_true = [element in set(trueIDidx) for element in self.filter_precursor_idx]
-        self.confusion_matrix = confusion_matrix(
-            y_true=y_true, y_pred=y_pred, normalize=None, labels=[True, False]
-        )
-        self.id_result = pd.DataFrame(
-            {
-                "Candidate": self.filter_precursor_idx,
-                "Activation": self.acts[result_idx] > 1,
-                "y_pred": y_pred,
-                "y_true": y_true,
-            }
-        )
-        self.cls_report = classification_report(
-            y_true=y_true, y_pred=y_pred, output_dict=True
-        )
-
-    def PlotObsAndInfer(self, log_intensity: bool = False):
-        plot_comparison(
-            y_true=self.obs_data_raw.flatten(),
-            y_pred=self.infer.flatten(),
-            log_y=log_intensity,
-        )
-
-    def calc_precursor_reconstruct_cos_dist(self):
-        self.reconstruc_cos_dist = []
-        for idx, val in enumerate(self.act):
-            if val > 0:
-                mask_act = self.act.copy()
-                mask_act[idx] = 0
-                y_minus_i = np.matmul(self.dictionary, mask_act)
-                y_i = self.obs_data_raw.reshape(-1) - y_minus_i
-                iso_mz_mask = (
-                    self.dictionary[:, idx] != 0
-                )  # only consider nonzero input in dict
-                self.reconstruc_cos_dist.append(
-                    spatial.distance.cosine(
-                        self.dictionary[:, idx][iso_mz_mask], y_i.flatten()[iso_mz_mask]
-                    )
-                )
-            else:
-                self.reconstruc_cos_dist.append(0)
-        return self.reconstruc_cos_dist
-
-    def CalcRMSE(self):
-        return mean_squared_error(
-            y_true=self.obs_data_raw.flatten(),
-            y_pred=self.infer.flatten(),
-            squared=False,
-        )
-
-    def CalcCosDist(self):
-        return spatial.distance.cosine(
-            self.obs_data_raw.flatten(), self.infer.flatten()
-        )
-
-    # def CalcExplainedValues(self): TODO: specify which alpha?
-    #     return len(self.infer_nonzero)/self.obs_data.shape[0]
-    def plot_iso_pattern_and_infer(
-        self,
-        Maxquant_result: pd.DataFrame,
-        precursor_id: List[int] | None = None,
-        precursor_idx: List[int] | None = None,
-        log_intensity: bool = False,
-    ):
-        plot_isopattern_and_obs(
-            maxquant_result=Maxquant_result,
-            infer_intensity=pd.Series(data=self.infer[0], index=self.obs_mz),
-            lower_plot="infer",
-            precursor_id=precursor_id,
-            precursor_idx=precursor_idx,
-            log_intensity=log_intensity,
-        )
-
-    def CalcExplainedInt(
-        self,
-    ):  # TODO: does not consider the correctness of explained peaks
-        return self.infer.sum() / self.obs_data_raw.sum()
+    return wrapper
 
 
-# def process_one_scan(
-#     scan_idx: int,
-#     OneScan: pd.core.series.Series,
-#     Maxquant_result: pd.DataFrame,
-#     scan_time: Union[float, None] = None,
-#     AbundanceMissingThres: float = 0.4,
-#     metric: _alpha_opt_metric = "cos_dist",
-#     alpha_criteria: _alpha_criteria = "convergence",
-#     alphas: Union[List, np.ndarray] = [0.00001, 0.0001, 0.001, 0.01, 0.1, 1, 10, 100],
-#     loss: _loss = "lasso",
-#     opt_algo: _algo = "lasso_cd",
-#     preprocessing_method: _pp_method = "raw",
-#     corr_thres: float = 0.9,
-#     max_iter: int = 1000,
-#     return_interim_results: bool = False,
-#     return_precursor_scan_cos_dist: bool = False,
-#     return_collinear_candidates: bool = False,
-#     plot_alpha_trace: bool = False,
-#     plot_obs_and_infer: bool = False,
-# ):
+# class Quant:
 #     """
-#     process one scan using lasso regression, return  alignment, \
-#         activation and scan summary
+#     Joint identification and quantification of candidates for given MS1 scan
 
-#     :scan_idx:
-#     :OneScan: a row in dataframe MS1Scans
-#     :
+#     :preprocessing: if CandidateDict and obs_data are preprocessed, if 'sqrt' \
+#         then act should be squared, and cos_dist calculation should also be \
+#             squared
 #     """
-#     Logger.debug("Start.")
-#     if scan_time is None:
-#         scan_time = OneScan["starttime"]
-#     CandidatePrecursorsByRT = Maxquant_result.loc[
-#         (Maxquant_result["RT_search_left"] <= scan_time)
-#         & (Maxquant_result["RT_search_right"] >= scan_time)
-#     ]
-#     Logger.debug("Filter by RT.")
 
-#     if CandidatePrecursorsByRT.shape[0] > 0:
-#         ScanDict = Dict(
-#             candidate_by_rt=CandidatePrecursorsByRT,
-#             one_scan=OneScan,
-#             abundance_missing_thres=AbundanceMissingThres,
-#         )
-#         CandidateDict = ScanDict.dict
-#         filteredPrecursorIdx = ScanDict.filtered_candidate_idx
-#         if CandidateDict is not None:
-#             y_true = ScanDict.obs_peak_int
+#     def __init__(
+#         self,
+#         candidate_dict: pd.DataFrame,
+#         obs_data: pd.DataFrame,
+#         filtered_precursor_idx: Union[np.ndarray, list],
+#         preprocessing_method: _pp_method,
+#     ) -> None:
+#         """
+#         Initialize the Inference class.
 
-#             ScanDict.get_feature_corr(
-#                 cos_sim_thres=corr_thres,
-#                 calc_jaccard_sim=False,
-#                 # plot_collinear_hist=False,
-#                 # plot_hmap=False,
-#             )
-#             num_corr_dict_candidate = ScanDict.high_corr_sol.shape[0]
-#             Logger.debug("Construct dictionary")
+#         :param candidate_dict: DataFrame containing candidate dictionary.
+#         :type candidate_dict: pd.DataFrame
+#         :param obs_data: DataFrame containing observed data. contains mzarray_obs and intensity.
+#         :type obs_data: pd.DataFrame
+#         :param filtered_precursor_idx: Filtered precursor indices.
+#         :type filtered_precursor_idx: Union[np.ndarray, list]
+#         :param preprocessing_method: Preprocessing method to be used.
+#         :type preprocessing_method: _pp_method
 
-#             PrecursorQuant = Quant(
-#                 candidate_dict=CandidateDict,
-#                 obs_data=y_true,
-#                 filtered_precursor_idx=filteredPrecursorIdx,
-#                 preprocessing_method=preprocessing_method,
-#             )
+#         :return: None
+#         """
+#         self.filter_precursor_idx = filtered_precursor_idx
+#         self.obs_data_raw = self.obs_data = obs_data[["intensity"]].values
+#         self.obs_mz = obs_data[["mzarray_obs"]].values[:, 0]
+#         Logger.debug("obs mz (index) dimension: %s", self.obs_mz.shape)
+#         if preprocessing_method == "raw":
+#             self.dictionary = candidate_dict[filtered_precursor_idx].values
+#             self.obs_data = obs_data[["intensity"]].values  # shape (n_mzvalues, 1)
+#         elif preprocessing_method == "sqrt":
+#             self.dictionary = np.sqrt(candidate_dict[filtered_precursor_idx].values)
+#             self.obs_data = np.sqrt(
+#                 obs_data[["intensity"]].values
+#             )  # shape (n_mzvalues, 1)
+#         self.preprocessing = preprocessing_method
+#         self.alphas = []
+#         self.acts = []
+#         self.inferences = []
+#         self.nonzeros = []
+#         self.metric = []
+#         self.infer = None
+#         self.best_alpha = None
+#         self.act = None
+#         self.confusion_matrix = None
+#         self.metric_used = None
+#         self.id_result = None
+#         self.cls_report = None
+#         self.reconstruc_cos_dist = None
 
-#             PrecursorQuant.optimizeAlphas(
-#                 alphas=alphas,
+#     def optimize(
+#         self,
+#         alpha: float,
+#         loss: _loss = "lasso",
+#         algorithm: _algo = "lasso_lars",
+#         max_iter: int = 1000,
+#         metric: _alpha_opt_metric = "RMSE",
+#     ):
+#         self.alphas.append(alpha)
+#         match loss:
+#             case "lasso":
+#                 act = sparse_encode(
+#                     X=self.obs_data.T,
+#                     dictionary=self.dictionary.T,
+#                     algorithm=algorithm,
+#                     positive=True,
+#                     alpha=alpha,
+#                     max_iter=max_iter,
+#                     verbose=50,
+#                     # n_jobs=-1
+#                 )
+#                 Logger.debug("dimension of act: %s", act.shape)
+#             case "sqrt_lasso":
+#                 sol = CustomLinearModel(
+#                     residue_loss=mean_square_root_error,
+#                     X=self.dictionary,
+#                     Y=self.obs_data,
+#                     reg_norm="l1",
+#                     reg_param=alpha,
+#                 )
+#                 sol.fit(method=algorithm)  # maxiter=max_iter,
+#                 if sol.beta is not None:
+#                     Logger.debug("dimension of sol.beta: %s", sol.beta.shape)
+#                     act = sol.beta.reshape(1, -1)
+#                     Logger.debug("dimension of act: %s", act.shape)
+#                 else:
+#                     Logger.warning("sol.beta is None, likely due to failed fit.")
+#                     act = np.array([[0]])
+#         if self.preprocessing == "raw":
+#             self.acts.append(act[0])
+#             self.infer = np.matmul(act, self.dictionary.T)
+#         elif self.preprocessing == "sqrt":
+#             self.acts.append(np.square(act[0]))
+#             self.infer = np.square(np.matmul(act[0], self.dictionary.T))
+
+#         self.inferences.append(self.infer)
+#         self.nonzeros.append(np.count_nonzero(act[0] > 1))
+
+#         self.metric_used = metric
+#         if metric == "cos_dist":
+#             self.metric.append(self.CalcCosDist())
+#         elif metric == "RMSE":
+#             self.metric.append(self.CalcRMSE())
+
+#     def optimizeAlphas(
+#         self,
+#         alphas: Union[List, np.ndarray],
+#         loss: _loss = "lasso",
+#         algorithm: _algo = "lasso_lars",
+#         criteria: _alpha_criteria = "min",
+#         metric: _alpha_opt_metric = "cos_dist",
+#         eps: Union[None, float] = None,
+#         max_iter: int = 1000,
+#         PlotTrace: bool = False,
+#         save_dir: Union[str, None] = None,
+#     ):
+#         """
+#         iterate through different alphas and algorithm,
+#         for ols, set algo = 'threshold' and alpha = 0.
+
+#         :alphas: if
+#         :algorithms:
+#         """
+
+#         if criteria == "convergence" and eps is None:
+#             eps = 0.0001
+#         if loss == "lasso":
+#             self.optimize(alpha=0, algorithm="threshold", metric=metric)
+#         else:
+#             self.optimize(
+#                 alpha=0,
 #                 loss=loss,
+#                 algorithm=algorithm,
 #                 metric=metric,
-#                 algorithm=opt_algo,
-#                 criteria=alpha_criteria,
-#                 PlotTrace=plot_alpha_trace,
 #                 max_iter=max_iter,
 #             )
-#             Logger.debug("Quant - optimize alphas")
-#             if plot_obs_and_infer:
-#                 PrecursorQuant.PlotObsAndInfer(log_intensity=False)
-#                 Logger.debug("Quant - Plot")
-
-#             activation = {
-#                 "precursor": filteredPrecursorIdx,
-#                 "activation": PrecursorQuant.act,
-#             }
-#             collinear_candidates = {
-#                 "precursor": ScanDict.collinear_precursors.index.values,
-#                 "collinear_candidates": ScanDict.collinear_precursors.values,
-#             }
-
-#             if return_precursor_scan_cos_dist:
-#                 cos_dist = PrecursorQuant.calc_precursor_reconstruct_cos_dist()
-#                 precursor_cos_dist = {
-#                     "precursor": filteredPrecursorIdx,
-#                     "cos_dist": cos_dist,
-#                 }
-#             cos_dist = PrecursorQuant.CalcCosDist()
-#             rmse = PrecursorQuant.CalcRMSE()
-#             scan_sum = (
-#                 scan_idx,
-#                 scan_time,
-#                 CandidatePrecursorsByRT.index,
-#                 filteredPrecursorIdx,
-#                 num_corr_dict_candidate,
-#                 PrecursorQuant.best_alpha,
-#                 cos_dist,
-#                 PrecursorQuant.CalcExplainedInt(),
-#             )
-#             Logger.info(
-#                 "scan index %s: activation successfully calculated with cosine distance"
-#                 " %s, RMSE %s.",
-#                 scan_idx,
-#                 cos_dist,
-#                 rmse,
-#             )
+#         if len(alphas) > 0:
+#             match criteria:
+#                 case "min":
+#                     for a in alphas:
+#                         self.optimize(
+#                             alpha=a,
+#                             loss=loss,
+#                             algorithm=algorithm,
+#                             metric=metric,
+#                             max_iter=max_iter,
+#                         )
+#                     BestAlphaIdx = int(np.array(self.metric).argmin())
+#                     self.best_alpha = self.alphas[int(BestAlphaIdx)]
+#                     Logger.info(
+#                         "Minimal distance reached at alpha = %s", self.best_alpha
+#                     )
+#                 case "convergence":
+#                     BestAlphaIdx = None
+#                     for a in alphas:
+#                         Logger.debug("Current alpha = %s", a)
+#                         self.optimize(
+#                             alpha=a,
+#                             loss=loss,
+#                             metric=metric,
+#                             algorithm=algorithm,
+#                             max_iter=max_iter,
+#                         )
+#                         Logger.debug("Alpha list %s", self.alphas)
+#                         diff = self.metric[-2] - self.metric[-1]
+#                         Logger.debug("Alpha = %s, tol = %s", a, diff)
+#                         if diff <= eps and diff > 0:
+#                             BestAlphaIdx = self.alphas.index(a)
+#                             self.best_alpha = self.alphas[BestAlphaIdx]
+#                             Logger.info(
+#                                 "Reached convergence criteria at alpha = %s",
+#                                 self.best_alpha,
+#                             )
+#                             break
+#                         if diff < 0:
+#                             BestAlphaIdx = list(alphas).index(a) - 1
+#                             self.best_alpha = self.alphas[BestAlphaIdx]
+#                             Logger.warning(
+#                                 "Increasing %s! Using previous alpha = %s as best"
+#                                 " candidate!",
+#                                 self.metric_used,
+#                                 self.best_alpha,
+#                             )
+#                             break
+#                     if BestAlphaIdx is None:
+#                         BestAlphaIdx = int(np.array(self.metric).argmin())
+#                         self.best_alpha = self.alphas[int(BestAlphaIdx)]
+#                         Logger.warning(
+#                             "Convergence not reached! Using alpha = %s with minimal"
+#                             " distance as candidate!",
+#                             self.best_alpha,
+#                         )
 #         else:
-#             activation = None
-#             precursor_cos_dist = None
-#             collinear_candidates = None
-#             scan_sum = (
-#                 scan_idx,
-#                 scan_time,
-#                 CandidatePrecursorsByRT.index,
-#                 filteredPrecursorIdx,
-#                 np.nan,
-#                 np.nan,
-#                 np.nan,
-#                 np.nan,
+#             BestAlphaIdx = 0
+#             self.best_alpha = self.alphas[BestAlphaIdx]
+#             Logger.info("Alpha not specified, using alpha = %s", self.best_alpha)
+#         self.infer = self.inferences[BestAlphaIdx]
+#         self.act = self.acts[BestAlphaIdx]
+
+#         if PlotTrace:  # plot trace with 2 y-axis: metric and count_nonzeors
+#             fig, ax1 = plt.subplots()
+#             ax1.set_xlabel("log10(alpha+1)")
+
+#             color = "tab:red"
+#             # ensure ylabel receives a str (self.metric_used may be None)
+#             ax1.set_ylabel(self.metric_used or "", color=color)
+#             ax1.plot(np.log10(np.array(self.alphas) + 1), self.metric, color=color)
+#             ax1.tick_params(axis="y", labelcolor=color)
+#             ax1.plot(
+#                 np.log10(self.best_alpha + 1),  # type: ignore[arg-type]
+#                 self.metric[BestAlphaIdx],
+#                 "x",
+#                 color="r",
 #             )
-#             Logger.info(
-#                 "scan index %s: less than 2 valid candidates after isotope pattern"
-#                 " matching.",
-#                 scan_idx,
+#             ax2 = ax1.twinx()  # instantiate a second axes that shares the same x-axis
+
+#             color = "tab:blue"
+#             ax2.set_ylabel(
+#                 "Num of Non-zero Act.", color=color
+#             )  # we already handled the x-label with ax1
+#             ax2.plot(np.log10(np.array(self.alphas) + 1), self.nonzeros, color=color)
+#             ax2.tick_params(axis="y", labelcolor=color)
+
+#             ax1.annotate(
+#                 "N0 = " + str(self.dictionary.shape[1]),
+#                 xy=(0.1, 0.9),
+#                 xycoords="axes fraction",
 #             )
 
-#     else:
-#         CandidateDict = None
-#         activation = None
-#         precursor_cos_dist = None
-#         collinear_candidates = None
-#         scan_sum = (
-#             scan_idx,
-#             scan_time,
-#             [],
-#             [],
-#             np.nan,
-#             np.nan,
-#             np.nan,
-#             np.nan,
+#             fig.tight_layout()  # otherwise the right y-label is slightly clipped
+#             plt.show()
+
+#             if save_dir is not None:
+#                 if not os.path.exists(save_dir):
+#                     os.makedirs(save_dir)
+#                 plt.savefig(fname=os.path.join(save_dir, "alphaTrace.png"), dpi=300)
+#                 plt.close()
+#             else:
+#                 plt.show()
+
+#     def analyzeID(self, trueIDidx: List, alpha: Union[float, None] = None):
+#         if alpha is None:
+#             Logger.warning(
+#                 "Alpha not specified, using best alpha value = %s", self.best_alpha
+#             )
+#             alpha = self.best_alpha
+
+#         result_idx = self.alphas.index(alpha)
+#         inferIDidx = self.filter_precursor_idx[self.acts[result_idx] > 1]
+#         Logger.info("Number of non-zero actiavation = %s", len(inferIDidx))
+#         y_pred = [element in set(inferIDidx) for element in self.filter_precursor_idx]
+#         y_true = [element in set(trueIDidx) for element in self.filter_precursor_idx]
+#         self.confusion_matrix = confusion_matrix(
+#             y_true=y_true, y_pred=y_pred, normalize=None, labels=[True, False]
 #         )
-#         Logger.info("scan index %s: no valid candidate by RT.", scan_idx)
+#         self.id_result = pd.DataFrame(
+#             {
+#                 "Candidate": self.filter_precursor_idx,
+#                 "Activation": self.acts[result_idx] > 1,
+#                 "y_pred": y_pred,
+#                 "y_true": y_true,
+#             }
+#         )
+#         self.cls_report = classification_report(
+#             y_true=y_true, y_pred=y_pred, output_dict=True
+#         )
 
-#     result_dict_onescan = {}
-#     result_dict_onescan[scan_idx] = {
-#         "activation": activation,
-#         "CandidateDict": CandidateDict,
-#         "scans_record": scan_sum,
-#         "precursor_collinear_sets": collinear_candidates,
-#     }
-#     match (return_interim_results, return_precursor_scan_cos_dist):
-#         case (True, True):
-#             result_dict_onescan[scan_idx]["precursor_cos_dist"] = precursor_cos_dist
-#             return result_dict_onescan, ScanDict, PrecursorQuant
-#         case (True, False):
-#             result_dict_onescan[scan_idx]["precursor_cos_dist"] = None
-#             return result_dict_onescan, ScanDict, PrecursorQuant
-#         case (False, True):
-#             result_dict_onescan[scan_idx]["precursor_cos_dist"] = precursor_cos_dist
-#             return result_dict_onescan
-#         case (False, False):
-#             result_dict_onescan[scan_idx]["precursor_cos_dist"] = None
-#             return result_dict_onescan
+#     @requires_infer
+#     def PlotObsAndInfer(self, log_intensity: bool = False):
+#         plot_comparison(
+#             y_true=pd.Series(self.obs_data_raw.flatten()),
+#             y_pred=pd.Series(self.infer.flatten()),
+#             log_y=log_intensity,
+#         )
+
+#     @requires_act
+#     def calc_precursor_reconstruct_cos_dist(self):
+#         self.reconstruc_cos_dist = []
+#         for idx, val in enumerate(self.act):
+#             if val > 0:
+#                 mask_act = self.act.copy()
+#                 mask_act[idx] = 0
+#                 y_minus_i = np.matmul(self.dictionary, mask_act)
+#                 y_i = self.obs_data_raw.reshape(-1) - y_minus_i
+#                 iso_mz_mask = (
+#                     self.dictionary[:, idx] != 0
+#                 )  # only consider nonzero input in dict
+#                 self.reconstruc_cos_dist.append(
+#                     spatial.distance.cosine(
+#                         self.dictionary[:, idx][iso_mz_mask], y_i.flatten()[iso_mz_mask]
+#                     )
+#                 )
+#             else:
+#                 self.reconstruc_cos_dist.append(0)
+#         return self.reconstruc_cos_dist
+
+#     @requires_infer
+#     def CalcRMSE(self):
+#         return root_mean_squared_error(
+#             y_true=self.obs_data_raw.flatten(),
+#             y_pred=self.infer.flatten(),
+#             # squared=False,
+#         )
+
+#     @requires_infer
+#     def CalcCosDist(self):
+#         return spatial.distance.cosine(
+#             self.obs_data_raw.flatten(), self.infer.flatten()
+#         )
+
+#     # def CalcExplainedValues(self): TODO: specify which alpha?
+#     #     return len(self.infer_nonzero)/self.obs_data.shape[0]
+#     @requires_infer
+#     def plot_iso_pattern_and_infer(
+#         self,
+#         Maxquant_result: pd.DataFrame,
+#         precursor_id: List[int] | None = None,
+#         precursor_idx: List[int] | None = None,
+#         log_intensity: bool = False,
+#     ):
+#         plot_isopattern_and_obs(
+#             maxquant_result=Maxquant_result,
+#             infer_intensity=pd.Series(data=self.infer[0], index=self.obs_mz),
+#             lower_plot="infer",
+#             precursor_id=precursor_id,
+#             precursor_idx=precursor_idx,
+#             log_intensity=log_intensity,
+#         )
+
+#     @requires_infer
+#     def CalcExplainedInt(
+#         self,
+#     ):  # TODO: does not consider the correctness of explained peaks
+#         return self.infer.sum() / self.obs_data_raw.sum()
 
 
 def sparse_encode_divide_and_conquer(frame_array, candidate_array):
