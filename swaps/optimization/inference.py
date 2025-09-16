@@ -1,7 +1,7 @@
 import logging
 import os
 from multiprocessing import cpu_count
-from typing import Callable, List, Union, Literal
+from typing import Callable, List, Union, Literal, Optional
 import itertools
 from operator import itemgetter
 import matplotlib.pyplot as plt
@@ -16,8 +16,10 @@ from sklearn.metrics import (
     classification_report,
     confusion_matrix,
     mean_squared_error,
+    root_mean_squared_error,
 )
 from math import floor
+from functools import wraps
 
 # from optimization.dictionary import Dict
 from optimization.custom_models import CustomLinearModel, mean_square_root_error
@@ -514,20 +516,28 @@ def slice_candidate_blocks_by_pept(matrix):
         non_zero_indices = np.flatnonzero(blocks_col_sum)
         # Logger.info("Block col sum shape %s", blocks_col_sum.shape)
         # Find index of the first non-zero value
-        col_cut_index_start = non_zero_indices[0] if non_zero_indices.size > 0 else None
-
-        # Find index of the last non-zero value
-        col_cut_index_end = non_zero_indices[-1] if non_zero_indices.size > 0 else None
-        # Logger.info(
-        #     "col cut index start and end %s %s", col_cut_index_start, col_cut_index_end
-        # )
-        block = matrix[
-            prev_row_cut:row_cut_index, col_cut_index_start : col_cut_index_end + 1
-        ]
+        if non_zero_indices.size > 0:
+            col_cut_index_start = non_zero_indices[0]
+            # Find index of the last non-zero value
+            col_cut_index_end = non_zero_indices[-1]
+            # Logger.info(
+            #     "col cut index start and end %s %s", col_cut_index_start, col_cut_index_end
+            # )
+            block = matrix[
+                prev_row_cut:row_cut_index, col_cut_index_start : col_cut_index_end + 1
+            ]
+            col_cut_indices_start.append(col_cut_index_start)
+            col_cut_indices_end.append(col_cut_index_end + 1)
+        else:
+            # No non-zero columns in this row block: create an empty (0-column) block
+            # and use safe integer slice bounds so we don't attempt arithmetic with None.
+            col_cut_index_start = 0
+            col_cut_index_end = -1
+            block = matrix[prev_row_cut:row_cut_index, 0:0]
+            col_cut_indices_start.append(0)
+            col_cut_indices_end.append(0)
         blocks.append(block)
         prev_row_cut = row_cut_index
-        col_cut_indices_start.append(col_cut_index_start)
-        col_cut_indices_end.append(col_cut_index_end + 1)
         Logger.info("block shape %s", block.shape)
     assert sum([block.shape[0] for block in blocks]) == matrix.shape[0]
     return blocks, col_cut_indices_start, col_cut_indices_end
@@ -587,16 +597,29 @@ def slice_candidate_blocks_by_mz(matrix):
         Logger.debug("Block row sum shape %s", blocks_row_sum.shape)
 
         # Find index of the first non-zero value
-        row_cut_index_start = non_zero_indices[0] if non_zero_indices.size > 0 else None
+        if non_zero_indices.size > 0:
+            row_cut_index_start = non_zero_indices[0]
+            # Find index of the last non-zero value
+            row_cut_index_end = non_zero_indices[-1]
+            Logger.info(
+                "row cut index start and end %s %s",
+                row_cut_index_start,
+                row_cut_index_end,
+            )
+            block = matrix[
+                row_cut_index_start : row_cut_index_end + 1, prev_col_cut:col_cut_index
+            ]
+        else:
+            # No non-zero rows in this column block: create an empty (0-row) block
+            row_cut_index_start = 0
+            row_cut_index_end = -1
+            Logger.info(
+                "No non-zero rows in block cols %s:%s; creating empty block",
+                prev_col_cut,
+                col_cut_index,
+            )
+            block = matrix[0:0, prev_col_cut:col_cut_index]
 
-        # Find index of the last non-zero value
-        row_cut_index_end = non_zero_indices[-1] if non_zero_indices.size > 0 else None
-        Logger.info(
-            "row cut index start and end %s %s", row_cut_index_start, row_cut_index_end
-        )
-        block = matrix[
-            row_cut_index_start : row_cut_index_end + 1, prev_col_cut:col_cut_index
-        ]
         blocks.append(block)
         col_cut_indices_start.append(prev_col_cut)
         col_cut_indices_end.append(col_cut_index)
@@ -638,7 +661,7 @@ def process_one_frame(
         "data": [],
     }
     if frame_data.shape[0] > 0:
-        scan_time = np.round(ms1scans.loc[ms1_frame_idx, "Time_minute"], decimals=4)
+        scan_time = np.round(ms1scans.loc[ms1_frame_idx, "Time_minute"], decimals=4)  # type: ignore[arg-type]
         Logger.info("Scan time: %s", scan_time)
         candidate_precursor_by_rt = maxquant_result_ref_with_im_index_sortmz.loc[
             (maxquant_result_ref_with_im_index_sortmz["RT_search_left"] <= scan_time)
@@ -721,7 +744,7 @@ def process_one_frame_ims(
     ms1scans: pd.DataFrame,
     ms1_frame_idx: int,
     maxquant_result_ref_with_im_index_sortmz: pd.DataFrame,
-    mobility_values: np.ndarray,
+    mobility_values: pd.DataFrame,
     delta_mobility_thres: int = 100,
     return_im_pept_act: bool = False,
     mz_bin_digits: int = 3,
@@ -730,6 +753,7 @@ def process_one_frame_ims(
     debug: bool = False,
     **kwargs,
 ):
+    """Process one frame data with IMS dimension with sparse encoding and peak selection."""
     Logger.debug("Start data preparation.")
     # prepare data
     frame_data = data[
@@ -747,7 +771,7 @@ def process_one_frame_ims(
         "data": [],
     }
     if frame_data.shape[0] > 0:
-        scan_time = np.round(ms1scans.loc[ms1_frame_idx, "Time_minute"], decimals=4)
+        scan_time = np.round(ms1scans.loc[ms1_frame_idx, "Time_minute"], decimals=4)  # type: ignore[arg-type]
         candidate_precursor_by_rt = maxquant_result_ref_with_im_index_sortmz.loc[
             (maxquant_result_ref_with_im_index_sortmz["RT_search_left"] <= scan_time)
             & (maxquant_result_ref_with_im_index_sortmz["RT_search_right"] >= scan_time)
@@ -995,6 +1019,7 @@ def process_batch_frame(
         )
     if return_im_pept_act:
         if use_ims:
+            assert mobility_values is not None
             batch_im_rt_pept_act_coo = make_coo_from_dict(
                 batch_im_rt_pept_act_coo_dict,
                 shape=(
@@ -1053,7 +1078,7 @@ def _prepare_sparse_matrices(
     all_id,
     mz_bin_digits: int = 3,
     use_ims: bool = True,
-    mobility_values: pd.DataFrame = None,
+    mobility_values: Optional[pd.DataFrame] = None,
 ):
     # prepare arrays from sparse matrices
     candidate_id = np.repeat(
@@ -1133,7 +1158,7 @@ def _prepare_sparse_matrices(
 
 
 def _select_im_peak_from_frame_act(
-    im_pept_act: pd.DataFrame,
+    im_pept_act: np.ndarray,
     all_pept_mzrank: np.ndarray,
     maxquant_result_dict_with_im_index: pd.DataFrame,
     delta_mobility_thres: int = 100,
@@ -1206,7 +1231,7 @@ def _select_peaks_from_im_pept_act(
             _extract_peaks_in_im(
                 im_pept_act_array=im_pept_act[:, idx],
                 index=idx,
-                pept_mzrank=pept_mzrank[idx],
+                pept_mzrank=int(pept_mzrank[idx]),
                 **kwargs,
             )
             for idx in pept_valid_idx
@@ -1245,7 +1270,7 @@ def parallel(func=None, args=(), merge_func=lambda x: x, parallelism=cpu_count()
     def decorator(func: Callable):
         def inner(*args, **kwargs):
             results = Parallel(n_jobs=parallelism)(
-                delayed(func)(*args, **kwargs) for i in range()
+                delayed(func)(*args, **kwargs) for i in range(parallelism)
             )
             return merge_func(results)
 

@@ -62,7 +62,7 @@ class ApproximateKSVD(object):
         if n_nonzero_coefs is None:
             n_nonzero_coefs = int(0.1 * X.shape[1])
 
-        return orthogonal_mp_gram(gram, Xy, n_nonzero_coefs=n_nonzero_coefs).T
+        return orthogonal_mp_gram(gram, Xy, n_nonzero_coefs=n_nonzero_coefs)[0].T
 
     def fit(self, X, D_init=None):
         """

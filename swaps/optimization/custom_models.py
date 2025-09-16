@@ -35,10 +35,16 @@ class CustomLinearModel:
         self.regularization_strength = reg_param
 
     def predict(self, X):
-        prediction = np.matmul(X, self.beta)
+        if self.beta is None:
+            raise ValueError(
+                "Model coefficients 'beta' are not set; fit the model before calling predict."
+            )
+        prediction = np.matmul(X, np.asarray(self.beta))
         return prediction
 
     def model_error(self):
+        if self.residue_loss is None:
+            raise ValueError("residue_loss cannot be None")
         error = self.residue_loss(self.predict(self.X), self.Y, self.sample_weights)
         return error
 
