@@ -441,7 +441,6 @@ def prepare_training_dataset(
     dataset_name: str = "train_datapoints_TD",
     pept_batch_indices_filtered: List[int] = None,
 ):
-
     # Create output directory
     ps_dir = os.path.join(result_dir, "peak_selection")
     os.makedirs(ps_dir, exist_ok=True)
@@ -449,6 +448,18 @@ def prepare_training_dataset(
     if source == ["ref"]:
         ps_data_dir = os.path.join(ps_data_dir, "ref")
     os.makedirs(ps_data_dir, exist_ok=True)
+
+    batch_paths = [
+        os.path.join(ps_data_dir, f)
+        for f in os.listdir(ps_data_dir)
+        if f.endswith(".hdf5")
+    ]
+    batch_paths.sort()
+    if batch_paths:
+        Logger.info(f"{len(batch_paths)} training batches already found in {ps_data_dir}. Skipping training data preparation")
+        return batch_paths
+    else:
+        Logger.info(f"No training batches found in {ps_data_dir}. Continue training data preparation")
 
     # Load relevant data
     if n_workers <= 0:

@@ -15,6 +15,7 @@ Logger = logging.getLogger(__name__)
 
 def infer_on_pept_act(
     cfg,
+    n: int,
     best_seg_model_path: str,
     best_cls_model_path: str,
     maxquant_dict: pd.DataFrame,
@@ -27,7 +28,7 @@ def infer_on_pept_act(
     device = "cuda" if torch.cuda.is_available() else "cpu"
     hint_matrix = sparse.load_npz(
         os.path.join(
-            cfg.RESULT_PATH, "peak_selection", "training_data", "hint_matrix.npz"
+            cfg.RESULT_PATHS[n], "peak_selection", "training_data", "hint_matrix.npz"
         )
     )
     transformation, _ = build_transformation(cfg.PEAK_SELECTION.DATASET)
@@ -49,7 +50,7 @@ def infer_on_pept_act(
         Logger.info("Infering on pept batch %d ...", i)
         act_3d = sparse.load_npz(
             os.path.join(
-                cfg.RESULT_PATH,
+                cfg.RESULT_PATHS[n],
                 "results",
                 "activation",
                 f"im_rt_pept_act_coo_peptbatch{i}.npz",
