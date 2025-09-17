@@ -5,7 +5,7 @@ import os
 import numpy as np
 import pandas as pd
 import alphatims.bruker
-
+from ..optimization.inference import get_apex_from_im_rt_pept_act_coo
 
 Logger = logging.getLogger(__name__)
 
@@ -130,7 +130,7 @@ def combine_3d_act_and_sum_int(
         prev_cutoff = 0
     # assert n_blocks_by_pept > 1
     # pept_act_sum_all_array = np.array([])
-
+    apex_df_arrays = None
     for pept_block_num in range(n_blocks_by_pept):
         try:
             act_3d_all = sparse.load_npz(
@@ -186,13 +186,23 @@ def combine_3d_act_and_sum_int(
                 ),
                 act_3d_all,
             )
+
+        apex_df_pept_batch = get_apex_from_im_rt_pept_act_coo(
+            im_rt_pept_act_coo=act_3d_all  # type: ignore
+        )
+        if apex_df_arrays is None:
+            # initialize on first loop, matching shape & dtype
+            apex_df_arrays = np.zeros_like(apex_df_pept_batch.to_numpy())
+        apex_df_arrays += (
+            apex_df_pept_batch.to_numpy()
+        )  # shape (n_pept, 3), accumulate over blocks
         if calc_pept_act_sum_filter_by_im:
             assert maxquant_result_ref is not None
             shape = act_3d_all.shape
             n_pept_in_blocks = shape[2] // n_blocks_by_pept
             cutoff = n_pept_in_blocks * (pept_block_num + 1)
 
-            pept_act_sum_filter_by_im = sum_3d_act_filter_by_im_fast(
+            pept_act_sum_filter_by_im = _sum_3d_act_filter_by_im_fast(
                 im_rt_pept_act_coo_peptbatch=act_3d_all,
                 maxquant_result_ref=maxquant_result_ref.loc[
                     maxquant_result_ref["mz_rank"].isin(range(prev_cutoff, cutoff))
@@ -225,42 +235,44 @@ def combine_3d_act_and_sum_int(
     pept_act_sum_array = sparse.asnumpy(pept_act_sum_all)
     Logger.info("pept_act_sum_all sum %s", pept_act_sum_array.shape)
     del pept_act_sum_all
-    if use_ims:
-        # pept_act_sum_all_array = np.append(pept_act_sum_all_array, pept_act_sum_array)
-        pept_act_sum_df = pd.DataFrame(
-            pept_act_sum_array[:],
-            columns=["pept_act_sum"],
-            index=np.arange(pept_act_sum_array.shape[0]),
+
+    # pept_act_sum_all_array = np.append(pept_act_sum_all_array, pept_act_sum_array)
+    apex_df = pd.DataFrame(
+        apex_df_arrays,
+        columns=["mz_rank", "im_apex_index", "rt_apex_index"],
+        index=np.arange(apex_df_arrays.shape[0]),  # type: ignore
+    )
+    pept_act_sum_df = pd.DataFrame(
+        pept_act_sum_array[:],
+        columns=["pept_act_sum"],
+        index=np.arange(pept_act_sum_array.shape[0]),
+    )
+    pept_act_sum_df["mz_rank"] = pept_act_sum_df.index
+    pept_act_sum_df.to_csv(os.path.join(act_dir, "pept_act_sum.csv"), index=False)
+    pept_act_df = pept_act_sum_df.merge(
+        apex_df, on="mz_rank", how="left", validate="one_to_one"
+    )
+    pept_act_df.to_csv(os.path.join(act_dir, "pept_act_sum_with_apex.csv"), index=False)
+
+    if use_ims and calc_pept_act_sum_filter_by_im:
+        pept_act_sum_filter_by_im_df = pd.DataFrame(
+            pept_act_sum_filter_by_im_array[:],
+            columns=["pept_act_sum_filter_by_im"],
+            index=np.arange(pept_act_sum_filter_by_im_array.shape[0]),
         )
-        pept_act_sum_df["mz_rank"] = pept_act_sum_df.index
-        pept_act_sum_df.to_csv(os.path.join(act_dir, "pept_act_sum.csv"), index=False)
-        if calc_pept_act_sum_filter_by_im:
-            pept_act_sum_filter_by_im_df = pd.DataFrame(
-                pept_act_sum_filter_by_im_array[:],
-                columns=["pept_act_sum_filter_by_im"],
-                index=np.arange(pept_act_sum_filter_by_im_array.shape[0]),
-            )
-            Logger.debug(
-                "pept_act_sum_filter_by_im_df sum %s",
-                pept_act_sum_filter_by_im_df["pept_act_sum_filter_by_im"].sum(),
-            )
-            pept_act_sum_filter_by_im_df["mz_rank"] = pept_act_sum_filter_by_im_df.index
-            pept_act_sum_filter_by_im_df.to_csv(
-                os.path.join(act_dir, "pept_act_sum_filter_by_im.csv"), index=False
-            )
-
-            return pept_act_sum_filter_by_im_df  # TODO: remove later
-    else:
-        pept_act_sum_df = pd.DataFrame(
-            pept_act_sum_array,
-            columns=["pept_act_sum"],
-            index=np.arange(len(pept_act_sum_array)),
+        Logger.debug(
+            "pept_act_sum_filter_by_im_df sum %s",
+            pept_act_sum_filter_by_im_df["pept_act_sum_filter_by_im"].sum(),
         )
-        pept_act_sum_df["mz_rank"] = pept_act_sum_df.index
-        pept_act_sum_df.to_csv(os.path.join(act_dir, "pept_act_sum.csv"), index=False)
+        pept_act_sum_filter_by_im_df["mz_rank"] = pept_act_sum_filter_by_im_df.index
+        pept_act_sum_filter_by_im_df.to_csv(
+            os.path.join(act_dir, "pept_act_sum_filter_by_im.csv"), index=False
+        )
+
+        return pept_act_sum_filter_by_im_df  # TODO: remove later
 
 
-def sum_3d_act_filter_by_im_fast(
+def _sum_3d_act_filter_by_im_fast(
     im_rt_pept_act_coo_peptbatch,
     maxquant_result_ref: pd.DataFrame,
     chunk_size: int = 200,
