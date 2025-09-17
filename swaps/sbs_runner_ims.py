@@ -87,11 +87,6 @@ def opt_scan_by_scan(config_path: str):
             logging.info("==================Load data==================")
             os.makedirs(cfg.RESULT_PATHS[i], exist_ok=True)
 
-            if str(cfg.RESULT_PATHS[i]).endswith("model"):  # ToDo
-                logging.info("Result path for Model Training found. Skipping data loading and generation.")
-                model_training(cfg, None)
-                return
-
             if cfg.USE_IMS:
                 data, hdf_file_name = load_dotd_data(
                     cfg.DATA_PATHS[i], swaps_result_dir=cfg.EXPORT_DATA_HDF5_DIR[i]
@@ -240,6 +235,11 @@ def opt_scan_by_scan(config_path: str):
             inference_evaluation(cfg, i, f"{ps_exp_dir}/{i}", maxquant_result_refs[i])
 
     if cfg.RESULT_ANALYSIS.ENABLE:  # TODO: haven't cleaned up the code
+        # Restore activation directory paths, if loading was skipped
+        if not act_dirs:
+            for i in range(len(cfg.RESULT_PATHS)):
+                act_dirs.append(os.path.join(cfg.RESULT_PATHS[i], "results", "activation"))
+
         for i in range(len(cfg.RESULT_PATHS)):
             res_analysis(cfg, i, f"{ps_exp_dir}/{i}", maxquant_result_refs[i], act_dirs[i])
 

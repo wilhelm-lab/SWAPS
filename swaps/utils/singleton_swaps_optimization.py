@@ -94,7 +94,7 @@ __C.PEAK_SELECTION.REF_TRAINING_DATA = []
 __C.PEAK_SELECTION.TRAINING_DATA_SOURCE = [
     "both"
 ]  # list with values from ["both", "ref", "exp"]
-__C.PEAK_SELECTION.EVAL_ON_TEST = True
+__C.PEAK_SELECTION.EVAL_ON_TEST = False
 __C.PEAK_SELECTION.INCLUDE_DECOYS = True
 __C.PEAK_SELECTION.EXP_DIR_NAME = ""
 __C.PEAK_SELECTION.BEST_SEG_MODEL_PATH = ""         # Set automatically; Only set manually if only Evaluation is done
