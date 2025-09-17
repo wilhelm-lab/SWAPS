@@ -82,26 +82,26 @@ def export_im_and_ms1scans(
     return ms1scans, mobility_values_df
 
 
-def sum_pept_act_by_peptbatch(n_blocks_by_pept: int, act_dir):
-    """Sum activation intensity for each peptide batch."""
-    for pept_block_num in range(n_blocks_by_pept):
-        act_3d = sparse.load_npz(
-            os.path.join(act_dir, f"im_rt_pept_act_coo_peptbatch{pept_block_num}.npz")
-        )
-        if pept_block_num == 0:
-            pept_act_sum_all = act_3d.sum(axis=(0, 1))
-        else:
-            pept_act_sum_all += act_3d.sum(axis=(0, 1))
-        del act_3d
-        Logger.info("sum activation intensity for pept batch %s", pept_block_num)
-    sparse.save_npz(os.path.join(act_dir, "pept_act_sum_all.npz"), pept_act_sum_all)
-    pept_act_sum_array = sparse.asnumpy(pept_act_sum_all)
-    pept_act_sum_df = pd.DataFrame(
-        pept_act_sum_array,
-        columns=["pept_act_sum"],
-        index=np.arange(pept_act_sum_array.shape[0]),
-    )
-    pept_act_sum_df.to_csv(os.path.join(act_dir, "pept_act_sum.csv"))
+# def sum_pept_act_by_peptbatch(n_blocks_by_pept: int, act_dir):
+#     """Sum activation intensity for each peptide batch."""
+#     for pept_block_num in range(n_blocks_by_pept):
+#         act_3d = sparse.load_npz(
+#             os.path.join(act_dir, f"im_rt_pept_act_coo_peptbatch{pept_block_num}.npz")
+#         )
+#         if pept_block_num == 0:
+#             pept_act_sum_all = act_3d.sum(axis=(0, 1))
+#         else:
+#             pept_act_sum_all += act_3d.sum(axis=(0, 1))
+#         del act_3d
+#         Logger.info("sum activation intensity for pept batch %s", pept_block_num)
+#     sparse.save_npz(os.path.join(act_dir, "pept_act_sum_all.npz"), pept_act_sum_all)
+#     pept_act_sum_array = sparse.asnumpy(pept_act_sum_all)
+#     pept_act_sum_df = pd.DataFrame(
+#         pept_act_sum_array,
+#         columns=["pept_act_sum"],
+#         index=np.arange(pept_act_sum_array.shape[0]),
+#     )
+#     pept_act_sum_df.to_csv(os.path.join(act_dir, "pept_act_sum.csv"))
 
 
 def combine_3d_act_and_sum_int(
@@ -415,49 +415,49 @@ def sum_3d_act_filter_by_im_fast(
         return pept_act_sum_array
 
 
-def sum_3d_act_filter_by_im_improved(
-    im_rt_pept_act_coo_peptbatch, maxquant_result_ref: pd.DataFrame
-):
-    """
-    Sum activation intensity for each peptide batch and filter by IM.
-    :param im_rt_pept_act_coo_peptbatch: sparse.coo_matrix, 3D activation intensity data
-    :param maxquant_result_ref: pd.DataFrame, MaxQuant reference data
-    :return: pept_act_sum_df: pd.DataFrame, summed activation intensity data filtered by IM dimension according to MaxQuant reference data
-    """
-    assert (
-        "Ion mobility length" in maxquant_result_ref.columns
-        and "mobility_values_index" in maxquant_result_ref.columns
-    )
+# def sum_3d_act_filter_by_im_improved(
+#     im_rt_pept_act_coo_peptbatch, maxquant_result_ref: pd.DataFrame
+# ):
+#     """
+#     Sum activation intensity for each peptide batch and filter by IM.
+#     :param im_rt_pept_act_coo_peptbatch: sparse.coo_matrix, 3D activation intensity data
+#     :param maxquant_result_ref: pd.DataFrame, MaxQuant reference data
+#     :return: pept_act_sum_df: pd.DataFrame, summed activation intensity data filtered by IM dimension according to MaxQuant reference data
+#     """
+#     assert (
+#         "Ion mobility length" in maxquant_result_ref.columns
+#         and "mobility_values_index" in maxquant_result_ref.columns
+#     )
 
-    # Calculate the start and end indices for the mobility values
-    mobility_start = np.round(
-        (
-            maxquant_result_ref["mobility_values_index"]
-            - maxquant_result_ref["Ion mobility length"] // 2
-        ),
-        decimals=0,
-    ).astype(int)
-    mobility_end = np.round(
-        (
-            maxquant_result_ref["mobility_values_index"]
-            + maxquant_result_ref["Ion mobility length"] // 2
-            + 1
-        ),
-        decimals=0,
-    ).astype(int)
-    # mz_rank = maxquant_result_ref["mz_rank"]
-    left_minus = im_rt_pept_act_coo_peptbatch[:, :mobility_start, :].sum(axis=(0, 1))
+#     # Calculate the start and end indices for the mobility values
+#     mobility_start = np.round(
+#         (
+#             maxquant_result_ref["mobility_values_index"]
+#             - maxquant_result_ref["Ion mobility length"] // 2
+#         ),
+#         decimals=0,
+#     ).astype(int)
+#     mobility_end = np.round(
+#         (
+#             maxquant_result_ref["mobility_values_index"]
+#             + maxquant_result_ref["Ion mobility length"] // 2
+#             + 1
+#         ),
+#         decimals=0,
+#     ).astype(int)
+#     # mz_rank = maxquant_result_ref["mz_rank"]
+#     left_minus = im_rt_pept_act_coo_peptbatch[:, :mobility_start, :].sum(axis=(0, 1))
 
-    right_minus = im_rt_pept_act_coo_peptbatch[:, mobility_end:, :].sum(axis=(0, 1))
-    total_value = im_rt_pept_act_coo_peptbatch[:, :, :].sum(axis=(0, 1))
-    pept_act_sum_array = total_value - left_minus - right_minus
+#     right_minus = im_rt_pept_act_coo_peptbatch[:, mobility_end:, :].sum(axis=(0, 1))
+#     total_value = im_rt_pept_act_coo_peptbatch[:, :, :].sum(axis=(0, 1))
+#     pept_act_sum_array = total_value - left_minus - right_minus
 
-    # pept_act_sum_array = im_rt_pept_act_coo_peptbatch.sum(axis=(0, 1))
-    pept_act_sum_df = pd.DataFrame(
-        pept_act_sum_array[:],
-        columns=["pept_act_sum"],
-        index=np.arange(pept_act_sum_array.shape[0]),
-    )
-    pept_act_sum_df["mz_rank"] = pept_act_sum_df.index
+#     # pept_act_sum_array = im_rt_pept_act_coo_peptbatch.sum(axis=(0, 1))
+#     pept_act_sum_df = pd.DataFrame(
+#         pept_act_sum_array[:],
+#         columns=["pept_act_sum"],
+#         index=np.arange(pept_act_sum_array.shape[0]),
+#     )
+#     pept_act_sum_df["mz_rank"] = pept_act_sum_df.index
 
-    return pept_act_sum_df
+#     return pept_act_sum_df
