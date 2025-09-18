@@ -11,7 +11,7 @@ import seaborn as sns
 from matplotlib_venn import venn2, venn3
 from scipy import stats
 from sparse import SparseArray
-from .tools import ExtractPeak
+from utils.tools import ExtractPeak
 from postprocessing.ims_3d import (
     get_ref_rt_im_range,
     slice_pept_act,
