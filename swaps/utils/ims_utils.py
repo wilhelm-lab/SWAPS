@@ -5,7 +5,7 @@ import os
 import numpy as np
 import pandas as pd
 import alphatims.bruker
-from ..optimization.inference import get_apex_from_im_rt_pept_act_coo
+from optimization.inference import get_apex_from_im_rt_pept_act_coo
 
 Logger = logging.getLogger(__name__)
 
@@ -239,7 +239,7 @@ def combine_3d_act_and_sum_int(
     # pept_act_sum_all_array = np.append(pept_act_sum_all_array, pept_act_sum_array)
     apex_df = pd.DataFrame(
         apex_df_arrays,
-        columns=["mz_rank", "im_apex_index", "rt_apex_index"],
+        columns=["mz_rank", "rt_apex_index", "im_apex_index"],
         index=np.arange(apex_df_arrays.shape[0]),  # type: ignore
     )
     pept_act_sum_df = pd.DataFrame(

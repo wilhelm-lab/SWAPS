@@ -1340,6 +1340,8 @@ def process_frames_parallel(
     """
     list_batch_im_pept_act_coo_dict = Parallel(n_jobs=n_jobs)(
         delayed(process_batch_frame)(
+            batch_scan_idx=batch,
+            batch_num=batch[0],
             **kwargs,
         )
         for batch in batch_scan_indices

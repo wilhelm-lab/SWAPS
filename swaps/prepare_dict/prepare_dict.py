@@ -473,7 +473,7 @@ def dict_add_im_index(
                     maxquant_df_with_im_index[
                         "mobility_values_index_center" + idx_suffix
                     ]
-                    - (im_idx_length or 0)
+                    - im_idx_length
                 ),
             )
         )
@@ -503,7 +503,7 @@ def dict_add_im_index(
                     maxquant_df_with_im_index[
                         "mobility_values_index_center" + idx_suffix
                     ]
-                    + (im_idx_length or 0)
+                    + im_idx_length
                 ),
             )
         )
