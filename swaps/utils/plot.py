@@ -3,7 +3,7 @@ import os
 from typing import List, Set, Union, Literal
 
 import matplotlib.pyplot as plt
-from matplotlib import colormaps, patches
+from matplotlib import colormaps, patches  # type: ignore
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -1015,9 +1015,9 @@ def plot_pept_im_rt_heatmap(
         ref_rt_range=rt_range,
         ref_im_range=im_range,
     )
-    Logger.info("Reference entry: %s", reference_entry)
+    Logger.info("Reference entry: %s, im_idx_range: %s", reference_entry, im_idx_range)
     slice_pept_act_sparse, rt_idx_range, im_idx_range = slice_pept_act(
-        pept_act_sparse=act_3d[:, :, batch_corrected_pept_mz_rank],
+        pept_act_sparse=act_3d[:, :, batch_corrected_pept_mz_rank],  # type: ignore
         plot_range=plot_range,
         rt_idx_range=rt_idx_range,
         im_idx_range=im_idx_range,

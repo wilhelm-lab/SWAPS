@@ -5,8 +5,8 @@ import sparse
 from sparse import SparseArray, asnumpy, COO
 import pandas as pd
 import numpy as np
-from scipy.ndimage.filters import maximum_filter
-from scipy.ndimage.morphology import generate_binary_structure, binary_erosion
+from scipy.ndimage import maximum_filter
+from scipy.ndimage import generate_binary_structure, binary_erosion
 from scipy.spatial.distance import euclidean
 
 Logger = logging.getLogger(__name__)
@@ -270,12 +270,16 @@ def get_peak_rt_im_range(peak_apex: tuple, pept_ref_slice):
     return rt_indices, im_indices
 
 
-def get_bbox_from_mq_exp(maxquant_result_exp_row: pd.Series):
+def get_bbox_from_mq_exp(
+    maxquant_result_exp_row: pd.Series,
+    rt_start_col: str = "Calibrated retention time start",
+    rt_end_col: str = "Calibrated retention time finish",
+):
     """
     Get bounding box from MaxQuant result experiment table, in absolute values
     """
-    min_rt = maxquant_result_exp_row["Calibrated retention time start"].values[0]
-    max_rt = maxquant_result_exp_row["Calibrated retention time finish"].values[0]
+    min_rt = maxquant_result_exp_row[rt_start_col].values[0]
+    max_rt = maxquant_result_exp_row[rt_end_col].values[0]
     center_rt = (min_rt + max_rt) / 2
     rt_width = max_rt - min_rt
     center_im = maxquant_result_exp_row["1/K0"].values[0]
