@@ -40,6 +40,7 @@ torchvision = "0.18.0"
 tensorboard = "2.12.3"
 tqdm = "4.66.5"
 yacs = "0.1.8"
+mokapot = "^0.10.0"
 
 [tool.poetry.scripts]
 sbs_runner_ims = "sbs_runner_ims:main"
@@ -50,5 +51,6 @@ build-backend = "poetry.core.masonry.api"
 
 [dependency-groups]
 dev = [
-    "ipython (<9.5)"
+    "ipython (<9.5)",
+    "scikit-image (>=0.25.2,<0.26.0)"
 ]
