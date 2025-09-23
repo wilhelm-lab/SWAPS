@@ -1079,3 +1079,64 @@ def plot_pept_im_rt_heatmap(
         )
         ax.legend()
         plt.show()
+
+
+def plot_pept_act_heatmap(
+    pept_act,
+    max_rt_index,
+    max_im_index,
+    fwhm_rt_left_index=None,
+    fwhm_rt_right_index=None,
+    rt_left_index=None,
+    rt_right_index=None,
+    rt_offset=75,
+    im_offset=30,
+    title=None,
+    log_scale=False,
+):
+    heatmap_data = pept_act.todense() + 1
+    if log_scale:
+        heatmap_data = np.log10(heatmap_data)
+    ax = sns.heatmap(heatmap_data, cmap="viridis")
+    ax.set_xlabel("Ion mobility index")
+    ax.set_ylabel("MS1 frame index")
+    ax.set_ylim(
+        max(0, max_rt_index - rt_offset),
+        min(max_rt_index + rt_offset, pept_act.shape[0] - 1),
+    )
+    ax.set_xlim(
+        max(0, max_im_index - im_offset),
+        min(max_im_index + im_offset, pept_act.shape[1]),
+    )
+    plt.vlines(
+        x=max_im_index,
+        ymin=max(0, max_rt_index - rt_offset),
+        ymax=min(max_rt_index + rt_offset, pept_act.shape[0] - 1),
+        color="red",
+        linestyle="-",
+    )
+    plt.hlines(
+        y=max_rt_index,
+        xmin=max(0, max_im_index - im_offset),
+        xmax=min(max_im_index + im_offset, pept_act.shape[1]),
+        color="red",
+        linestyle="-",
+    )
+    if fwhm_rt_left_index is not None and fwhm_rt_right_index is not None:
+        plt.hlines(
+            y=[fwhm_rt_left_index, fwhm_rt_right_index],
+            xmin=max(0, max_im_index - im_offset),
+            xmax=min(max_im_index + im_offset, pept_act.shape[1]),
+            color="white",
+            linestyle="--",
+        )
+    if rt_left_index is not None and rt_right_index is not None:
+        plt.hlines(
+            y=[rt_left_index, rt_right_index],
+            xmin=max(0, max_im_index - im_offset),
+            xmax=min(max_im_index + im_offset, pept_act.shape[1]),
+            color="red",
+            linestyle="--",
+        )
+    if title is not None:
+        plt.title(title)
