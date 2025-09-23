@@ -474,7 +474,7 @@ def dict_add_im_index(
                         "mobility_values_index_center" + idx_suffix
                     ]
                     - im_idx_length
-                ),
+                ),  # type: ignore
             )
         )
         # mq_im_left_col = "mobility_values_index_left"
@@ -504,7 +504,7 @@ def dict_add_im_index(
                         "mobility_values_index_center" + idx_suffix
                     ]
                     + im_idx_length
-                ),
+                ),  # type: ignore
             )
         )
         # mq_im_right_col = "mobility_values_index_right"
