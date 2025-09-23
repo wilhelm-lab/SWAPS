@@ -4,6 +4,16 @@ import sparse
 import os
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor
+
+from scipy import ndimage as ndi
+from skimage.feature import peak_local_max
+from skimage.segmentation import watershed
+from skimage.measure import regionprops_table
+from scipy.ndimage import gaussian_filter1d
+from skimage.measure import regionprops_table
+
 import alphatims.bruker
 from optimization.inference import get_apex_from_im_rt_pept_act_coo
 
@@ -113,6 +123,8 @@ def combine_3d_act_and_sum_int(
     maxquant_result_ref: Optional[pd.DataFrame] = None,
     use_ims: bool = True,
     im_ref: str = "exp",
+    n_cpu: int = 1,
+    chunk_size: int = 500,
 ):
     """
     Combine peptide blocks of 3D activation intensity data.
@@ -122,6 +134,10 @@ def combine_3d_act_and_sum_int(
     :param remove_batch_file: bool, whether to remove batch files, default False
     :param calc_pept_act_sum_filter_by_im: bool, whether to calculate summed activation intensity filtered by IM, default False
     :param maxquant_result_ref: pd.DataFrame, MaxQuant reference data, default None, only used when calc_pept_act_sum_filter_by_im is True
+    :param use_ims: bool, whether the data contains ion mobility dimesion.
+    :param im_ref: str, which ion mobility values to use for filtering, "exp" or "ref", default "exp"
+    :param n_cpu: int, number of cpu to use for parallel processing, default 1
+    :param chunk_size: int, chunk size for peak detection and property calculation, default 500, larger values require larger memory
     """
     if calc_pept_act_sum_filter_by_im:
         assert maxquant_result_ref is not None
@@ -186,6 +202,38 @@ def combine_3d_act_and_sum_int(
                 ),
                 act_3d_all,
             )
+
+        # Peak detection and property calculation
+        # TODO: this only works when peptide_chunk == 1 for now
+        # Split mz ranks into chunks
+        num_mz_ranks = act_3d_all.shape[2]
+        chunk_size = 500
+        n_cpu = 10
+        # Compute start/end indices for each chunk
+        chunk_indices = [
+            (i, min(i + chunk_size, num_mz_ranks))
+            for i in range(0, num_mz_ranks, chunk_size)
+        ]
+
+        collected_peak_results = []
+        with ProcessPoolExecutor(max_workers=len(chunk_indices)) as executor:
+            futures = [
+                executor.submit(
+                    detect_2d_peak_and_calculate_peak_property,
+                    act_3d_all,
+                    start_idx,
+                    end_idx,
+                )
+                for start_idx, end_idx in chunk_indices
+            ]
+
+            for f in tqdm(futures, desc="Processing chunks"):
+                collected_peak_results.append(f.result())
+        peak_property = pd.concat(collected_peak_results, ignore_index=True)
+        peak_property.to_csv(
+            os.path.join(act_dir, f"peptbatch{pept_block_num}_peak_properties.csv"),
+            index=False,
+        )
 
         apex_df_pept_batch = get_apex_from_im_rt_pept_act_coo(
             im_rt_pept_act_coo=act_3d_all  # type: ignore
@@ -473,3 +521,286 @@ def _sum_3d_act_filter_by_im_fast(
 #     pept_act_sum_df["mz_rank"] = pept_act_sum_df.index
 
 #     return pept_act_sum_df
+
+
+def detect_2d_peak_with_watershed(
+    pept_act_log,
+    int_threshold=0.5,
+    min_distance=5,
+    threshold_rel=0.2,
+    on_gradient: bool = False,
+):
+    """
+    Detect peaks in a 2D image using the watershed algorithm.
+
+    Parameters:
+    - pept_act_log: 2D numpy array
+        The input image in which to detect peaks. Usually log10 transformed intensity.
+    - log_threshold: float
+        Threshold for log-transformed intensity to create the signal mask.
+    - min_distance: int
+        Minimum distance between detected peaks.
+    - threshold_rel: float
+        Minimum intensity of peaks, calculated as max(image) * threshold_rel.
+    Returns:
+    - labels: 2D numpy array
+        Labeled regions corresponding to detected peaks.
+    """
+    # 1. Create mask of signal regions
+    mask_signal = pept_act_log > int_threshold
+    if not mask_signal.any():
+        return np.empty((0, 2), dtype=int), np.zeros_like(pept_act_log, dtype=int)
+
+    # 2. Compute distance transform inside signal
+    if on_gradient:
+        dy, dx = np.gradient(pept_act_log)
+        distance = -dy
+    else:
+        distance = pept_act_log
+    # distance = ndi.distance_transform_edt(mask_signal)
+    # 3. Find local maxima in distance map
+    coordinates = peak_local_max(
+        distance,
+        min_distance=min_distance,
+        threshold_rel=threshold_rel,
+        labels=mask_signal,
+    )
+    if coordinates.size == 0:
+        return coordinates, np.zeros_like(pept_act_log, dtype=int)
+    mask = np.zeros(distance.shape, dtype=bool)
+    mask[tuple(coordinates.T)] = True
+    markers, _ = ndi.label(mask)  # type: ignore
+
+    # 4. Watershed on *negative distance*
+    labels = watershed(-distance, markers, mask=mask_signal)
+    return coordinates, labels
+
+
+def calculate_peak_property_from_coords_and_labels(
+    coords,
+    labels,
+    image_2d,
+    image_2d_log,
+    min_peak_area=10,
+    min_peak_sum_intensity=1000,
+    return_dy: bool = False,
+):
+    """
+    Calculate properties of detected peaks from coordinates of the local maximum and labels.
+
+    Parameters:
+    - coords: 2D numpy array
+        The coordinates of the local maxima.
+    - labels: 2D numpy array
+        The labeled regions corresponding to detected peaks.
+    - image_2d: 2D numpy array
+        The original image from which to calculate peak properties.
+    - image_2d_log: 2D numpy array
+        The log-transformed image from which to calculate peak properties.
+    - min_peak_area: int
+        Minimum area of peaks to be considered valid.
+    - min_peak_sum_intensity: float
+        Minimum sum intensity of peaks to be considered valid.
+
+    Returns:
+    - df: pd.DataFrame
+        A DataFrame containing peak properties, including row-based smoothness.
+    """
+    num_labels = labels.max()
+    if num_labels == 0:
+        return pd.DataFrame()
+
+    # Region properties from skimage (fast, C-based)
+    props = regionprops_table(
+        labels,
+        intensity_image=image_2d,
+        properties=(
+            "label",
+            "centroid",
+            "area",
+            "area_filled",
+            "bbox",
+            "intensity_max",
+            "intensity_mean",
+            "intensity_std",
+            "solidity",
+        ),
+    )
+    df = pd.DataFrame(props)
+
+    # Derived properties
+    df["intensity_sum"] = df["intensity_mean"] * df["area"]
+    df["intensity_cv"] = df["intensity_std"] / (df["intensity_mean"] + 1e-8)
+    df["im_length"] = df["bbox-2"] - df["bbox-0"]
+    df["rt_length"] = df["bbox-3"] - df["bbox-1"]
+
+    # Filter out small/weak peaks
+    df = df[
+        (df["area"] >= min_peak_area) & (df["intensity_sum"] >= min_peak_sum_intensity)
+    ]
+    if df.empty:
+        Logger.warning(
+            "All detected peaks are filtered out by min area %s and min intensity sum %s",
+            min_peak_area,
+            min_peak_sum_intensity,
+        )
+        return None
+    # Compute row-based smoothness
+    dy, dx = np.gradient(image_2d_log)
+    row_smoothness_df = compute_row_smoothness(
+        labels=labels,
+        dy=dy,
+        label_values=df["label"].values,
+        apply_gaussian_smoothing=False,
+    )
+
+    df = df.merge(row_smoothness_df, on="label", how="left")
+    if return_dy:
+        return df, dy
+    else:
+        return df
+
+
+def compute_row_smoothness(
+    labels,
+    dy,
+    label_values,
+    apply_gaussian_smoothing: bool = True,
+    sigma: float = 1.0,
+):
+    """
+    Compute row-wise smoothness metrics for each labeled region.
+
+    Parameters
+    ----------
+    labels : 2D numpy array
+        Labeled peak regions.
+    dy : 2D numpy array
+        Gradient along rows (RT dimension).
+    label_values : list or array-like
+        Unique label values to compute metrics for.
+    apply_gaussian_smoothing : bool, optional
+        Whether to apply Gaussian smoothing to column profiles before computing second derivatives. Default is True.
+    sigma : float, optional
+        Standard deviation for Gaussian kernel if smoothing is applied. Default is 1.0.
+
+    Returns
+    -------
+    pd.DataFrame
+        DataFrame with columns:
+        - label
+        - within_row_consistency
+        - across_row_score_smoothness
+        - row_smoothness (geometric mean)
+    """
+    records = []
+
+    for lbl in label_values:
+        mask = labels == lbl
+        rows = np.where(np.any(mask, axis=1))[0]
+        cols = np.where(np.any(mask, axis=0))[0]
+        if len(rows) == 0 or len(cols) == 0:
+            records.append(
+                {
+                    "label": lbl,
+                    "within_row_consistency": np.nan,
+                    "across_row_score_smoothness": np.nan,
+                    "row_smoothness": np.nan,
+                }
+            )
+            continue
+
+        # 1️⃣ within-row score: stability of dy along each row
+        std_vals = [np.std(dy[r, mask[r, :]]) for r in rows]
+        within_row_consistency = 1 / (1 + np.mean(std_vals))
+
+        # 2️⃣ across-row score: smooth Gaussian-like shape per column
+        col_scores = []
+        for c in cols:
+            col_mask = mask[:, c]
+            col_vals = dy[:, c][col_mask]
+            if len(col_vals) < 3:
+                continue  # need at least 3 points to compute second derivative
+            if apply_gaussian_smoothing:
+                col_vals = gaussian_filter1d(col_vals, sigma=sigma)
+            # col_vals_smooth = gaussian_filter1d(col_vals, sigma=1.0)
+            second_deriv = np.diff(col_vals, n=2)
+            col_score = 1 / (1 + np.mean(np.abs(second_deriv)))
+            col_scores.append(col_score)
+
+        if len(col_scores) == 0:
+            across_row_score_smoothness = np.nan
+        else:
+            across_row_score_smoothness = np.mean(col_scores)
+
+        # 3️⃣ geometric mean as combined score
+        geom_mean = np.sqrt(within_row_consistency * across_row_score_smoothness)
+
+        records.append(
+            {
+                "label": lbl,
+                "within_row_consistency": within_row_consistency,
+                "across_row_score_smoothness": across_row_score_smoothness,
+                "row_smoothness": geom_mean,
+            }
+        )
+
+    return pd.DataFrame(records)
+
+
+def detect_2d_peak_and_calculate_peak_property(
+    im_rt_pept_act_coo,
+    start_idx: int,
+    end_idx: int,
+    detect_kwargs=None,
+    calc_kwargs=None,
+):
+    """
+    Detect 2D peaks and calculate their properties for a range of mz ranks.
+
+    :param im_rt_pept_act_coo: 3D sparse COO array of ion intensity data.
+    :type im_rt_pept_act_coo: np.ndarray
+    :param start_idx: int
+        Starting m/z rank index to process.
+    :param end_idx: int
+        Ending m/z rank index to process.
+    :param detect_kwargs: dict, optional
+        Keyword arguments for detect_2d_peak_with_watershed.
+    :param calc_kwargs: dict, optional
+        Keyword arguments for calculate_peak_property_from_coords_and_labels.
+    :return: DataFrame containing peak properties for all detected peaks.
+    :rtype: pd.DataFrame
+    """
+    results = []
+
+    detect_kwargs = detect_kwargs or {}
+    calc_kwargs = calc_kwargs or {}
+    im_rt_pept_act_coo_dense = im_rt_pept_act_coo[
+        :, :, start_idx:end_idx
+    ].todense()  # Convert to dense for easier indexing
+    for mz_rank in range(start_idx, end_idx):
+        rel_idx = mz_rank - start_idx
+        # Extract and log-transform
+        pept_act = im_rt_pept_act_coo_dense[:, :, rel_idx]
+        pept_act_log = np.log10(1 + pept_act)
+
+        # Detect peaks with flexible kwargs
+        coordinates, labels = detect_2d_peak_with_watershed(
+            pept_act_log, **detect_kwargs
+        )
+
+        # Calculate peak properties with flexible kwargs
+        peak_properties = calculate_peak_property_from_coords_and_labels(
+            coordinates, labels, pept_act, pept_act_log, **calc_kwargs
+        )
+
+        if isinstance(peak_properties, pd.DataFrame) and not peak_properties.empty:
+            peak_properties["mz_rank"] = mz_rank
+            results.append(peak_properties)
+        else:
+            Logger.warning("No peaks detected for mz_rank %s", mz_rank)
+
+    if results:
+        return pd.concat(results, ignore_index=True)
+    else:
+        return pd.DataFrame()

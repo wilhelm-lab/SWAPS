@@ -249,6 +249,7 @@ def opt_scan_by_scan(config_path: str):
                 maxquant_result_ref=maxquant_result_ref,
                 use_ims=cfg.USE_IMS,
                 im_ref=cfg.PREPARE_DICT.IM_REF,
+                n_cpu=cfg.N_CPU,
             )
 
     if cfg.PEAK_SELECTION.ENABLE:
