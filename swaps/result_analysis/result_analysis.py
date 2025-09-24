@@ -1,8 +1,9 @@
 import logging
 import os
-from typing import List, Literal, Union
+from typing import List, Literal, Union, Optional
 
 import matplotlib.pyplot as plt
+from matplotlib.font_manager import FontProperties
 import numpy as np
 import pandas as pd
 import seaborn as sns
@@ -215,7 +216,7 @@ def plot_alphas_across_scan(
         x=EmptyScans[x],
         y=np.repeat(np.log10(zero_replace), EmptyScans.shape[0]),
         s=10,
-        marker="x",
+        marker="x",  # type: ignore
         c="black",
     )  # empty scans
     plt.xlabel(x)
@@ -234,8 +235,9 @@ class SWAPSResult:
         infer_intensity_col: str = "sum_intensity_ps",
         fdr_thres: float | None = 0.1,
         log_sum_intensity_thres: float = 1,
-        save_dir: str = None,
+        save_dir: Optional[str] = None,
         include_decoys: bool = True,
+        score_col: str = "target_decoy_score",
         **kwargs,
     ):
         """
@@ -377,11 +379,11 @@ class SWAPSResult:
 
     def plot_intensity_distr(
         self,
-        title: str = None,
+        title: Optional[str] = None,
         font_size: int = 20,
         line_width: int = 2,
         fig_size: tuple = (8, 6),
-        x_lim: tuple = None,
+        x_lim: Optional[tuple] = None,
     ):
         """
         Plot the distribution of the intensity from the experiment file and the activation columns
@@ -422,13 +424,13 @@ class SWAPSResult:
         plt.xlabel("SWAPS Inferred Intensity (Log10)")
         # Modify the legend to make it smaller
         legend = ax.get_legend()
+        assert legend is not None
         # legend.set_title(None)  # Remove the legend title if you want
-        plt.setp(
-            legend.get_texts(), fontsize=font_size * 0.9
-        )  # Make legend text 70% of the main font size
+        plt.setp(legend.get_texts(), fontsize=font_size * 0.9)
         legend.set_title(
-            "Identified By", prop={"size": font_size * 0.9}
+            "Identified By", prop=FontProperties(size=font_size * 0.9)
         )  # Make legend title same size as legend text
+
         if title is not None:
             plt.title(title)
         # Set the width of all spines (top, right, bottom, left)
@@ -562,7 +564,7 @@ class SBSResult:
         sum_cols: List[str] | None = None,
         ims: bool = False,
         other_cols: List[str] = [],
-        save_dir: str = None,
+        save_dir: Optional[str] = None,
     ) -> None:
         """
         Initialize SBSResult object and intergrate all activation data.
