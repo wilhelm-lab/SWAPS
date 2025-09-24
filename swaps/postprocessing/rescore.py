@@ -126,7 +126,8 @@ def brew_with_mokapot(
     """
     if work_dir is None:
         work_dir = os.getcwd()
-
+    else:
+        os.makedirs(work_dir, exist_ok=True)
     # Prepare mokapot input
     mokapot_input = prepare_mokapot_input(
         peptide_info_dataframe,
@@ -148,6 +149,92 @@ def brew_with_mokapot(
     )
 
     # Clean up the temporary file
-    os.remove(os.path.join(work_dir, "mokapot_input.pin"))
+    # os.remove(os.path.join(work_dir, "mokapot_input.pin"))
+    result.plot_qvalues()
+    plt.savefig(os.path.join(work_dir, "mokapot_qvalues.png"))
+    plt.close()
 
+    result.to_txt(work_dir, decoys=True)
     return result, model
+
+
+def merge_peaks_result_and_dict(peaks_result, dict_ref, ms1_scan_gap):
+    """
+    Merges the peaks result DataFrame with a reference dictionary DataFrame based on the 'peptide' column.
+    This function combines information from both DataFrames, ensuring that all relevant data is retained.
+
+    Parameters
+    ----------
+    peaks_result : pandas.DataFrame
+        DataFrame containing peak results with a 'peptide' column
+    dict_ref : pandas.DataFrame
+        Reference dictionary DataFrame containing additional information with a 'peptide' column
+    ms1_scan_gap : float
+        The gap between MS1 scans, used for calculating retention time index length
+
+    Returns
+    -------
+    pandas.DataFrame
+        Merged DataFrame containing combined information from both input DataFrames
+    """
+    dict_ref["rt_idx_length"] = (
+        dict_ref["MS1_frame_idx_right_ref"] - dict_ref["MS1_frame_idx_left_ref"]
+    )
+    dict_ref["rt_idx_length_calc"] = dict_ref["Retention length"] / ms1_scan_gap
+    peaks_result_merged_dict = pd.merge(
+        peaks_result,
+        dict_ref[
+            [
+                "mz_rank",
+                "IM_search_idx_center",
+                "MS1_frame_idx_center_ref",
+                "Decoy",
+                "Sequence",
+                "Charge",
+                "Proteins",
+                "Ion mobility length",
+                "rt_idx_length",
+                "rt_idx_length_calc",
+                "Intensity",
+                "source",
+            ]
+        ],
+        left_on="mz_rank",
+        right_on="mz_rank",
+        how="left",
+    )
+    peaks_result_merged_dict["log_Intensity_MQ"] = np.log10(
+        1 + peaks_result_merged_dict["Intensity"]
+    )
+    peaks_result_merged_dict["rt_diff"] = abs(
+        peaks_result_merged_dict["rt_apex_index"]
+        - peaks_result_merged_dict["MS1_frame_idx_center_ref"]
+    )
+    peaks_result_merged_dict["im_diff"] = abs(
+        peaks_result_merged_dict["im_apex_index"]
+        - peaks_result_merged_dict["IM_search_idx_center"]
+    )
+    peaks_result_merged_dict["im_length_diff"] = abs(
+        peaks_result_merged_dict["im_length"]
+        - peaks_result_merged_dict["Ion mobility length"]
+    )
+    peaks_result_merged_dict["rt_length_diff"] = abs(
+        peaks_result_merged_dict["rt_length"]
+        - peaks_result_merged_dict["rt_idx_length_calc"]
+    )
+    peaks_result_merged_dict["log_int_diff"] = abs(
+        np.log10(1 + peaks_result_merged_dict["intensity_sum"])
+        - peaks_result_merged_dict["log_Intensity_MQ"]
+    )
+    peaks_result_merged_dict.rename(
+        columns={
+            "bbox-0": "rt_min_index",
+            "bbox-2": "rt_max_index",
+            "bbox-1": "im_min_index",
+            "bbox-3": "im_max_index",
+            "centroid-0": "pixel_apex_rt",
+            "centroid-1": "pixel_apex_im",
+        },
+        inplace=True,
+    )
+    return peaks_result_merged_dict

@@ -18,7 +18,7 @@ torch.backends.cudnn.enabled = False
 from utils.ims_utils import (
     load_dotd_data,
     export_im_and_ms1scans,
-    combine_3d_act_and_sum_int,
+    combine_3d_act_and_detect_peak,
 )
 from utils.tools import load_mzml
 from utils.config import get_cfg_defaults
@@ -36,6 +36,7 @@ from peak_detection_2d.utils import (
 from result_analysis import result_analysis
 from prepare_dict.prepare_dict import construct_dict, get_mzrank_batch_cutoff
 from prepare_dict.search_engine_output_parser import sage_parser
+from postprocessing.rescore import merge_peaks_result_and_dict, brew_with_mokapot
 from postprocessing.fdr import (
     generate_signal_compete_pairs,
     get_isolated_decoys_from_pairs,
@@ -176,7 +177,11 @@ def opt_scan_by_scan(config_path: str):
     try:  # try and read results
         pept_act_sum_df = pd.read_csv(
             os.path.join(act_dir, "pept_act_sum.csv"), index_col=0
-        )  # TODO: pept_act_sum is not the end
+        )
+        peak_property_all_pept_batches = pd.read_csv(
+            os.path.join(act_dir, "all_pept_batches_peak_properties.csv"),
+            index_col=False,
+        )
         if cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM:
             pept_act_sum_filter_by_im_df = pd.read_csv(
                 os.path.join(act_dir, "pept_act_sum_filter_by_im.csv"), index_col=0
@@ -184,13 +189,17 @@ def opt_scan_by_scan(config_path: str):
         logging.info("Loaded pre-calculated optimization.")
     except FileNotFoundError:
         try:
-            combine_3d_act_and_sum_int(
+            peak_property_all_pept_batches = combine_3d_act_and_detect_peak(
                 n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
                 n_batch=cfg.OPTIMIZATION.N_BATCH,
                 act_dir=act_dir,
-                remove_batch_file=False,
+                remove_batch_file=True,
                 calc_pept_act_sum_filter_by_im=cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM,
                 maxquant_result_ref=maxquant_result_ref,
+                use_ims=cfg.USE_IMS,
+                im_ref=cfg.PREPARE_DICT.IM_REF,
+                n_cpu=cfg.N_CPU,
+                chunk_size=cfg.RESULT_ANALYSIS.POST_PROCESSING.PEAK_DETECTION_CHUNK_SIZE,
             )
             logging.info("Loaded pre-calculated activation")
         except FileNotFoundError:
@@ -240,7 +249,7 @@ def opt_scan_by_scan(config_path: str):
 
             logging.info("=================Post Processing==================")
             # TODO: test when pept_batch_number > 1
-            combine_3d_act_and_sum_int(
+            peak_property_all_pept_batches = combine_3d_act_and_detect_peak(
                 n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
                 n_batch=cfg.OPTIMIZATION.N_BATCH,
                 act_dir=act_dir,
@@ -250,8 +259,64 @@ def opt_scan_by_scan(config_path: str):
                 use_ims=cfg.USE_IMS,
                 im_ref=cfg.PREPARE_DICT.IM_REF,
                 n_cpu=cfg.N_CPU,
+                chunk_size=cfg.RESULT_ANALYSIS.POST_PROCESSING.PEAK_DETECTION_CHUNK_SIZE,
             )
 
+    logging.info("==================Rescoring==================")
+    ms1_scan_gap = ms1scans["Time_minute"].diff().mode()[0]
+    peaks_result_merged_dict = merge_peaks_result_and_dict(
+        peaks_result=peak_property_all_pept_batches,
+        dict_ref=maxquant_result_ref,
+        ms1_scan_gap=ms1_scan_gap,
+    )
+    result, model = brew_with_mokapot(
+        peaks_result_merged_dict,
+        feature_cols=[
+            "intensity_cv",
+            "solidity",
+            "within_row_consistency",
+            "across_row_score_smoothness",
+            # "row_smoothness",
+            "rt_diff",
+            "im_diff",
+            "im_length_diff",
+            "rt_length_diff",
+            "log_int_diff",
+        ],
+        peptide_col="Sequence",
+        protein_col="Proteins",
+        decoy_col="Decoy",
+        train_fdr=cfg.RESULT_ANALYSIS.POST_PROCESSING.MOKAPOT.TRAIN_FDR,
+        test_fdr=cfg.RESULT_ANALYSIS.POST_PROCESSING.MOKAPOT.TEST_FDR,
+        scannr_col="mz_rank",
+        work_dir=os.path.join(cfg.RESULT_PATH, "results", "mokapot"),
+    )
+
+    # merge with mokapot results
+    psms = result.confidence_estimates["psms"]
+    psms_decoy = result.decoy_confidence_estimates["psms"]
+    psms = pd.concat([psms, psms_decoy], ignore_index=True)
+    psms["peak_label"] = psms["specid"].str.split("_").str[1].astype(int)
+    peaks_result_merged_dict_merged_conf = pd.merge(
+        peaks_result_merged_dict,
+        psms[
+            ["mokapot q-value", "mokapot PEP", "mokapot score", "peak_label", "scannr"]
+        ],
+        left_on=["mz_rank", "label"],
+        right_on=["scannr", "peak_label"],
+        how="inner",
+        suffixes=("_swaps", "_mokapot"),
+    )
+    peaks_result_merged_dict_merged_conf["fdr"] = peaks_result_merged_dict_merged_conf[
+        "mokapot q-value"
+    ]
+    peaks_result_merged_dict_merged_conf.to_csv(
+        os.path.join(
+            act_dir,
+            "peaks_result_merged_dict_merged_conf.csv",
+        ),
+        index=False,
+    )
     if cfg.PEAK_SELECTION.ENABLE:
         logging.info("==================Peak Selection==================")
         if len(cfg.PEAK_SELECTION.TRAINING_DATA) == 0:
@@ -463,8 +528,10 @@ def opt_scan_by_scan(config_path: str):
             eval_dir = os.path.join(cfg.RESULT_PATH, "results", "evaluation")
         os.makedirs(eval_dir, exist_ok=True)
 
-        pept_act_sum_df = pd.read_csv(os.path.join(act_dir, "pept_act_sum.csv"))
-        infer_int_col = "pept_act_sum"
+        pept_act_sum_df = pd.read_csv(
+            os.path.join(act_dir, "peaks_result_merged_dict_merged_conf.csv")
+        )
+        infer_int_col = "intensity_sum"
         # TODO: fix im filter config
         if cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM:
             pept_act_sum_filter_by_im_df = pd.read_csv(
@@ -508,6 +575,7 @@ def opt_scan_by_scan(config_path: str):
             log_sum_intensity_thres=cfg.RESULT_ANALYSIS.LOG_SUM_INTENSITY_THRESHOLD,
             save_dir=eval_dir,
             include_decoys=cfg.PREPARE_DICT.GENERATE_DECOY,
+            score_col="mokapot score",
         )
         swaps_result.plot_intensity_corr()
         # swaps_result.plot_intensity_corr(contour=True)

@@ -259,6 +259,7 @@ class SWAPSResult:
         self.save_dir = save_dir
         self.target_decoy_score_thres = None
         self.infer_intensity_col = infer_intensity_col
+        self.score_col = score_col
         self.pept_act_sum.dropna(subset=[self.infer_intensity_col], inplace=True)
         Logger.info(
             "Drop na values in %s, Pept activation sum entries: %s",
@@ -294,7 +295,7 @@ class SWAPSResult:
                 Logger.info("Calculating FDR results after filter...")
                 self.pept_act_sum = calc_fdr_and_thres(
                     self.pept_act_sum,
-                    score_col="target_decoy_score",
+                    score_col=self.score_col,
                     filter_dict={"log_sum_intensity": [0, 100]},
                     return_plot=True,
                     save_dir=save_dir,
@@ -307,11 +308,10 @@ class SWAPSResult:
                     self.pept_act_sum.shape[0],
                 )
                 self.target_decoy_score_thres = pept_act_sum_df.loc[
-                    pept_act_sum_df["fdr"] <= self.fdr_thres, "target_decoy_score"
+                    pept_act_sum_df["fdr"] <= self.fdr_thres, self.score_col
                 ].min()
                 self.pept_act_sum = self.pept_act_sum.loc[
-                    self.pept_act_sum["target_decoy_score"]
-                    >= self.target_decoy_score_thres,
+                    self.pept_act_sum[self.score_col] >= self.target_decoy_score_thres,
                     :,
                 ]
                 Logger.info(
@@ -353,12 +353,17 @@ class SWAPSResult:
         """
         Plot the correlation between the intensity from the experiment file and the activation columns
         """
-        maxquant_exp = self.maxquant_dict.loc[
-            self.maxquant_dict["source"].isin(["exp", "both"])
-        ]
-        int_compare = pd.merge(
-            maxquant_exp, self.pept_act_sum, on="mz_rank", how="inner"
-        )
+        if "Intensity" not in self.pept_act_sum.columns:
+            maxquant_exp = self.maxquant_dict.loc[
+                self.maxquant_dict["source"].isin(["exp", "both"])
+            ]
+            int_compare = pd.merge(
+                maxquant_exp, self.pept_act_sum, on="mz_rank", how="inner"
+            )
+        else:
+            int_compare = self.pept_act_sum.loc[
+                self.pept_act_sum["source"].isin(["exp", "both"])
+            ]
         Logger.info(
             "Number of entries after merging %s and columns %s",
             int_compare.shape[0],

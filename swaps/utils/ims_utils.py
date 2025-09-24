@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from concurrent.futures import ProcessPoolExecutor
+import matplotlib.pyplot as plt
 
 from scipy import ndimage as ndi
 from skimage.feature import peak_local_max
@@ -124,7 +125,7 @@ def combine_3d_act_and_detect_peak(
     use_ims: bool = True,
     im_ref: str = "exp",
     n_cpu: int = 1,
-    chunk_size: int = 500,
+    chunk_size: int = 1000,
 ):
     """
     Combine peptide blocks of 3D activation intensity data, \
@@ -147,10 +148,12 @@ def combine_3d_act_and_detect_peak(
         assert maxquant_result_ref is not None
         maxquant_result_ref_sorted = maxquant_result_ref.copy()
         maxquant_result_ref_sorted.sort_values("mz_rank", inplace=True)
-        prev_cutoff = 0
+
     # assert n_blocks_by_pept > 1
     # pept_act_sum_all_array = np.array([])
     apex_df_arrays = None
+    prev_cutoff = 0
+    peak_property_all_pept_batches = pd.DataFrame()
     for pept_block_num in range(n_blocks_by_pept):
         try:
             act_3d_all = sparse.load_npz(
@@ -207,52 +210,57 @@ def combine_3d_act_and_detect_peak(
                 act_3d_all,
             )
 
-        # Peak detection and property calculation
-        # TODO: this only works when peptide_chunk == 1 for now
-        # Split mz ranks into chunks
-        num_mz_ranks = act_3d_all.shape[2]
-        chunk_size = 500
-        n_cpu = 10
-        # Compute start/end indices for each chunk
-        chunk_indices = [
-            (i, min(i + chunk_size, num_mz_ranks))
-            for i in range(0, num_mz_ranks, chunk_size)
-        ]
+        # -----------Peak detection and property calculation-----------
+        shape = act_3d_all.shape
+        n_pept_in_blocks = shape[2] // n_blocks_by_pept
+        cutoff = n_pept_in_blocks * (pept_block_num + 1)
+        try:
+            peak_property = pd.read_csv(
+                os.path.join(act_dir, f"peptbatch{pept_block_num}_peak_properties.csv")
+            )
+            Logger.info(
+                "Loaded existing peak properties for pept batch %s", pept_block_num
+            )
+        except FileNotFoundError:
 
-        collected_peak_results = []
-        with ProcessPoolExecutor(max_workers=len(chunk_indices)) as executor:
-            futures = [
-                executor.submit(
-                    detect_2d_peak_and_calculate_peak_property,
-                    act_3d_all,
-                    start_idx,
-                    end_idx,
-                )
-                for start_idx, end_idx in chunk_indices
+            # Split mz ranks into chunks and compute start/end indices for each chunk
+            chunk_indices = [
+                (i, min(i + chunk_size, cutoff))
+                for i in range(prev_cutoff, cutoff, chunk_size)
             ]
+            Logger.info(
+                "Processing pept batch %s from %s to %s with chunks: %s",
+                pept_block_num,
+                prev_cutoff,
+                cutoff,
+                chunk_indices,
+            )
 
-            for f in tqdm(futures, desc="Processing chunks"):
-                collected_peak_results.append(f.result())
-        peak_property = pd.concat(collected_peak_results, ignore_index=True)
-        peak_property.to_csv(
-            os.path.join(act_dir, f"peptbatch{pept_block_num}_peak_properties.csv"),
-            index=False,
+            collected_peak_results = []
+            with ProcessPoolExecutor(max_workers=n_cpu) as executor:
+                futures = [
+                    executor.submit(
+                        detect_2d_peak_and_calculate_peak_property,
+                        act_3d_all,
+                        start_idx,
+                        end_idx,
+                    )
+                    for start_idx, end_idx in chunk_indices
+                ]
+
+                for f in tqdm(futures, desc="Processing chunks"):
+                    collected_peak_results.append(f.result())
+            peak_property = pd.concat(collected_peak_results, ignore_index=True)
+            peak_property.to_csv(
+                os.path.join(act_dir, f"peptbatch{pept_block_num}_peak_properties.csv"),
+                index=False,
+            )
+        peak_property_all_pept_batches = pd.concat(
+            [peak_property_all_pept_batches, peak_property], ignore_index=True
         )
 
-        apex_df_pept_batch = get_apex_from_im_rt_pept_act_coo(
-            im_rt_pept_act_coo=act_3d_all  # type: ignore
-        )
-        if apex_df_arrays is None:
-            # initialize on first loop, matching shape & dtype
-            apex_df_arrays = np.zeros_like(apex_df_pept_batch.to_numpy())
-        apex_df_arrays += (
-            apex_df_pept_batch.to_numpy()
-        )  # shape (n_pept, 3), accumulate over blocks
         if calc_pept_act_sum_filter_by_im:
             assert maxquant_result_ref is not None
-            shape = act_3d_all.shape
-            n_pept_in_blocks = shape[2] // n_blocks_by_pept
-            cutoff = n_pept_in_blocks * (pept_block_num + 1)
 
             pept_act_sum_filter_by_im = _sum_3d_act_filter_by_im_fast(
                 im_rt_pept_act_coo_peptbatch=act_3d_all,
@@ -274,26 +282,59 @@ def combine_3d_act_and_detect_peak(
                 "pept_act_sum_filter_by_im_array sum %s",
                 pept_act_sum_filter_by_im_array.sum(),
             )
-            prev_cutoff = cutoff
 
         if remove_batch_file:
+            Logger.info("Removing batch files for pept batch %s", pept_block_num)
             for batch_num in range(n_batch):
-                os.remove(
+                if os.path.exists(
                     os.path.join(
                         act_dir,
                         f"im_rt_pept_act_coo_batch{batch_num}_peptbatch{pept_block_num}.npz",
                     )
-                )
+                ):
+                    os.remove(
+                        os.path.join(
+                            act_dir,
+                            f"im_rt_pept_act_coo_batch{batch_num}_peptbatch{pept_block_num}.npz",
+                        )
+                    )
+                else:
+                    Logger.warning(
+                        "Batch file for batch %s and pept batch %s does not exist, skipping removal.",
+                        batch_num,
+                        pept_block_num,
+                    )
+                    continue
+
+        prev_cutoff = cutoff
+        Logger.info("Finished processing pept batch %s", pept_block_num)
+
+    peak_property_all_pept_batches.to_csv(
+        os.path.join(act_dir, "all_pept_batches_peak_properties.csv"), index=False
+    )
+    Logger.info(
+        "Peak property calculation done for all peptide batches. Total peaks: %s",
+        peak_property_all_pept_batches.shape[0],
+    )
+    peak_property_all_pept_batches.groupby("mz_rank").size().hist(bins=58)
+    plt.xlabel("Number of peaks detected per image")
+    plt.ylabel("Frequency")
+    xlim_right = plt.xlim()[1] * 0.6
+    ylim_top = plt.ylim()[1] * 0.8
+    plt.text(
+        xlim_right,
+        ylim_top,
+        f"n_peaks={len(peak_property_all_pept_batches)}\nn_images={peak_property_all_pept_batches['mz_rank'].nunique()}",
+        fontsize=12,
+    )
+    plt.savefig(os.path.join(act_dir, "peak_count_per_image_histogram.png"), dpi=300)
+    plt.close()
+
+    # Peak activation sum without filtering
     pept_act_sum_array = sparse.asnumpy(pept_act_sum_all)
     Logger.info("pept_act_sum_all sum %s", pept_act_sum_array.shape)
     del pept_act_sum_all
 
-    # pept_act_sum_all_array = np.append(pept_act_sum_all_array, pept_act_sum_array)
-    apex_df = pd.DataFrame(
-        apex_df_arrays,
-        columns=["mz_rank", "rt_apex_index", "im_apex_index"],
-        index=np.arange(apex_df_arrays.shape[0]),  # type: ignore
-    )
     pept_act_sum_df = pd.DataFrame(
         pept_act_sum_array[:],
         columns=["pept_act_sum"],
@@ -301,10 +342,6 @@ def combine_3d_act_and_detect_peak(
     )
     pept_act_sum_df["mz_rank"] = pept_act_sum_df.index
     pept_act_sum_df.to_csv(os.path.join(act_dir, "pept_act_sum.csv"), index=False)
-    pept_act_df = pept_act_sum_df.merge(
-        apex_df, on="mz_rank", how="left", validate="one_to_one"
-    )
-    pept_act_df.to_csv(os.path.join(act_dir, "pept_act_sum_with_apex.csv"), index=False)
 
     if use_ims and calc_pept_act_sum_filter_by_im:
         pept_act_sum_filter_by_im_df = pd.DataFrame(
@@ -321,7 +358,7 @@ def combine_3d_act_and_detect_peak(
             os.path.join(act_dir, "pept_act_sum_filter_by_im.csv"), index=False
         )
 
-        return pept_act_sum_filter_by_im_df  # TODO: remove later
+    return peak_property_all_pept_batches
 
 
 def _sum_3d_act_filter_by_im_fast(
