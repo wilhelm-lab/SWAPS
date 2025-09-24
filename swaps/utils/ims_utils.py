@@ -114,7 +114,7 @@ def export_im_and_ms1scans(
 #     pept_act_sum_df.to_csv(os.path.join(act_dir, "pept_act_sum.csv"))
 
 
-def combine_3d_act_and_sum_int(
+def combine_3d_act_and_detect_peak(
     n_blocks_by_pept: int,
     n_batch: int,
     act_dir: str,
@@ -127,7 +127,9 @@ def combine_3d_act_and_sum_int(
     chunk_size: int = 500,
 ):
     """
-    Combine peptide blocks of 3D activation intensity data.
+    Combine peptide blocks of 3D activation intensity data, \
+        do peak detection and calculate peak properties
+
     :param n_blocks_by_pept: int, number of blocks by peptide
     :param n_batch: int, number of batch by ms1 scans
     :param act_dir: str, path to the directory of activation intensity data
@@ -138,6 +140,8 @@ def combine_3d_act_and_sum_int(
     :param im_ref: str, which ion mobility values to use for filtering, "exp" or "ref", default "exp"
     :param n_cpu: int, number of cpu to use for parallel processing, default 1
     :param chunk_size: int, chunk size for peak detection and property calculation, default 500, larger values require larger memory
+
+    :return: peak_property_all_pept_batches: pd.DataFrame, peak properties for all peptide batches
     """
     if calc_pept_act_sum_filter_by_im:
         assert maxquant_result_ref is not None
@@ -576,8 +580,7 @@ def detect_2d_peak_with_watershed(
     return coordinates, labels
 
 
-def calculate_peak_property_from_coords_and_labels(
-    coords,
+def calculate_peak_property_from_labels_and_image(
     labels,
     image_2d,
     image_2d_log,
@@ -589,8 +592,6 @@ def calculate_peak_property_from_coords_and_labels(
     Calculate properties of detected peaks from coordinates of the local maximum and labels.
 
     Parameters:
-    - coords: 2D numpy array
-        The coordinates of the local maxima.
     - labels: 2D numpy array
         The labeled regions corresponding to detected peaks.
     - image_2d: 2D numpy array
@@ -608,7 +609,8 @@ def calculate_peak_property_from_coords_and_labels(
     """
     num_labels = labels.max()
     if num_labels == 0:
-        return pd.DataFrame()
+        Logger.info("No peaks detected after watershed.")
+        return None
 
     # Region properties from skimage (fast, C-based)
     props = regionprops_table(
@@ -639,17 +641,20 @@ def calculate_peak_property_from_coords_and_labels(
         (df["area"] >= min_peak_area) & (df["intensity_sum"] >= min_peak_sum_intensity)
     ]
     if df.empty:
-        Logger.warning(
+        Logger.info(
             "All detected peaks are filtered out by min area %s and min intensity sum %s",
             min_peak_area,
             min_peak_sum_intensity,
         )
         return None
+    # Logger.info("Unique label values after filtering: %s", df["label"].values)
+
     # Compute row-based smoothness
     dy, dx = np.gradient(image_2d_log)
-    row_smoothness_df = compute_row_smoothness(
+    row_smoothness_df = compute_row_smoothness_and_apex_index(
         labels=labels,
         dy=dy,
+        pept_act=image_2d,
         label_values=df["label"].values,
         apply_gaussian_smoothing=False,
     )
@@ -796,11 +801,23 @@ def detect_2d_peak_and_calculate_peak_property(
 
         if isinstance(peak_properties, pd.DataFrame) and not peak_properties.empty:
             peak_properties["mz_rank"] = mz_rank
-            results.append(peak_properties)
+            all_peak_properties_in_chunk.append(peak_properties)
         else:
-            Logger.warning("No peaks detected for mz_rank %s", mz_rank)
+            Logger.info("No peaks detected for mz_rank %s", mz_rank)
+            continue
 
-    if results:
-        return pd.concat(results, ignore_index=True)
+    if len(all_peak_properties_in_chunk) > 1:
+        all_peak_properties_in_chunk_df = pd.concat(
+            all_peak_properties_in_chunk, ignore_index=True
+        )
+        Logger.info(
+            "Returning %s images/mzrank with %s peaks in chunk %s - %s",
+            len(all_peak_properties_in_chunk),
+            all_peak_properties_in_chunk_df.shape[0],
+            start_idx,
+            end_idx,
+        )
+        return all_peak_properties_in_chunk_df
     else:
-        return pd.DataFrame()
+        Logger.warning("No peaks returned in chunk %s - %s", start_idx, end_idx)
+        return None
