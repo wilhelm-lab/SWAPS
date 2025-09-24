@@ -666,9 +666,10 @@ def calculate_peak_property_from_labels_and_image(
         return df
 
 
-def compute_row_smoothness(
+def compute_row_smoothness_and_apex_index(
     labels,
     dy,
+    pept_act,
     label_values,
     apply_gaussian_smoothing: bool = True,
     sigma: float = 1.0,
@@ -714,7 +715,8 @@ def compute_row_smoothness(
                 }
             )
             continue
-
+        rt_apex = rows[np.argmax(pept_act[rows, :][:, cols].sum(axis=1))]
+        im_apex = cols[np.argmax(pept_act[:, cols][rows, :].sum(axis=0))]
         # 1️⃣ within-row score: stability of dy along each row
         std_vals = [np.std(dy[r, mask[r, :]]) for r in rows]
         within_row_consistency = 1 / (1 + np.mean(std_vals))
@@ -747,6 +749,8 @@ def compute_row_smoothness(
                 "within_row_consistency": within_row_consistency,
                 "across_row_score_smoothness": across_row_score_smoothness,
                 "row_smoothness": geom_mean,
+                "rt_apex_index": rt_apex,
+                "im_apex_index": im_apex,
             }
         )
 
@@ -776,13 +780,13 @@ def detect_2d_peak_and_calculate_peak_property(
     :return: DataFrame containing peak properties for all detected peaks.
     :rtype: pd.DataFrame
     """
-    results = []
+    all_peak_properties_in_chunk = []
 
     detect_kwargs = detect_kwargs or {}
     calc_kwargs = calc_kwargs or {}
-    im_rt_pept_act_coo_dense = im_rt_pept_act_coo[
-        :, :, start_idx:end_idx
-    ].todense()  # Convert to dense for easier indexing
+    im_rt_pept_act_coo_dense = np.atleast_3d(
+        im_rt_pept_act_coo[:, :, start_idx:end_idx].todense()
+    )  # Convert to dense for easier indexing
     for mz_rank in range(start_idx, end_idx):
         rel_idx = mz_rank - start_idx
         # Extract and log-transform
@@ -795,8 +799,8 @@ def detect_2d_peak_and_calculate_peak_property(
         )
 
         # Calculate peak properties with flexible kwargs
-        peak_properties = calculate_peak_property_from_coords_and_labels(
-            coordinates, labels, pept_act, pept_act_log, **calc_kwargs
+        peak_properties = calculate_peak_property_from_labels_and_image(
+            labels, pept_act, pept_act_log, **calc_kwargs
         )
 
         if isinstance(peak_properties, pd.DataFrame) and not peak_properties.empty:
