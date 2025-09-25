@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
 from scipy import spatial
-from scipy.sparse import coo_matrix
+from sparse import COO
 from scipy.signal import find_peaks
 from sklearn.decomposition import sparse_encode
 from math import floor
@@ -326,7 +326,6 @@ def process_one_frame(
                 use_ims=False,
             )
 
-            assert frame_array.shape[1] == candidate_array.shape[1]
             Logger.debug("Start optimization with sparse encoding.")
 
             im_pept_act = sparse_encode_divide_and_conquer_with_residual_stats(
@@ -424,7 +423,6 @@ def process_one_frame_ims(
                 use_ims=True,
             )
 
-            assert frame_array.shape[1] == candidate_array.shape[1]
             Logger.debug(
                 "Finished preparing sparse matrix. Start optimization with sparse encoding."
             )
@@ -708,24 +706,29 @@ def _prepare_sparse_matrices(
     use_ims: bool = True,
     mobility_values: Optional[pd.DataFrame] = None,
 ):
-    # prepare arrays from sparse matrices
+    # --- Candidate arrays ---
     candidate_id = np.repeat(
-        candidate_precursor_by_rt.mz_rank.values, candidate_precursor_by_rt.mz_length
+        candidate_precursor_by_rt.mz_rank.values,
+        candidate_precursor_by_rt.mz_length.values,
     )
     candidate_mz = np.round(
-        np.array(list(itertools.chain(*candidate_precursor_by_rt.IsoMZ.values))),
+        np.concatenate(candidate_precursor_by_rt.IsoMZ.values),
         decimals=mz_bin_digits,
     )
-    candidate_abundance = np.array(
-        list(itertools.chain(*candidate_precursor_by_rt.IsoAbundance.values))
+    candidate_abundance = np.concatenate(candidate_precursor_by_rt.IsoAbundance.values)
+    Logger.debug(
+        "Candidate array shapes for id, mz and abundance: %s %s %s",
+        candidate_id.shape,
+        candidate_mz.shape,
+        candidate_abundance.shape,
     )
-
     candidate_id_index = np.searchsorted(all_id, candidate_id)
+
     if use_ims:
         frame_mz = np.round(frame_data["mz_values"], decimals=mz_bin_digits)
     else:
         frame_mz = np.round(frame_data["mzarray"].values[0], decimals=mz_bin_digits)
-    all_mz = np.sort(np.array(list(set(frame_mz).union(set(candidate_mz)))))
+    all_mz = np.union1d(frame_mz, candidate_mz)
     Logger.debug(
         "Number of mz values in candidate, frame and joint:%s, %s, %s",
         len(set(candidate_mz)),
@@ -734,17 +737,54 @@ def _prepare_sparse_matrices(
     )
     candidate_mz_index = np.searchsorted(all_mz, candidate_mz)
     frame_mz_index = np.searchsorted(all_mz, frame_mz)
+
+    # prepare arrays from sparse matrices
+    min_mz_index = max(candidate_mz_index.min(), frame_mz_index.min())
+    max_mz_index = min(candidate_mz_index.max(), frame_mz_index.max())
+    Logger.debug("min and max mz index: %s %s", min_mz_index, max_mz_index)
+
+    # make sure candidate mz index is not out of range of observed mz in frame
+    mask = (candidate_mz_index >= min_mz_index) & (candidate_mz_index <= max_mz_index)
+    candidate_mz_index_filtered = candidate_mz_index[mask]
+    candidate_abundance_filtered = candidate_abundance[mask]
+    candidate_id_index_filtered = candidate_id_index[mask]
+    Logger.debug(
+        "Shape of mask, candidate mz index, abundance and id index: %s, %s, %s, %s, sum of mask %s",
+        mask.shape,
+        candidate_mz_index_filtered.shape,
+        candidate_abundance_filtered.shape,
+        candidate_id_index_filtered.shape,
+        sum(mask),
+    )
+
+    # Now build compact column set + mapping
+    unique_idx, mapped_idx = np.unique(candidate_mz_index_filtered, return_inverse=True)
+
+    # Allocate dense matrix directly
+    candidate_array = np.zeros(
+        (all_id.size, unique_idx.size), dtype=candidate_abundance.dtype
+    )
+
+    # Fill with filtered data
+    candidate_array[candidate_id_index_filtered, mapped_idx] = (
+        candidate_abundance_filtered
+    )
+
+    Logger.debug(
+        "Number of mz values in filtered candidate index: %s",
+        len(candidate_mz_index_filtered),
+    )
     if use_ims:
         assert mobility_values is not None
         all_im = np.sort(mobility_values["mobility_values"])
         frame_im_index = np.searchsorted(all_im, frame_data["mobility_values"])
 
-        frame_coo = coo_matrix(
+        frame_coo = COO(
             (frame_data["intensity_values"], (frame_im_index, frame_mz_index)),
         )
     else:
         intarray = frame_data["intarray"].values[0]
-        frame_coo = coo_matrix(
+        frame_coo = COO(
             (
                 intarray,
                 (
@@ -754,31 +794,17 @@ def _prepare_sparse_matrices(
             ),
             shape=(1, len(all_mz)),
         )
-    candidate_coo = coo_matrix(
-        (candidate_abundance, (candidate_id_index, candidate_mz_index))
-    )
-    # prepare arrays from sparse matrices
-    min_mz_index = max(candidate_mz_index.min(), frame_mz_index.min())
-    max_mz_index = min(candidate_mz_index.max(), frame_mz_index.max())
-    Logger.debug("min and max mz index: %s %s", min_mz_index, max_mz_index)
 
-    # make sure candidate mz index is not out of range of observed mz in frame
-    candidate_mz_index_filtered = list(
-        set(
-            candidate_mz_index[
-                (min_mz_index <= candidate_mz_index)
-                & (candidate_mz_index <= max_mz_index)
-            ]
-        )
-    )
-    Logger.debug(
-        "Number of mz values in filtered candidate index: %s",
-        len(candidate_mz_index_filtered),
-    )
     # only candidate mz is considered
-    frame_array = frame_coo.toarray()[:, candidate_mz_index_filtered]
-    candidate_array = candidate_coo.toarray()[:, candidate_mz_index_filtered]
-
+    frame_array = frame_coo.todense()[
+        :, np.unique(candidate_mz_index_filtered).tolist()
+    ]
+    assert (
+        frame_array.shape[1] == candidate_array.shape[1]
+    ), "m/z dimension of frame array and candidate array mismatch %s, %s" % (
+        frame_array.shape[1],
+        candidate_array.shape[1],
+    )
     return (
         frame_array,
         candidate_array,
