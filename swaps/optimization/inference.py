@@ -377,9 +377,9 @@ def process_one_frame_ims(
     mobility_values: pd.DataFrame,
     delta_mobility_thres: int = 100,
     mz_bin_digits: int = 3,
-    process_in_blocks: bool = True,
     extract_im_peak: bool = True,
     debug: bool = False,
+    return_res_stats: bool = False,
     **kwargs,
 ):
     """Process one frame data with IMS dimension with sparse encoding and peak selection."""
@@ -391,9 +391,11 @@ def process_one_frame_ims(
             "precursor_indices": [0],
         }
     ]
-    Logger.debug("Frame data shape: %s", frame_data.shape[0])
+    Logger.debug("Finished data indexing, frame data shape: %s", frame_data.shape[0])
     peaks_df = pd.DataFrame()
     im_pept_act_coo_dict = {}
+    im_pept_res_coo_dict = {}
+
     if frame_data.shape[0] > 0:
         scan_time = np.round(ms1scans.loc[ms1_frame_idx, "Time_minute"], decimals=4)  # type: ignore[arg-type]
         candidate_precursor_by_rt = maxquant_result_ref_with_im_index_sortmz.loc[
@@ -401,7 +403,7 @@ def process_one_frame_ims(
             & (maxquant_result_ref_with_im_index_sortmz["RT_search_right"] >= scan_time)
         ]
         Logger.info(
-            "Number of candidates by RT in frame %s: %s",
+            "Finished filtering candidate precursors. Number of candidates by RT in frame %s: %s",
             ms1_frame_idx,
             candidate_precursor_by_rt.shape[0],
         )
@@ -423,22 +425,28 @@ def process_one_frame_ims(
             )
 
             assert frame_array.shape[1] == candidate_array.shape[1]
-            Logger.debug("Start optimization with sparse encoding.")
-            if candidate_precursor_by_rt.shape[0] > 6000 and process_in_blocks:
-                im_pept_act = sparse_encode_divide_and_conquer(
-                    frame_array, candidate_array
+            Logger.debug(
+                "Finished preparing sparse matrix. Start optimization with sparse encoding."
+            )
+
+            deconv_results = sparse_encode_divide_and_conquer_with_residual_stats(
+                frame_array, candidate_array, return_act_res=return_res_stats
+            )
+            Logger.debug("Finished sparse encoding.")
+            if return_res_stats:
+                im_pept_act, im_pept_res = deconv_results  # type: ignore[assignment]
+                im_pept_res_coo_dict["data"] = im_pept_res[np.nonzero(im_pept_res)]  # type: ignore[assignment]
+                im_pept_res_coo_dict["coord_frame_indices"] = np.repeat(
+                    ms1_frame_idx, len(im_pept_res_coo_dict["data"])
                 )
+                im_pept_res_coo_dict["coord_im_indices"] = np.nonzero(im_pept_res)[0]  # type: ignore[assignment]
+                im_pept_res_coo_dict["coord_pept_indices"] = all_frame_pept_idx[
+                    np.nonzero(im_pept_res)[1]  # type: ignore[assignment]
+                ]
+                Logger.debug("Finished preparing residual COO dict.")
             else:
-                # optimization with sparse encoding
-                im_pept_act = sparse_encode(
-                    frame_array,
-                    candidate_array,
-                    algorithm="threshold",
-                    alpha=0,
-                    positive=True,
-                    # n_jobs=4,
-                )
-            Logger.debug("Start peak selection.")
+                im_pept_act = deconv_results  # type: ignore[assignment]
+            assert isinstance(im_pept_act, np.ndarray)
             if extract_im_peak:
                 peaks_df = _select_im_peak_from_frame_act(
                     im_pept_act=im_pept_act,
@@ -466,7 +474,7 @@ def process_one_frame_ims(
     if debug:
         return (
             peaks_df,
-            im_pept_act_coo,
+            im_pept_act_coo_dict,
             frame_array,
             candidate_array,
             im_pept_act,
@@ -474,13 +482,13 @@ def process_one_frame_ims(
             all_frame_pept_idx,
         )
     else:
-        return (
-            peaks_df,
-            im_pept_act_coo,
-            # candidate_array,
-            # frame_array,
-            # im_pept_act,
-        )  # TODO: remove candidate array
+        if return_res_stats:
+            return (peaks_df, im_pept_act_coo_dict, im_pept_res_coo_dict)
+        else:
+            return (
+                peaks_df,
+                im_pept_act_coo_dict,
+            )
 
 
 def make_coo_from_dict(data_dict, shape: tuple, cutoff: List[int]):
