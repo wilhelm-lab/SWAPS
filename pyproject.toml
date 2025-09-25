@@ -52,5 +52,6 @@ build-backend = "poetry.core.masonry.api"
 [dependency-groups]
 dev = [
     "ipython (<9.5)",
-    "scikit-image (>=0.25.2,<0.26.0)"
+    "scikit-image (>=0.25.2,<0.26.0)",
+    "line-profiler (>=5.0.0,<6.0.0)"
 ]
