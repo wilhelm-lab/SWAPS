@@ -12,11 +12,6 @@ from scipy import spatial
 from scipy.sparse import coo_matrix
 from scipy.signal import find_peaks
 from sklearn.decomposition import sparse_encode
-from sklearn.metrics import (
-    classification_report,
-    confusion_matrix,
-    mean_squared_error,
-)
 from math import floor
 from functools import wraps
 
@@ -35,510 +30,155 @@ import sparse
 Logger = logging.getLogger(__name__)
 
 
-def requires_infer(func):
-    """Decorator to ensure `self.infer` is available before calling method."""
+def sparse_encode_divide_and_conquer_with_residual_stats(
+    frame_array, candidate_array, return_act_res=False, target_block_size=6000
+):
+    """
+    Perform sparse encoding using divide-and-conquer on candidate blocks.
+    Optionally compute residual statistics in measurement and candidate spaces.
 
-    @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        if getattr(self, "infer", None) is None:
-            raise RuntimeError(
-                "Inference result 'infer' is not set. Call 'optimize' or 'optimizeAlphas' first."
-            )
-        return func(self, *args, **kwargs)
+    Parameters
+    ----------
+    frame_array : np.ndarray
+        Measurement data (m_z, im)
+    candidate_array : np.ndarray
+        Candidate dictionary (m_z, pept)
+    return_act_res : bool, optional
+        Whether to compute activation residuals (per candidate and im)
+    target_block_size : int, optional
+        Target number of rows per candidate block
 
-    return wrapper
-
-
-def requires_act(func):
-    """Decorator to ensure `self.act` is available before calling method."""
-
-    @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        if getattr(self, "act", None) is None:
-            raise RuntimeError(
-                "Activation 'act' is not set. Call 'optimize' or 'optimizeAlphas' first."
-            )
-        return func(self, *args, **kwargs)
-
-    return wrapper
-
-
-# class Quant:
-#     """
-#     Joint identification and quantification of candidates for given MS1 scan
-
-#     :preprocessing: if CandidateDict and obs_data are preprocessed, if 'sqrt' \
-#         then act should be squared, and cos_dist calculation should also be \
-#             squared
-#     """
-
-#     def __init__(
-#         self,
-#         candidate_dict: pd.DataFrame,
-#         obs_data: pd.DataFrame,
-#         filtered_precursor_idx: Union[np.ndarray, list],
-#         preprocessing_method: _pp_method,
-#     ) -> None:
-#         """
-#         Initialize the Inference class.
-
-#         :param candidate_dict: DataFrame containing candidate dictionary.
-#         :type candidate_dict: pd.DataFrame
-#         :param obs_data: DataFrame containing observed data. contains mzarray_obs and intensity.
-#         :type obs_data: pd.DataFrame
-#         :param filtered_precursor_idx: Filtered precursor indices.
-#         :type filtered_precursor_idx: Union[np.ndarray, list]
-#         :param preprocessing_method: Preprocessing method to be used.
-#         :type preprocessing_method: _pp_method
-
-#         :return: None
-#         """
-#         self.filter_precursor_idx = filtered_precursor_idx
-#         self.obs_data_raw = self.obs_data = obs_data[["intensity"]].values
-#         self.obs_mz = obs_data[["mzarray_obs"]].values[:, 0]
-#         Logger.debug("obs mz (index) dimension: %s", self.obs_mz.shape)
-#         if preprocessing_method == "raw":
-#             self.dictionary = candidate_dict[filtered_precursor_idx].values
-#             self.obs_data = obs_data[["intensity"]].values  # shape (n_mzvalues, 1)
-#         elif preprocessing_method == "sqrt":
-#             self.dictionary = np.sqrt(candidate_dict[filtered_precursor_idx].values)
-#             self.obs_data = np.sqrt(
-#                 obs_data[["intensity"]].values
-#             )  # shape (n_mzvalues, 1)
-#         self.preprocessing = preprocessing_method
-#         self.alphas = []
-#         self.acts = []
-#         self.inferences = []
-#         self.nonzeros = []
-#         self.metric = []
-#         self.infer = None
-#         self.best_alpha = None
-#         self.act = None
-#         self.confusion_matrix = None
-#         self.metric_used = None
-#         self.id_result = None
-#         self.cls_report = None
-#         self.reconstruc_cos_dist = None
-
-#     def optimize(
-#         self,
-#         alpha: float,
-#         loss: _loss = "lasso",
-#         algorithm: _algo = "lasso_lars",
-#         max_iter: int = 1000,
-#         metric: _alpha_opt_metric = "RMSE",
-#     ):
-#         self.alphas.append(alpha)
-#         match loss:
-#             case "lasso":
-#                 act = sparse_encode(
-#                     X=self.obs_data.T,
-#                     dictionary=self.dictionary.T,
-#                     algorithm=algorithm,
-#                     positive=True,
-#                     alpha=alpha,
-#                     max_iter=max_iter,
-#                     verbose=50,
-#                     # n_jobs=-1
-#                 )
-#                 Logger.debug("dimension of act: %s", act.shape)
-#             case "sqrt_lasso":
-#                 sol = CustomLinearModel(
-#                     residue_loss=mean_square_root_error,
-#                     X=self.dictionary,
-#                     Y=self.obs_data,
-#                     reg_norm="l1",
-#                     reg_param=alpha,
-#                 )
-#                 sol.fit(method=algorithm)  # maxiter=max_iter,
-#                 if sol.beta is not None:
-#                     Logger.debug("dimension of sol.beta: %s", sol.beta.shape)
-#                     act = sol.beta.reshape(1, -1)
-#                     Logger.debug("dimension of act: %s", act.shape)
-#                 else:
-#                     Logger.warning("sol.beta is None, likely due to failed fit.")
-#                     act = np.array([[0]])
-#         if self.preprocessing == "raw":
-#             self.acts.append(act[0])
-#             self.infer = np.matmul(act, self.dictionary.T)
-#         elif self.preprocessing == "sqrt":
-#             self.acts.append(np.square(act[0]))
-#             self.infer = np.square(np.matmul(act[0], self.dictionary.T))
-
-#         self.inferences.append(self.infer)
-#         self.nonzeros.append(np.count_nonzero(act[0] > 1))
-
-#         self.metric_used = metric
-#         if metric == "cos_dist":
-#             self.metric.append(self.CalcCosDist())
-#         elif metric == "RMSE":
-#             self.metric.append(self.CalcRMSE())
-
-#     def optimizeAlphas(
-#         self,
-#         alphas: Union[List, np.ndarray],
-#         loss: _loss = "lasso",
-#         algorithm: _algo = "lasso_lars",
-#         criteria: _alpha_criteria = "min",
-#         metric: _alpha_opt_metric = "cos_dist",
-#         eps: Union[None, float] = None,
-#         max_iter: int = 1000,
-#         PlotTrace: bool = False,
-#         save_dir: Union[str, None] = None,
-#     ):
-#         """
-#         iterate through different alphas and algorithm,
-#         for ols, set algo = 'threshold' and alpha = 0.
-
-#         :alphas: if
-#         :algorithms:
-#         """
-
-#         if criteria == "convergence" and eps is None:
-#             eps = 0.0001
-#         if loss == "lasso":
-#             self.optimize(alpha=0, algorithm="threshold", metric=metric)
-#         else:
-#             self.optimize(
-#                 alpha=0,
-#                 loss=loss,
-#                 algorithm=algorithm,
-#                 metric=metric,
-#                 max_iter=max_iter,
-#             )
-#         if len(alphas) > 0:
-#             match criteria:
-#                 case "min":
-#                     for a in alphas:
-#                         self.optimize(
-#                             alpha=a,
-#                             loss=loss,
-#                             algorithm=algorithm,
-#                             metric=metric,
-#                             max_iter=max_iter,
-#                         )
-#                     BestAlphaIdx = int(np.array(self.metric).argmin())
-#                     self.best_alpha = self.alphas[int(BestAlphaIdx)]
-#                     Logger.info(
-#                         "Minimal distance reached at alpha = %s", self.best_alpha
-#                     )
-#                 case "convergence":
-#                     BestAlphaIdx = None
-#                     for a in alphas:
-#                         Logger.debug("Current alpha = %s", a)
-#                         self.optimize(
-#                             alpha=a,
-#                             loss=loss,
-#                             metric=metric,
-#                             algorithm=algorithm,
-#                             max_iter=max_iter,
-#                         )
-#                         Logger.debug("Alpha list %s", self.alphas)
-#                         diff = self.metric[-2] - self.metric[-1]
-#                         Logger.debug("Alpha = %s, tol = %s", a, diff)
-#                         if diff <= eps and diff > 0:
-#                             BestAlphaIdx = self.alphas.index(a)
-#                             self.best_alpha = self.alphas[BestAlphaIdx]
-#                             Logger.info(
-#                                 "Reached convergence criteria at alpha = %s",
-#                                 self.best_alpha,
-#                             )
-#                             break
-#                         if diff < 0:
-#                             BestAlphaIdx = list(alphas).index(a) - 1
-#                             self.best_alpha = self.alphas[BestAlphaIdx]
-#                             Logger.warning(
-#                                 "Increasing %s! Using previous alpha = %s as best"
-#                                 " candidate!",
-#                                 self.metric_used,
-#                                 self.best_alpha,
-#                             )
-#                             break
-#                     if BestAlphaIdx is None:
-#                         BestAlphaIdx = int(np.array(self.metric).argmin())
-#                         self.best_alpha = self.alphas[int(BestAlphaIdx)]
-#                         Logger.warning(
-#                             "Convergence not reached! Using alpha = %s with minimal"
-#                             " distance as candidate!",
-#                             self.best_alpha,
-#                         )
-#         else:
-#             BestAlphaIdx = 0
-#             self.best_alpha = self.alphas[BestAlphaIdx]
-#             Logger.info("Alpha not specified, using alpha = %s", self.best_alpha)
-#         self.infer = self.inferences[BestAlphaIdx]
-#         self.act = self.acts[BestAlphaIdx]
-
-#         if PlotTrace:  # plot trace with 2 y-axis: metric and count_nonzeors
-#             fig, ax1 = plt.subplots()
-#             ax1.set_xlabel("log10(alpha+1)")
-
-#             color = "tab:red"
-#             # ensure ylabel receives a str (self.metric_used may be None)
-#             ax1.set_ylabel(self.metric_used or "", color=color)
-#             ax1.plot(np.log10(np.array(self.alphas) + 1), self.metric, color=color)
-#             ax1.tick_params(axis="y", labelcolor=color)
-#             ax1.plot(
-#                 np.log10(self.best_alpha + 1),  # type: ignore[arg-type]
-#                 self.metric[BestAlphaIdx],
-#                 "x",
-#                 color="r",
-#             )
-#             ax2 = ax1.twinx()  # instantiate a second axes that shares the same x-axis
-
-#             color = "tab:blue"
-#             ax2.set_ylabel(
-#                 "Num of Non-zero Act.", color=color
-#             )  # we already handled the x-label with ax1
-#             ax2.plot(np.log10(np.array(self.alphas) + 1), self.nonzeros, color=color)
-#             ax2.tick_params(axis="y", labelcolor=color)
-
-#             ax1.annotate(
-#                 "N0 = " + str(self.dictionary.shape[1]),
-#                 xy=(0.1, 0.9),
-#                 xycoords="axes fraction",
-#             )
-
-#             fig.tight_layout()  # otherwise the right y-label is slightly clipped
-#             plt.show()
-
-#             if save_dir is not None:
-#                 if not os.path.exists(save_dir):
-#                     os.makedirs(save_dir)
-#                 plt.savefig(fname=os.path.join(save_dir, "alphaTrace.png"), dpi=300)
-#                 plt.close()
-#             else:
-#                 plt.show()
-
-#     def analyzeID(self, trueIDidx: List, alpha: Union[float, None] = None):
-#         if alpha is None:
-#             Logger.warning(
-#                 "Alpha not specified, using best alpha value = %s", self.best_alpha
-#             )
-#             alpha = self.best_alpha
-
-#         result_idx = self.alphas.index(alpha)
-#         inferIDidx = self.filter_precursor_idx[self.acts[result_idx] > 1]
-#         Logger.info("Number of non-zero actiavation = %s", len(inferIDidx))
-#         y_pred = [element in set(inferIDidx) for element in self.filter_precursor_idx]
-#         y_true = [element in set(trueIDidx) for element in self.filter_precursor_idx]
-#         self.confusion_matrix = confusion_matrix(
-#             y_true=y_true, y_pred=y_pred, normalize=None, labels=[True, False]
-#         )
-#         self.id_result = pd.DataFrame(
-#             {
-#                 "Candidate": self.filter_precursor_idx,
-#                 "Activation": self.acts[result_idx] > 1,
-#                 "y_pred": y_pred,
-#                 "y_true": y_true,
-#             }
-#         )
-#         self.cls_report = classification_report(
-#             y_true=y_true, y_pred=y_pred, output_dict=True
-#         )
-
-#     @requires_infer
-#     def PlotObsAndInfer(self, log_intensity: bool = False):
-#         plot_comparison(
-#             y_true=pd.Series(self.obs_data_raw.flatten()),
-#             y_pred=pd.Series(self.infer.flatten()),
-#             log_y=log_intensity,
-#         )
-
-#     @requires_act
-#     def calc_precursor_reconstruct_cos_dist(self):
-#         self.reconstruc_cos_dist = []
-#         for idx, val in enumerate(self.act):
-#             if val > 0:
-#                 mask_act = self.act.copy()
-#                 mask_act[idx] = 0
-#                 y_minus_i = np.matmul(self.dictionary, mask_act)
-#                 y_i = self.obs_data_raw.reshape(-1) - y_minus_i
-#                 iso_mz_mask = (
-#                     self.dictionary[:, idx] != 0
-#                 )  # only consider nonzero input in dict
-#                 self.reconstruc_cos_dist.append(
-#                     spatial.distance.cosine(
-#                         self.dictionary[:, idx][iso_mz_mask], y_i.flatten()[iso_mz_mask]
-#                     )
-#                 )
-#             else:
-#                 self.reconstruc_cos_dist.append(0)
-#         return self.reconstruc_cos_dist
-
-#     @requires_infer
-#     def CalcRMSE(self):
-#         return root_mean_squared_error(
-#             y_true=self.obs_data_raw.flatten(),
-#             y_pred=self.infer.flatten(),
-#             # squared=False,
-#         )
-
-#     @requires_infer
-#     def CalcCosDist(self):
-#         return spatial.distance.cosine(
-#             self.obs_data_raw.flatten(), self.infer.flatten()
-#         )
-
-#     # def CalcExplainedValues(self): TODO: specify which alpha?
-#     #     return len(self.infer_nonzero)/self.obs_data.shape[0]
-#     @requires_infer
-#     def plot_iso_pattern_and_infer(
-#         self,
-#         Maxquant_result: pd.DataFrame,
-#         precursor_id: List[int] | None = None,
-#         precursor_idx: List[int] | None = None,
-#         log_intensity: bool = False,
-#     ):
-#         plot_isopattern_and_obs(
-#             maxquant_result=Maxquant_result,
-#             infer_intensity=pd.Series(data=self.infer[0], index=self.obs_mz),
-#             lower_plot="infer",
-#             precursor_id=precursor_id,
-#             precursor_idx=precursor_idx,
-#             log_intensity=log_intensity,
-#         )
-
-#     @requires_infer
-#     def CalcExplainedInt(
-#         self,
-#     ):  # TODO: does not consider the correctness of explained peaks
-#         return self.infer.sum() / self.obs_data_raw.sum()
-
-
-def sparse_encode_divide_and_conquer(frame_array, candidate_array):
+    Returns
+    -------
+    frame_act : np.ndarray
+        Activation matrix (im, pept)
+    frame_res : np.ndarray, optional
+        Residual in candidate space (pept, im)
+    """
+    # --- Slice candidate array into blocks (rows = m/z) ---
     candidate_coo_blocks, col_start, col_end = slice_candidate_blocks_by_pept(
-        candidate_array
+        candidate_array, target_block_size=target_block_size
     )
-    # frame_coo_blocks = slice_frame_data_blocks(frame_array, col_start, col_end)
-    act = []
+
+    im = frame_array.shape[0]  # im, m_z
+    pept = candidate_array.shape[0]  # pept, m_z
+
+    # Preallocate outputs
+    frame_act = np.zeros((im, pept), dtype=np.float32)
+    Logger.debug("Frame activation shape: %s", frame_act.shape)
+    reconstruction = np.zeros_like(frame_array, dtype=np.float32)
+
+    # Precompute offsets for placing peptide activations
+    block_sizes = [cb.shape[1] for cb in candidate_coo_blocks]
+    col_offsets = np.cumsum([0] + block_sizes[:-1])
+
+    # --- Encoding loop ---
     for idx, candidate_block in enumerate(candidate_coo_blocks):
-        # Logger.debug("frame and candiate shape %s %s", frame_array.shape, candidate.shape)
+        start, end = col_start[idx], col_end[idx]  # m/z row slice for this block
+        frame_block = frame_array[:, start:end]  # (m_z_block, im)
+        Logger.debug(
+            "Frame block shape: %s, candidate block shape: %s",
+            frame_block.shape,
+            candidate_block.shape,
+        )
+        # sparse_encode expects: frame_block (m_z_block, im), candidate_block (m_z_block, pept_block)
         im_pept_act = sparse_encode(
-            frame_array[:, col_start[idx] : col_end[idx]],
+            frame_block,
             candidate_block,
             algorithm="threshold",
             alpha=0,
             positive=True,
-            # n_jobs=4,
+        )  # returns (im, pept_block)
+        Logger.debug("im_pept_act shape: %s", im_pept_act.shape)
+        # Place activations in correct columns
+        col_offset = col_offsets[idx]
+        Logger.debug(
+            "Processing block %s: m/z rows %s-%s, col offset %s",
+            idx,
+            start,
+            end,
+            col_offset,
         )
-        Logger.debug("act shape %s", im_pept_act.shape)
-        act.append(im_pept_act)
-    frame_act = np.concatenate(act, axis=1)
-    assert frame_act.shape[1] == candidate_array.shape[0]
-    return frame_act
+        frame_act[:, col_offset : col_offset + candidate_block.shape[1]] += im_pept_act
+
+        if return_act_res:
+            # Add reconstruction contribution for residual computation
+            reconstruction[start:end, :] += im_pept_act @ candidate_block
+    Logger.debug("frame_act non-zero count: %s", np.count_nonzero(frame_act))
+    if return_act_res:
+        # --- Measurement-space residual ---
+        residual_im_mz = frame_array - reconstruction  # (im, m_z)
+
+        # # --- Candidate-space residual stats ---
+
+        # Mean residual per peptide
+        frame_res = (
+            candidate_array > 0
+        ) @ residual_im_mz.T  # (pept, im) same dim as frame_act.T
+        return frame_act, frame_res
+
+    else:
+        return frame_act
 
 
-def slice_candidate_blocks_by_pept(matrix):
-    # slice candidate block by not splitting up isotope envlopes
-    if matrix.shape[0] > 6000 and matrix.shape[0] < 8000:
-        Logger.info("Divide matrix into 2 blocks.")
-        row_cut_indices = [matrix.shape[0] // 2]
-    elif matrix.shape[0] >= 8000 and matrix.shape[0] < 12000:
-        Logger.info("Divide matrix into 4 blocks.")
-        row_cut_indices = [
-            floor(matrix.shape[0] * 0.35),
-            floor(matrix.shape[0] * 0.6),
-            floor(matrix.shape[0] * 0.85),
-            # floor(matrix.shape[0] * 0.3),
-        ]
-    elif matrix.shape[0] >= 12000 and matrix.shape[0] < 16000:
-        Logger.info("Divide matrix into 6 blocks.")
-        row_cut_indices = [
-            floor(matrix.shape[0] * 0.2),
-            floor(matrix.shape[0] * 0.4),
-            floor(matrix.shape[0] * 0.6),
-            floor(matrix.shape[0] * 0.8),
-            floor(matrix.shape[0] * 0.9),
-        ]
-    elif matrix.shape[0] >= 16000 and matrix.shape[0] < 24000:
-        Logger.info("Divide matrix into 8 blocks.")
-        row_cut_indices = [
-            floor(matrix.shape[0] * 0.2),
-            floor(matrix.shape[0] * 0.4),
-            floor(matrix.shape[0] * 0.5),
-            floor(matrix.shape[0] * 0.6),
-            floor(matrix.shape[0] * 0.7),
-            floor(matrix.shape[0] * 0.8),
-            floor(matrix.shape[0] * 0.9),
-        ]
-    elif matrix.shape[0] >= 24000 and matrix.shape[0] < 30000:
-        Logger.info("Divide matrix into 10 blocks.")
-        row_cut_indices = [
-            floor(matrix.shape[0] * 0.1),
-            floor(matrix.shape[0] * 0.2),
-            floor(matrix.shape[0] * 0.3),
-            floor(matrix.shape[0] * 0.4),
-            floor(matrix.shape[0] * 0.5),
-            floor(matrix.shape[0] * 0.6),
-            floor(matrix.shape[0] * 0.7),
-            floor(matrix.shape[0] * 0.8),
-            floor(matrix.shape[0] * 0.9),
-        ]
-    elif matrix.shape[0] >= 30000:
-        Logger.info("Divide matrix into 20 blocks.")
-        row_cut_indices = [
-            floor(matrix.shape[0] * 0.05),
-            floor(matrix.shape[0] * 0.1),
-            floor(matrix.shape[0] * 0.15),
-            floor(matrix.shape[0] * 0.2),
-            floor(matrix.shape[0] * 0.25),
-            floor(matrix.shape[0] * 0.3),
-            floor(matrix.shape[0] * 0.35),
-            floor(matrix.shape[0] * 0.4),
-            floor(matrix.shape[0] * 0.45),
-            floor(matrix.shape[0] * 0.5),
-            floor(matrix.shape[0] * 0.55),
-            floor(matrix.shape[0] * 0.6),
-            floor(matrix.shape[0] * 0.65),
-            floor(matrix.shape[0] * 0.7),
-            floor(matrix.shape[0] * 0.75),
-            floor(matrix.shape[0] * 0.8),
-            floor(matrix.shape[0] * 0.85),
-            floor(matrix.shape[0] * 0.9),
-            floor(matrix.shape[0] * 0.95),
-        ]
+def _decide_row_cuts(n_rows, target_block_size=6000):
+    """
+    Decide row cut indices intelligently based on target block size.
+    Tries to split evenly if leftover is small.
+    """
+    if n_rows <= target_block_size:
+        return [n_rows]  # no slicing needed
 
-    if row_cut_indices[-1] != matrix.shape[0] + 1:
-        row_cut_indices.append(matrix.shape[0] + 1)
+    num_blocks = round(n_rows / target_block_size)
+    num_blocks = max(1, num_blocks)  # ensure at least one block
+
+    block_size = n_rows / num_blocks
+    row_cut_indices = [round(block_size * (i + 1)) for i in range(num_blocks)]
+
+    # Ensure final cut exactly matches n_rows
+    row_cut_indices[-1] = n_rows
+
+    return row_cut_indices
+
+
+def slice_candidate_blocks_by_pept(matrix, target_block_size):
+    """
+    Slices candidate matrix into row blocks without splitting isotope envelopes.
+    Returns blocks, start and end column indices for each block.
+    """
+    n_rows = matrix.shape[0]
+    row_cut_indices = _decide_row_cuts(n_rows, target_block_size)
+
     blocks = []
-    prev_row_cut = 0
     col_cut_indices_start = []
     col_cut_indices_end = []
-    Logger.debug(row_cut_indices)
+
+    prev_row_cut = 0
     for row_cut_index in row_cut_indices:
-        # Logger.debug("row indices start and end %s %s", prev_row_cut, row_cut_index)
         block_rows = matrix[prev_row_cut:row_cut_index, :]
         blocks_col_sum = block_rows.sum(axis=0)
-        # get the first and last col with non-zero entries
 
         non_zero_indices = np.flatnonzero(blocks_col_sum)
-        # Logger.info("Block col sum shape %s", blocks_col_sum.shape)
-        # Find index of the first non-zero value
+
         if non_zero_indices.size > 0:
             col_cut_index_start = non_zero_indices[0]
-            # Find index of the last non-zero value
-            col_cut_index_end = non_zero_indices[-1]
-            # Logger.info(
-            #     "col cut index start and end %s %s", col_cut_index_start, col_cut_index_end
-            # )
+            col_cut_index_end = (
+                non_zero_indices[-1] + 1
+            )  # +1 because Python slicing is exclusive
             block = matrix[
-                prev_row_cut:row_cut_index, col_cut_index_start : col_cut_index_end + 1
+                prev_row_cut:row_cut_index, col_cut_index_start:col_cut_index_end
             ]
-            col_cut_indices_start.append(col_cut_index_start)
-            col_cut_indices_end.append(col_cut_index_end + 1)
         else:
-            # No non-zero columns in this row block: create an empty (0-column) block
-            # and use safe integer slice bounds so we don't attempt arithmetic with None.
-            col_cut_index_start = 0
-            col_cut_index_end = -1
+            col_cut_index_start, col_cut_index_end = 0, 0
             block = matrix[prev_row_cut:row_cut_index, 0:0]
-            col_cut_indices_start.append(0)
-            col_cut_indices_end.append(0)
+
         blocks.append(block)
+        col_cut_indices_start.append(col_cut_index_start)
+        col_cut_indices_end.append(col_cut_index_end)
+
         prev_row_cut = row_cut_index
-        Logger.info("block shape %s", block.shape)
-    assert sum([block.shape[0] for block in blocks]) == matrix.shape[0]
+
+    assert sum(block.shape[0] for block in blocks) == n_rows, "Row slicing mismatch"
     return blocks, col_cut_indices_start, col_cut_indices_end
 
 
@@ -645,7 +285,6 @@ def process_one_frame(
     maxquant_result_ref_with_im_index_sortmz: pd.DataFrame,
     return_pept_act: bool = False,
     mz_bin_digits: int = 3,
-    process_in_blocks: bool = True,
     debug: bool = False,
 ):
     """Process one frame data without IMS dimension with sparse encoding and peak selection."""
@@ -689,24 +328,16 @@ def process_one_frame(
 
             assert frame_array.shape[1] == candidate_array.shape[1]
             Logger.debug("Start optimization with sparse encoding.")
-            if candidate_precursor_by_rt.shape[0] > 6000 and process_in_blocks:
-                im_pept_act = sparse_encode_divide_and_conquer(
-                    frame_array, candidate_array
-                )
-            else:
-                # optimization with sparse encoding
-                im_pept_act = sparse_encode(
-                    frame_array,
-                    candidate_array,
-                    algorithm="threshold",
-                    alpha=0,
-                    positive=True,
-                )
+
+            im_pept_act = sparse_encode_divide_and_conquer_with_residual_stats(
+                frame_array, candidate_array
+            )  # TODO: not yet hanlding returning residues
+
             Logger.debug("Start peak selection.")
             if return_pept_act:
                 pept_act_coo = {}
                 nonzero_indices = np.nonzero(im_pept_act)
-                pept_act_coo["data"] = im_pept_act[nonzero_indices]
+                pept_act_coo["data"] = im_pept_act[nonzero_indices]  # type: ignore[assignment]
                 pept_act_coo["coord_frame_indices"] = np.repeat(
                     ms1_frame_idx, len(pept_act_coo["data"])
                 )
@@ -745,7 +376,6 @@ def process_one_frame_ims(
     maxquant_result_ref_with_im_index_sortmz: pd.DataFrame,
     mobility_values: pd.DataFrame,
     delta_mobility_thres: int = 100,
-    return_im_pept_act: bool = False,
     mz_bin_digits: int = 3,
     process_in_blocks: bool = True,
     extract_im_peak: bool = True,
@@ -763,12 +393,7 @@ def process_one_frame_ims(
     ]
     Logger.debug("Frame data shape: %s", frame_data.shape[0])
     peaks_df = pd.DataFrame()
-    im_pept_act_coo = {
-        "coord_frame_indices": [],
-        "coord_im_indices": [],
-        "coord_pept_indices": [],
-        "data": [],
-    }
+    im_pept_act_coo_dict = {}
     if frame_data.shape[0] > 0:
         scan_time = np.round(ms1scans.loc[ms1_frame_idx, "Time_minute"], decimals=4)  # type: ignore[arg-type]
         candidate_precursor_by_rt = maxquant_result_ref_with_im_index_sortmz.loc[
@@ -823,18 +448,17 @@ def process_one_frame_ims(
                     **kwargs,
                 )
                 peaks_df["frame_indices"] = ms1_frame_idx
-            Logger.debug("Scan-wise opimtization completed.")
-            if return_im_pept_act:
-                im_pept_act_coo = {}
-                nonzero_indices = np.nonzero(im_pept_act)
-                im_pept_act_coo["data"] = im_pept_act[nonzero_indices]
-                im_pept_act_coo["coord_frame_indices"] = np.repeat(
-                    ms1_frame_idx, len(im_pept_act_coo["data"])
-                )
-                im_pept_act_coo["coord_im_indices"] = nonzero_indices[0]
-                im_pept_act_coo["coord_pept_indices"] = all_frame_pept_idx[
-                    nonzero_indices[1]
-                ]
+
+            nonzero_indices = np.nonzero(im_pept_act)
+            im_pept_act_coo_dict["data"] = im_pept_act[nonzero_indices]
+            im_pept_act_coo_dict["coord_frame_indices"] = np.repeat(
+                ms1_frame_idx, len(im_pept_act_coo_dict["data"])
+            )
+            im_pept_act_coo_dict["coord_im_indices"] = nonzero_indices[0]
+            im_pept_act_coo_dict["coord_pept_indices"] = all_frame_pept_idx[
+                nonzero_indices[1]
+            ]
+            Logger.debug("Finished preparing activation COO dict.")
         else:
             Logger.info("No candidate precursor by RT from frame %s", ms1_frame_idx)
     else:
@@ -984,7 +608,6 @@ def process_batch_frame(
                 maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
                 mobility_values=mobility_values,
                 delta_mobility_thres=delta_mobility_thres,
-                return_im_pept_act=return_im_pept_act,
                 extract_im_peak=extract_im_peak,
                 debug=False,
                 **kwargs,
@@ -1312,20 +935,6 @@ def process_frames_parallel(
     n_jobs: int,
     batch_scan_indices: list,
     **kwargs,
-    # data,
-    # ms1scans: pd.DataFrame,
-    # maxquant_result_ref_with_im_index: pd.DataFrame,
-    # mobility_values: pd.DataFrame,
-    # cutoff: List[int],
-    # delta_mobility_thres: int = 100,
-    # mz_bin_digits: int = 3,
-    # process_in_blocks: bool = True,
-    # width: int = 4,
-    # save_dir: str = "",
-    # return_im_pept_act: bool = False,
-    # extract_im_peak: bool = True,
-    # use_ims: bool = True,
-    ## n_blocks_by_pept: int = 0,
 ):
     """
     Process frames in parallel by splitting frame indices into batches.

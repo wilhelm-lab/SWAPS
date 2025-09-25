@@ -16,7 +16,6 @@ from scipy.ndimage import gaussian_filter1d
 from skimage.measure import regionprops_table
 
 import alphatims.bruker
-from optimization.inference import get_apex_from_im_rt_pept_act_coo
 
 Logger = logging.getLogger(__name__)
 
