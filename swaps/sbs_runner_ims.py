@@ -88,8 +88,8 @@ def opt_scan_by_scan(config_path: str):
 
     # Restore MQ Result Dataframe, if loading was skipped
     if not maxquant_result_refs:
-        for i in range(len(cfg.DICT_PICKLE_PATHS)):
-            maxquant_result_refs.append(pd.read_pickle(cfg.DICT_PICKLE_PATHS[i]))
+        for dict_pickle_path in cfg.DICT_PICKLE_PATHS:
+            maxquant_result_refs.append(pd.read_pickle(dict_pickle_path))
 
     if len(cfg.PEAK_SELECTION.TRAINING_DATA) == 0:
         for i in range(len(cfg.RESULT_PATHS)):
@@ -103,26 +103,31 @@ def opt_scan_by_scan(config_path: str):
         random.shuffle(cfg.PEAK_SELECTION.TRAINING_DATA)
         cfg.PEAK_SELECTION.TEST_BATCH_PATH = cfg.PEAK_SELECTION.TRAINING_DATA.pop()     # ToDo For Testing later
 
-    ps_exp_dir = model_training(cfg, None)
+    # Restore activation directory paths, if loading was skipped
+    if not act_dirs:
+        for i in range(len(cfg.RESULT_PATHS)):
+            act_dirs.append(os.path.join(cfg.RESULT_PATHS[i], "results", "activation"))
 
-    # Inference
     for i in range(len(cfg.RESULT_PATHS)):
-        inference(cfg, i, cfg.PEAK_SELECTION.BEST_SEG_MODEL_PATH, cfg.PEAK_SELECTION.BEST_CLS_MODEL_PATH,
-                  maxquant_result_refs[i], f"{ps_exp_dir}/{i}")
+        # Training: During & after first iteration additional testing over all maxquant_result_ref
+        ps_exp_dir = model_training(cfg, i, maxquant_result_refs[i])
 
-    # Inference eval
-    if cfg.PREPARE_DICT.GENERATE_DECOY:
-        for i in range(len(cfg.RESULT_PATHS)):
-            inference_evaluation(cfg, i, f"{ps_exp_dir}/{i}", maxquant_result_refs[i])
+        # Inference
+        inference(
+            cfg,
+            i,
+            cfg.PEAK_SELECTION.BEST_SEG_MODEL_PATH,
+            cfg.PEAK_SELECTION.BEST_CLS_MODEL_PATH,
+            maxquant_result_refs[i],
+            ps_exp_dir
+        )
 
-    if cfg.RESULT_ANALYSIS.ENABLE:  # TODO: haven't cleaned up the code
-        # Restore activation directory paths, if loading was skipped
-        if not act_dirs:
-            for i in range(len(cfg.RESULT_PATHS)):
-                act_dirs.append(os.path.join(cfg.RESULT_PATHS[i], "results", "activation"))
+        # Inference eval
+        if cfg.PREPARE_DICT.GENERATE_DECOY:
+            inference_evaluation(cfg, i, ps_exp_dir, maxquant_result_refs[i])
 
-        for i in range(len(cfg.RESULT_PATHS)):
-            res_analysis(cfg, i, f"{ps_exp_dir}/{i}", maxquant_result_refs[i], act_dirs[i])
+        if cfg.RESULT_ANALYSIS.ENABLE:  # TODO: haven't cleaned up the code
+            res_analysis(cfg, i, ps_exp_dir, maxquant_result_refs[i], act_dirs[i])
 
 
 def dictionary_preparation(cfg, n, act_dir, name_timestamp):
@@ -138,7 +143,7 @@ def dictionary_preparation(cfg, n, act_dir, name_timestamp):
 
     if len(cfg.DICT_PICKLE_PATHS) == len(cfg.RESULT_PATHS):
         maxquant_result_ref = pd.read_pickle(filepath_or_buffer=cfg.DICT_PICKLE_PATHS[n])
-        ms1scans = pd.read_csv(os.path.join(cfg.RESULT_PATHS[i], "ms1scans.csv"))
+        ms1scans = pd.read_csv(os.path.join(cfg.RESULT_PATHS[n], "ms1scans.csv"))
         mobility_values_df = pd.read_csv(
             os.path.join(cfg.RESULT_PATHS[n], "mobility_values.csv")
         )
@@ -355,15 +360,15 @@ def prepare_training_data(cfg, i, maxquant_result_ref, name_timestamp):
     )
 
 
-def model_training(cfg, maxquant_result_ref):
+def model_training(cfg, n, maxquant_result_ref):
     if cfg.PEAK_SELECTION.EXP_DIR_NAME != "":
         ps_exp_dir = os.path.join(
-            cfg.RESULT_PATHS[0], "peak_selection", cfg.PEAK_SELECTION.EXP_DIR_NAME
+            cfg.RESULT_PATHS[n], "peak_selection", cfg.PEAK_SELECTION.EXP_DIR_NAME      # ToDo where save model
         )
     else:
         train_name_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         ps_exp_dir = os.path.join(
-            cfg.RESULT_PATHS[0], "peak_selection", "exp_" + train_name_timestamp
+            cfg.RESULT_PATHS[n], "peak_selection", "exp_" + train_name_timestamp
         )
         cfg.PEAK_SELECTION.EXP_DIR_NAME = "exp_" + train_name_timestamp
 

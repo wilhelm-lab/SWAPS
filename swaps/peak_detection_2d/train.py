@@ -725,6 +725,9 @@ def testset_eval(
         test_pred_df_full["sum_intensity"] + 1
     )
 
+    # Fill NaN with False (since if it's not in MaxQuant reference, it’s not a decoy)
+    test_pred_df_full["Decoy"] = test_pred_df_full["Decoy"].fillna(False).astype(bool)
+
     test_pred_df_full.to_csv(os.path.join(result_dir, "test_pred_df.csv"), index=False)
 
     # Plot metric distribution
