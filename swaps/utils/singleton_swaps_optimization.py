@@ -81,6 +81,9 @@ __C.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH = (
     4  # TODO: width for IM peak extraction, not used if extract_im_peak == False
 )
 __C.OPTIMIZATION.PEPTACT_SHAPE = [0, 0, 0]
+__C.OPTIMIZATION.RETURN_ACT_RES = (
+    False  # whether to return the residue sparse matrix in addition to activation
+)
 
 # peak selection
 __C.PEAK_SELECTION = ConfigurationNode()

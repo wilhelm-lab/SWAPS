@@ -114,7 +114,7 @@ def export_im_and_ms1scans(
 #     pept_act_sum_df.to_csv(os.path.join(act_dir, "pept_act_sum.csv"))
 
 
-def combine_3d_act_and_detect_peak(
+def combine_3d_act_and_detect_peak(  # TODO: integrate res coo
     n_blocks_by_pept: int,
     n_batch: int,
     act_dir: str,
@@ -620,6 +620,7 @@ def calculate_peak_property_from_labels_and_image(
     labels,
     image_2d,
     image_2d_log,
+    image_res_2d: Optional[np.ndarray] = None,
     min_peak_area=10,
     min_peak_sum_intensity=1000,
     return_dy: bool = False,
@@ -665,25 +666,41 @@ def calculate_peak_property_from_labels_and_image(
         ),
     )
     df = pd.DataFrame(props)
-
-    # Derived properties
-    df["intensity_sum"] = df["intensity_mean"] * df["area"]
-    df["intensity_cv"] = df["intensity_std"] / (df["intensity_mean"] + 1e-8)
-    df["im_length"] = df["bbox-2"] - df["bbox-0"]
-    df["rt_length"] = df["bbox-3"] - df["bbox-1"]
-
     # Filter out small/weak peaks
+    df["intensity_sum"] = df["intensity_mean"] * df["area"]
     df = df[
         (df["area"] >= min_peak_area) & (df["intensity_sum"] >= min_peak_sum_intensity)
     ]
     if df.empty:
-        Logger.info(
+        Logger.debug(
             "All detected peaks are filtered out by min area %s and min intensity sum %s",
             min_peak_area,
             min_peak_sum_intensity,
         )
         return None
+    # Derived properties
+
+    df["intensity_cv"] = df["intensity_std"] / (df["intensity_mean"] + 1e-8)
+    df["im_length"] = df["bbox-2"] - df["bbox-0"]
+    df["rt_length"] = df["bbox-3"] - df["bbox-1"]
+
     # Logger.info("Unique label values after filtering: %s", df["label"].values)
+    if image_res_2d is not None:
+        res_act_ratio = np.log1p(image_res_2d / (image_2d + 1e-6))
+        props_res = regionprops_table(
+            labels,
+            intensity_image=res_act_ratio,
+            properties=(
+                "label",
+                "intensity_max",
+                "intensity_min",
+                "intensity_mean",
+                "intensity_std",
+            ),
+        )
+        df_res = pd.DataFrame(props_res)
+        df = df.merge(df_res, on="label", how="left", suffixes=("", "_res"))
+        # df.drop(columns=["label_res"], inplace=True)
 
     # Compute row-based smoothness
     dy, dx = np.gradient(image_2d_log)

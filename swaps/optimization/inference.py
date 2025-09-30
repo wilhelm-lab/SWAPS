@@ -103,7 +103,7 @@ def sparse_encode_divide_and_conquer_with_residual_stats(
 
         if return_act_res:
             # Add reconstruction contribution for residual computation
-            reconstruction[start:end, :] += im_pept_act @ candidate_block
+            reconstruction += im_pept_act @ candidate_block
     Logger.debug("frame_act non-zero count: %s", np.count_nonzero(frame_act))
     if return_act_res:
         # --- Measurement-space residual ---
@@ -115,7 +115,10 @@ def sparse_encode_divide_and_conquer_with_residual_stats(
         frame_res = (
             candidate_array > 0
         ) @ residual_im_mz.T  # (pept, im) same dim as frame_act.T
-        return frame_act, frame_res
+        Logger.info(
+            "frame_res shape: %s; frame_act shape: %s", frame_res.shape, frame_act.shape
+        )
+        return frame_act, frame_res.T # transpose to (im, pept)
 
     else:
         return frame_act
@@ -127,6 +130,7 @@ def _decide_row_cuts(n_rows, target_block_size=6000):
     Tries to split evenly if leftover is small.
     """
     if n_rows <= target_block_size:
+        Logger.debug("No slicing needed, n_rows <= target_block_size")
         return [n_rows]  # no slicing needed
 
     num_blocks = round(n_rows / target_block_size)
@@ -394,9 +398,12 @@ def process_one_frame_ims(
         "coord_pept_indices": [],
         "data": [],
     }
-    im_pept_act_coo_dict = {}
-    im_pept_res_coo_dict = {}
-
+    im_pept_res_coo_dict = {
+        "coord_frame_indices": [],
+        "coord_im_indices": [],
+        "coord_pept_indices": [],
+        "data": [],
+    }
     if frame_data.shape[0] > 0:
         scan_time = np.round(ms1scans.loc[ms1_frame_idx, "Time_minute"], decimals=4)  # type: ignore[arg-type]
         candidate_precursor_by_rt = maxquant_result_ref_with_im_index_sortmz.loc[
@@ -430,19 +437,20 @@ def process_one_frame_ims(
             )
 
             deconv_results = sparse_encode_divide_and_conquer_with_residual_stats(
-                frame_array, candidate_array, return_act_res=return_res_stats
+                frame_array, candidate_array, return_act_res=return_res_coo_dict
             )
             Logger.debug("Finished sparse encoding.")
-            if return_res_stats:
+            if return_res_coo_dict:
                 im_pept_act, im_pept_res = deconv_results  # type: ignore[assignment]
-                im_pept_res_coo_dict["data"] = im_pept_res[np.nonzero(im_pept_res)]  # type: ignore[assignment]
+                nonzero_indices_res = np.nonzero(im_pept_res)
+                im_pept_res_coo_dict["data"] = im_pept_res[nonzero_indices_res].tolist()  # type: ignore[assignment]
                 im_pept_res_coo_dict["coord_frame_indices"] = np.repeat(
                     ms1_frame_idx, len(im_pept_res_coo_dict["data"])
-                )
-                im_pept_res_coo_dict["coord_im_indices"] = np.nonzero(im_pept_res)[0]  # type: ignore[assignment]
+                ).tolist()
+                im_pept_res_coo_dict["coord_im_indices"] = nonzero_indices_res[0].tolist()  # type: ignore[assignment]
                 im_pept_res_coo_dict["coord_pept_indices"] = all_frame_pept_idx[
-                    np.nonzero(im_pept_res)[1]  # type: ignore[assignment]
-                ]
+                    nonzero_indices_res[1]
+                ].tolist()
                 Logger.debug("Finished preparing residual COO dict.")
             else:
                 im_pept_act = deconv_results  # type: ignore[assignment]
@@ -482,7 +490,7 @@ def process_one_frame_ims(
             all_frame_pept_idx,
         )
     else:
-        if return_res_stats:
+        if return_res_coo_dict:
             return (peaks_df, im_pept_act_coo_dict, im_pept_res_coo_dict)
         else:
             return (
@@ -586,7 +594,6 @@ def process_batch_frame(
     delta_mobility_thres: int = 100,
     batch_num: int = 0,
     save_dir: str = "",
-    return_im_pept_act: bool = False,
     extract_im_peak: bool = False,
     use_ims: bool = True,
     return_res_coo_dict: bool = False,
@@ -595,6 +602,12 @@ def process_batch_frame(
     batch_peaks_df = []
     if use_ims:
         batch_im_rt_pept_act_coo_dict = {
+            "coord_frame_indices": [],
+            "coord_im_indices": [],
+            "coord_pept_indices": [],
+            "data": [],
+        }
+        batch_im_rt_pept_res_coo_dict = {
             "coord_frame_indices": [],
             "coord_im_indices": [],
             "coord_pept_indices": [],
@@ -610,7 +623,7 @@ def process_batch_frame(
         Logger.debug("Start processing frame index %s", scan_idx)
         if use_ims:
             assert mobility_values is not None
-            peaks_df, frame_im_pept_act_coo = process_one_frame_ims(  # type: ignore[assignment]
+            one_frame_results = process_one_frame_ims(  # type: ignore[assignment]
                 data=data,
                 ms1scans=ms1scans,
                 ms1_frame_idx=scan_idx,
@@ -619,27 +632,35 @@ def process_batch_frame(
                 delta_mobility_thres=delta_mobility_thres,
                 extract_im_peak=extract_im_peak,
                 debug=False,
-                **kwargs,
+                return_res_coo_dict=return_res_coo_dict,
+                **im_peak_selection_kwargs,
             )
+            if return_res_coo_dict:
+                peaks_df, frame_im_pept_act_coo_dict, frame_im_pept_res_coo_dict = one_frame_results  # type: ignore[assignment]
+            else:
+                peaks_df, frame_im_pept_act_coo_dict = one_frame_results  # type: ignore[assignment]
             if extract_im_peak:
                 batch_peaks_df.append(peaks_df)
-            if return_im_pept_act:
-                for key in batch_im_rt_pept_act_coo_dict.keys():
-                    batch_im_rt_pept_act_coo_dict[key].extend(
-                        frame_im_pept_act_coo[key]
-                    )
+
+            for key in batch_im_rt_pept_act_coo_dict.keys():
+                batch_im_rt_pept_act_coo_dict[key].extend(
+                    frame_im_pept_act_coo_dict[key]
+                )
+                if return_res_coo_dict:
+                    batch_im_rt_pept_res_coo_dict[key].extend(
+                        frame_im_pept_res_coo_dict[key]
+                    )  # type: ignore[assignment]
         else:
             peaks_df, frame_im_pept_act_coo = process_one_frame(  # type: ignore[assignment]
                 ms1scans=ms1scans,
                 ms1_frame_idx=scan_idx,
                 maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
-                return_pept_act=return_im_pept_act,
                 debug=False,
-                **kwargs,
+                **im_peak_selection_kwargs,
             )
-            if return_im_pept_act:
-                for key in batch_rt_pept_act_coo_dict.keys():
-                    batch_rt_pept_act_coo_dict[key].extend(frame_im_pept_act_coo[key])
+
+            for key in batch_rt_pept_act_coo_dict.keys():
+                batch_rt_pept_act_coo_dict[key].extend(frame_im_pept_act_coo[key])
 
     if use_ims and extract_im_peak:
         batch_peaks_df = pd.concat(batch_peaks_df).reset_index(drop=True)
@@ -710,6 +731,33 @@ def process_batch_frame(
             batch_num,
             batch_im_rt_pept_act_coo.nbytes / 1e6,
         )
+    if return_res_coo_dict and use_ims:
+        if isinstance(batch_im_rt_pept_res_coo, list):
+            for pept_batch_idx, pept_batch_dict in enumerate(batch_im_rt_pept_res_coo):
+                sparse.save_npz(
+                    os.path.join(
+                        save_dir,
+                        f"im_rt_pept_res_coo_batch{batch_num}_peptbatch{pept_batch_idx}.npz",
+                    ),
+                    pept_batch_dict,
+                )
+                Logger.info(
+                    "Size of residual COO matrix in batch %s, peptide batch %s: %s Mb",
+                    batch_num,
+                    pept_batch_idx,
+                    pept_batch_dict.nbytes / 1e6,
+                )
+        else:
+            sparse.save_npz(
+                os.path.join(
+                    save_dir, f"im_rt_pept_res_coo_batch{batch_num}_peptbatch0.npz"
+                ),
+                batch_im_rt_pept_res_coo,
+            )
+            Logger.info(
+                "Size of residual COO matrix in batch %s: %s Mb",
+                batch_num,
+                batch_im_rt_pept_res_coo.nbytes / 1e6,
             )
 
 
