@@ -235,9 +235,10 @@ def opt_scan_by_scan(config_path: str):
                 process_in_blocks=True,
                 width=cfg.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH,
                 save_dir=act_dir,
-                return_im_pept_act=True,
+                # return_im_pept_act=True,
                 extract_im_peak=False,
                 use_ims=cfg.USE_IMS,
+                return_res_coo_dict=cfg.OPTIMIZATION.RETURN_ACT_RES,
             )
 
             minutes, seconds = divmod(time.time() - start_time, 60)

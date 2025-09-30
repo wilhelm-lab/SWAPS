@@ -283,7 +283,6 @@ def process_one_frame(
     ms1scans: pd.DataFrame,
     ms1_frame_idx: int,
     maxquant_result_ref_with_im_index_sortmz: pd.DataFrame,
-    return_pept_act: bool = False,
     mz_bin_digits: int = 3,
     debug: bool = False,
 ):
@@ -333,17 +332,15 @@ def process_one_frame(
             )  # TODO: not yet hanlding returning residues
 
             Logger.debug("Start peak selection.")
-            if return_pept_act:
-                pept_act_coo = {}
-                nonzero_indices = np.nonzero(im_pept_act)
-                pept_act_coo["data"] = im_pept_act[nonzero_indices]  # type: ignore[assignment]
-                pept_act_coo["coord_frame_indices"] = np.repeat(
-                    ms1_frame_idx, len(pept_act_coo["data"])
-                )
-                # pept_act_coo["coord_im_indices"] = nonzero_indices[0]
-                pept_act_coo["coord_pept_indices"] = all_frame_pept_idx[
-                    nonzero_indices[1]
-                ]
+
+            nonzero_indices = np.nonzero(im_pept_act)
+            pept_act_coo["data"] = im_pept_act[nonzero_indices].tolist()  # type: ignore[assignment]
+            pept_act_coo["coord_frame_indices"] = np.repeat(
+                ms1_frame_idx, len(pept_act_coo["data"])
+            ).tolist()
+            pept_act_coo["coord_pept_indices"] = all_frame_pept_idx[
+                nonzero_indices[1]
+            ].tolist()
         else:
             Logger.info("No candidate precursor by RT from frame %s", ms1_frame_idx)
     else:
@@ -374,12 +371,11 @@ def process_one_frame_ims(
     ms1_frame_idx: int,
     maxquant_result_ref_with_im_index_sortmz: pd.DataFrame,
     mobility_values: pd.DataFrame,
-    delta_mobility_thres: int = 100,
     mz_bin_digits: int = 3,
-    extract_im_peak: bool = True,
+    extract_im_peak: bool = False,
     debug: bool = False,
-    return_res_stats: bool = False,
-    **kwargs,
+    return_res_coo_dict: bool = False,
+    **im_peak_selection_kwargs,
 ):
     """Process one frame data with IMS dimension with sparse encoding and peak selection."""
     Logger.debug("Start data preparation.")
@@ -392,6 +388,12 @@ def process_one_frame_ims(
     ]
     Logger.debug("Finished data indexing, frame data shape: %s", frame_data.shape[0])
     peaks_df = pd.DataFrame()
+    im_pept_act_coo_dict = {
+        "coord_frame_indices": [],
+        "coord_im_indices": [],
+        "coord_pept_indices": [],
+        "data": [],
+    }
     im_pept_act_coo_dict = {}
     im_pept_res_coo_dict = {}
 
@@ -450,20 +452,20 @@ def process_one_frame_ims(
                     im_pept_act=im_pept_act,
                     all_pept_mzrank=all_frame_pept_idx,
                     maxquant_result_dict_with_im_index=candidate_precursor_by_rt,
-                    delta_mobility_thres=delta_mobility_thres,
-                    **kwargs,
+                    # delta_mobility_thres=delta_mobility_thres,
+                    **im_peak_selection_kwargs,
                 )
                 peaks_df["frame_indices"] = ms1_frame_idx
 
             nonzero_indices = np.nonzero(im_pept_act)
-            im_pept_act_coo_dict["data"] = im_pept_act[nonzero_indices]
+            im_pept_act_coo_dict["data"] = im_pept_act[nonzero_indices].tolist()  # type: ignore[assignment]
             im_pept_act_coo_dict["coord_frame_indices"] = np.repeat(
                 ms1_frame_idx, len(im_pept_act_coo_dict["data"])
-            )
-            im_pept_act_coo_dict["coord_im_indices"] = nonzero_indices[0]
+            ).tolist()
+            im_pept_act_coo_dict["coord_im_indices"] = nonzero_indices[0].tolist()
             im_pept_act_coo_dict["coord_pept_indices"] = all_frame_pept_idx[
                 nonzero_indices[1]
-            ]
+            ].tolist()
             Logger.debug("Finished preparing activation COO dict.")
         else:
             Logger.info("No candidate precursor by RT from frame %s", ms1_frame_idx)
@@ -585,9 +587,10 @@ def process_batch_frame(
     batch_num: int = 0,
     save_dir: str = "",
     return_im_pept_act: bool = False,
-    extract_im_peak: bool = True,
+    extract_im_peak: bool = False,
     use_ims: bool = True,
-    **kwargs,
+    return_res_coo_dict: bool = False,
+    **im_peak_selection_kwargs,
 ):
     batch_peaks_df = []
     if use_ims:
@@ -643,11 +646,22 @@ def process_batch_frame(
         batch_peaks_df.to_csv(
             os.path.join(save_dir, f"batch_peaks_df_{batch_num}.csv"), index=False
         )
-    if return_im_pept_act:
-        if use_ims:
-            assert mobility_values is not None
-            batch_im_rt_pept_act_coo = make_coo_from_dict(
-                batch_im_rt_pept_act_coo_dict,
+    if use_ims:
+        assert mobility_values is not None
+        batch_im_rt_pept_act_coo = make_coo_from_dict(
+            batch_im_rt_pept_act_coo_dict,
+            shape=(
+                len(ms1scans.index.values)
+                + 1,  # this index is rank, starting from 1, add 1 for the last frame
+                len(mobility_values),
+                len(maxquant_result_ref_with_im_index_sortmz.mz_rank)
+                + 1,  # this index is rank, starting from 1, add 1 for the last frame
+            ),
+            cutoff=cutoff,
+        )
+        if return_res_coo_dict:
+            batch_im_rt_pept_res_coo = make_coo_from_dict(
+                batch_im_rt_pept_res_coo_dict,
                 shape=(
                     len(ms1scans.index.values)
                     + 1,  # this index is rank, starting from 1, add 1 for the last frame
@@ -657,44 +671,45 @@ def process_batch_frame(
                 ),
                 cutoff=cutoff,
             )
-        else:
-            batch_im_rt_pept_act_coo = make_coo_from_dict_no_ims(
-                batch_rt_pept_act_coo_dict,
-                shape=(
-                    len(ms1scans.index.values)
-                    + 1,  # this index is rank, starting from 1, add 1 for the last frame
-                    len(maxquant_result_ref_with_im_index_sortmz.mz_rank)
-                    + 1,  # this index is rank, starting from 1, add 1 for the last frame
-                ),
-                cutoff=cutoff,
-            )
+    else:
+        batch_im_rt_pept_act_coo = make_coo_from_dict_no_ims(
+            batch_rt_pept_act_coo_dict,
+            shape=(
+                len(ms1scans.index.values)
+                + 1,  # this index is rank, starting from 1, add 1 for the last frame
+                len(maxquant_result_ref_with_im_index_sortmz.mz_rank)
+                + 1,  # this index is rank, starting from 1, add 1 for the last frame
+            ),
+            cutoff=cutoff,
+        )
 
-        if isinstance(batch_im_rt_pept_act_coo, list):
-            for pept_batch_idx, pept_batch_dict in enumerate(batch_im_rt_pept_act_coo):
-                sparse.save_npz(
-                    os.path.join(
-                        save_dir,
-                        f"im_rt_pept_act_coo_batch{batch_num}_peptbatch{pept_batch_idx}.npz",
-                    ),
-                    pept_batch_dict,
-                )
-                Logger.info(
-                    "Size of COO matrix in batch %s, peptide batch %s: %s Mb",
-                    batch_num,
-                    pept_batch_idx,
-                    pept_batch_dict.nbytes / 1e6,
-                )
-        else:
+    if isinstance(batch_im_rt_pept_act_coo, list):
+        for pept_batch_idx, pept_batch_dict in enumerate(batch_im_rt_pept_act_coo):
             sparse.save_npz(
                 os.path.join(
-                    save_dir, f"im_rt_pept_act_coo_batch{batch_num}_peptbatch0.npz"
+                    save_dir,
+                    f"im_rt_pept_act_coo_batch{batch_num}_peptbatch{pept_batch_idx}.npz",
                 ),
-                batch_im_rt_pept_act_coo,
+                pept_batch_dict,
             )
             Logger.info(
-                "Size of COO matrix in batch %s: %s Mb",
+                "Size of COO matrix in batch %s, peptide batch %s: %s Mb",
                 batch_num,
-                batch_im_rt_pept_act_coo.nbytes / 1e6,
+                pept_batch_idx,
+                pept_batch_dict.nbytes / 1e6,
+            )
+    else:
+        sparse.save_npz(
+            os.path.join(
+                save_dir, f"im_rt_pept_act_coo_batch{batch_num}_peptbatch0.npz"
+            ),
+            batch_im_rt_pept_act_coo,
+        )
+        Logger.info(
+            "Size of COO matrix in batch %s: %s Mb",
+            batch_num,
+            batch_im_rt_pept_act_coo.nbytes / 1e6,
+        )
             )
 
 
@@ -781,7 +796,7 @@ def _prepare_sparse_matrices(
 
         frame_coo = COO(
             (frame_data["intensity_values"], (frame_im_index, frame_mz_index)),
-        )
+        )  # TODO: frame array can be improved the same way
     else:
         intarray = frame_data["intarray"].values[0]
         frame_coo = COO(
@@ -989,10 +1004,6 @@ def process_frames_parallel(
         )
         for batch in batch_scan_indices
     )
-    # scan_result_dict = dict(pair for d in scan_results_list for pair in d.items())
-    # if there is multiple values in return
-    # frame_results_df = pd.concat(frame_results_list).reset_index(drop=True)
-    # return frame_results_df
 
 
 def get_apex_from_im_rt_pept_act_coo(im_rt_pept_act_coo: sparse.COO):
