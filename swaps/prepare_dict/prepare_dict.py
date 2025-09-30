@@ -1718,15 +1718,25 @@ def construct_dict(
     maxquant_dict["pept_batch_idx"] = (
         maxquant_dict["mz_rank"] // pept_batch_size
     ).astype(int)
+    # split between target and decoys
+    maxquant_dict_target = maxquant_dict.loc[~maxquant_dict["Decoy"]].copy()
+    maxquant_dict_decoy = maxquant_dict.loc[maxquant_dict["Decoy"]].copy()
+    # get batch cutoff based on target peptides
     # save results
-    dict_pickle_path = os.path.join(result_dir, "maxquant_result_ref.pkl")
+    dict_pickle_path = os.path.join(result_dir, "maxquant_result_dict.pkl")
+    dict_target_pickle_path = os.path.join(result_dir, "maxquant_result_target_ref.pkl")
+    dict_decoy_pickle_path = os.path.join(
+        result_dir, "maxquant_result_decoy_ref.pkl"
+    )
+    maxquant_dict_target.to_pickle(dict_target_pickle_path)
+    maxquant_dict_decoy.to_pickle(dict_decoy_pickle_path)
     maxquant_dict.to_pickle(dict_pickle_path)
     Logger.info(
         "Finish dictionary construction. Filtered prediction dataframe dimension: %s.",
         maxquant_dict.shape,
     )
     Logger.debug("Columns in maxquant_dict: %s", maxquant_dict.columns)
-    return maxquant_dict, dict_pickle_path, cfg_prepare_dict
+    return maxquant_dict,maxquant_dict_target, maxquant_dict_decoy, dict_target_pickle_path, dict_decoy_pickle_path,cfg_prepare_dict
 
 
 def get_mzrank_batch_cutoff(maxquant_dict_df: pd.DataFrame):

@@ -597,9 +597,12 @@ def process_batch_frame(
     extract_im_peak: bool = False,
     use_ims: bool = True,
     return_res_coo_dict: bool = False,
+    max_mz_rank: int = 0,
     **im_peak_selection_kwargs,
 ):
     batch_peaks_df = []
+    if max_mz_rank == 0:
+        max_mz_rank = maxquant_result_ref_with_im_index_sortmz.mz_rank.max()
     if use_ims:
         batch_im_rt_pept_act_coo_dict = {
             "coord_frame_indices": [],
@@ -675,8 +678,7 @@ def process_batch_frame(
                 len(ms1scans.index.values)
                 + 1,  # this index is rank, starting from 1, add 1 for the last frame
                 len(mobility_values),
-                len(maxquant_result_ref_with_im_index_sortmz.mz_rank)
-                + 1,  # this index is rank, starting from 1, add 1 for the last frame
+                max_mz_rank + 1,  # this index is rank, starting from 1, add 1 for the last frame
             ),
             cutoff=cutoff,
         )
@@ -687,8 +689,7 @@ def process_batch_frame(
                     len(ms1scans.index.values)
                     + 1,  # this index is rank, starting from 1, add 1 for the last frame
                     len(mobility_values),
-                    len(maxquant_result_ref_with_im_index_sortmz.mz_rank)
-                    + 1,  # this index is rank, starting from 1, add 1 for the last frame
+                    max_mz_rank + 1,  # this index is rank, starting from 1, add 1 for the last frame
                 ),
                 cutoff=cutoff,
             )
@@ -698,8 +699,7 @@ def process_batch_frame(
             shape=(
                 len(ms1scans.index.values)
                 + 1,  # this index is rank, starting from 1, add 1 for the last frame
-                len(maxquant_result_ref_with_im_index_sortmz.mz_rank)
-                + 1,  # this index is rank, starting from 1, add 1 for the last frame
+                max_mz_rank + 1,  # this index is rank, starting from 1, add 1 for the last frame
             ),
             cutoff=cutoff,
         )
