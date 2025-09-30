@@ -626,37 +626,49 @@ def create_dataset_and_loader(
         train_ratio=cfg_peak_selection_dataset.TRAIN_VAL_SIZE,
         seed=random_state,
     )
-    # sanity check
-    image, hint, label = train_val_dataset[99]
-    Logger.info("Image shape in train_val_dataset: %s", image.shape)
-    train_dataset, val_dataset = train_val_dataset.split_dataset(
-        train_ratio=cfg_peak_selection_dataset.TRAIN_SIZE,
-        seed=random_state,
-    )
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=cfg_peak_selection_dataset.TRAIN_BATCH_SIZE,
-        shuffle=True,
-    )
-    _, train_eval_dataset = train_dataset.split_dataset(
-        train_ratio=0.9, seed=random_state
-    )
-    train_eval_dataloader = torch.utils.data.DataLoader(
-        train_eval_dataset,
-        batch_size=cfg_peak_selection_dataset.VAL_BATCH_SIZE,
-        shuffle=True,
-    )
-    val_dataloader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=cfg_peak_selection_dataset.VAL_BATCH_SIZE, shuffle=True
-    )
+    Logger.info(f"size dataset {len(dataset)}; size train {len(train_val_dataset)}; size test {len(test_dataset)}")
+
+    if cfg_peak_selection_dataset.TRAIN_VAL_SIZE > 0.0:
+        # sanity check
+        image, hint, label = train_val_dataset[99]
+        Logger.info("Image shape in train_val_dataset: %s", image.shape)
+
+        train_dataset, val_dataset = train_val_dataset.split_dataset(
+            train_ratio=cfg_peak_selection_dataset.TRAIN_SIZE,
+            seed=random_state,
+        )
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=cfg_peak_selection_dataset.TRAIN_BATCH_SIZE,
+            shuffle=True,
+        )
+        _, train_eval_dataset = train_dataset.split_dataset(
+            train_ratio=0.9, seed=random_state
+        )
+        train_eval_dataloader = torch.utils.data.DataLoader(
+            train_eval_dataset,
+            batch_size=cfg_peak_selection_dataset.VAL_BATCH_SIZE,
+            shuffle=True,
+        )
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset, batch_size=cfg_peak_selection_dataset.VAL_BATCH_SIZE, shuffle=True
+        )
+        Logger.info("Train dataset size: %d", len(train_dataset))
+        Logger.info("Train eval dataset size: %d", len(train_eval_dataset))
+        Logger.info("Validation dataset size: %d", len(val_dataset))
+    else:
+        train_dataset = None
+        train_dataloader = None
+        train_eval_dataset = None
+        train_eval_dataloader = None
+        val_dataset = None
+        val_dataloader = None
+
     test_dataloader = torch.utils.data.DataLoader(
         test_dataset,
         batch_size=cfg_peak_selection_dataset.TEST_BATCH_SIZE,
         shuffle=True,
     )
-    Logger.info("Train dataset size: %d", len(train_dataset))
-    Logger.info("Train eval dataset size: %d", len(train_eval_dataset))
-    Logger.info("Validation dataset size: %d", len(val_dataset))
     Logger.info("Test dataset size: %d", len(test_dataset))
     return (
         train_dataset,

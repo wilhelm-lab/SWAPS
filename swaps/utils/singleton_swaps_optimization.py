@@ -8,7 +8,6 @@ swaps_optimization_cfg = __C
 # general setup
 __C.DESCRIPTION = "Default config from the Singleton"
 __C.DEBUG = False
-__C.MULTI_TRAIN = False
 __C.DATA_PATHS = []  # different results depending on data ending with .mzml or .d
 __C.RESULT_PATHS = []  # list of paths to save all intermediate and final results
 __C.ADD_TIMESTAMP_TO_RESULT_PATH = False  # disenble when reusing the same result path
