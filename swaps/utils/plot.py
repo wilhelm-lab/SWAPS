@@ -1140,3 +1140,102 @@ def plot_pept_act_heatmap(
         )
     if title is not None:
         plt.title(title)
+
+
+def plot_pept_act_align_channels(
+    pept_act_log,
+    grad_mag,
+    coordinates,
+    labels,
+    peak_properties,
+    rt_exp_start,
+    rt_exp_end,
+    figsize=(15, 5),
+    annotate=True,
+):
+    """
+    Plot peptide activity, gradient magnitude and watershed labels with annotations.
+
+    Parameters:
+    - pept_act_log: 2D array of log-transformed intensities
+    - grad_mag: 2D array of gradient magnitudes
+    - coordinates: Nx2 array of detected peak coordinates (row, col)
+    - labels: 2D int array of watershed labels
+    - peak_properties: DataFrame containing detected peak properties (must include 'label',
+      'centroid-0', 'centroid-1' and 'row_smoothness' to annotate)
+    - rt_exp_start, rt_exp_end: horizontal lines (RT window) in pixel/index units
+    - figsize: figure size tuple
+    - annotate: whether to annotate centroids with label and smoothness
+    """
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+
+    # left: log intensity with detected peak locations
+    ax = axes[0]
+    im0 = ax.imshow(pept_act_log, cmap="viridis", aspect="auto", interpolation="nearest")
+    xlim = ax.get_xlim()
+    ax.hlines([rt_exp_start, rt_exp_end], xmin=xlim[0], xmax=xlim[1], colors="white", linestyles="dashed")
+    if coordinates is not None and len(coordinates) > 0:
+        ax.scatter(coordinates[:, 1], coordinates[:, 0], color="r", s=20)
+    ax.set_title("pept_act_log + peaks")
+    fig.colorbar(im0, ax=ax)
+
+    # middle: gradient magnitude
+    ax = axes[1]
+    im1 = ax.imshow(grad_mag, cmap="gray", aspect="auto", interpolation="nearest")
+    ax.hlines([rt_exp_start, rt_exp_end], xmin=xlim[0], xmax=xlim[1], colors="white", linestyles="dashed")
+    ax.set_title("gradient magnitude mask")
+    fig.colorbar(im1, ax=ax)
+
+    # right: watershed labels (only plot labels present in peak_properties)
+    assert isinstance(peak_properties, pd.DataFrame)
+    filtered_labels = peak_properties["label"].values
+    labels_mask = np.isin(labels, filtered_labels)  # type: ignore
+    labels_to_plot = labels * labels_mask
+    ax = axes[2]
+    im2 = ax.imshow(
+        labels_to_plot,
+        cmap=plt.cm.nipy_spectral,  # type: ignore
+        aspect="auto",
+        interpolation="nearest",
+    )
+    ax.hlines([rt_exp_start, rt_exp_end], xmin=xlim[0], xmax=xlim[1], colors="white", linestyles="dashed")
+    ax.set_title("watershed on distance")
+    fig.colorbar(im2, ax=ax)
+
+    # annotate each detected coordinate with its watershed label and row_smoothness
+    if annotate and not peak_properties.empty:
+        # use centroid coords and row_smoothness from peak_properties
+        cols = ["centroid-0", "centroid-1", "row_smoothness"]
+        # guard if some columns missing
+        if all(c in peak_properties.columns for c in cols):
+            for (r, c, s) in peak_properties[cols].values:
+                rr, cc = int(round(r)), int(round(c))
+                # ensure indices are inside bounds
+                if 0 <= rr < labels.shape[0] and 0 <= cc < labels.shape[1]:
+                    lbl = int(labels[rr, cc])
+                else:
+                    lbl = 0
+                ax.text(
+                    c,
+                    r,
+                    str(lbl),
+                    color="white",
+                    fontsize=7,
+                    ha="center",
+                    va="center",
+                    bbox=dict(facecolor="black", alpha=0.6, pad=0.2),
+                )
+                ax.text(
+                    c,
+                    r + 2,
+                    f"{s:.2f}",
+                    color="yellow",
+                    fontsize=7,
+                    ha="center",
+                    va="center",
+                    bbox=dict(facecolor="black", alpha=0.6, pad=0.2),
+                )
+
+    plt.tight_layout()
+    plt.show()
+    return fig, axes
