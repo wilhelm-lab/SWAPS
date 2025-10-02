@@ -765,6 +765,79 @@ def process_batch_frame(
                 batch_im_rt_pept_res_coo.nbytes / 1e6,
             )
 
+def _match_candidate_mz_and_frame_mz_by_ppm_and_frame_bin(
+    candidate_mz,
+    frame_mz,
+    frame_int: Optional[np.ndarray] = None,
+    ppm_tol: float = 10,
+    bin_width: float = 0.01,  # <-- new: bin size in Daltons
+):
+    """
+    Match candidate m/z values to frame m/z values within ppm tolerance.
+
+    Args:
+        candidate_mz: Array of candidate m/z values.
+        frame_mz: Array of frame m/z values.
+        frame_int: Optional array of frame intensity values for weighted binning.
+        ppm_tol: PPM tolerance for matching.
+        bin_width: Width of m/z bins in Daltons.
+
+    Returns:
+        uniform_mz_idx: Indices of matched frame m/z values.
+        candidate_mz_idx: Indices of (binned) candidate m/z values.
+        mapped_candidate_mz_idx: Mapped indices of candidate m/z to unique frame m/z.
+        frame_mz_idx: Indices of (binned) frame m/z values.
+        mapped_frame_mz_idx: Mapped indices of frame m/z to unique frame m/z.
+        candidate_mask: Boolean mask of candidates m/z that are kept.
+        frame_mask: Boolean mask of frame m/z that are kept.
+    """
+    # --- Bin frame m/z into stable bins ---
+    mz_min, mz_max = frame_mz.min(), frame_mz.max()
+    bin_edges = np.arange(mz_min, mz_max + bin_width, bin_width)
+    frame_bin_idx = np.digitize(frame_mz, bin_edges) - 1
+
+    # Sum intensities per bin
+    # binned_frame_int = np.bincount(frame_bin_idx, weights=frame_int, minlength=len(bin_edges))
+    if frame_int is None:
+        binned_frame_mz = (bin_edges[:-1] + bin_edges[1:]) / 2  # bin centers
+    else:
+        # 2. weighted sum of m/z per bin
+        weighted_sum = np.bincount(frame_bin_idx, weights=frame_mz * frame_int, minlength=len(bin_edges)-1)
+
+        # 3. total intensity per bin
+        weight_total = np.bincount(frame_bin_idx, weights=frame_int, minlength=len(bin_edges)-1)
+
+        # 4. intensity-weighted bin m/z (avoid division by zero)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            binned_frame_mz = np.where(weight_total > 0, weighted_sum / weight_total, 0.0)
+
+    # --- Map candidate m/z into bins (with ppm tolerance) ---
+    candidate_mz_idx = np.searchsorted(binned_frame_mz, candidate_mz)
+    candidate_mz_idx = np.clip(candidate_mz_idx, 0, len(binned_frame_mz) - 1)
+
+    # ppm check: keep only if candidate fits within tolerance to bin (weighted) center
+    dist = np.abs(binned_frame_mz[candidate_mz_idx] - candidate_mz)
+    tol = candidate_mz * ppm_tol / 1e6
+    candidate_mask = dist <= tol
+    if candidate_mask.sum() == 0:
+        Logger.warning("No candidates left after ppm filtering!")
+        return None
+    candidate_mz_idx_filtered = candidate_mz_idx[candidate_mask]
+    unique_candidate_mz_idx, mapped_unique_candidate_mz_idx = np.unique(candidate_mz_idx_filtered, return_inverse=True)
+    
+    frame_mask = np.isin(frame_bin_idx, unique_candidate_mz_idx)
+    # Map reduced bin indices into compact index space [0 .. len(unique_idx)-1]
+    bin_mapping = {b: i for i, b in enumerate(unique_candidate_mz_idx)}
+    frame_bin_idx_filtered = frame_bin_idx[frame_mask]
+    mapped_bins = np.array([bin_mapping[b] for b in frame_bin_idx_filtered])
+
+    return (unique_candidate_mz_idx, 
+            candidate_mz_idx, 
+            mapped_unique_candidate_mz_idx,
+            frame_bin_idx, 
+            mapped_bins, 
+            candidate_mask, 
+            frame_mask)
 
 def _prepare_sparse_matrices(
     candidate_precursor_by_rt,
@@ -808,99 +881,51 @@ def _prepare_sparse_matrices(
         frame_mz = frame_data["mzarray"].values[0]
         frame_int = frame_data["intarray"].values[0]
 
-    # --- Bin frame m/z into stable bins ---
-    mz_min, mz_max = frame_mz.min(), frame_mz.max()
-    bin_edges = np.arange(mz_min, mz_max + bin_width, bin_width)
-    frame_bin_idx = np.digitize(frame_mz, bin_edges) - 1
-
-    # Sum intensities per bin
-    # binned_frame_int = np.bincount(frame_bin_idx, weights=frame_int, minlength=len(bin_edges))
-    # binned_frame_mz = (bin_edges[:-1] + bin_edges[1:]) / 2  # bin centers
-    # 2. weighted sum of m/z per bin
-    weighted_sum = np.bincount(frame_bin_idx, weights=frame_mz * frame_int, minlength=len(bin_edges)-1)
-
-    # 3. total intensity per bin
-    weight_total = np.bincount(frame_bin_idx, weights=frame_int, minlength=len(bin_edges)-1)
-
-    # 4. intensity-weighted bin m/z (avoid division by zero)
-    with np.errstate(divide="ignore", invalid="ignore"):
-        binned_frame_mz = np.where(weight_total > 0, weighted_sum / weight_total, 0.0)
-
-    # --- Map candidate m/z into bins (with ppm tolerance) ---
-    candidate_mz_idx = np.searchsorted(binned_frame_mz, candidate_mz)
-    candidate_mz_idx = np.clip(candidate_mz_idx, 0, len(binned_frame_mz) - 1)
-
-    # ppm check: keep only if candidate fits within tolerance to bin center
-    dist = np.abs(binned_frame_mz[candidate_mz_idx] - candidate_mz)
-    tol = candidate_mz * ppm_tol / 1e6
-    mask = dist <= tol
-    if mask.sum() == 0:
-        Logger.warning("No candidates left after ppm filtering!")
-        # Return empty arrays
+    # --- Match candidate m/z to frame m/z with ppm tolerance and binning ---
+    match_results = _match_candidate_mz_and_frame_mz_by_ppm_and_frame_bin(
+        candidate_mz=candidate_mz,
+        frame_mz=frame_mz,
+        frame_int=None,
+        ppm_tol=ppm_tol,
+        bin_width=bin_width,
+    )
+    if match_results is None:
+        Logger.warning("No matched candidates and frame m/z!")
         return None, None
-    candidate_mz_idx_filtered = candidate_mz_idx[mask]
-    candidate_abundance_filtered = candidate_abundance[mask]
-    candidate_id_idx_filtered = candidate_id_idx[mask]
-
+    else:
+        uniform_mz_idx, candidate_mz_idx, mapped_unique_candidate_mz_idx,frame_bin_idx, mapped_bins, candidate_mask, frame_mask = match_results
+    
+    # --- Build candidate array ---
+    candidate_mz_idx_filtered = candidate_mz_idx[candidate_mask]
+    candidate_abundance_filtered = candidate_abundance[candidate_mask]
+    candidate_id_idx_filtered = candidate_id_idx[candidate_mask]
     Logger.debug(
         "After ppm+binning: %s candidates mz idx kept (out of %s)",
         len(candidate_mz_idx_filtered),
         len(candidate_mz),
     )
-
-    # --- Build candidate array ---
-    unique_candidate_mz_idx, mapped_unique_candidate_mz_idx = np.unique(candidate_mz_idx_filtered, return_inverse=True)
-    Logger.debug("Length of unique candidate m/z bins: %s, mapped_unique_candidate_mz_idx: %s, and candidate_mz_filtered: %s", len(unique_candidate_mz_idx), len(mapped_unique_candidate_mz_idx), len(candidate_mz_idx_filtered))
     candidate_array = np.zeros(
-        (all_id.size, unique_candidate_mz_idx.size), dtype=candidate_abundance.dtype
+        (all_id.size, uniform_mz_idx.size), dtype=candidate_abundance.dtype
     )
-    # candidate_array[candidate_id_idx_filtered, mapped_unique_candidate_mz_idx] = candidate_abundance_filtered
     np.add.at(candidate_array, (candidate_id_idx_filtered, mapped_unique_candidate_mz_idx), candidate_abundance_filtered)
 
     # --- Build frame array ---
-
-
+    if frame_mask.sum() == 0:
+        Logger.warning("No frame data left after candidate_bin filtering!")
+        return None, None
+    frame_int_filtered = frame_int[frame_mask]
     if use_ims:
         assert mobility_values is not None
         all_im = np.sort(mobility_values["mobility_values"])
         frame_im_index = np.searchsorted(all_im, frame_data["mobility_values"])
+        frame_im_idx_filtered = frame_im_index[frame_mask]
 
-        # Only keep bins that were used by candidates. Reduce directly to candidate bins
-        mask = np.isin(frame_bin_idx, unique_candidate_mz_idx)
-        if mask.sum() == 0:
-            Logger.warning("No frame data left after candidate_bin filtering!")
-            return None, None
-        frame_bin_idx_filtered = frame_bin_idx[mask]
-        frame_im_idx_filtered = frame_im_index[mask]
-        frame_int_filtered = frame_int[mask]
-
-        # Map reduced bin indices into compact index space [0 .. len(unique_idx)-1]
-        bin_mapping = {b: i for i, b in enumerate(unique_candidate_mz_idx)}
-        mapped_bins = np.array([bin_mapping[b] for b in frame_bin_idx_filtered])
-
-        frame_array = np.zeros((all_im.size, len(unique_candidate_mz_idx)), dtype=frame_int.dtype)
+        frame_array = np.zeros((all_im.size, len(uniform_mz_idx)), dtype=frame_int.dtype)
         np.add.at(frame_array, (frame_im_idx_filtered, mapped_bins), frame_int_filtered)
 
     else:
-        # Similar for non-IMS case
-        mask = np.isin(frame_bin_idx, unique_candidate_mz_idx)
-        if mask.sum() == 0:
-            Logger.warning("No frame data left after candidate_bin filtering!")
-            return None, None
-        frame_bin_idx_filtered = frame_bin_idx[mask]
-        frame_int_filtered = frame_int[mask]
-
-        bin_mapping = {b: i for i, b in enumerate(unique_candidate_mz_idx)}
-        mapped_bins = np.array([bin_mapping[b] for b in frame_bin_idx_filtered])
-
-        frame_array = np.zeros((1, len(unique_candidate_mz_idx)), dtype=frame_int.dtype)
+        frame_array = np.zeros((1, len(uniform_mz_idx)), dtype=frame_int.dtype)
         np.add.at(frame_array, (np.zeros(len(frame_int_filtered), dtype=int), mapped_bins), frame_int_filtered)
-
-    #frame_array = frame_coo.todense()[:, unique_idx.tolist()]
-
-    assert frame_array.shape[1] == candidate_array.shape[1], (
-        f"m/z dimension mismatch {frame_array.shape[1]} vs {candidate_array.shape[1]}"
-    )
 
     return frame_array, candidate_array
 
@@ -997,7 +1022,6 @@ def _select_peaks_from_im_pept_act(
 def _extract_peaks_in_im(
     im_pept_act_array, index: int, pept_mzrank: int, height=0.1, width=4, rel_height=1
 ):
-    # Logger.debug("Peak extration width %s", width)
     peaks, peak_properties = find_peaks(
         im_pept_act_array, height=height, width=width, rel_height=rel_height
     )
@@ -1006,9 +1030,6 @@ def _extract_peaks_in_im(
         peak_properties["pept_mzrank"] = np.repeat(pept_mzrank, len(peaks))
         peak_properties["peak"] = peaks
         peak_properties = pd.DataFrame(peak_properties)
-        # Logger.debug(
-        #     "Number of peaks extracted from pept_id %s: %s", pept_id, len(peaks)
-        # )
     else:
         # Logger.debug("No peak extracted from pept_id %s in this frame.", pept_id)
         peak_properties = None
