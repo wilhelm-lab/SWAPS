@@ -4,12 +4,10 @@ import logging
 import os
 from datetime import datetime
 import time
-import fire
 import argparse
 import numpy as np
 import pandas as pd
 import pickle
-
 import torch
 
 # Disable cuDNN globally BEFORE anything else
@@ -276,11 +274,11 @@ def opt_scan_by_scan(config_path: str):
                 mobility_values=mobility_values_df,
                 cutoff=cutoff,
                 delta_mobility_thres=cfg.OPTIMIZATION.DELTA_MOBILITY_INDEX_THRES,
-                mz_bin_digits=cfg.PREPARE_DICT.MZ_BIN_DIGITS,
+                ppm_tol=cfg.PREPARE_DICT.PPM_TOL,
+                bin_width=cfg.PREPARE_DICT.BIN_WIDTH,
                 process_in_blocks=True,
                 width=cfg.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH,
                 save_dir=os.path.join(act_dir, "target"),
-                # return_im_pept_act=True,
                 extract_im_peak=False,
                 use_ims=cfg.USE_IMS,
                 return_res_coo_dict=cfg.OPTIMIZATION.RETURN_ACT_RES,
@@ -297,11 +295,11 @@ def opt_scan_by_scan(config_path: str):
                     mobility_values=mobility_values_df,
                     cutoff=cutoff,
                     delta_mobility_thres=cfg.OPTIMIZATION.DELTA_MOBILITY_INDEX_THRES,
-                    mz_bin_digits=cfg.PREPARE_DICT.MZ_BIN_DIGITS,
+                    ppm_tol=cfg.PREPARE_DICT.PPM_TOL,
+                    bin_width=cfg.PREPARE_DICT.BIN_WIDTH,
                     process_in_blocks=True,
                     width=cfg.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH,
                     save_dir=os.path.join(act_dir, "decoy"),
-                    # return_im_pept_act=True,
                     extract_im_peak=False,
                     use_ims=cfg.USE_IMS,
                     return_res_coo_dict=cfg.OPTIMIZATION.RETURN_ACT_RES,

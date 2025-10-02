@@ -325,7 +325,7 @@ def process_one_frame(
                 candidate_precursor_by_rt=candidate_precursor_by_rt,
                 frame_data=frame_data,
                 all_id=all_frame_pept_idx,
-                mz_bin_digits=mz_bin_digits,
+                ppm_tol=mz_bin_digits,
                 use_ims=False,
             )
 
@@ -375,7 +375,8 @@ def process_one_frame_ims(
     ms1_frame_idx: int,
     maxquant_result_ref_with_im_index_sortmz: pd.DataFrame,
     mobility_values: pd.DataFrame,
-    mz_bin_digits: int = 3,
+    ppm_tol: int = 20,
+    bin_width: float = 0.01,
     extract_im_peak: bool = False,
     debug: bool = False,
     return_res_coo_dict: bool = False,
@@ -428,53 +429,57 @@ def process_one_frame_ims(
                 frame_data=frame_data,
                 mobility_values=mobility_values,
                 all_id=all_frame_pept_idx,
-                mz_bin_digits=mz_bin_digits,
+                ppm_tol=ppm_tol,
+                bin_width=bin_width,
                 use_ims=True,
             )
-
-            Logger.debug(
-                "Finished preparing sparse matrix. Start optimization with sparse encoding."
-            )
-
-            deconv_results = sparse_encode_divide_and_conquer_with_residual_stats(
-                frame_array, candidate_array, return_act_res=return_res_coo_dict
-            )
-            Logger.debug("Finished sparse encoding.")
-            if return_res_coo_dict:
-                im_pept_act, im_pept_res = deconv_results  # type: ignore[assignment]
-                nonzero_indices_res = np.nonzero(im_pept_res)
-                im_pept_res_coo_dict["data"] = im_pept_res[nonzero_indices_res].tolist()  # type: ignore[assignment]
-                im_pept_res_coo_dict["coord_frame_indices"] = np.repeat(
-                    ms1_frame_idx, len(im_pept_res_coo_dict["data"])
-                ).tolist()
-                im_pept_res_coo_dict["coord_im_indices"] = nonzero_indices_res[0].tolist()  # type: ignore[assignment]
-                im_pept_res_coo_dict["coord_pept_indices"] = all_frame_pept_idx[
-                    nonzero_indices_res[1]
-                ].tolist()
-                Logger.debug("Finished preparing residual COO dict.")
+            if frame_array is None:
+                im_pept_act = None
+                Logger.warning("No sparse matrices reutrn for frame %s", ms1_frame_idx)
             else:
-                im_pept_act = deconv_results  # type: ignore[assignment]
-            assert isinstance(im_pept_act, np.ndarray)
-            if extract_im_peak:
-                peaks_df = _select_im_peak_from_frame_act(
-                    im_pept_act=im_pept_act,
-                    all_pept_mzrank=all_frame_pept_idx,
-                    maxquant_result_dict_with_im_index=candidate_precursor_by_rt,
-                    # delta_mobility_thres=delta_mobility_thres,
-                    **im_peak_selection_kwargs,
+                Logger.debug(
+                    "Finished preparing sparse matrix. Start optimization with sparse encoding."
                 )
-                peaks_df["frame_indices"] = ms1_frame_idx
 
-            nonzero_indices = np.nonzero(im_pept_act)
-            im_pept_act_coo_dict["data"] = im_pept_act[nonzero_indices].tolist()  # type: ignore[assignment]
-            im_pept_act_coo_dict["coord_frame_indices"] = np.repeat(
-                ms1_frame_idx, len(im_pept_act_coo_dict["data"])
-            ).tolist()
-            im_pept_act_coo_dict["coord_im_indices"] = nonzero_indices[0].tolist()
-            im_pept_act_coo_dict["coord_pept_indices"] = all_frame_pept_idx[
-                nonzero_indices[1]
-            ].tolist()
-            Logger.debug("Finished preparing activation COO dict.")
+                deconv_results = sparse_encode_divide_and_conquer_with_residual_stats(
+                    frame_array, candidate_array, return_act_res=return_res_coo_dict
+                )
+                Logger.debug("Finished sparse encoding.")
+                if return_res_coo_dict:
+                    im_pept_act, im_pept_res = deconv_results  # type: ignore[assignment]
+                    nonzero_indices_res = np.nonzero(im_pept_res)
+                    im_pept_res_coo_dict["data"] = im_pept_res[nonzero_indices_res].tolist()  # type: ignore[assignment]
+                    im_pept_res_coo_dict["coord_frame_indices"] = np.repeat(
+                        ms1_frame_idx, len(im_pept_res_coo_dict["data"])
+                    ).tolist()
+                    im_pept_res_coo_dict["coord_im_indices"] = nonzero_indices_res[0].tolist()  # type: ignore[assignment]
+                    im_pept_res_coo_dict["coord_pept_indices"] = all_frame_pept_idx[
+                        nonzero_indices_res[1]
+                    ].tolist()
+                    Logger.debug("Finished preparing residual COO dict.")
+                else:
+                    im_pept_act = deconv_results  # type: ignore[assignment]
+                assert isinstance(im_pept_act, np.ndarray)
+                if extract_im_peak:
+                    peaks_df = _select_im_peak_from_frame_act(
+                        im_pept_act=im_pept_act,
+                        all_pept_mzrank=all_frame_pept_idx,
+                        maxquant_result_dict_with_im_index=candidate_precursor_by_rt,
+                        # delta_mobility_thres=delta_mobility_thres,
+                        **im_peak_selection_kwargs,
+                    )
+                    peaks_df["frame_indices"] = ms1_frame_idx
+
+                nonzero_indices = np.nonzero(im_pept_act)
+                im_pept_act_coo_dict["data"] = im_pept_act[nonzero_indices].tolist()  # type: ignore[assignment]
+                im_pept_act_coo_dict["coord_frame_indices"] = np.repeat(
+                    ms1_frame_idx, len(im_pept_act_coo_dict["data"])
+                ).tolist()
+                im_pept_act_coo_dict["coord_im_indices"] = nonzero_indices[0].tolist()
+                im_pept_act_coo_dict["coord_pept_indices"] = all_frame_pept_idx[
+                    nonzero_indices[1]
+                ].tolist()
+                Logger.debug("Finished preparing activation COO dict.")
         else:
             Logger.info("No candidate precursor by RT from frame %s", ms1_frame_idx)
     else:
@@ -598,7 +603,7 @@ def process_batch_frame(
     use_ims: bool = True,
     return_res_coo_dict: bool = False,
     max_mz_rank: int = 0,
-    **im_peak_selection_kwargs,
+    **process_frame_kwargs,
 ):
     batch_peaks_df = []
     if max_mz_rank == 0:
@@ -636,7 +641,7 @@ def process_batch_frame(
                 extract_im_peak=extract_im_peak,
                 debug=False,
                 return_res_coo_dict=return_res_coo_dict,
-                **im_peak_selection_kwargs,
+                **process_frame_kwargs,
             )
             if return_res_coo_dict:
                 peaks_df, frame_im_pept_act_coo_dict, frame_im_pept_res_coo_dict = one_frame_results  # type: ignore[assignment]
@@ -651,7 +656,7 @@ def process_batch_frame(
                 )
                 if return_res_coo_dict:
                     batch_im_rt_pept_res_coo_dict[key].extend(
-                        frame_im_pept_res_coo_dict[key]
+                        frame_im_pept_res_coo_dict[key] #type: ignore[assignment]
                     )  # type: ignore[assignment]
         else:
             peaks_df, frame_im_pept_act_coo = process_one_frame(  # type: ignore[assignment]
@@ -659,7 +664,7 @@ def process_batch_frame(
                 ms1_frame_idx=scan_idx,
                 maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
                 debug=False,
-                **im_peak_selection_kwargs,
+                **process_frame_kwargs,
             )
 
             for key in batch_rt_pept_act_coo_dict.keys():
@@ -765,113 +770,140 @@ def _prepare_sparse_matrices(
     candidate_precursor_by_rt,
     frame_data,
     all_id,
-    mz_bin_digits: int = 3,
+    ppm_tol: float = 10,
+    bin_width: float = 0.01,  # <-- new: bin size in Daltons
     use_ims: bool = True,
     mobility_values: Optional[pd.DataFrame] = None,
 ):
+    """ 
+    Prepare frame and candidate arrays for sparse encoding.
+
+    Args:
+        candidate_precursor_by_rt: DataFrame with candidate precursors for the frame.
+        frame_data: DataFrame with m/z and intensity values for the frame.
+        all_id: Array of all candidate IDs (mz_rank).
+        ppm_tol: PPM tolerance for matching m/z values.
+        bin_width: Width of m/z bins in Daltons.
+        use_ims: Whether to include IMS dimension.
+        mobility_values: DataFrame with mobility values if use_ims is True.
+
+    Returns:
+        frame_array: 2D array (im, m/z bins) or (1, m/z bins) if no IMS.
+        candidate_array: 2D array (candidates, m/z bins).
+    """
     # --- Candidate arrays ---
     candidate_id = np.repeat(
         candidate_precursor_by_rt.mz_rank.values,
         candidate_precursor_by_rt.mz_length.values,
     )
-    candidate_mz = np.round(
-        np.concatenate(candidate_precursor_by_rt.IsoMZ.values),
-        decimals=mz_bin_digits,
-    )
+    candidate_mz = np.concatenate(candidate_precursor_by_rt.IsoMZ.values)
     candidate_abundance = np.concatenate(candidate_precursor_by_rt.IsoAbundance.values)
-    Logger.debug(
-        "Candidate array shapes for id, mz and abundance: %s %s %s",
-        candidate_id.shape,
-        candidate_mz.shape,
-        candidate_abundance.shape,
-    )
-    candidate_id_index = np.searchsorted(all_id, candidate_id)
+    candidate_id_idx = np.searchsorted(all_id, candidate_id)
 
+    # --- Frame m/z values ---
     if use_ims:
-        frame_mz = np.round(frame_data["mz_values"], decimals=mz_bin_digits)
+        frame_mz = frame_data["mz_values"].values
+        frame_int = frame_data["intensity_values"]
     else:
-        frame_mz = np.round(frame_data["mzarray"].values[0], decimals=mz_bin_digits)
-    all_mz = np.union1d(frame_mz, candidate_mz)
-    Logger.debug(
-        "Number of mz values in candidate, frame and joint:%s, %s, %s",
-        len(set(candidate_mz)),
-        len(set(frame_mz)),
-        len(all_mz),
-    )
-    candidate_mz_index = np.searchsorted(all_mz, candidate_mz)
-    frame_mz_index = np.searchsorted(all_mz, frame_mz)
+        frame_mz = frame_data["mzarray"].values[0]
+        frame_int = frame_data["intarray"].values[0]
 
-    # prepare arrays from sparse matrices
-    min_mz_index = max(candidate_mz_index.min(), frame_mz_index.min())
-    max_mz_index = min(candidate_mz_index.max(), frame_mz_index.max())
-    Logger.debug("min and max mz index: %s %s", min_mz_index, max_mz_index)
+    # --- Bin frame m/z into stable bins ---
+    mz_min, mz_max = frame_mz.min(), frame_mz.max()
+    bin_edges = np.arange(mz_min, mz_max + bin_width, bin_width)
+    frame_bin_idx = np.digitize(frame_mz, bin_edges) - 1
 
-    # make sure candidate mz index is not out of range of observed mz in frame
-    mask = (candidate_mz_index >= min_mz_index) & (candidate_mz_index <= max_mz_index)
-    candidate_mz_index_filtered = candidate_mz_index[mask]
+    # Sum intensities per bin
+    # binned_frame_int = np.bincount(frame_bin_idx, weights=frame_int, minlength=len(bin_edges))
+    # binned_frame_mz = (bin_edges[:-1] + bin_edges[1:]) / 2  # bin centers
+    # 2. weighted sum of m/z per bin
+    weighted_sum = np.bincount(frame_bin_idx, weights=frame_mz * frame_int, minlength=len(bin_edges)-1)
+
+    # 3. total intensity per bin
+    weight_total = np.bincount(frame_bin_idx, weights=frame_int, minlength=len(bin_edges)-1)
+
+    # 4. intensity-weighted bin m/z (avoid division by zero)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        binned_frame_mz = np.where(weight_total > 0, weighted_sum / weight_total, 0.0)
+
+    # --- Map candidate m/z into bins (with ppm tolerance) ---
+    candidate_mz_idx = np.searchsorted(binned_frame_mz, candidate_mz)
+    candidate_mz_idx = np.clip(candidate_mz_idx, 0, len(binned_frame_mz) - 1)
+
+    # ppm check: keep only if candidate fits within tolerance to bin center
+    dist = np.abs(binned_frame_mz[candidate_mz_idx] - candidate_mz)
+    tol = candidate_mz * ppm_tol / 1e6
+    mask = dist <= tol
+    if mask.sum() == 0:
+        Logger.warning("No candidates left after ppm filtering!")
+        # Return empty arrays
+        return None, None
+    candidate_mz_idx_filtered = candidate_mz_idx[mask]
     candidate_abundance_filtered = candidate_abundance[mask]
-    candidate_id_index_filtered = candidate_id_index[mask]
+    candidate_id_idx_filtered = candidate_id_idx[mask]
+
     Logger.debug(
-        "Shape of mask, candidate mz index, abundance and id index: %s, %s, %s, %s, sum of mask %s",
-        mask.shape,
-        candidate_mz_index_filtered.shape,
-        candidate_abundance_filtered.shape,
-        candidate_id_index_filtered.shape,
-        sum(mask),
+        "After ppm+binning: %s candidates mz idx kept (out of %s)",
+        len(candidate_mz_idx_filtered),
+        len(candidate_mz),
     )
 
-    # Now build compact column set + mapping
-    unique_idx, mapped_idx = np.unique(candidate_mz_index_filtered, return_inverse=True)
-
-    # Allocate dense matrix directly
+    # --- Build candidate array ---
+    unique_candidate_mz_idx, mapped_unique_candidate_mz_idx = np.unique(candidate_mz_idx_filtered, return_inverse=True)
+    Logger.debug("Length of unique candidate m/z bins: %s, mapped_unique_candidate_mz_idx: %s, and candidate_mz_filtered: %s", len(unique_candidate_mz_idx), len(mapped_unique_candidate_mz_idx), len(candidate_mz_idx_filtered))
     candidate_array = np.zeros(
-        (all_id.size, unique_idx.size), dtype=candidate_abundance.dtype
+        (all_id.size, unique_candidate_mz_idx.size), dtype=candidate_abundance.dtype
     )
+    # candidate_array[candidate_id_idx_filtered, mapped_unique_candidate_mz_idx] = candidate_abundance_filtered
+    np.add.at(candidate_array, (candidate_id_idx_filtered, mapped_unique_candidate_mz_idx), candidate_abundance_filtered)
 
-    # Fill with filtered data
-    candidate_array[candidate_id_index_filtered, mapped_idx] = (
-        candidate_abundance_filtered
-    )
+    # --- Build frame array ---
 
-    Logger.debug(
-        "Number of mz values in filtered candidate index: %s",
-        len(candidate_mz_index_filtered),
-    )
+
     if use_ims:
         assert mobility_values is not None
         all_im = np.sort(mobility_values["mobility_values"])
         frame_im_index = np.searchsorted(all_im, frame_data["mobility_values"])
 
-        frame_coo = COO(
-            (frame_data["intensity_values"], (frame_im_index, frame_mz_index)),
-        )  # TODO: frame array can be improved the same way
-    else:
-        intarray = frame_data["intarray"].values[0]
-        frame_coo = COO(
-            (
-                intarray,
-                (
-                    np.zeros(len(intarray)).astype(int),
-                    frame_mz_index,
-                ),
-            ),
-            shape=(1, len(all_mz)),
-        )
+        # Only keep bins that were used by candidates. Reduce directly to candidate bins
+        mask = np.isin(frame_bin_idx, unique_candidate_mz_idx)
+        if mask.sum() == 0:
+            Logger.warning("No frame data left after candidate_bin filtering!")
+            return None, None
+        frame_bin_idx_filtered = frame_bin_idx[mask]
+        frame_im_idx_filtered = frame_im_index[mask]
+        frame_int_filtered = frame_int[mask]
 
-    # only candidate mz is considered
-    frame_array = frame_coo.todense()[
-        :, np.unique(candidate_mz_index_filtered).tolist()
-    ]
-    assert (
-        frame_array.shape[1] == candidate_array.shape[1]
-    ), "m/z dimension of frame array and candidate array mismatch %s, %s" % (
-        frame_array.shape[1],
-        candidate_array.shape[1],
+        # Map reduced bin indices into compact index space [0 .. len(unique_idx)-1]
+        bin_mapping = {b: i for i, b in enumerate(unique_candidate_mz_idx)}
+        mapped_bins = np.array([bin_mapping[b] for b in frame_bin_idx_filtered])
+
+        frame_array = np.zeros((all_im.size, len(unique_candidate_mz_idx)), dtype=frame_int.dtype)
+        np.add.at(frame_array, (frame_im_idx_filtered, mapped_bins), frame_int_filtered)
+
+    else:
+        # Similar for non-IMS case
+        mask = np.isin(frame_bin_idx, unique_candidate_mz_idx)
+        if mask.sum() == 0:
+            Logger.warning("No frame data left after candidate_bin filtering!")
+            return None, None
+        frame_bin_idx_filtered = frame_bin_idx[mask]
+        frame_int_filtered = frame_int[mask]
+
+        bin_mapping = {b: i for i, b in enumerate(unique_candidate_mz_idx)}
+        mapped_bins = np.array([bin_mapping[b] for b in frame_bin_idx_filtered])
+
+        frame_array = np.zeros((1, len(unique_candidate_mz_idx)), dtype=frame_int.dtype)
+        np.add.at(frame_array, (np.zeros(len(frame_int_filtered), dtype=int), mapped_bins), frame_int_filtered)
+
+    #frame_array = frame_coo.todense()[:, unique_idx.tolist()]
+
+    assert frame_array.shape[1] == candidate_array.shape[1], (
+        f"m/z dimension mismatch {frame_array.shape[1]} vs {candidate_array.shape[1]}"
     )
-    return (
-        frame_array,
-        candidate_array,
-    )  # , pd.DataFrame({"mz_index":frame_mz_index, "mz_value":frame_mz}), pd.DataFrame({"mz_index":candidate_mz_index, "mz_value":candidate_mz}) #TODO: remove extra returns
+
+    return frame_array, candidate_array
+
 
 
 def _select_im_peak_from_frame_act(
