@@ -5,8 +5,9 @@ import numpy as np
 import mokapot
 import logging
 import matplotlib.pyplot as plt
+import seaborn as sns
 from tqdm import tqdm
-
+from sklearn.base import BaseEstimator
 Logger = logging.getLogger(__name__)
 
 
@@ -15,6 +16,7 @@ def prepare_mokapot_input(
     feature_cols: list,
     scannr_col: Optional[str] = None,
     psmid_col: Optional[str] = None,
+    normalize_features: bool = True,
     decoy_col: str = "decoy",
     peptide_col: str = "modified_sequence",
     protein_col: str = "proteins",
@@ -37,6 +39,8 @@ def prepare_mokapot_input(
         this column is not necessarily unique
     psmid_col : str, optional
         Column name containing PSM IDs (default: None), this column should be unique
+    normalize_features : bool, optional
+        Whether to normalize feature columns (default: True)
     decoy_col : str, optional
         Column name indicating decoy status (default: "decoy")
     peptide_col : str, optional
@@ -90,6 +94,12 @@ def prepare_mokapot_input(
         df_pin["filename"] = "file"
         id_col.append("filename")
     df_pin = df_pin[id_col + feature_cols]
+    if normalize_features:
+        for col in tqdm(feature_cols, desc="Normalizing features"):
+            col_z = col + "_z"
+            df_pin[col_z] = (df_pin[col] - df_pin[col].mean()) / df_pin[col].std()
+        feature_cols = [col + "_z" for col in feature_cols]
+        df_pin = df_pin[id_col + feature_cols]
     Logger.info("Prepared mokapot input: %s", df_pin.head(5))
     return df_pin
 
@@ -98,8 +108,10 @@ def brew_with_mokapot(
     peptide_info_dataframe: pd.DataFrame,
     train_fdr: float = 0.1,
     test_fdr: float = 0.1,
+    model: Optional[BaseEstimator] = None,
     # level: Literal["pfm", "protein"] = "pfm",
     work_dir: Optional[str] = None,
+    direction: Optional[str] = None,
     **kwargs,
 ):
     """
@@ -143,22 +155,41 @@ def brew_with_mokapot(
 
     # Read the .pin file and run mokapot
     psms_pin = mokapot.read_pin(os.path.join(work_dir, "mokapot_input.pin"))
-    mokapot_model = mokapot.model.PercolatorModel(train_fdr=train_fdr)
+    if model is None:
+        mokapot_model = mokapot.model.PercolatorModel(train_fdr=train_fdr, direction=direction)
+    else:
+        mokapot_model = mokapot.model.Model(model, train_fdr=train_fdr)
     result, model = mokapot.brew(
-        psms_pin, model=mokapot_model, test_fdr=test_fdr, folds=3
+        psms_pin, model=mokapot_model, test_fdr=test_fdr, folds=5
     )
 
     # Clean up the temporary file
     # os.remove(os.path.join(work_dir, "mokapot_input.pin"))
     result.plot_qvalues()
-    plt.savefig(os.path.join(work_dir, "mokapot_qvalues.png"))
+    plt.savefig(os.path.join(work_dir, "mokapot_qvalues.png"), dpi=300, bbox_inches='tight')
     plt.close()
 
     result.to_txt(work_dir, decoys=True)
-    return result, model
+
+    # merge with mokapot results
+    psms = result.confidence_estimates["psms"]
+    psms_decoy = result.decoy_confidence_estimates["psms"]
+    psms = pd.concat([psms, psms_decoy], ignore_index=True)
+    psms["peak_label"] = psms["specid"].str.split("_").str[1].astype(int)
+
+    sns.histplot(data = psms, x="mokapot score", bins=100, hue = "label")
+    plt.savefig(os.path.join(work_dir, "mokapot_score_distr.png"), dpi=300, bbox_inches='tight')
+    plt.close()
+    return result, model, psms
 
 
-def merge_peaks_result_and_dict(peaks_result, dict_ref, ms1_scan_gap):
+def merge_peaks_result_and_dict(peaks_result, 
+                                dict_ref,
+                                ms1_scan_gap, 
+                                remove_bias: bool = False, 
+                                log_int_bias = 1, 
+                                keep_closet_int: Optional[int] = None,
+                                keep_closet_rt: Optional[int] = None):
     """
     Merges the peaks result DataFrame with a reference dictionary DataFrame based on the 'peptide' column.
     This function combines information from both DataFrames, ensuring that all relevant data is retained.
@@ -171,15 +202,16 @@ def merge_peaks_result_and_dict(peaks_result, dict_ref, ms1_scan_gap):
         Reference dictionary DataFrame containing additional information with a 'peptide' column
     ms1_scan_gap : float
         The gap between MS1 scans, used for calculating retention time index length
-
+    log_int_bias : float, optional
+        Bias added to log transformed intensity sum to ensure linearity for log_diff feature
     Returns
     -------
     pandas.DataFrame
         Merged DataFrame containing combined information from both input DataFrames
     """
-    dict_ref["rt_idx_length"] = (
-        dict_ref["MS1_frame_idx_right_ref"] - dict_ref["MS1_frame_idx_left_ref"]
-    )
+    # dict_ref["rt_idx_length"] = (
+    #     dict_ref["MS1_frame_idx_right_ref"] - dict_ref["MS1_frame_idx_left_ref"]
+    # )
     dict_ref["rt_idx_length_calc"] = dict_ref["Retention length"] / ms1_scan_gap
     peaks_result_merged_dict = pd.merge(
         peaks_result,
@@ -187,13 +219,16 @@ def merge_peaks_result_and_dict(peaks_result, dict_ref, ms1_scan_gap):
             [
                 "mz_rank",
                 "IM_search_idx_center",
+                # "MS1_frame_idx_center",
                 "MS1_frame_idx_center_ref",
+                "MS1_frame_idx_left_ref",
+                "MS1_frame_idx_right_ref",
                 "Decoy",
                 "Sequence",
                 "Charge",
                 "Proteins",
                 "Ion mobility length",
-                "rt_idx_length",
+                # "rt_idx_length",
                 "rt_idx_length_calc",
                 "Intensity",
                 "source",
@@ -202,29 +237,6 @@ def merge_peaks_result_and_dict(peaks_result, dict_ref, ms1_scan_gap):
         left_on="mz_rank",
         right_on="mz_rank",
         how="left",
-    )
-    peaks_result_merged_dict["log_Intensity_MQ"] = np.log10(
-        1 + peaks_result_merged_dict["Intensity"]
-    )
-    peaks_result_merged_dict["rt_diff"] = abs(
-        peaks_result_merged_dict["rt_apex_index"]
-        - peaks_result_merged_dict["MS1_frame_idx_center_ref"]
-    )
-    peaks_result_merged_dict["im_diff"] = abs(
-        peaks_result_merged_dict["im_apex_index"]
-        - peaks_result_merged_dict["IM_search_idx_center"]
-    )
-    peaks_result_merged_dict["im_length_diff"] = abs(
-        peaks_result_merged_dict["im_length"]
-        - peaks_result_merged_dict["Ion mobility length"]
-    )
-    peaks_result_merged_dict["rt_length_diff"] = abs(
-        peaks_result_merged_dict["rt_length"]
-        - peaks_result_merged_dict["rt_idx_length_calc"]
-    )
-    peaks_result_merged_dict["log_int_diff"] = abs(
-        np.log10(1 + peaks_result_merged_dict["intensity_sum"])
-        - peaks_result_merged_dict["log_Intensity_MQ"]
     )
     peaks_result_merged_dict.rename(
         columns={
@@ -237,4 +249,61 @@ def merge_peaks_result_and_dict(peaks_result, dict_ref, ms1_scan_gap):
         },
         inplace=True,
     )
+    peaks_result_merged_dict["log_Intensity_MQ"] = np.log10(
+        1 + peaks_result_merged_dict["Intensity"]
+    )
+    peaks_result_merged_dict["rt_diff"] = (
+        peaks_result_merged_dict["rt_apex_index"]
+        - peaks_result_merged_dict["MS1_frame_idx_center_ref"]
+    )
+    peaks_result_merged_dict["rt_pixel_diff"] = (
+        peaks_result_merged_dict["pixel_apex_rt"]
+        - peaks_result_merged_dict["MS1_frame_idx_center_ref"]
+    )
+    # peaks_result_merged_dict["rt_start_diff"] = (
+    #     peaks_result_merged_dict["rt_min_index"]
+    #     - peaks_result_merged_dict["MS1_frame_idx_left_ref"]
+    # )
+    # peaks_result_merged_dict["rt_end_diff"] = (
+    #     peaks_result_merged_dict["rt_max_index"]
+    #     - peaks_result_merged_dict["MS1_frame_idx_right_ref"]
+    # )
+    peaks_result_merged_dict["im_diff"] = (
+        peaks_result_merged_dict["im_apex_index"]
+        - peaks_result_merged_dict["IM_search_idx_center"]
+    )
+    peaks_result_merged_dict["im_length_diff"] = (
+        peaks_result_merged_dict["im_length"]
+        - peaks_result_merged_dict["Ion mobility length"]
+    )
+    peaks_result_merged_dict["rt_length_diff"] = (
+        peaks_result_merged_dict["rt_length"]
+        - peaks_result_merged_dict["rt_idx_length_calc"]
+    )
+    peaks_result_merged_dict["log_int_diff"] = (
+        np.log10(1 + peaks_result_merged_dict["intensity_sum"])
+        - peaks_result_merged_dict["log_Intensity_MQ"] 
+        + log_int_bias
+    )
+
+    for col in peaks_result_merged_dict.columns:
+        if "diff" in col:
+            if remove_bias and (col in ['rt_length_diff', 'im_length_diff', 'rt_diff', 'im_diff', "rt_pixel_diff"]):
+                    Logger.info("Column %s: median %.4f", col,
+                        peaks_result_merged_dict[col].median())
+                    peaks_result_merged_dict[col] = (
+                        peaks_result_merged_dict[col] - peaks_result_merged_dict[col].median()
+                    )
+            # Take absolute value for diff features
+            peaks_result_merged_dict[col] = abs(peaks_result_merged_dict[col])
+    if keep_closet_rt is not None:
+        Logger.info("Keeping only the %d closest retention times per peptide, rows before filtering: %d", keep_closet_rt, peaks_result_merged_dict.shape[0])
+        peaks_result_merged_dict.sort_values(by=["rt_diff"], inplace=True, ascending = True)
+        peaks_result_merged_dict = peaks_result_merged_dict.groupby("mz_rank").head(keep_closet_rt).reset_index(drop=True)
+        Logger.info("Rows after filtering: %d", peaks_result_merged_dict.shape[0])
+    if keep_closet_int is not None:
+        Logger.info("Keeping only the %d closest intensities per peptide, rows before filtering: %d", keep_closet_int, peaks_result_merged_dict.shape[0])
+        peaks_result_merged_dict.sort_values(by=["log_int_diff"], inplace=True, ascending = True)
+        peaks_result_merged_dict = peaks_result_merged_dict.groupby("mz_rank").head(keep_closet_int).reset_index(drop=True)
+        Logger.info("Rows after filtering: %d", peaks_result_merged_dict.shape[0])
     return peaks_result_merged_dict

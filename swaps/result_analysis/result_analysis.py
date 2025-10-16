@@ -238,6 +238,7 @@ class SWAPSResult:
         save_dir: Optional[str] = None,
         include_decoys: bool = True,
         score_col: str = "target_decoy_score",
+        fdr_col: Optional[str] = None,
         **kwargs,
     ):
         """
@@ -261,6 +262,7 @@ class SWAPSResult:
         self.infer_intensity_col = infer_intensity_col
         self.score_col = score_col
         self.pept_act_sum.dropna(subset=[self.infer_intensity_col], inplace=True)
+        self.fdr_col = fdr_col
         Logger.info(
             "Drop na values in %s, Pept activation sum entries: %s",
             self.infer_intensity_col,
@@ -293,15 +295,19 @@ class SWAPSResult:
                     self.fdr_thres = self.fdr_max
             if self.fdr_thres is not None:
                 Logger.info("Calculating FDR results after filter...")
-                self.pept_act_sum = calc_fdr_and_thres(
-                    self.pept_act_sum,
-                    score_col=self.score_col,
-                    filter_dict={"log_sum_intensity": [0, 100]},
-                    return_plot=True,
-                    save_dir=save_dir,
-                    dataset_name="result_analysis",
-                    **kwargs,
-                )
+                if self.fdr_col is None:
+                    
+                    self.pept_act_sum = calc_fdr_and_thres(
+                        self.pept_act_sum,
+                        score_col=self.score_col,
+                        filter_dict={"log_sum_intensity": [0, 100]},
+                        return_plot=True,
+                        save_dir=save_dir,
+                        dataset_name="result_analysis",
+                        **kwargs,
+                    )
+                else:
+                    self.pept_act_sum['fdr'] = self.pept_act_sum[self.fdr_col]
                 Logger.info(
                     "Filtering the data by FDR threshold %s, number of entries before filtering %s",
                     self.fdr_thres,

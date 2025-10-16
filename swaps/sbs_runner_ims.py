@@ -358,8 +358,11 @@ def opt_scan_by_scan(config_path: str):
         peaks_result=peak_property_all_pept_batches,
         dict_ref=maxquant_result_ref, # TODO: here uses both target and decoy
         ms1_scan_gap=ms1_scan_gap,
+        remove_bias = True,
+        log_int_bias = 1,
+        keep_closet_int = 3
     )
-    result, model = brew_with_mokapot(
+    result, model, psms = brew_with_mokapot(
         peaks_result_merged_dict,
         feature_cols=[
             "intensity_cv",
@@ -382,11 +385,7 @@ def opt_scan_by_scan(config_path: str):
         work_dir=os.path.join(cfg.RESULT_PATH, "results", "mokapot"),
     )
 
-    # merge with mokapot results
-    psms = result.confidence_estimates["psms"]
-    psms_decoy = result.decoy_confidence_estimates["psms"]
-    psms = pd.concat([psms, psms_decoy], ignore_index=True)
-    psms["peak_label"] = psms["specid"].str.split("_").str[1].astype(int)
+
     peaks_result_merged_dict_merged_conf = pd.merge(
         peaks_result_merged_dict,
         psms[
@@ -666,6 +665,7 @@ def opt_scan_by_scan(config_path: str):
             save_dir=eval_dir,
             include_decoys=cfg.PREPARE_DICT.GENERATE_DECOY,
             score_col="mokapot score",
+            fdr_col = "mokapot q-value"
         )
         swaps_result.plot_intensity_corr()
         # swaps_result.plot_intensity_corr(contour=True)

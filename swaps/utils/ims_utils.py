@@ -1,5 +1,5 @@
 import logging
-from typing import Optional
+from typing import Optional, Literal
 import sparse
 import os
 import numpy as np
@@ -12,9 +12,8 @@ from scipy import ndimage as ndi
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
 from skimage.measure import regionprops_table
-from scipy.ndimage import gaussian_filter1d
-from skimage.measure import regionprops_table
-
+from scipy.ndimage import gaussian_filter1d, uniform_filter, gaussian_filter
+from skimage.morphology import h_minima, remove_small_objects
 import alphatims.bruker
 
 Logger = logging.getLogger(__name__)
@@ -571,11 +570,11 @@ def _sum_3d_act_filter_by_im_fast(
 
 
 def detect_2d_peak_with_watershed(
-    pept_act_log,
+    image,
     int_threshold=0.5,
     min_distance=5,
     threshold_rel=0.2,
-    on_gradient: bool = False,
+
 ):
     """
     Detect peaks in a 2D image using the watershed algorithm.
@@ -593,19 +592,20 @@ def detect_2d_peak_with_watershed(
     - labels: 2D numpy array
         Labeled regions corresponding to detected peaks.
     """
-    # 1. Create mask of signal regions
-    mask_signal = pept_act_log > int_threshold
-    if not mask_signal.any():
-        return np.empty((0, 2), dtype=int), np.zeros_like(pept_act_log, dtype=int)
 
-    # 2. Compute distance transform inside signal
-    if on_gradient:
-        dy, dx = np.gradient(pept_act_log)
-        distance = -dy
-    else:
-        distance = pept_act_log
+
+    # 2. Compute distance (to background) transform inside signal
+    distance = image
+
+    # 1. Create mask of signal regions
+    mask_signal = distance > int_threshold
+    if not mask_signal.any():
+        distance[~mask_signal] = 0
+        return np.empty((0, 2), dtype=int), np.zeros_like(distance, dtype=int), np.zeros_like(distance, dtype=float)
+    
     # distance = ndi.distance_transform_edt(mask_signal)
     # 3. Find local maxima in distance map
+
     coordinates = peak_local_max(
         distance,
         min_distance=min_distance,
@@ -613,20 +613,21 @@ def detect_2d_peak_with_watershed(
         labels=mask_signal,
     )
     if coordinates.size == 0:
-        return coordinates, np.zeros_like(pept_act_log, dtype=int)
+        return coordinates, np.zeros_like(image, dtype=int), np.zeros_like(image, dtype=float)
     mask = np.zeros(distance.shape, dtype=bool)
     mask[tuple(coordinates.T)] = True
     markers, _ = ndi.label(mask)  # type: ignore
 
     # 4. Watershed on *negative distance*
-    labels = watershed(-distance, markers, mask=mask_signal)
-    return coordinates, labels
+    labels = watershed(-image, markers, mask=mask_signal, compactness=10) #type: ignore
+    
+    return coordinates, labels, distance
 
 
 def calculate_peak_property_from_labels_and_image(
     labels,
     image_2d,
-    image_2d_log,
+    grad_mag,
     image_res_2d: Optional[np.ndarray] = None,
     min_peak_area=10,
     min_peak_sum_intensity=1000,
@@ -655,6 +656,7 @@ def calculate_peak_property_from_labels_and_image(
     if num_labels == 0:
         Logger.info("No peaks detected after watershed.")
         return None
+
 
     # Region properties from skimage (fast, C-based)
     props = regionprops_table(
@@ -710,10 +712,10 @@ def calculate_peak_property_from_labels_and_image(
         # df.drop(columns=["label_res"], inplace=True)
 
     # Compute row-based smoothness
-    dy, dx = np.gradient(image_2d_log)
+
     row_smoothness_df = compute_row_smoothness_and_apex_index(
         labels=labels,
-        dy=dy,
+        dy=grad_mag,
         pept_act=image_2d,
         label_values=df["label"].values,
         apply_gaussian_smoothing=False,
@@ -721,7 +723,7 @@ def calculate_peak_property_from_labels_and_image(
 
     df = df.merge(row_smoothness_df, on="label", how="left")
     if return_dy:
-        return df, dy
+        return df, grad_mag
     else:
         return df
 
@@ -823,6 +825,7 @@ def detect_2d_peak_and_calculate_peak_property(
     start_mz_idx: int,
     end_mz_idx: int,
     im_rt_pept_res_coo: Optional[sparse.COO] = None,
+    filter: Literal["gaussian", "uniform", None] = "gaussian",
     detect_kwargs=None,
     calc_kwargs=None,
 ):
@@ -866,9 +869,6 @@ def detect_2d_peak_and_calculate_peak_property(
         im_rt_pept_act_coo_dense = np.atleast_3d(
             im_rt_pept_act_coo[rt_min:rt_max, im_min:im_max, mz_idx].todense()
         )  # Convert to dense for easier indexing
-        # im_rt_pept_act_coo_dense = np.atleast_3d(
-        #     im_rt_pept_act_coo[:, :, start_mz_idx:end_mz_idx].todense()
-        # )  # Convert to dense for easier indexing
         Logger.debug("Original COO shape: %s, dense array shape: %s", im_rt_pept_act_coo.shape, im_rt_pept_act_coo_dense.shape)
         if im_rt_pept_res_coo is not None:
             im_rt_pept_res_coo_dense = np.abs(
@@ -877,24 +877,37 @@ def detect_2d_peak_and_calculate_peak_property(
         else:
             im_rt_pept_res_coo_dense = None
         for rel_idx, mz_rank in enumerate(mz_idx):
-            # rel_idx = mz_rank - start_mz_idx
-            # Extract and log-transform
             pept_act = im_rt_pept_act_coo_dense[:, :, rel_idx]
-            pept_act_log = np.log10(1 + pept_act)
 
-            pept_res = (
-                im_rt_pept_res_coo_dense[:, :, rel_idx]
-                if im_rt_pept_res_coo_dense is not None
-                else None
-            )
+            # pept_act = im_rt_pept_act_coo[rt_start:rt_end, im_start:im_end, pept_idx].todense()
+            cleaned_mask = remove_small_objects(pept_act>=10, min_size=9) # TODO: hardcoded threshold
+            match filter:
+                case "gaussian":
+                    pept_act_smoothed = gaussian_filter(pept_act, sigma=1.0)
+                case "uniform":
+                    blurred = uniform_filter(pept_act, size=9)
+                    pept_act_smoothed = np.maximum(pept_act, blurred)
+                case None:
+                    pept_act_smoothed = pept_act
+            pept_act_smoothed = pept_act_smoothed * cleaned_mask
+            pept_act_smoothed_log = np.log10(1 + pept_act_smoothed)
+
+
+            # Calculate gradient mask
+            dy, dx = np.gradient(pept_act_smoothed)
+            grad_mag = np.sqrt(dx**2 + dy**2)
+            # grad_mag_smooth = gaussian_filter(grad_mag, sigma=2.0)
+
             # Detect peaks with flexible kwargs
-            coordinates, labels = detect_2d_peak_with_watershed(
-                pept_act_log, **detect_kwargs
+            coordinates, labels, distance = detect_2d_peak_with_watershed(
+                pept_act_smoothed_log, 
+                int_threshold=1, 
+                threshold_rel = 0.2, 
+                min_distance=10
             )
-
             # Calculate peak properties with flexible kwargs
             peak_properties = calculate_peak_property_from_labels_and_image(
-                labels, pept_act, pept_act_log, pept_res, **calc_kwargs
+                labels, pept_act, grad_mag, **calc_kwargs
             )
 
             if isinstance(peak_properties, pd.DataFrame) and not peak_properties.empty:
