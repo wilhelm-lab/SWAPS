@@ -1,6 +1,6 @@
 import logging
 import os
-from typing import List, Set, Union, Literal
+from typing import List, Set, Union, Literal, Optional
 
 import matplotlib.pyplot as plt
 from matplotlib import colormaps, patches  # type: ignore
@@ -1143,15 +1143,26 @@ def plot_pept_act_heatmap(
 
 
 def plot_pept_act_align_channels(
-    pept_act_log,
+    act_raw,
+    act_log,
+    act_transformed_log,
     grad_mag,
-    coordinates,
-    labels,
-    peak_properties,
+    grad_mag_smoothed,
     rt_exp_start,
     rt_exp_end,
+    rt_exp_center,
+    im_exp_start,
+    im_exp_center,
+    im_exp_end,
+    coordinates = None,
+    labels = None,
+    peak_properties=None,
+    sub_fig3 = None,
     figsize=(15, 5),
     annotate=True,
+    title: Optional[str] = None,
+    save_dir: Optional[str] = None,
+    fig_spec_name: str = "",
 ):
     """
     Plot peptide activity, gradient magnitude and watershed labels with annotations.
@@ -1167,45 +1178,48 @@ def plot_pept_act_align_channels(
     - figsize: figure size tuple
     - annotate: whether to annotate centroids with label and smoothness
     """
-    fig, axes = plt.subplots(1, 3, figsize=figsize)
-
+    fig, axes = plt.subplots(2, 3, figsize=figsize)
+    axes = axes.flatten()
     # left: log intensity with detected peak locations
     ax = axes[0]
-    im0 = ax.imshow(pept_act_log, cmap="viridis", aspect="auto", interpolation="nearest")
-    xlim = ax.get_xlim()
-    ax.hlines([rt_exp_start, rt_exp_end], xmin=xlim[0], xmax=xlim[1], colors="white", linestyles="dashed")
-    if coordinates is not None and len(coordinates) > 0:
-        ax.scatter(coordinates[:, 1], coordinates[:, 0], color="r", s=20)
-    ax.set_title("pept_act_log + peaks")
+    im0 = ax.imshow(act_raw, cmap="viridis", aspect="auto", interpolation="nearest")
+    ax.set_title("Raw")
     fig.colorbar(im0, ax=ax)
 
-    # middle: gradient magnitude
     ax = axes[1]
-    im1 = ax.imshow(grad_mag, cmap="gray", aspect="auto", interpolation="nearest")
-    ax.hlines([rt_exp_start, rt_exp_end], xmin=xlim[0], xmax=xlim[1], colors="white", linestyles="dashed")
-    ax.set_title("gradient magnitude mask")
+    im1 = ax.imshow(act_log, cmap="viridis", aspect="auto", interpolation="nearest")
+    ax.set_title("Log-Transformed")
     fig.colorbar(im1, ax=ax)
 
-    # right: watershed labels (only plot labels present in peak_properties)
-    assert isinstance(peak_properties, pd.DataFrame)
-    filtered_labels = peak_properties["label"].values
-    labels_mask = np.isin(labels, filtered_labels)  # type: ignore
-    labels_to_plot = labels * labels_mask
     ax = axes[2]
-    im2 = ax.imshow(
-        labels_to_plot,
-        cmap=plt.cm.nipy_spectral,  # type: ignore
+    im2 = ax.imshow(act_transformed_log, cmap="viridis", aspect="auto", interpolation="nearest")
+    if coordinates is not None and len(coordinates) > 0:
+        ax.scatter(coordinates[:, 1], coordinates[:, 0], color="r", s=20)
+    ax.set_title("Transformed, Log + Local Max")
+    fig.colorbar(im2, ax=ax)
+
+
+
+    if sub_fig3 is None:
+        # right: watershed labels (only plot labels present in peak_properties)
+        assert isinstance(peak_properties, pd.DataFrame)
+        filtered_labels = peak_properties["label"].values
+        labels_mask = np.isin(labels, filtered_labels)  # type: ignore
+        sub_fig3 = labels * labels_mask
+    ax = axes[3]
+    im5 = ax.imshow(
+        sub_fig3,
+        cmap=plt.cm.nipy_spectral,
         aspect="auto",
         interpolation="nearest",
     )
-    ax.hlines([rt_exp_start, rt_exp_end], xmin=xlim[0], xmax=xlim[1], colors="white", linestyles="dashed")
-    ax.set_title("watershed on distance")
-    fig.colorbar(im2, ax=ax)
-
+    ax.set_title("Watershed Segmentation")
+    fig.colorbar(im5, ax=ax)
+    
     # annotate each detected coordinate with its watershed label and row_smoothness
     if annotate and not peak_properties.empty:
         # use centroid coords and row_smoothness from peak_properties
-        cols = ["centroid-0", "centroid-1", "row_smoothness"]
+        cols = ["centroid-0", "centroid-1", "intensity_sum"]
         # guard if some columns missing
         if all(c in peak_properties.columns for c in cols):
             for (r, c, s) in peak_properties[cols].values:
@@ -1220,22 +1234,140 @@ def plot_pept_act_align_channels(
                     r,
                     str(lbl),
                     color="white",
-                    fontsize=7,
+                    fontsize=12,
                     ha="center",
                     va="center",
                     bbox=dict(facecolor="black", alpha=0.6, pad=0.2),
                 )
                 ax.text(
                     c,
-                    r + 2,
-                    f"{s:.2f}",
+                    r + 10,
+                    f"{np.log10(s+1):.2f}",
                     color="yellow",
-                    fontsize=7,
+                    fontsize=12,
                     ha="center",
                     va="center",
                     bbox=dict(facecolor="black", alpha=0.6, pad=0.2),
                 )
+        # middle: gradient magnitude
+    ax = axes[4]
+    im3 = ax.imshow(grad_mag, cmap = "gray", aspect="auto", interpolation="nearest")
+    ax.set_title("Gradient Magnitude")
+    fig.colorbar(im3, ax=ax)
+
+     # right: smoothed gradient magnitude
+    ax = axes[5]
+    im4 = ax.imshow(grad_mag_smoothed, cmap = "gray", aspect="auto", interpolation="nearest")
+    ax.set_title("Smoothed Gradient Magnitude")
+    fig.colorbar(im4, ax=ax)
+
+    for ax in axes:
+        xlim = ax.get_xlim()
+        ax.hlines([rt_exp_start, rt_exp_end], xmin=xlim[0], xmax=xlim[1], colors="white", linestyles="dashed")
+        ax.vlines([im_exp_start,im_exp_end], ymin=ax.get_ylim()[0], ymax=ax.get_ylim()[1], colors="white", linestyles="dashed")
+        ax.hlines([rt_exp_center], xmin=xlim[0], xmax=xlim[1], colors="white", linestyles="solid")
+        ax.vlines([im_exp_center], ymin=ax.get_ylim()[0], ymax=ax.get_ylim()[1], colors="white", linestyles="solid")
+    if title is not None:
+        fig.suptitle(title)
+    plt.tight_layout()
+    if save_dir is not None:
+        save_plot(
+            save_dir,
+            fig_type_name="pept_act_align_channels",
+            fig_spec_name=fig_spec_name,
+            fig_format=["png"],
+        )
+    else:
+        plt.show()
+
+
+def plot_heat(ax, heat_df, title, filtered_precursor, rows, match_col="mz_rank", mark_col="mobility_values_index_center_exp"):
+    sns.heatmap(heat_df, cmap="viridis", ax=ax)
+    ax.set_title(title)
+    ax.tick_params(axis="y", labelrotation=0)
+    for lbl in ax.get_yticklabels():
+        lbl.set_ha("right")
+    cols = heat_df.columns.values
+    for y_pos, mz_rank in enumerate(rows):
+        sel = filtered_precursor.loc[filtered_precursor[match_col] == mz_rank, mark_col]
+
+        if sel.empty:
+            continue
+        mobility_idx = sel.values[0]
+        # print(y_pos, mz_rank, mobility_idx)
+        if pd.isna(mobility_idx):
+            continue
+        # find nearest mobility column in the heatmap
+        col_pos = np.argmin(np.abs(cols - mobility_idx))
+        ax.scatter(col_pos + 0.5, y_pos + 0.5, marker="x", color="red", s=20)
+
+
+def plot_frame_act_and_mono_mz(frame_data, filtered_precursor, act_3d_dict, ppm_tol=20, log_int= False,log_act=False):
+    """
+    Plot side-by-side heatmaps:
+      1. Experimental mobility–intensity map
+      2. Activation (3D) map
+    with red markers indicating precursor positions.
+
+    Parameters
+    ----------
+    frame_data : pd.DataFrame
+        Columns: "mz_values", "intensity_values", "mobility_values"
+    filtered_precursor : pd.DataFrame
+        Must contain columns: "IsoMZ", "1/K0", "mz_rank", "mobility_values_index_center_exp"
+    act_3d_dict : dict
+        Keys: "coord_pept_indices", "coord_im_indices", "data"
+    ppm_tol : float, optional
+        PPM tolerance for selecting mz window around each precursor center
+    """
+
+    # --- Extract basic arrays ---
+    mz_vals = frame_data["mz_values"].values
+    intensities = frame_data["intensity_values"].values
+    scans = frame_data["mobility_values"].values
+
+    # --- Precursor centers and tolerances ---
+    centers = np.array([mz[0] for mz in filtered_precursor["IsoMZ"].values])
+    tolerances = centers * ppm_tol / 1e6
+
+    # --- Aggregate intensity per mobility for each precursor ---
+    records = []
+    for c, tol in zip(centers, tolerances):
+        mask = (mz_vals >= (c - tol)) & (mz_vals <= (c + tol))
+        if not np.any(mask):
+            continue
+        df_sub = (
+            pd.DataFrame({
+                "mobility_values": scans[mask],
+                "intensity_values": intensities[mask]
+            })
+            .groupby("mobility_values", as_index=False)["intensity_values"].sum()
+        )
+        df_sub["center_mz"] = c
+        records.append(df_sub)
+
+    result_df = pd.concat(records, ignore_index=True)
+    heat_exp = result_df.pivot(index="center_mz", columns="mobility_values", values="intensity_values")
+    left_title = f"Experimental MonoM/Z (ppm={ppm_tol}) - 1/K0 - Intensity"
+    if log_int:
+        heat_exp = np.log1p(heat_exp)
+        left_title += " (log-scaled)"
+    # --- Activation data ---
+    act_3d_df = pd.DataFrame(act_3d_dict)
+    act_3d_df = act_3d_df[act_3d_df["coord_pept_indices"].isin(filtered_precursor["mz_rank"].values)]
+    right_title = "Activation Map"
+    if log_act:
+        act_3d_df["data"] = np.log1p(act_3d_df["data"])
+        right_title += " (log-scaled)"
+    heat_act = act_3d_df.pivot(index="coord_pept_indices", columns="coord_im_indices", values="data").fillna(0)
+
+    # --- Plot ---
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    filtered_precursor['mono_mz'] = np.array([mz[0] for mz in filtered_precursor["IsoMZ"].values])
+    # Left: experimental
+    plot_heat(axes[0], heat_exp, left_title, filtered_precursor, heat_exp.index.values, "mono_mz", "1/K0")
+    # Right: activation
+    plot_heat(axes[1], heat_act, right_title, filtered_precursor, heat_act.index.values, "mz_rank", "mobility_values_index_center_exp")
 
     plt.tight_layout()
     plt.show()
-    return fig, axes
