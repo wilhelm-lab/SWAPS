@@ -79,6 +79,8 @@ def opt_scan_by_scan(config_path: str):
         mzml_data = load_mzml(cfg.DATA_PATH, unify_format=True)
     if cfg.DICT_PICKLE_PATH != "":
         maxquant_result_ref = pd.read_pickle(filepath_or_buffer=cfg.DICT_PICKLE_PATH)
+        maxquant_target_result_ref = maxquant_result_ref.loc[~maxquant_result_ref["Decoy"]]
+        maxquant_decoy_result_ref = maxquant_result_ref.loc[maxquant_result_ref["Decoy"]]
         ms1scans = pd.read_csv(os.path.join(cfg.RESULT_PATH, "ms1scans.csv"))
         mobility_values_df = pd.read_csv(
             os.path.join(cfg.RESULT_PATH, "mobility_values.csv")
@@ -122,7 +124,7 @@ def opt_scan_by_scan(config_path: str):
             "sage_discriminant_score" in maxquant_result_ref_ori.columns
         ):  # infer search engine, remap column names
             maxquant_result_ref_ori = sage_parser(maxquant_result_ref_ori)
-        maxquant_result_ref, maxquant_target_result_ref, maxquant_decoy_result_ref, dict_target_pickle_path, dict_decoy_pickle_path, cfg_prepare_dict = construct_dict(
+        maxquant_result_ref, maxquant_target_result_ref, maxquant_decoy_result_ref, dict_target_pickle_path, dict_decoy_pickle_path, dict_pickle_path, cfg_prepare_dict = construct_dict(
             cfg_prepare_dict=cfg.PREPARE_DICT,
             filter_exp_by_raw_file=cfg.FILTER_EXP_BY_RAW_FILE,
             maxquant_exp_path=cfg.MQ_EXP_PATH,
@@ -158,7 +160,7 @@ def opt_scan_by_scan(config_path: str):
                 + 1,  # this index is rank, starting from 1
             )
         cfg.PREPARE_DICT = cfg_prepare_dict
-        cfg.DICT_PICKLE_PATH = dict_target_pickle_path
+        cfg.DICT_PICKLE_PATH = dict_pickle_path
         cfg.OPTIMIZATION.PEPTACT_SHAPE = peptact_shape
         cfg.dump(
             stream=open(
@@ -210,19 +212,21 @@ def opt_scan_by_scan(config_path: str):
         logging.info("Loaded pre-calculated optimization.")
     except FileNotFoundError:
         try:
-            peak_property_all_pept_batches = combine_3d_act_and_detect_peak(
-                n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
-                n_batch=cfg.OPTIMIZATION.N_BATCH,
-                act_dir=os.path.join(act_dir, "target"),
-                remove_batch_file=True,
-                calc_pept_act_sum_filter_by_im=cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM,
-                maxquant_result_ref=maxquant_target_result_ref,
-                use_ims=cfg.USE_IMS,
-                im_ref=cfg.PREPARE_DICT.IM_REF,
-                n_cpu=cfg.N_CPU,
-                chunk_size=cfg.RESULT_ANALYSIS.POST_PROCESSING.PEAK_DETECTION_CHUNK_SIZE,
-                rt_group=cfg.RESULT_ANALYSIS.POST_PROCESSING.RT_GROUP,
-            )
+            if 'peak_property_all_pept_batches' not in locals():
+                logging.info("Precalculated target peak properties not found, start post processing.")
+                peak_property_all_pept_batches = combine_3d_act_and_detect_peak(
+                    n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
+                    n_batch=cfg.OPTIMIZATION.N_BATCH,
+                    act_dir=os.path.join(act_dir, "target"),
+                    remove_batch_file=True,
+                    calc_pept_act_sum_filter_by_im=cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM,
+                    maxquant_result_ref=maxquant_target_result_ref,
+                    use_ims=cfg.USE_IMS,
+                    im_ref=cfg.PREPARE_DICT.IM_REF,
+                    n_cpu=cfg.N_CPU,
+                    chunk_size=cfg.RESULT_ANALYSIS.POST_PROCESSING.PEAK_DETECTION_CHUNK_SIZE,
+                    rt_group=cfg.RESULT_ANALYSIS.POST_PROCESSING.RT_GROUP,
+                )
             if cfg.PREPARE_DICT.GENERATE_DECOY:
                 peak_property_all_pept_batches_decoy = combine_3d_act_and_detect_peak(
                     n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,

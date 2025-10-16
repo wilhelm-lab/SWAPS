@@ -1748,7 +1748,7 @@ def construct_dict(
         maxquant_dict.shape,
     )
     Logger.debug("Columns in maxquant_dict: %s", maxquant_dict.columns)
-    return maxquant_dict,maxquant_dict_target, maxquant_dict_decoy, dict_target_pickle_path, dict_decoy_pickle_path,cfg_prepare_dict
+    return maxquant_dict,maxquant_dict_target, maxquant_dict_decoy, dict_target_pickle_path, dict_decoy_pickle_path, dict_pickle_path, cfg_prepare_dict
 
 
 def get_mzrank_batch_cutoff(maxquant_dict_df: pd.DataFrame):
