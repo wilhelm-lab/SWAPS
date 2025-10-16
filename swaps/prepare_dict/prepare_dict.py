@@ -67,19 +67,19 @@ def merge_ref_and_exp(
         maxquant_ref_df, remove_decoys=True, how_duplicates="keep_highest_int"
     )
     Logger.debug(
-        "NaN values in ref df Calibrated retentiont time start_exp/exp/finish_exp: %s, %s, %s",
-        maxquant_ref_df["Calibrated retention time start"].isna().sum(),
-        maxquant_ref_df["Calibrated retention time"].isna().sum(),
-        maxquant_ref_df["Calibrated retention time finish"].isna().sum(),
+        "NaN values in ref df Retention time start_exp/exp/finish_exp: %s, %s, %s",
+        maxquant_ref_df["Retention time start"].isna().sum(),
+        maxquant_ref_df["Retention time"].isna().sum(),
+        maxquant_ref_df["Retention time finish"].isna().sum(),
     )
     maxquant_exp_df = cleanup_maxquant(
         maxquant_exp_df, remove_decoys=True, how_duplicates="keep_highest_int"
     )
     Logger.debug(
-        "NaN values in exp df Calibrated retentiont time start_exp/exp/finish_exp: %s, %s, %s",
-        maxquant_exp_df["Calibrated retention time start"].isna().sum(),
-        maxquant_exp_df["Calibrated retention time"].isna().sum(),
-        maxquant_exp_df["Calibrated retention time finish"].isna().sum(),
+        "NaN values in exp df Retention time start_exp/exp/finish_exp: %s, %s, %s",
+        maxquant_exp_df["Retention time start"].isna().sum(),
+        maxquant_exp_df["Retention time"].isna().sum(),
+        maxquant_exp_df["Retention time finish"].isna().sum(),
     )
     join_on_columns = ["Modified sequence", "Sequence", "Charge"]
     ref_selected = maxquant_ref_df[join_on_columns]
@@ -112,9 +112,9 @@ def merge_ref_and_exp(
     )
     ref_unique_df = ref_unique_df.rename(
         columns={
-            "Calibrated retention time start": "Calibrated retention time start_ref",
-            "Calibrated retention time": "Calibrated retention time_ref",
-            "Calibrated retention time finish": "Calibrated retention time finish_ref",
+            "Retention time start": "Retention time start_ref",
+            "Retention time": "Retention time_ref",
+            "Retention time finish": "Retention time finish_ref",
         }
     )
     exp_unique_df = maxquant_exp_df.merge(
@@ -122,16 +122,16 @@ def merge_ref_and_exp(
     )
     exp_unique_df = exp_unique_df.rename(
         columns={
-            "Calibrated retention time start": "Calibrated retention time start_exp",
-            "Calibrated retention time": "Calibrated retention time_exp",
-            "Calibrated retention time finish": "Calibrated retention time finish_exp",
+            "Retention time start": "Retention time start_exp",
+            "Retention time": "Retention time_exp",
+            "Retention time finish": "Retention time finish_exp",
         }
     )
     if ref_type == "MQ":
         ref_spec_columns = [
-            "Calibrated retention time start",
-            "Calibrated retention time",
-            "Calibrated retention time finish",
+            "Retention time start",
+            "Retention time",
+            "Retention time finish",
         ]
         if use_ims:
             ref_spec_columns += [
@@ -175,10 +175,10 @@ def merge_ref_and_exp(
         suffixes=("_exp", "_ref"),
     )
     Logger.debug(
-        "NaN values in both_unique_df Calibrated retentiont time start_exp/exp/finish_exp: %s, %s, %s",
-        both_unique_df["Calibrated retention time start_exp"].isna().sum(),
-        both_unique_df["Calibrated retention time_exp"].isna().sum(),
-        both_unique_df["Calibrated retention time finish_exp"].isna().sum(),
+        "NaN values in both_unique_df Retention time start_exp/exp/finish_exp: %s, %s, %s",
+        both_unique_df["Retention time start_exp"].isna().sum(),
+        both_unique_df["Retention time_exp"].isna().sum(),
+        both_unique_df["Retention time finish_exp"].isna().sum(),
     )
     exp_unique_df["source"] = "exp"
     ref_unique_df["source"] = "ref"
@@ -205,10 +205,10 @@ def merge_ref_and_exp(
         join="outer",
     )
     Logger.debug(
-        "NaN values in maxquant_merge_df (concat) Calibrated retentiont time start_exp/exp/finish_exp: %s, %s, %s",
-        maxquant_merge_df["Calibrated retention time start_exp"].isna().sum(),
-        maxquant_merge_df["Calibrated retention time_exp"].isna().sum(),
-        maxquant_merge_df["Calibrated retention time finish_exp"].isna().sum(),
+        "NaN values in maxquant_merge_df (concat) Retention time start_exp/exp/finish_exp: %s, %s, %s",
+        maxquant_merge_df["Retention time start_exp"].isna().sum(),
+        maxquant_merge_df["Retention time_exp"].isna().sum(),
+        maxquant_merge_df["Retention time finish_exp"].isna().sum(),
     )
     # evaluate
     plt.bar(
@@ -533,55 +533,57 @@ def dict_add_im_index(
 def dict_add_rt_index(
     maxquant_df: pd.DataFrame,
     rt_values_df: pd.DataFrame,
-    mq_rt_left_col: str = "RT_search_left",
-    mq_rt_center_col: str = "RT_search_center",
-    mq_rt_right_col: str = "RT_search_right",
+    mq_rt_left_col: Optional[str] = "RT_search_left",
+    mq_rt_center_col: Optional[str] = "RT_search_center",
+    mq_rt_right_col: Optional[str] = "RT_search_right",
     idx_suffix: str = "",
 ):
     """Get RT index of RT_search_left, RT_search_center and RT_search_right/
     as indicated in RT values from .d file for each row in maxquant_dict_df/
     has built-in control of int type for index"""
     Logger.debug("dict_add_rt_index columns: %s", maxquant_df.columns)
-    Logger.info("mq_rt_center_col columns: %s", mq_rt_center_col)
-    maxquant_df = maxquant_df.sort_values(mq_rt_center_col)
-    maxquant_df = pd.merge_asof(
-        left=maxquant_df,
-        right=rt_values_df[["Time_minute", "MS1_frame_idx"]],
-        left_on=mq_rt_center_col,
-        right_on="Time_minute",
-        direction="nearest",
-        suffixes=("", "_center" + idx_suffix),
-    )
-    for col in ["Time_minute", "MS1_frame_idx"]:
-        if col in maxquant_df.columns:
-            maxquant_df.rename(
-                {col: col + "_center" + idx_suffix}, axis=1, inplace=True
-            )
-    maxquant_df = maxquant_df.sort_values(mq_rt_left_col)
-    maxquant_df = pd.merge_asof(
-        left=maxquant_df,
-        right=rt_values_df[["Time_minute", "MS1_frame_idx"]],
-        left_on=mq_rt_left_col,
-        right_on="Time_minute",
-        direction="nearest",
-        suffixes=("", "_left" + idx_suffix),
-    )
-    for col in ["Time_minute", "MS1_frame_idx"]:
-        if col in maxquant_df.columns:
-            maxquant_df.rename({col: col + "_left" + idx_suffix}, axis=1, inplace=True)
-
-    maxquant_df = maxquant_df.sort_values(mq_rt_right_col)
-    maxquant_df = pd.merge_asof(
-        left=maxquant_df,
-        right=rt_values_df[["Time_minute", "MS1_frame_idx"]],
-        left_on=mq_rt_right_col,
-        right_on="Time_minute",
-        direction="nearest",
-        suffixes=("", "_right" + idx_suffix),
-    )
-    for col in ["Time_minute", "MS1_frame_idx"]:
-        if col in maxquant_df.columns:
-            maxquant_df.rename({col: col + "_right" + idx_suffix}, axis=1, inplace=True)
+    if mq_rt_center_col is not None:
+        Logger.info("mq_rt_center_col columns: %s", mq_rt_center_col)
+        maxquant_df = maxquant_df.sort_values(mq_rt_center_col)
+        maxquant_df = pd.merge_asof(
+            left=maxquant_df,
+            right=rt_values_df[["Time_minute", "MS1_frame_idx"]],
+            left_on=mq_rt_center_col,
+            right_on="Time_minute",
+            direction="nearest",
+            suffixes=("", "_center" + idx_suffix),
+        )
+        for col in ["Time_minute", "MS1_frame_idx"]:
+            if col in maxquant_df.columns:
+                maxquant_df.rename(
+                    {col: col + "_center" + idx_suffix}, axis=1, inplace=True
+                )
+    if mq_rt_left_col is not None:
+        maxquant_df = maxquant_df.sort_values(mq_rt_left_col)
+        maxquant_df = pd.merge_asof(
+            left=maxquant_df,
+            right=rt_values_df[["Time_minute", "MS1_frame_idx"]],
+            left_on=mq_rt_left_col,
+            right_on="Time_minute",
+            direction="nearest",
+            suffixes=("", "_left" + idx_suffix),
+        )
+        for col in ["Time_minute", "MS1_frame_idx"]:
+            if col in maxquant_df.columns:
+                maxquant_df.rename({col: col + "_left" + idx_suffix}, axis=1, inplace=True)
+    if mq_rt_right_col is not None:
+        maxquant_df = maxquant_df.sort_values(mq_rt_right_col)
+        maxquant_df = pd.merge_asof(
+            left=maxquant_df,
+            right=rt_values_df[["Time_minute", "MS1_frame_idx"]],
+            left_on=mq_rt_right_col,
+            right_on="Time_minute",
+            direction="nearest",
+            suffixes=("", "_right" + idx_suffix),
+        )
+        for col in ["Time_minute", "MS1_frame_idx"]:
+            if col in maxquant_df.columns:
+                maxquant_df.rename({col: col + "_right" + idx_suffix}, axis=1, inplace=True)
 
     Logger.debug("dict_add_rt_index columns: %s", maxquant_df.columns)
     return maxquant_df
@@ -764,12 +766,12 @@ def _define_rt_search_range(
             #     inplace=True,
             # )
             maxquant_result_dict["RT_search_left"] = (
-                maxquant_result_dict["Calibrated retention time start_exp"] - rt_tol
+                maxquant_result_dict["Retention time start_exp"] - rt_tol
             )
             maxquant_result_dict["RT_search_right"] = (
-                maxquant_result_dict["Calibrated retention time finish_exp"] + rt_tol
+                maxquant_result_dict["Retention time finish_exp"] + rt_tol
             )
-            rt_ref_act_peak = "Calibrated retention time_exp"
+            rt_ref_act_peak = "Retention time_exp"
         case "pred" | "align_lowess":
             maxquant_result_dict["RT_search_left"] = (
                 maxquant_result_dict["predicted_RT"] - rt_tol
@@ -780,20 +782,20 @@ def _define_rt_search_range(
             rt_ref_act_peak = "predicted_RT"
         case "ref":
             maxquant_result_dict["RT_search_left"] = (
-                maxquant_result_dict["Calibrated retention time start_ref"] - rt_tol
+                maxquant_result_dict["Retention time start_ref"] - rt_tol
             )
             maxquant_result_dict["RT_search_right"] = (
-                maxquant_result_dict["Calibrated retention time finish_ref"] + rt_tol
+                maxquant_result_dict["Retention time finish_ref"] + rt_tol
             )
-            rt_ref_act_peak = "Calibrated retention time_ref"
+            rt_ref_act_peak = "Retention time_ref"
         case "mix":
             maxquant_result_dict["RT_search_left"] = (
-                maxquant_result_dict["Calibrated retention time start_ss"] - rt_tol
+                maxquant_result_dict["Retention time start_ss"] - rt_tol
             )
             maxquant_result_dict["RT_search_right"] = (
-                maxquant_result_dict["Calibrated retention time finish_ss"] + rt_tol
+                maxquant_result_dict["Retention time finish_ss"] + rt_tol
             )
-            rt_ref_act_peak = "Calibrated retention time_ss"
+            rt_ref_act_peak = "Retention time_ss"
         case _:
             raise ValueError(f"RT reference {rt_ref} not supported")
     maxquant_result_dict["RT_search_center"] = maxquant_result_dict[rt_ref_act_peak]
@@ -1251,8 +1253,8 @@ def dict_add_rt_align_lowess(
 
     # select the precursors appearing in both ref and exp for training and testing
     Logger.info("aligning RT using LOWESS")
-    min_exp_rt = maxquant_dict["Calibrated retention time_exp"].min()
-    max_exp_rt = maxquant_dict["Calibrated retention time_exp"].max()
+    min_exp_rt = maxquant_dict["Retention time_exp"].min()
+    max_exp_rt = maxquant_dict["Retention time_exp"].max()
     Logger.info("min_exp_rt: %s, max_exp_rt: %s", min_exp_rt, max_exp_rt)
     try:
         both = maxquant_dict.loc[
@@ -1266,14 +1268,14 @@ def dict_add_rt_align_lowess(
     )
     lowess = sm.nonparametric.lowess
     both_test["predicted_RT"] = lowess(
-        endog=both_train["Calibrated retention time_exp"],
-        exog=both_train["Calibrated retention time_ref"],
+        endog=both_train["Retention time_exp"],
+        exog=both_train["Retention time_ref"],
         frac=0.05,
         return_sorted=False,
-        xvals=both_test["Calibrated retention time_ref"],
+        xvals=both_test["Retention time_ref"],
     )
     lowess_eval = RT_metrics(
-        both_test["Calibrated retention time_exp"],
+        both_test["Retention time_exp"],
         both_test["predicted_RT"],
     )
 
@@ -1283,12 +1285,12 @@ def dict_add_rt_align_lowess(
         test_delta95,
     )
     maxquant_dict.loc[maxquant_dict["source"] != "exp", "predicted_RT"] = lowess(
-        endog=both_train["Calibrated retention time_exp"],
-        exog=both_train["Calibrated retention time_ref"],
+        endog=both_train["Retention time_exp"],
+        exog=both_train["Retention time_ref"],
         frac=0.05,
         return_sorted=False,
         xvals=maxquant_dict.loc[
-            maxquant_dict["source"] != "exp", "Calibrated retention time_ref"
+            maxquant_dict["source"] != "exp", "Retention time_ref"
         ],
     )
     # maxquant_dict.loc[maxquant_dict["source"] == "exp", "predicted_RT"] = (
@@ -1301,7 +1303,7 @@ def dict_add_rt_align_lowess(
     lowess_fit_residuals = (
         maxquant_dict.loc[maxquant_dict["source"] == "both", "predicted_RT"]
         - maxquant_dict.loc[
-            maxquant_dict["source"] == "both", "Calibrated retention time_exp"
+            maxquant_dict["source"] == "both", "Retention time_exp"
         ]
     )
     noise = np.random.choice(
@@ -1313,7 +1315,7 @@ def dict_add_rt_align_lowess(
     )
     maxquant_dict.loc[maxquant_dict["source"] == "exp", "predicted_RT"] = (
         maxquant_dict.loc[
-            maxquant_dict["source"] == "exp", "Calibrated retention time_exp"
+            maxquant_dict["source"] == "exp", "Retention time_exp"
         ]
         + noise
     )
@@ -1540,14 +1542,18 @@ def construct_dict(
         else:
             Logger.info("Using existing IM model")
             delta_im_95 = cfg_prepare_dict.DELTA_IM_95
-
+    
+    maxquant_exp_df['Retention time start'] = maxquant_exp_df['Calibrated retention time start'] - maxquant_exp_df['Retention time calibration']
+    maxquant_exp_df['Retention time finish'] = maxquant_exp_df['Calibrated retention time finish'] - maxquant_exp_df['Retention time calibration']
+    maxquant_exp_df['Retention time start'].fillna(maxquant_exp_df['Calibrated retention time start'], inplace=True) # if rt calibration is missing that rt should be the same before and after calib
+    maxquant_exp_df['Retention time finish'].fillna(maxquant_exp_df['Calibrated retention time finish'], inplace=True) # if rt calibration is missing that rt should be the same before and after calib
     # get idx of exp RT and IM values
     maxquant_exp_df = dict_add_rt_index(
         maxquant_df=maxquant_exp_df,
         rt_values_df=rt_values_df,
-        mq_rt_left_col="Calibrated retention time start",
-        mq_rt_center_col="Calibrated retention time",
-        mq_rt_right_col="Calibrated retention time finish",
+        mq_rt_left_col="Retention time start",
+        mq_rt_center_col="Retention time",
+        mq_rt_right_col="Retention time finish",
         idx_suffix="_exp",
     )  # exp values are based on the calibration
     Logger.debug(
@@ -1571,7 +1577,11 @@ def construct_dict(
             idx_suffix="_ref",
             im_idx_length=None,
         )
-
+    
+    maxquant_ref_df['Retention time start'] = maxquant_ref_df['Calibrated retention time start'] - maxquant_ref_df['Retention time calibration']
+    maxquant_ref_df['Retention time finish'] = maxquant_ref_df['Calibrated retention time finish'] - maxquant_ref_df['Retention time calibration']
+    maxquant_ref_df['Retention time start'].fillna(maxquant_ref_df['Calibrated retention time start'], inplace=True) # if rt calibration is missing that rt should be the same before and after calib
+    maxquant_ref_df['Retention time finish'].fillna(maxquant_ref_df['Calibrated retention time finish'], inplace=True) # if rt calibration is missing that rt should be the same before and after calib 
     # merge reference and experiment
     maxquant_dict = merge_ref_and_exp(
         maxquant_ref_df=maxquant_ref_df,
@@ -1591,9 +1601,11 @@ def construct_dict(
     # IM/RT prediction for full dictionary, define RT and IM search range
     dict_path = os.path.join(construct_dict_dir, "maxquant_dict_for_pred.txt")
     maxquant_dict_to_pred = maxquant_dict.copy()
-    maxquant_dict_to_pred["Retention time"] = maxquant_dict["Retention time"].fillna(
-        maxquant_dict["Retention time"].mean()
-    )
+    # Logger.info("Maxquant_dict_to_pred columns: %s", maxquant_dict_to_pred.columns)
+    # Logger.info("Maxquant_dict columns : %s", maxquant_dict.columns)
+    # maxquant_dict_to_pred["Retention time"] = maxquant_dict["Retention time"].fillna(
+    #     maxquant_dict["Retention time"].mean()
+    # )
     maxquant_dict_to_pred.to_csv(
         dict_path,
         sep="\t",
