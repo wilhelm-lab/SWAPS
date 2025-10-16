@@ -1765,3 +1765,55 @@ def get_mzrank_batch_cutoff(maxquant_dict_df: pd.DataFrame):
         max_min_mz_rank["max"].values[-1] + 1
     )  # end at the last, +1 to include the last
     return cutoff
+
+def align_rt_from_multiple_source(original_dict: pd.DataFrame, target_col: str) -> pd.DataFrame:
+    # Filter first
+    filtered = original_dict[original_dict["Type"] == "TIMS-MULTI-MSMS"]
+
+    # Group and keep only the row with the highest Intensity in each group
+    original_dict_agg_int_max = (
+        filtered.loc[
+            filtered.groupby(["Modified sequence", "Charge", "Raw file"])["Intensity"].idxmax()
+        ]
+    )
+    # pivot rt table
+    rt_pivot = original_dict_agg_int_max.pivot_table(index=["Modified sequence", "Charge"],columns=["Raw file"], values="Retention time", aggfunc="mean")
+
+    # New DataFrame for aligned results
+    aligned_df = pd.DataFrame(index=rt_pivot.index)
+
+    # Loop over all other columns
+    for col in rt_pivot.columns:
+        if col == target_col:
+            aligned_df[col] = rt_pivot[col]  # keep original reference as-is
+            continue
+        
+        # Get non-missing pairs between reference and current column
+        valid = rt_pivot[[target_col, col]].dropna()
+        if len(valid) < 3:
+            aligned_df[col] = np.nan  # too few points to fit LOWESS
+            continue
+        
+        xvals = rt_pivot[col]  # your x values (may have NaN)
+        mask_valid_x = xvals.notna()  # remember where xvals are valid
+
+        # Prepare output array filled with NaN
+        aligned_col = np.full(len(xvals), np.nan)
+
+        # Fit LOWESS using valid data only
+        fitted = sm.nonparametric.lowess(
+            endog=valid[target_col],
+            exog=valid[col],
+            frac=0.05,
+            return_sorted=False,
+            xvals=xvals[mask_valid_x]
+        )
+
+        # Insert fitted values only where xvals were valid
+        aligned_col[mask_valid_x] = fitted
+
+        # Store in result DataFrame
+        aligned_df[col] = aligned_col
+    ref_rt = aligned_df.drop(columns=[target_col]).mean(axis=1)
+    ref_rt.fillna(aligned_df[target_col], inplace=True)
+    return ref_rt.reset_index().rename(columns={0: "Retention time_ref"})
