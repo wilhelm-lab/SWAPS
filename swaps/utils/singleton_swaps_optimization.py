@@ -55,7 +55,7 @@ __C.PREPARE_DICT.DELTA_IM_95 = (
 )  # delta IM for 95% of the data, only used if IM_REF == "pred"
 __C.PREPARE_DICT.FILTER_TRAIN_BY_RAW_FILE = ""  # None for not filtering, "" for filtering by raw file that shares the same name with the data directory
 __C.PREPARE_DICT.FILTER_PRED_BY_RAW_FILE = ""  # None for not filtering, "" for filtering by raw file that shares the same name with the data directory
-__C.PREPARE_DICT.MZ_BIN_DIGITS = 2
+__C.PREPARE_DICT.MZ_BIN_DIGITS = 2 # legacy, not used
 __C.PREPARE_DICT.ISO_MIN_AB_THRES = 0.01
 __C.PREPARE_DICT.GENERATE_DECOY = False
 __C.PREPARE_DICT.RT_MAX = 0.0
@@ -65,6 +65,8 @@ __C.PREPARE_DICT.EXP_OK_FDR = 0.01  # FDR threshold for oktoberfest output
 __C.PREPARE_DICT.REF_OK_DIR = ""  # path to the oktoberfest output directory for using rescoring output, then MQ evidence should be 100FDR
 __C.PREPARE_DICT.REF_OK_OUTPUT = "psms"  # one of ["psms", "peptides"], whether use ok psms or peptides table for filtering
 __C.PREPARE_DICT.REF_OK_FDR = 0.01  # FDR threshold for oktoberfest output
+__C.PREPARE_DICT.PPM_TOL = 20  # ppm tolerance for matching precursors to MS1 peaks
+__C.PREPARE_DICT.BIN_WIDTH = 0.01  # m/z bin
 # optimization
 __C.OPTIMIZATION = ConfigurationNode()
 __C.OPTIMIZATION.N_BLOCKS_BY_PEPT = 4

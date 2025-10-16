@@ -1,7 +1,7 @@
 import logging
 import os
 from multiprocessing import cpu_count
-from typing import Callable, List, Union, Literal, Optional
+from typing import Callable, List, Literal, Optional
 import itertools
 from operator import itemgetter
 import matplotlib.pyplot as plt
@@ -376,6 +376,7 @@ def process_one_frame_ims(
     maxquant_result_ref_with_im_index_sortmz: pd.DataFrame,
     mobility_values: pd.DataFrame,
     ppm_tol: int = 20,
+    bin_frame_mz: bool = True,
     bin_width: float = 0.01,
     extract_im_peak: bool = False,
     debug: bool = False,
@@ -429,6 +430,7 @@ def process_one_frame_ims(
                 frame_data=frame_data,
                 mobility_values=mobility_values,
                 all_id=all_frame_pept_idx,
+                bin_frame_mz=bin_frame_mz,
                 ppm_tol=ppm_tol,
                 bin_width=bin_width,
                 use_ims=True,
@@ -765,7 +767,7 @@ def process_batch_frame(
                 batch_im_rt_pept_res_coo.nbytes / 1e6,
             )
 
-def _match_candidate_mz_and_frame_mz_by_ppm_and_frame_bin(
+def _match_candidate_mz_and_binned_frame_mz_by_ppm(
     candidate_mz,
     frame_mz,
     frame_int: Optional[np.ndarray] = None,
@@ -818,11 +820,11 @@ def _match_candidate_mz_and_frame_mz_by_ppm_and_frame_bin(
     # ppm check: keep only if candidate fits within tolerance to bin (weighted) center
     dist = np.abs(binned_frame_mz[candidate_mz_idx] - candidate_mz)
     tol = candidate_mz * ppm_tol / 1e6
-    candidate_mask = dist <= tol
-    if candidate_mask.sum() == 0:
-        Logger.warning("No candidates left after ppm filtering!")
+    candidate_mz_mask = dist <= tol
+    if candidate_mz_mask.sum() == 0:
+        Logger.warning("No candidate mz left after ppm filtering!")
         return None
-    candidate_mz_idx_filtered = candidate_mz_idx[candidate_mask]
+    candidate_mz_idx_filtered = candidate_mz_idx[candidate_mz_mask]
     unique_candidate_mz_idx, mapped_unique_candidate_mz_idx = np.unique(candidate_mz_idx_filtered, return_inverse=True)
     
     frame_mask = np.isin(frame_bin_idx, unique_candidate_mz_idx)
@@ -836,14 +838,176 @@ def _match_candidate_mz_and_frame_mz_by_ppm_and_frame_bin(
             mapped_unique_candidate_mz_idx,
             frame_bin_idx, 
             mapped_bins, 
-            candidate_mask, 
+            candidate_mz_mask, 
             frame_mask)
+
+def _match_merged_candidate_mz_and_frame_mz_by_ppm(
+    candidate_mz,
+    candidate_abundance,
+    frame_mz,
+    ppm_tol=10.0,
+):
+    """
+    Match candidate m/z to frame m/z directly (no binning), within ppm tolerance.
+    Returns index mappings and masks compatible with downstream array construction.
+    """
+
+    if len(candidate_mz) == 0 or len(frame_mz) == 0:
+        return None
+    candidate_mz_idx = np.arange(candidate_mz.size)
+    anchor_mz, unique_candidate_mz_idx, mapped_unique_candidate_mz_idx, candidate_mask = anchor_bin_hybrid_with_assignments(candidate_mz, candidate_abundance,
+                                                                                             ppm_tol=ppm_tol)
+    Logger.debug("Number of anchors selected: %s from %s", len(anchor_mz), len(candidate_mz))
+    frame_mz_idx = np.arange(frame_mz.size)
+    frame_mask, mapped_frame_mz_idx = match_frame_to_anchors(frame_mz, anchor_mz, ppm_tol=ppm_tol)
+    Logger.debug("Number of frame m/z matched to anchors: %s from %s", frame_mask.sum(), len(frame_mz))
+
+    return (unique_candidate_mz_idx,
+            candidate_mz_idx,
+            mapped_unique_candidate_mz_idx,
+            frame_mz_idx,
+            mapped_frame_mz_idx[mapped_frame_mz_idx != -1],
+            candidate_mask,
+            frame_mask)
+
+
+
+def anchor_bin_hybrid_with_assignments(candidate_mz, candidate_abundance, ppm_tol:float=10):
+    """
+    Hybrid anchor selection and assignment:
+    1. Isolated peaks (no neighbor within ppm_tol) become anchors directly.
+    2. Crowded peaks are greedily anchored by abundance.
+    Returns:
+        anchors: array of anchor m/z
+        assignments: array of same length as candidate_mz
+                     giving index of the assigned anchor
+    """
+    candidate_mz = np.asarray(candidate_mz, dtype=np.float64)
+    candidate_abundance = np.asarray(candidate_abundance, dtype=np.float64)
+    n = len(candidate_mz)
+
+    # Sort by m/z
+    sort_idx = np.argsort(candidate_mz)
+    mz_sorted = candidate_mz[sort_idx]
+    abundance_sorted = candidate_abundance[sort_idx]
+    ppm_factor = ppm_tol * 1e-6
+
+    # Compute ppm-based neighbor differences
+    left_diff = np.full(n, np.inf)
+    right_diff = np.full(n, np.inf)
+    left_diff[1:] = (mz_sorted[1:] - mz_sorted[:-1]) / mz_sorted[1:] * 1e6
+    right_diff[:-1] = (mz_sorted[1:] - mz_sorted[:-1]) / mz_sorted[:-1] * 1e6
+
+    # Identify isolated peaks
+    isolated_mask = (left_diff > ppm_tol) & (right_diff > ppm_tol)
+    anchors_mask = isolated_mask.copy()
+    assigned = isolated_mask.copy()
+
+    # Prepare assignment array (anchor index per candidate)
+    assignments = np.full(n, -1, dtype=int)
+    anchor_ids = np.full(n, -1, dtype=int)
+
+    # Initialize isolated anchors
+    anchor_count = 0
+    for i in np.where(isolated_mask)[0]:
+        assignments[i] = anchor_count
+        anchor_ids[i] = anchor_count
+        anchor_count += 1
+
+    # Process crowded peaks (greedy by abundance)
+    crowded_idx = np.where(~isolated_mask)[0]
+    for i in crowded_idx[np.argsort(-abundance_sorted[crowded_idx])]:
+        if assigned[i]:
+            continue
+
+        anchor_mz = mz_sorted[i]
+        tol = anchor_mz * ppm_factor
+        lower = anchor_mz - tol
+        upper = anchor_mz + tol
+
+        # Find neighbors in tolerance
+        left = np.searchsorted(mz_sorted, lower, side="left")
+        right = np.searchsorted(mz_sorted, upper, side="right")
+
+        # Assign all unassigned peaks in this region
+        unassigned = ~assigned[left:right]
+        if np.any(unassigned):
+            assignments[left:right][unassigned] = anchor_count
+            assigned[left:right][unassigned] = True
+
+        anchors_mask[i] = True
+        anchor_ids[i] = anchor_count
+        anchor_count += 1
+
+    anchors_sorted = mz_sorted[anchors_mask]
+
+    # Map assignments back to original candidate order
+    reverse_idx = np.empty_like(sort_idx)
+    reverse_idx[sort_idx] = np.arange(n)
+    assignments_original = assignments[reverse_idx]
+    anchor_mz = anchors_sorted
+    candidate_mz_idx = np.arange(candidate_mz.size)
+    candidate_mask = assignments_original != -1
+    unique_candidate_mz_idx, mapped_unique_candidate_mz_idx = np.unique(candidate_mz_idx[candidate_mask], return_inverse=True)
+    return anchor_mz, unique_candidate_mz_idx, mapped_unique_candidate_mz_idx, candidate_mask
+
+
+def match_frame_to_anchors(frame_mz, anchors, ppm_tol:float=10):
+    """
+    Match frame_mz values to anchor m/z values within ±ppm tolerance.
+
+    Parameters
+    ----------
+    frame_mz : array-like
+        Array of m/z values to match.
+    anchors : array-like
+        Sorted array of anchor m/z values.
+    ppm_tol : float
+        Tolerance in ppm.
+
+    Returns
+    -------
+    match_mask : ndarray of bool
+        True for frame_mz entries that matched at least one anchor.
+    matched_anchor_idx : ndarray of int (optional)
+        Index of the matching anchor for each frame_mz (–1 if no match).
+    """
+    frame_mz = np.asarray(frame_mz, dtype=np.float64)
+    anchors = np.asarray(anchors, dtype=np.float64)
+    anchors.sort()
+
+    # Nearest anchor indices via binary search
+    idx_right = np.searchsorted(anchors, frame_mz, side="left")
+
+    # Candidate indices (left and right neighbor anchors)
+    idx_left = np.clip(idx_right - 1, 0, len(anchors) - 1)
+    idx_right = np.clip(idx_right, 0, len(anchors) - 1)
+
+    # Distances in ppm to left and right anchors
+    ppm_left = np.abs(frame_mz - anchors[idx_left]) / anchors[idx_left] * 1e6
+    ppm_right = np.abs(frame_mz - anchors[idx_right]) / anchors[idx_right] * 1e6
+
+    # Choose the closer anchor
+    use_right = ppm_right < ppm_left
+    nearest_idx = np.where(use_right, idx_right, idx_left)
+    nearest_ppm = np.where(use_right, ppm_right, ppm_left)
+
+    # Determine matches within tolerance
+    match_mask = nearest_ppm <= ppm_tol
+    matched_anchor_idx = np.full(frame_mz.shape, -1, dtype=int)
+    matched_anchor_idx[match_mask] = nearest_idx[match_mask]
+
+    # matched_anchor_idx = matched_anchor_idx[match_mask]
+
+    return match_mask, matched_anchor_idx
+
 
 def _prepare_sparse_matrices(
     candidate_precursor_by_rt,
     frame_data,
     all_id,
     ppm_tol: float = 10,
+    bin_frame_mz: bool = True, # TODO: change the default to False later
     bin_width: float = 0.01,  # <-- new: bin size in Daltons
     use_ims: bool = True,
     mobility_values: Optional[pd.DataFrame] = None,
@@ -882,13 +1046,24 @@ def _prepare_sparse_matrices(
         frame_int = frame_data["intarray"].values[0]
 
     # --- Match candidate m/z to frame m/z with ppm tolerance and binning ---
-    match_results = _match_candidate_mz_and_frame_mz_by_ppm_and_frame_bin(
-        candidate_mz=candidate_mz,
-        frame_mz=frame_mz,
-        frame_int=None,
-        ppm_tol=ppm_tol,
-        bin_width=bin_width,
-    )
+    if bin_frame_mz:
+        match_results = _match_candidate_mz_and_binned_frame_mz_by_ppm(
+            candidate_mz=candidate_mz,
+            frame_mz=frame_mz,
+            frame_int=None,
+            ppm_tol=ppm_tol,
+            bin_width=bin_width,
+        )
+    else: 
+        # TODO: this is not yet correct! When other candidate m/z 
+        # are put inside the anchor mz bin, the anchor mz bin width 
+        # remain the same meaning mz values towards bin edge are not really properly dealt with!
+        match_results = _match_merged_candidate_mz_and_frame_mz_by_ppm(
+            candidate_mz=candidate_mz,
+            candidate_abundance=candidate_abundance,
+            frame_mz=frame_mz,
+            ppm_tol=ppm_tol,
+        )
     if match_results is None:
         Logger.warning("No matched candidates and frame m/z!")
         return None, None
