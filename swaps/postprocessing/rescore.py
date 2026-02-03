@@ -212,6 +212,10 @@ def merge_peaks_result_and_dict(peaks_result,
     # dict_ref["rt_idx_length"] = (
     #     dict_ref["MS1_frame_idx_right_ref"] - dict_ref["MS1_frame_idx_left_ref"]
     # )
+    if "Retention length" not in dict_ref.columns:
+        dict_ref["Retention length"] = (
+            dict_ref["Retention time finish_ref"] - dict_ref["Retention time start_ref"]
+        ) * 60.0 / ms1_scan_gap  # convert to index length
     dict_ref["rt_idx_length_calc"] = dict_ref["Retention length"] / ms1_scan_gap
     peaks_result_merged_dict = pd.merge(
         peaks_result,
