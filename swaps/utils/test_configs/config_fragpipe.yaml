@@ -1,0 +1,27 @@
+RESULT_PATH: /cmnfs/proj/ORIGINS/SWAPS_exp/test/test_fragpipe
+ADD_TIMESTAMP_TO_RESULT_PATH: true
+DATA_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/visit_bruker_0804_0808/Data/hela_apex_sampling_50ng/a000/20250808_JigsawProject_HeLa_50ng_jigsaw_InTr1200_5min_IO8x150_1000nl_a000_run2_Slot2-1_1_12425.d/
+DEBUG: false
+DICT_PICKLE_PATH: ''
+EXPORT_DATA_HDF5_DIR: ''
+FP_COMBINE_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/visit_bruker_0804_0808/fragpipe_diann/hela_apex_sampling_50ng/a000/fragPipeOutput/combined_ion.tsv
+N_CPU: 5
+OPTIMIZATION:
+  N_BLOCKS_BY_PEPT: 1
+  N_BATCH: 5
+PREPARE_DICT:
+  DICT_PICKLE_PATH: ''
+  FILTER_PRED_BY_RAW_FILE: ''
+  FILTER_TRAIN_BY_RAW_FILE: ''
+  KEEP_MATCHED_PRECURSORS: false
+  GENERATE_DECOY: true
+  IM_REF: ref
+  RT_REF: ref
+  RT_TOL: 0.1
+RANDOM_SEED: 42
+PEAK_SELECTION:
+  ENABLE: false
+RESULT_ANALYSIS:
+  ENABLE: true
+  POST_PROCESSING:
+    FILTER_BY_IM: false

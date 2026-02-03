@@ -101,7 +101,23 @@ def opt_scan_by_scan(config_path: str):
         elif dir_with_extension.endswith(".mzML"):
             ms1scans = mzml_data
             mobility_values_df = None
-        maxquant_result_ref_ori = pd.read_csv(cfg.MQ_REF_PATH, sep="\t", low_memory=False)
+        # maxquant_result_ref_ori = pd.read_csv(cfg.MQ_REF_PATH, sep="\t", low_memory=False)
+        if cfg.FP_COMBINE_PATH != "":
+            logging.info("Loading FragPipe combined_ion.tsv from %s", cfg.FP_COMBINE_PATH)
+            combined_ion = pd.read_csv(cfg.FP_COMBINE_PATH, sep="\t", low_memory=False)
+            from prepare_dict.search_engine_output_parser import fragpipe_parser
+            maxquant_result_ref_ori = fragpipe_parser(
+                combined_ion
+            )
+            maxquant_result_exp = fragpipe_parser(
+                combined_ion, exp_name=dir_wo_extension
+            )
+            maxquant_result_exp.to_csv(
+                os.path.join(cfg.RESULT_PATH, "fragpipe_parsed_exp.tsv"), index=False, sep="\t"
+            )
+            cfg.MQ_EXP_PATH = os.path.join(cfg.RESULT_PATH, "fragpipe_parsed_exp.tsv")
+        else:
+            maxquant_result_ref_ori = pd.read_csv(cfg.MQ_REF_PATH, sep="\t", low_memory=False)
         if len(cfg.FILTER_REF_BY_RAW_FILE) > 0:
             if cfg.FILTER_REF_BY_RAW_FILE[0] == "data":
                 maxquant_result_ref_ori = maxquant_result_ref_ori[

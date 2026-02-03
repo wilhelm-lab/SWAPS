@@ -14,6 +14,7 @@ __C.ADD_TIMESTAMP_TO_RESULT_PATH = False  # disenble when reusing the same resul
 __C.EXPORT_DATA_HDF5_DIR = ""  # empty string for export to data directory
 __C.MQ_EXP_PATH = ""  # path to MaxQuant experiment evidence file
 __C.MQ_REF_PATH = ""  # path to MaxQuant reference file, pickle
+__C.FP_COMBINE_PATH = "" # path to FragPipe combined_ion.tsv file
 __C.FILTER_EXP_BY_RAW_FILE = (
     []
 )  # None for not filtering, "" for filtering by raw file that shares the same name with the data directory

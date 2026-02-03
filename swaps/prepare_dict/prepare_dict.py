@@ -29,7 +29,7 @@ from alphabase.psm_reader import psm_reader_provider
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
 from peptdeep.pretrained_models import ModelManager
-from .search_engine_output_parser import sage_parser
+from .search_engine_output_parser import sage_parser, fragpipe_parser
 
 Logger = logging.getLogger(__name__)
 
@@ -140,29 +140,6 @@ def merge_ref_and_exp(
                 "mobility_values_index_center_ref",
                 "mobility_values_center_ref",
             ]
-        # ref_spec_columns = [  # Not including Time_minute and MS1_frame_idx since ref should be mapped to ref ms1scan, not exp
-        #     # "Time_minute_left_ref",
-        #     # "Time_minute_right_ref",
-        #     # "Time_minute_center_ref",
-        #     # "MS1_frame_idx_left_ref",
-        #     # "MS1_frame_idx_right_ref",
-        #     # "MS1_frame_idx_center_ref",
-        #     # "MS1_frame_idx_left",
-        #     # "MS1_frame_idx_right",
-        #     # "MS1_frame_idx_center",
-        #     "Calibrated retention time start",
-        #     "Calibrated retention time",
-        #     "Calibrated retention time finish",
-        #     "mobility_values_index_left_ref",
-        #     "mobility_values_index_right_ref",
-        #     "mobility_values_index_center_ref",
-        #     # "mobility_values_left_ref",
-        #     # "mobility_values_right_ref",
-        #     "mobility_values_center_ref",
-        #     # "mobility_values_left_ref",
-        #     # "mobility_values_right_ref",
-        #     # "mobility_values_center_ref",
-        # ]
         Logger.info("ref spec columns: %s", ref_spec_columns)
     elif ref_type in ["pred"]:
         ref_spec_columns = []
@@ -799,12 +776,16 @@ def _define_rt_search_range(
         case _:
             raise ValueError(f"RT reference {rt_ref} not supported")
     maxquant_result_dict["RT_search_center"] = maxquant_result_dict[rt_ref_act_peak]
+    if maxquant_result_dict["RT_search_center"].isna().sum() > 0:
+        Logger.warning(maxquant_result_dict.loc[
+            maxquant_result_dict["RT_search_center"].isna()])
     Logger.debug(
         "NaN values, before clipping, in RT_search_left, right and center: %s, %s, %s",
         maxquant_result_dict["RT_search_left"].isna().sum(),
         maxquant_result_dict["RT_search_right"].isna().sum(),
         maxquant_result_dict["RT_search_center"].isna().sum(),
     )
+    
     maxquant_result_dict[
         ["RT_search_left", "RT_search_center", "RT_search_right"]
     ].clip(rt_range[0], rt_range[1], inplace=True)
@@ -1376,7 +1357,6 @@ def construct_dict(
     result_dir: str,
     rt_values_df: pd.DataFrame,
     ref_type: Literal["MQ", "pred"] = "MQ",
-    # maxquant_exp_df: pd.DataFrame,
     mobility_values_df: Optional[pd.DataFrame] = None,
     use_ims: bool = True,
     random_seed: int = 42,
@@ -1399,7 +1379,7 @@ def construct_dict(
     if (
         "sage_discriminant_score" in maxquant_exp_df.columns
     ):  # infer search engine, remap column names
-        Logger.debug("Sage discriminant score found, renaming columns")
+        Logger.debug("Sage discriminant score found, parsing sage results")
         maxquant_exp_df = sage_parser(maxquant_exp_df)
         Logger.debug("Renamed columns: %s", maxquant_exp_df.columns)
     Logger.info("maxquant_exp_df size: %s", maxquant_exp_df.shape)
