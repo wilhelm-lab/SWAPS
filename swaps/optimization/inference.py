@@ -118,7 +118,7 @@ def sparse_encode_divide_and_conquer_with_residual_stats(
         Logger.info(
             "frame_res shape: %s; frame_act shape: %s", frame_res.shape, frame_act.shape
         )
-        return frame_act, frame_res.T # transpose to (im, pept)
+        return frame_act, frame_res.T  # transpose to (im, pept)
 
     else:
         return frame_act
@@ -381,6 +381,7 @@ def process_one_frame_ims(
     extract_im_peak: bool = False,
     debug: bool = False,
     return_res_coo_dict: bool = False,
+    write_zarr_path: Optional[str] = None,
     **im_peak_selection_kwargs,
 ):
     """Process one frame data with IMS dimension with sparse encoding and peak selection."""
@@ -658,7 +659,7 @@ def process_batch_frame(
                 )
                 if return_res_coo_dict:
                     batch_im_rt_pept_res_coo_dict[key].extend(
-                        frame_im_pept_res_coo_dict[key] #type: ignore[assignment]
+                        frame_im_pept_res_coo_dict[key]  # type: ignore[assignment]
                     )  # type: ignore[assignment]
         else:
             peaks_df, frame_im_pept_act_coo = process_one_frame(  # type: ignore[assignment]
@@ -685,7 +686,8 @@ def process_batch_frame(
                 len(ms1scans.index.values)
                 + 1,  # this index is rank, starting from 1, add 1 for the last frame
                 len(mobility_values),
-                max_mz_rank + 1,  # this index is rank, starting from 1, add 1 for the last frame
+                max_mz_rank
+                + 1,  # this index is rank, starting from 1, add 1 for the last frame
             ),
             cutoff=cutoff,
         )
@@ -696,7 +698,8 @@ def process_batch_frame(
                     len(ms1scans.index.values)
                     + 1,  # this index is rank, starting from 1, add 1 for the last frame
                     len(mobility_values),
-                    max_mz_rank + 1,  # this index is rank, starting from 1, add 1 for the last frame
+                    max_mz_rank
+                    + 1,  # this index is rank, starting from 1, add 1 for the last frame
                 ),
                 cutoff=cutoff,
             )
@@ -706,7 +709,8 @@ def process_batch_frame(
             shape=(
                 len(ms1scans.index.values)
                 + 1,  # this index is rank, starting from 1, add 1 for the last frame
-                max_mz_rank + 1,  # this index is rank, starting from 1, add 1 for the last frame
+                max_mz_rank
+                + 1,  # this index is rank, starting from 1, add 1 for the last frame
             ),
             cutoff=cutoff,
         )
@@ -767,6 +771,7 @@ def process_batch_frame(
                 batch_im_rt_pept_res_coo.nbytes / 1e6,
             )
 
+
 def _match_candidate_mz_and_binned_frame_mz_by_ppm(
     candidate_mz,
     frame_mz,
@@ -804,14 +809,20 @@ def _match_candidate_mz_and_binned_frame_mz_by_ppm(
         binned_frame_mz = (bin_edges[:-1] + bin_edges[1:]) / 2  # bin centers
     else:
         # 2. weighted sum of m/z per bin
-        weighted_sum = np.bincount(frame_bin_idx, weights=frame_mz * frame_int, minlength=len(bin_edges)-1)
+        weighted_sum = np.bincount(
+            frame_bin_idx, weights=frame_mz * frame_int, minlength=len(bin_edges) - 1
+        )
 
         # 3. total intensity per bin
-        weight_total = np.bincount(frame_bin_idx, weights=frame_int, minlength=len(bin_edges)-1)
+        weight_total = np.bincount(
+            frame_bin_idx, weights=frame_int, minlength=len(bin_edges) - 1
+        )
 
         # 4. intensity-weighted bin m/z (avoid division by zero)
         with np.errstate(divide="ignore", invalid="ignore"):
-            binned_frame_mz = np.where(weight_total > 0, weighted_sum / weight_total, 0.0)
+            binned_frame_mz = np.where(
+                weight_total > 0, weighted_sum / weight_total, 0.0
+            )
 
     # --- Map candidate m/z into bins (with ppm tolerance) ---
     candidate_mz_idx = np.searchsorted(binned_frame_mz, candidate_mz)
@@ -825,21 +836,26 @@ def _match_candidate_mz_and_binned_frame_mz_by_ppm(
         Logger.warning("No candidate mz left after ppm filtering!")
         return None
     candidate_mz_idx_filtered = candidate_mz_idx[candidate_mz_mask]
-    unique_candidate_mz_idx, mapped_unique_candidate_mz_idx = np.unique(candidate_mz_idx_filtered, return_inverse=True)
-    
+    unique_candidate_mz_idx, mapped_unique_candidate_mz_idx = np.unique(
+        candidate_mz_idx_filtered, return_inverse=True
+    )
+
     frame_mask = np.isin(frame_bin_idx, unique_candidate_mz_idx)
     # Map reduced bin indices into compact index space [0 .. len(unique_idx)-1]
     bin_mapping = {b: i for i, b in enumerate(unique_candidate_mz_idx)}
     frame_bin_idx_filtered = frame_bin_idx[frame_mask]
     mapped_bins = np.array([bin_mapping[b] for b in frame_bin_idx_filtered])
 
-    return (unique_candidate_mz_idx, 
-            candidate_mz_idx, 
-            mapped_unique_candidate_mz_idx,
-            frame_bin_idx, 
-            mapped_bins, 
-            candidate_mz_mask, 
-            frame_mask)
+    return (
+        unique_candidate_mz_idx,
+        candidate_mz_idx,
+        mapped_unique_candidate_mz_idx,
+        frame_bin_idx,
+        mapped_bins,
+        candidate_mz_mask,
+        frame_mask,
+    )
+
 
 def _match_merged_candidate_mz_and_frame_mz_by_ppm(
     candidate_mz,
@@ -855,24 +871,41 @@ def _match_merged_candidate_mz_and_frame_mz_by_ppm(
     if len(candidate_mz) == 0 or len(frame_mz) == 0:
         return None
     candidate_mz_idx = np.arange(candidate_mz.size)
-    anchor_mz, unique_candidate_mz_idx, mapped_unique_candidate_mz_idx, candidate_mask = anchor_bin_hybrid_with_assignments(candidate_mz, candidate_abundance,
-                                                                                             ppm_tol=ppm_tol)
-    Logger.debug("Number of anchors selected: %s from %s", len(anchor_mz), len(candidate_mz))
+    (
+        anchor_mz,
+        unique_candidate_mz_idx,
+        mapped_unique_candidate_mz_idx,
+        candidate_mask,
+    ) = anchor_bin_hybrid_with_assignments(
+        candidate_mz, candidate_abundance, ppm_tol=ppm_tol
+    )
+    Logger.debug(
+        "Number of anchors selected: %s from %s", len(anchor_mz), len(candidate_mz)
+    )
     frame_mz_idx = np.arange(frame_mz.size)
-    frame_mask, mapped_frame_mz_idx = match_frame_to_anchors(frame_mz, anchor_mz, ppm_tol=ppm_tol)
-    Logger.debug("Number of frame m/z matched to anchors: %s from %s", frame_mask.sum(), len(frame_mz))
+    frame_mask, mapped_frame_mz_idx = match_frame_to_anchors(
+        frame_mz, anchor_mz, ppm_tol=ppm_tol
+    )
+    Logger.debug(
+        "Number of frame m/z matched to anchors: %s from %s",
+        frame_mask.sum(),
+        len(frame_mz),
+    )
 
-    return (unique_candidate_mz_idx,
-            candidate_mz_idx,
-            mapped_unique_candidate_mz_idx,
-            frame_mz_idx,
-            mapped_frame_mz_idx[mapped_frame_mz_idx != -1],
-            candidate_mask,
-            frame_mask)
+    return (
+        unique_candidate_mz_idx,
+        candidate_mz_idx,
+        mapped_unique_candidate_mz_idx,
+        frame_mz_idx,
+        mapped_frame_mz_idx[mapped_frame_mz_idx != -1],
+        candidate_mask,
+        frame_mask,
+    )
 
 
-
-def anchor_bin_hybrid_with_assignments(candidate_mz, candidate_abundance, ppm_tol:float=10):
+def anchor_bin_hybrid_with_assignments(
+    candidate_mz, candidate_abundance, ppm_tol: float = 10
+):
     """
     Hybrid anchor selection and assignment:
     1. Isolated peaks (no neighbor within ppm_tol) become anchors directly.
@@ -948,11 +981,18 @@ def anchor_bin_hybrid_with_assignments(candidate_mz, candidate_abundance, ppm_to
     anchor_mz = anchors_sorted
     candidate_mz_idx = np.arange(candidate_mz.size)
     candidate_mask = assignments_original != -1
-    unique_candidate_mz_idx, mapped_unique_candidate_mz_idx = np.unique(candidate_mz_idx[candidate_mask], return_inverse=True)
-    return anchor_mz, unique_candidate_mz_idx, mapped_unique_candidate_mz_idx, candidate_mask
+    unique_candidate_mz_idx, mapped_unique_candidate_mz_idx = np.unique(
+        candidate_mz_idx[candidate_mask], return_inverse=True
+    )
+    return (
+        anchor_mz,
+        unique_candidate_mz_idx,
+        mapped_unique_candidate_mz_idx,
+        candidate_mask,
+    )
 
 
-def match_frame_to_anchors(frame_mz, anchors, ppm_tol:float=10):
+def match_frame_to_anchors(frame_mz, anchors, ppm_tol: float = 10):
     """
     Match frame_mz values to anchor m/z values within ±ppm tolerance.
 
@@ -1007,12 +1047,12 @@ def _prepare_sparse_matrices(
     frame_data,
     all_id,
     ppm_tol: float = 10,
-    bin_frame_mz: bool = True, # TODO: change the default to False later
+    bin_frame_mz: bool = True,  # TODO: change the default to False later
     bin_width: float = 0.01,  # <-- new: bin size in Daltons
     use_ims: bool = True,
     mobility_values: Optional[pd.DataFrame] = None,
 ):
-    """ 
+    """
     Prepare frame and candidate arrays for sparse encoding.
 
     Args:
@@ -1054,9 +1094,9 @@ def _prepare_sparse_matrices(
             ppm_tol=ppm_tol,
             bin_width=bin_width,
         )
-    else: 
-        # TODO: this is not yet correct! When other candidate m/z 
-        # are put inside the anchor mz bin, the anchor mz bin width 
+    else:
+        # TODO: this is not yet correct! When other candidate m/z
+        # are put inside the anchor mz bin, the anchor mz bin width
         # remain the same meaning mz values towards bin edge are not really properly dealt with!
         match_results = _match_merged_candidate_mz_and_frame_mz_by_ppm(
             candidate_mz=candidate_mz,
@@ -1068,8 +1108,16 @@ def _prepare_sparse_matrices(
         Logger.warning("No matched candidates and frame m/z!")
         return None, None
     else:
-        uniform_mz_idx, candidate_mz_idx, mapped_unique_candidate_mz_idx,frame_bin_idx, mapped_bins, candidate_mask, frame_mask = match_results
-    
+        (
+            uniform_mz_idx,
+            candidate_mz_idx,
+            mapped_unique_candidate_mz_idx,
+            frame_bin_idx,
+            mapped_bins,
+            candidate_mask,
+            frame_mask,
+        ) = match_results
+
     # --- Build candidate array ---
     candidate_mz_idx_filtered = candidate_mz_idx[candidate_mask]
     candidate_abundance_filtered = candidate_abundance[candidate_mask]
@@ -1082,7 +1130,11 @@ def _prepare_sparse_matrices(
     candidate_array = np.zeros(
         (all_id.size, uniform_mz_idx.size), dtype=candidate_abundance.dtype
     )
-    np.add.at(candidate_array, (candidate_id_idx_filtered, mapped_unique_candidate_mz_idx), candidate_abundance_filtered)
+    np.add.at(
+        candidate_array,
+        (candidate_id_idx_filtered, mapped_unique_candidate_mz_idx),
+        candidate_abundance_filtered,
+    )
 
     # --- Build frame array ---
     if frame_mask.sum() == 0:
@@ -1095,15 +1147,20 @@ def _prepare_sparse_matrices(
         frame_im_index = np.searchsorted(all_im, frame_data["mobility_values"])
         frame_im_idx_filtered = frame_im_index[frame_mask]
 
-        frame_array = np.zeros((all_im.size, len(uniform_mz_idx)), dtype=frame_int.dtype)
+        frame_array = np.zeros(
+            (all_im.size, len(uniform_mz_idx)), dtype=frame_int.dtype
+        )
         np.add.at(frame_array, (frame_im_idx_filtered, mapped_bins), frame_int_filtered)
 
     else:
         frame_array = np.zeros((1, len(uniform_mz_idx)), dtype=frame_int.dtype)
-        np.add.at(frame_array, (np.zeros(len(frame_int_filtered), dtype=int), mapped_bins), frame_int_filtered)
+        np.add.at(
+            frame_array,
+            (np.zeros(len(frame_int_filtered), dtype=int), mapped_bins),
+            frame_int_filtered,
+        )
 
     return frame_array, candidate_array
-
 
 
 def _select_im_peak_from_frame_act(
@@ -1234,25 +1291,87 @@ def generate_id_partitions(
     n_batch,
     how: Literal["round_robin", "block"] = "block",
     n_edge_counts: int = 50,
+    *,
+    rt_chunk: int | None = None,
 ):
+    """
+    Generate partitions of scan IDs.
+
+    If rt_chunk is provided:
+      - round_robin is done over RT chunks (SAFE)
+      - block is done over contiguous RT chunks (SAFE)
+
+    Returns
+    -------
+    List[List[int]]
+    """
+
+    # --------------------------------------------------
+    # RT-chunk aware mode
+    # --------------------------------------------------
+    if rt_chunk is not None:
+        # 1) group scan IDs by RT chunk
+        chunk_map = {}
+        for rt in id_array:
+            cid = rt // rt_chunk
+            chunk_map.setdefault(cid, []).append(rt)
+
+        # ensure deterministic order
+        chunk_ids = sorted(chunk_map.keys())
+        chunk_lists = [chunk_map[cid] for cid in chunk_ids]
+
+        partitions = [[] for _ in range(n_batch)]
+
+        if how == "round_robin":
+            Logger.info("Generate RT-chunk partitions by round robin.")
+            for i, chunk in enumerate(chunk_lists):
+                partitions[i % n_batch].extend(chunk)
+
+        elif how == "block":
+            Logger.info("Generate RT-chunk partitions by block.")
+            n_chunks = len(chunk_lists)
+            block_size = (n_chunks - 2 * n_edge_counts) // n_batch
+
+            mark = 0
+            for i in range(n_batch):
+                if i == 0:
+                    end = block_size + n_edge_counts
+                elif i == n_batch - 1:
+                    end = n_chunks
+                else:
+                    end = mark + block_size
+
+                for chunk in chunk_lists[mark:end]:
+                    partitions[i].extend(chunk)
+
+                mark = end
+
+        return partitions
+
+    # --------------------------------------------------
+    # ORIGINAL behavior (unchanged)
+    # --------------------------------------------------
     id_partitions = [[] for _ in range(n_batch)]
+
     if how == "round_robin":
         Logger.info("Generate id partitions by round robin.")
         for i in range(n_batch):
             batch_idx = np.arange(i, len(id_array), n_batch)
-            id_partitions[i] = id_array[batch_idx]
+            id_partitions[i] = id_array[batch_idx].tolist()
+
     elif how == "block":
         Logger.info("Generate id partitions by block.")
         block_size = (len(id_array) - 2 * n_edge_counts) // n_batch
         for i in range(n_batch):
             if i == 0:
                 mark = block_size + n_edge_counts
-                id_partitions[i] = id_array[:mark]
+                id_partitions[i] = id_array[:mark].tolist()
             elif i == n_batch - 1:
-                id_partitions[i] = id_array[mark:]
+                id_partitions[i] = id_array[mark:].tolist()
             else:
-                id_partitions[i] = id_array[mark : mark + block_size]
+                id_partitions[i] = id_array[mark : mark + block_size].tolist()
                 mark = block_size * (i + 1) + n_edge_counts
+
     return id_partitions
 
 
