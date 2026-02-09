@@ -14,6 +14,9 @@ from scipy.signal import find_peaks
 from sklearn.decomposition import sparse_encode
 from math import floor
 from functools import wraps
+import pyarrow as pa
+import pyarrow.parquet as pq
+import tqdm
 
 # from optimization.dictionary import Dict
 from optimization.custom_models import CustomLinearModel, mean_square_root_error
@@ -381,7 +384,11 @@ def process_one_frame_ims(
     extract_im_peak: bool = False,
     debug: bool = False,
     return_res_coo_dict: bool = False,
-    write_zarr_path: Optional[str] = None,
+    parquet_file: Optional[str] = None,
+    writer=None,
+    # zarr_path: Optional[str] = None,
+    # zarr_shape: Optional[tuple] = None,
+    # zarr_chunks: tuple = (256, 128, 1),
     **im_peak_selection_kwargs,
 ):
     """Process one frame data with IMS dimension with sparse encoding and peak selection."""
@@ -395,18 +402,28 @@ def process_one_frame_ims(
     ]
     Logger.debug("Finished data indexing, frame data shape: %s", frame_data.shape[0])
     peaks_df = pd.DataFrame()
-    im_pept_act_coo_dict = {
-        "coord_frame_indices": [],
-        "coord_im_indices": [],
-        "coord_pept_indices": [],
-        "data": [],
-    }
-    im_pept_res_coo_dict = {
-        "coord_frame_indices": [],
-        "coord_im_indices": [],
-        "coord_pept_indices": [],
-        "data": [],
-    }
+    if writer is None:
+        im_pept_act_coo_dict = {
+            "coord_frame_indices": [],
+            "coord_im_indices": [],
+            "coord_pept_indices": [],
+            "data": [],
+        }
+        im_pept_res_coo_dict = {
+            "coord_frame_indices": [],
+            "coord_im_indices": [],
+            "coord_pept_indices": [],
+            "data": [],
+        }
+    # else:
+    #     z = zarr.open(
+    #         zarr_path,
+    #         mode="a",
+    #         shape=zarr_shape,  # will be resized when appending data
+    #         chunks=zarr_chunks,
+    #         dtype=np.float32,
+    #         compressor=zarr.Blosc(cname="zstd", clevel=5, shuffle=2),
+    #     )
     if frame_data.shape[0] > 0:
         scan_time = np.round(ms1scans.loc[ms1_frame_idx, "Time_minute"], decimals=4)  # type: ignore[arg-type]
         candidate_precursor_by_rt = maxquant_result_ref_with_im_index_sortmz.loc[
@@ -473,20 +490,27 @@ def process_one_frame_ims(
                     )
                     peaks_df["frame_indices"] = ms1_frame_idx
 
-                nonzero_indices = np.nonzero(im_pept_act)
-                im_pept_act_coo_dict["data"] = im_pept_act[nonzero_indices].tolist()  # type: ignore[assignment]
-                im_pept_act_coo_dict["coord_frame_indices"] = np.repeat(
-                    ms1_frame_idx, len(im_pept_act_coo_dict["data"])
-                ).tolist()
-                im_pept_act_coo_dict["coord_im_indices"] = nonzero_indices[0].tolist()
-                im_pept_act_coo_dict["coord_pept_indices"] = all_frame_pept_idx[
-                    nonzero_indices[1]
-                ].tolist()
-                Logger.debug("Finished preparing activation COO dict.")
+                if writer is not None:
+                    writer.write_frame(ms1_frame_idx, all_frame_pept_idx, im_pept_act)
+                else:
+                    nonzero_indices = np.nonzero(im_pept_act)
+                    im_pept_act_coo_dict["data"] = im_pept_act[nonzero_indices].tolist()  # type: ignore[assignment]
+                    im_pept_act_coo_dict["coord_frame_indices"] = np.repeat(
+                        ms1_frame_idx, len(im_pept_act_coo_dict["data"])
+                    ).tolist()
+                    im_pept_act_coo_dict["coord_im_indices"] = nonzero_indices[
+                        0
+                    ].tolist()
+                    im_pept_act_coo_dict["coord_pept_indices"] = all_frame_pept_idx[
+                        nonzero_indices[1]
+                    ].tolist()
+                    Logger.debug("Finished preparing activation COO dict.")
         else:
             Logger.info("No candidate precursor by RT from frame %s", ms1_frame_idx)
     else:
         Logger.info("No data for frame index %s", ms1_frame_idx)
+    if writer is not None:
+        return None
     if debug:
         return (
             peaks_df,
@@ -770,6 +794,229 @@ def process_batch_frame(
                 batch_num,
                 batch_im_rt_pept_res_coo.nbytes / 1e6,
             )
+
+
+def process_batch_frame_save_parquet(
+    data: pd.DataFrame,
+    ms1scans: pd.DataFrame,
+    batch_scan_idx: list,
+    maxquant_result_ref_with_im_index_sortmz: pd.DataFrame,
+    parquet_file: str,
+    mobility_values: Optional[pd.DataFrame],
+    delta_mobility_thres: int = 100,
+    batch_num: int = 0,
+    save_dir: str = "",
+    extract_im_peak: bool = False,
+    use_ims: bool = True,
+    return_res_coo_dict: bool = False,
+    max_mz_rank: int = 0,
+    **process_frame_kwargs,
+):
+    batch_peaks_df = []
+    if max_mz_rank == 0:
+        max_mz_rank = maxquant_result_ref_with_im_index_sortmz.mz_rank.max()
+    if use_ims:
+        batch_im_rt_pept_act_coo_dict = {
+            "coord_frame_indices": [],
+            "coord_im_indices": [],
+            "coord_pept_indices": [],
+            "data": [],
+        }
+        batch_im_rt_pept_res_coo_dict = {
+            "coord_frame_indices": [],
+            "coord_im_indices": [],
+            "coord_pept_indices": [],
+            "data": [],
+        }
+    else:  # TODO: fix non ims module
+        batch_rt_pept_act_coo_dict = {
+            "coord_frame_indices": [],
+            "coord_pept_indices": [],
+            "data": [],
+        }
+    path_act = f"{parquet_file}_activation.parquet"
+    path_res = f"{parquet_file}_residue.parquet"
+    schema_act = init_parquet_scheme(data_col_name="activation")
+    schema_res = init_parquet_scheme(data_col_name="residue")
+    with pq.ParquetWriter(path_act, schema_act) as writer_act, pq.ParquetWriter(
+        path_res, schema_res
+    ) as writer_res:
+        for scan_idx in tqdm.tqdm(
+            batch_scan_idx,
+            desc=f"Processing batch starting {batch_scan_idx[0]}",
+            total=len(batch_scan_idx),
+        ):
+            Logger.debug("Start processing frame index %s", scan_idx)
+            if use_ims:
+                assert mobility_values is not None
+                one_frame_results = process_one_frame_ims(  # type: ignore[assignment]
+                    data=data,
+                    ms1scans=ms1scans,
+                    ms1_frame_idx=scan_idx,
+                    maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
+                    mobility_values=mobility_values,
+                    delta_mobility_thres=delta_mobility_thres,
+                    extract_im_peak=extract_im_peak,
+                    debug=False,
+                    return_res_coo_dict=return_res_coo_dict,
+                    **process_frame_kwargs,
+                )
+                if return_res_coo_dict:
+                    peaks_df, frame_im_pept_act_coo_dict, frame_im_pept_res_coo_dict = one_frame_results  # type: ignore[assignment]
+                else:
+                    peaks_df, frame_im_pept_act_coo_dict = one_frame_results  # type: ignore[assignment]
+                if extract_im_peak:
+                    batch_peaks_df.append(peaks_df)
+
+                for key in batch_im_rt_pept_act_coo_dict.keys():
+                    batch_im_rt_pept_act_coo_dict[key].extend(
+                        frame_im_pept_act_coo_dict[key]
+                    )
+                    if return_res_coo_dict:
+                        batch_im_rt_pept_res_coo_dict[key].extend(
+                            frame_im_pept_res_coo_dict[key]  # type: ignore[assignment]
+                        )  # type: ignore[assignment]
+            else:
+                peaks_df, frame_im_pept_act_coo = process_one_frame(  # type: ignore[assignment]
+                    ms1scans=ms1scans,
+                    ms1_frame_idx=scan_idx,
+                    maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
+                    debug=False,
+                    **process_frame_kwargs,
+                )
+
+                for key in batch_rt_pept_act_coo_dict.keys():
+                    batch_rt_pept_act_coo_dict[key].extend(frame_im_pept_act_coo[key])
+
+        if use_ims and extract_im_peak:
+            batch_peaks_df = pd.concat(batch_peaks_df).reset_index(drop=True)
+            batch_peaks_df.to_csv(
+                os.path.join(save_dir, f"batch_peaks_df_{batch_num}.csv"), index=False
+            )
+        if use_ims:
+            assert mobility_values is not None
+            table_act = pa.Table.from_pydict(
+                {
+                    "frame_idx": np.array(
+                        batch_im_rt_pept_act_coo_dict["coord_frame_indices"],
+                        dtype=np.uint16,
+                    ),
+                    "im_idx": np.array(
+                        batch_im_rt_pept_act_coo_dict["coord_im_indices"],
+                        dtype=np.uint16,
+                    ),
+                    "mz_rank": np.array(
+                        batch_im_rt_pept_act_coo_dict["coord_pept_indices"],
+                        dtype=np.uint32,
+                    ),
+                    "activation": np.array(
+                        batch_im_rt_pept_act_coo_dict["data"], dtype=np.float32
+                    ),
+                }
+            )
+
+            writer_act.write_table(table_act)
+            if return_res_coo_dict:
+                table_res = pa.Table.from_pydict(
+                    {
+                        "frame_idx": np.array(
+                            batch_im_rt_pept_res_coo_dict["coord_frame_indices"],
+                            dtype=np.uint16,
+                        ),
+                        "im_idx": np.array(
+                            batch_im_rt_pept_res_coo_dict["coord_im_indices"],
+                            dtype=np.uint16,
+                        ),
+                        "mz_rank": np.array(
+                            batch_im_rt_pept_res_coo_dict["coord_pept_indices"],
+                            dtype=np.uint32,
+                        ),
+                        "residue": np.array(
+                            batch_im_rt_pept_res_coo_dict["data"], dtype=np.float32
+                        ),
+                    }
+                )
+                writer_res.write_table(table_res)
+            else:
+                os.remove(path_res)  # remove residue parquet if not return res coo dict
+
+
+def process_batch_frame_save_zarr(
+    data: pd.DataFrame,
+    ms1scans: pd.DataFrame,
+    batch_scan_idx: list,
+    zarr_path: str,
+    maxquant_result_ref_with_im_index_sortmz: pd.DataFrame,
+    mobility_values: Optional[pd.DataFrame],
+    delta_mobility_thres: int = 100,
+    extract_im_peak: bool = False,
+    use_ims: bool = True,
+    return_res_coo_dict: bool = False,
+    max_mz_rank: Optional[int] = None,
+    zarr_chunks: tuple = (256, 256, 1),
+    **process_frame_kwargs,
+):
+    # TODO: only ims so far
+    batch_peaks_df = []
+    if max_mz_rank is None:
+        max_mz_rank = maxquant_result_ref_with_im_index_sortmz.mz_rank.max()
+    z = zarr.open(
+        zarr_path,
+        mode="a",
+        shape=(
+            len(ms1scans.index.values)
+            + 1,  # this index is rank, starting from 1, add 1 for the last frame
+            len(mobility_values) if mobility_values is not None else 1,
+            max_mz_rank
+            + 1,  # this index is rank, starting from 1, add 1 for the last frame
+        ),
+        chunks=zarr_chunks,
+        dtype=np.float32,
+        compressor=zarr.Blosc(cname="zstd", clevel=5, shuffle=2),
+    )
+    writer = RTChunkWriter(z)
+    for scan_idx in tqdm.tqdm(
+        batch_scan_idx, desc="Processing frames in batch", total=len(batch_scan_idx)
+    ):
+        Logger.debug("Start processing frame index %s", scan_idx)
+        if use_ims:
+            assert mobility_values is not None
+            one_frame_results = process_one_frame_ims(  # type: ignore[assignment]
+                data=data,
+                ms1scans=ms1scans,
+                ms1_frame_idx=scan_idx,
+                maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
+                mobility_values=mobility_values,
+                delta_mobility_thres=delta_mobility_thres,
+                extract_im_peak=extract_im_peak,
+                debug=False,
+                return_res_coo_dict=return_res_coo_dict,
+                writer=writer,
+                # zarr_path=zarr_path,
+                # zarr_chunks=zarr_chunks,
+                # zarr_shape=(
+                #     len(ms1scans.index.values)
+                #     + 1,  # this index is rank, starting from 1, add 1 for the last frame
+                #     len(mobility_values),
+                #     max_mz_rank
+                #     + 1,  # this index is rank, starting from 1, add 1 for the last frame
+                # ),
+                **process_frame_kwargs,
+            )
+
+        else:
+            # TODO: fixme
+            peaks_df, frame_im_pept_act_coo = process_one_frame(  # type: ignore[assignment]
+                ms1scans=ms1scans,
+                ms1_frame_idx=scan_idx,
+                maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
+                debug=False,
+                **process_frame_kwargs,
+            )
+
+            for key in batch_rt_pept_act_coo_dict.keys():
+                batch_rt_pept_act_coo_dict[key].extend(frame_im_pept_act_coo[key])
+    writer.flush()
 
 
 def _match_candidate_mz_and_binned_frame_mz_by_ppm(
@@ -1378,6 +1625,7 @@ def generate_id_partitions(
 def process_frames_parallel(
     n_jobs: int,
     batch_scan_indices: list,
+    parquet_file_stem: Optional[str] = None,
     **kwargs,
 ):
     """
@@ -1391,14 +1639,25 @@ def process_frames_parallel(
     **kwargs : dict
         Additional arguments for `process_batch_frame` function.
     """
-    list_batch_im_pept_act_coo_dict = Parallel(n_jobs=n_jobs)(
-        delayed(process_batch_frame)(
-            batch_scan_idx=batch,
-            batch_num=batch[0],
-            **kwargs,
+    if parquet_file_stem is not None:
+        Logger.info("Processing frames in parallel with Parquet output.")
+        Parallel(n_jobs=n_jobs)(
+            delayed(process_batch_frame_save_parquet)(
+                batch_scan_idx=batch,
+                parquet_file=f"{parquet_file_stem}_frame_batch_{i}.parquet",
+                **kwargs,
+            )
+            for i, batch in enumerate(batch_scan_indices)
         )
-        for batch in batch_scan_indices
-    )
+    else:
+        list_batch_im_pept_act_coo_dict = Parallel(n_jobs=n_jobs)(
+            delayed(process_batch_frame)(
+                batch_scan_idx=batch,
+                batch_num=batch[0],
+                **kwargs,
+            )
+            for batch in batch_scan_indices
+        )
 
 
 def get_apex_from_im_rt_pept_act_coo(im_rt_pept_act_coo: sparse.COO):
@@ -1453,39 +1712,16 @@ def get_apex_from_im_rt_pept_act_coo(im_rt_pept_act_coo: sparse.COO):
     return apex_df
 
 
-# def process_scans_parallel(
-#     n_jobs: int,
-#     ms1scans: pd.DataFrame,
-#     maxquant_ref: pd.DataFrame,
-#     abundance_missing_threshold: float = 0.4,
-#     alpha_criteria: _alpha_criteria = "convergence",
-#     alphas: Union[List, np.ndarray] = [0.00001, 0.0001, 0.001, 0.01, 0.1, 1, 10, 100],
-#     loss: _loss = "lasso",
-#     opt_algo: _algo = "lasso_cd",
-#     metric: _alpha_opt_metric = "cos_dist",
-#     preprocessing_method: _pp_method = "raw",
-#     corr_thres: float = 0.95,
-#     max_iter: int = 1000,
-#     return_precursor_scan_cos_dist: bool = False,
-# ):
-#     scan_result_list = Parallel(n_jobs=n_jobs)(
-#         delayed(process_one_scan)(
-#             scan_idx=scan_idx,
-#             OneScan=OneScan,
-#             Maxquant_result=maxquant_ref,
-#             AbundanceMissingThres=abundance_missing_threshold,
-#             alpha_criteria=alpha_criteria,
-#             alphas=alphas,
-#             metric=metric,
-#             loss=loss,
-#             opt_algo=opt_algo,
-#             preprocessing_method=preprocessing_method,
-#             corr_thres=corr_thres,
-#             max_iter=max_iter,
-#             return_interim_results=False,
-#             return_precursor_scan_cos_dist=return_precursor_scan_cos_dist,
-#         )
-#         for scan_idx, OneScan in ms1scans.iterrows()
-#     )
-#     scan_result_dict = dict(pair for d in scan_result_list for pair in d.items())
-#     return scan_result_dict
+def init_parquet_scheme(data_col_name: Literal["activation", "residue"] = "activation"):
+    schema = pa.schema(
+        [
+            ("frame_idx", pa.uint16()),  # maximum 65535 frames
+            ("im_idx", pa.uint16()),  # maximum 65535 mobility bins
+            (
+                "mz_rank",
+                pa.uint32(),
+            ),  # maximum 4 billion peptides, should be enough for now
+            (data_col_name, pa.float32()),
+        ]
+    )
+    return schema
