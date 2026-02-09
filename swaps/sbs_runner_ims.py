@@ -79,8 +79,12 @@ def opt_scan_by_scan(config_path: str):
         mzml_data = load_mzml(cfg.DATA_PATH, unify_format=True)
     if cfg.DICT_PICKLE_PATH != "":
         maxquant_result_ref = pd.read_pickle(filepath_or_buffer=cfg.DICT_PICKLE_PATH)
-        maxquant_target_result_ref = maxquant_result_ref.loc[~maxquant_result_ref["Decoy"]]
-        maxquant_decoy_result_ref = maxquant_result_ref.loc[maxquant_result_ref["Decoy"]]
+        maxquant_target_result_ref = maxquant_result_ref.loc[
+            ~maxquant_result_ref["Decoy"]
+        ]
+        maxquant_decoy_result_ref = maxquant_result_ref.loc[
+            maxquant_result_ref["Decoy"]
+        ]
         ms1scans = pd.read_csv(os.path.join(cfg.RESULT_PATH, "ms1scans.csv"))
         mobility_values_df = pd.read_csv(
             os.path.join(cfg.RESULT_PATH, "mobility_values.csv")
@@ -103,21 +107,26 @@ def opt_scan_by_scan(config_path: str):
             mobility_values_df = None
         # maxquant_result_ref_ori = pd.read_csv(cfg.MQ_REF_PATH, sep="\t", low_memory=False)
         if cfg.FP_COMBINE_PATH != "":
-            logging.info("Loading FragPipe combined_ion.tsv from %s", cfg.FP_COMBINE_PATH)
+            logging.info(
+                "Loading FragPipe combined_ion.tsv from %s", cfg.FP_COMBINE_PATH
+            )
             combined_ion = pd.read_csv(cfg.FP_COMBINE_PATH, sep="\t", low_memory=False)
             from prepare_dict.search_engine_output_parser import fragpipe_parser
-            maxquant_result_ref_ori = fragpipe_parser(
-                combined_ion
-            )
+
+            maxquant_result_ref_ori = fragpipe_parser(combined_ion)
             maxquant_result_exp = fragpipe_parser(
                 combined_ion, exp_name=dir_wo_extension
             )
             maxquant_result_exp.to_csv(
-                os.path.join(cfg.RESULT_PATH, "fragpipe_parsed_exp.tsv"), index=False, sep="\t"
+                os.path.join(cfg.RESULT_PATH, "fragpipe_parsed_exp.tsv"),
+                index=False,
+                sep="\t",
             )
             cfg.MQ_EXP_PATH = os.path.join(cfg.RESULT_PATH, "fragpipe_parsed_exp.tsv")
         else:
-            maxquant_result_ref_ori = pd.read_csv(cfg.MQ_REF_PATH, sep="\t", low_memory=False)
+            maxquant_result_ref_ori = pd.read_csv(
+                cfg.MQ_REF_PATH, sep="\t", low_memory=False
+            )
         if len(cfg.FILTER_REF_BY_RAW_FILE) > 0:
             if cfg.FILTER_REF_BY_RAW_FILE[0] == "data":
                 maxquant_result_ref_ori = maxquant_result_ref_ori[
@@ -140,7 +149,15 @@ def opt_scan_by_scan(config_path: str):
             "sage_discriminant_score" in maxquant_result_ref_ori.columns
         ):  # infer search engine, remap column names
             maxquant_result_ref_ori = sage_parser(maxquant_result_ref_ori)
-        maxquant_result_ref, maxquant_target_result_ref, maxquant_decoy_result_ref, dict_target_pickle_path, dict_decoy_pickle_path, dict_pickle_path, cfg_prepare_dict = construct_dict(
+        (
+            maxquant_result_ref,
+            maxquant_target_result_ref,
+            maxquant_decoy_result_ref,
+            dict_target_pickle_path,
+            dict_decoy_pickle_path,
+            dict_pickle_path,
+            cfg_prepare_dict,
+        ) = construct_dict(
             cfg_prepare_dict=cfg.PREPARE_DICT,
             filter_exp_by_raw_file=cfg.FILTER_EXP_BY_RAW_FILE,
             maxquant_exp_path=cfg.MQ_EXP_PATH,
@@ -190,23 +207,23 @@ def opt_scan_by_scan(config_path: str):
             os.path.join(cfg.RESULT_PATH, f"config_{name_timestamp}.yaml"),
         )
     logging.info("==================try and read results==================")
-    try:  
+    try:
         pept_act_sum_df = pd.read_csv(
-            os.path.join(act_dir,"target", "pept_act_sum.csv"), index_col=0
+            os.path.join(act_dir, "target", "pept_act_sum.csv"), index_col=0
         )
         peak_property_all_pept_batches = pd.read_csv(
-            os.path.join(act_dir, "target","all_pept_batches_peak_properties.csv"),
+            os.path.join(act_dir, "target", "all_pept_batches_peak_properties.csv"),
             index_col=False,
         )
         if cfg.PREPARE_DICT.GENERATE_DECOY:
             pept_act_sum_df_decoy = pd.read_csv(
-                os.path.join(act_dir,"decoy", "pept_act_sum_decoy.csv"), index_col=0
+                os.path.join(act_dir, "decoy", "pept_act_sum_decoy.csv"), index_col=0
             )
             pept_act_sum_df = pd.concat(
                 [pept_act_sum_df, pept_act_sum_df_decoy], ignore_index=True
             )
             peak_property_all_pept_batches_decoy = pd.read_csv(
-                os.path.join(act_dir, "decoy","all_pept_batches_peak_properties.csv"),
+                os.path.join(act_dir, "decoy", "all_pept_batches_peak_properties.csv"),
                 index_col=False,
             )
             peak_property_all_pept_batches = pd.concat(
@@ -215,11 +232,15 @@ def opt_scan_by_scan(config_path: str):
             )
         if cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM:
             pept_act_sum_filter_by_im_df = pd.read_csv(
-                os.path.join(act_dir,"target", "pept_act_sum_filter_by_im.csv"), index_col=0
+                os.path.join(act_dir, "target", "pept_act_sum_filter_by_im.csv"),
+                index_col=0,
             )
             if cfg.PREPARE_DICT.GENERATE_DECOY:
                 pept_act_sum_filter_by_im_df_decoy = pd.read_csv(
-                    os.path.join(act_dir,"decoy", "pept_act_sum_filter_by_im_decoy.csv"), index_col=0
+                    os.path.join(
+                        act_dir, "decoy", "pept_act_sum_filter_by_im_decoy.csv"
+                    ),
+                    index_col=0,
                 )
                 pept_act_sum_filter_by_im_df = pd.concat(
                     [pept_act_sum_filter_by_im_df, pept_act_sum_filter_by_im_df_decoy],
@@ -228,8 +249,10 @@ def opt_scan_by_scan(config_path: str):
         logging.info("Loaded pre-calculated optimization.")
     except FileNotFoundError:
         try:
-            if 'peak_property_all_pept_batches' not in locals():
-                logging.info("Precalculated target peak properties not found, start post processing.")
+            if "peak_property_all_pept_batches" not in locals():
+                logging.info(
+                    "Precalculated target peak properties not found, start post processing."
+                )
                 peak_property_all_pept_batches = combine_3d_act_and_detect_peak(
                     n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
                     n_batch=cfg.OPTIMIZATION.N_BATCH,
@@ -258,7 +281,10 @@ def opt_scan_by_scan(config_path: str):
                     rt_group=cfg.RESULT_ANALYSIS.POST_PROCESSING.RT_GROUP,
                 )
                 peak_property_all_pept_batches = pd.concat(
-                    [peak_property_all_pept_batches, peak_property_all_pept_batches_decoy],
+                    [
+                        peak_property_all_pept_batches,
+                        peak_property_all_pept_batches_decoy,
+                    ],
                     ignore_index=True,
                 )
             logging.info("Loaded pre-calculated activation")
@@ -332,8 +358,6 @@ def opt_scan_by_scan(config_path: str):
                 int(seconds),
             )
 
-
-
             logging.info("=================Post Processing==================")
             # TODO: test when pept_batch_number > 1
             peak_property_all_pept_batches = combine_3d_act_and_detect_peak(
@@ -364,7 +388,10 @@ def opt_scan_by_scan(config_path: str):
                     rt_group=cfg.RESULT_ANALYSIS.POST_PROCESSING.RT_GROUP,
                 )
                 peak_property_all_pept_batches = pd.concat(
-                    [peak_property_all_pept_batches, peak_property_all_pept_batches_decoy],
+                    [
+                        peak_property_all_pept_batches,
+                        peak_property_all_pept_batches_decoy,
+                    ],
                     ignore_index=True,
                 )
 
@@ -372,11 +399,11 @@ def opt_scan_by_scan(config_path: str):
     ms1_scan_gap = ms1scans["Time_minute"].diff().mode()[0]
     peaks_result_merged_dict = merge_peaks_result_and_dict(
         peaks_result=peak_property_all_pept_batches,
-        dict_ref=maxquant_result_ref, # TODO: here uses both target and decoy
+        dict_ref=maxquant_result_ref,  # TODO: here uses both target and decoy
         ms1_scan_gap=ms1_scan_gap,
-        remove_bias = True,
-        log_int_bias = 1,
-        keep_closet_int = 3
+        remove_bias=True,
+        log_int_bias=1,
+        keep_closet_int=3,
     )
     result, model, psms = brew_with_mokapot(
         peaks_result_merged_dict,
@@ -400,7 +427,6 @@ def opt_scan_by_scan(config_path: str):
         scannr_col="mz_rank",
         work_dir=os.path.join(cfg.RESULT_PATH, "results", "mokapot"),
     )
-
 
     peaks_result_merged_dict_merged_conf = pd.merge(
         peaks_result_merged_dict,
@@ -681,7 +707,7 @@ def opt_scan_by_scan(config_path: str):
             save_dir=eval_dir,
             include_decoys=cfg.PREPARE_DICT.GENERATE_DECOY,
             score_col="mokapot score",
-            fdr_col = "mokapot q-value"
+            fdr_col="mokapot q-value",
         )
         swaps_result.plot_intensity_corr()
         # swaps_result.plot_intensity_corr(contour=True)

@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tqdm import tqdm
 from sklearn.base import BaseEstimator
+
 Logger = logging.getLogger(__name__)
 
 
@@ -156,7 +157,9 @@ def brew_with_mokapot(
     # Read the .pin file and run mokapot
     psms_pin = mokapot.read_pin(os.path.join(work_dir, "mokapot_input.pin"))
     if model is None:
-        mokapot_model = mokapot.model.PercolatorModel(train_fdr=train_fdr, direction=direction)
+        mokapot_model = mokapot.model.PercolatorModel(
+            train_fdr=train_fdr, direction=direction
+        )
     else:
         mokapot_model = mokapot.model.Model(model, train_fdr=train_fdr)
     result, model = mokapot.brew(
@@ -166,7 +169,9 @@ def brew_with_mokapot(
     # Clean up the temporary file
     # os.remove(os.path.join(work_dir, "mokapot_input.pin"))
     result.plot_qvalues()
-    plt.savefig(os.path.join(work_dir, "mokapot_qvalues.png"), dpi=300, bbox_inches='tight')
+    plt.savefig(
+        os.path.join(work_dir, "mokapot_qvalues.png"), dpi=300, bbox_inches="tight"
+    )
     plt.close()
 
     result.to_txt(work_dir, decoys=True)
@@ -177,19 +182,23 @@ def brew_with_mokapot(
     psms = pd.concat([psms, psms_decoy], ignore_index=True)
     psms["peak_label"] = psms["specid"].str.split("_").str[1].astype(int)
 
-    sns.histplot(data = psms, x="mokapot score", bins=100, hue = "label")
-    plt.savefig(os.path.join(work_dir, "mokapot_score_distr.png"), dpi=300, bbox_inches='tight')
+    sns.histplot(data=psms, x="mokapot score", bins=100, hue="label")
+    plt.savefig(
+        os.path.join(work_dir, "mokapot_score_distr.png"), dpi=300, bbox_inches="tight"
+    )
     plt.close()
     return result, model, psms
 
 
-def merge_peaks_result_and_dict(peaks_result, 
-                                dict_ref,
-                                ms1_scan_gap, 
-                                remove_bias: bool = False, 
-                                log_int_bias = 1, 
-                                keep_closet_int: Optional[int] = None,
-                                keep_closet_rt: Optional[int] = None):
+def merge_peaks_result_and_dict(
+    peaks_result,
+    dict_ref,
+    ms1_scan_gap,
+    remove_bias: bool = False,
+    log_int_bias=1,
+    keep_closet_int: Optional[int] = None,
+    keep_closet_rt: Optional[int] = None,
+):
     """
     Merges the peaks result DataFrame with a reference dictionary DataFrame based on the 'peptide' column.
     This function combines information from both DataFrames, ensuring that all relevant data is retained.
@@ -214,8 +223,13 @@ def merge_peaks_result_and_dict(peaks_result,
     # )
     if "Retention length" not in dict_ref.columns:
         dict_ref["Retention length"] = (
-            dict_ref["Retention time finish_ref"] - dict_ref["Retention time start_ref"]
-        ) * 60.0 / ms1_scan_gap  # convert to index length
+            (
+                dict_ref["Retention time finish_ref"]
+                - dict_ref["Retention time start_ref"]
+            )
+            * 60.0
+            / ms1_scan_gap
+        )  # convert to index length
     dict_ref["rt_idx_length_calc"] = dict_ref["Retention length"] / ms1_scan_gap
     peaks_result_merged_dict = pd.merge(
         peaks_result,
@@ -286,28 +300,61 @@ def merge_peaks_result_and_dict(peaks_result,
     )
     peaks_result_merged_dict["log_int_diff"] = (
         np.log10(1 + peaks_result_merged_dict["intensity_sum"])
-        - peaks_result_merged_dict["log_Intensity_MQ"] 
+        - peaks_result_merged_dict["log_Intensity_MQ"]
         + log_int_bias
     )
 
     for col in peaks_result_merged_dict.columns:
         if "diff" in col:
-            if remove_bias and (col in ['rt_length_diff', 'im_length_diff', 'rt_diff', 'im_diff', "rt_pixel_diff"]):
-                    Logger.info("Column %s: median %.4f", col,
-                        peaks_result_merged_dict[col].median())
-                    peaks_result_merged_dict[col] = (
-                        peaks_result_merged_dict[col] - peaks_result_merged_dict[col].median()
-                    )
+            if remove_bias and (
+                col
+                in [
+                    "rt_length_diff",
+                    "im_length_diff",
+                    "rt_diff",
+                    "im_diff",
+                    "rt_pixel_diff",
+                ]
+            ):
+                Logger.info(
+                    "Column %s: median %.4f",
+                    col,
+                    peaks_result_merged_dict[col].median(),
+                )
+                peaks_result_merged_dict[col] = (
+                    peaks_result_merged_dict[col]
+                    - peaks_result_merged_dict[col].median()
+                )
             # Take absolute value for diff features
             peaks_result_merged_dict[col] = abs(peaks_result_merged_dict[col])
     if keep_closet_rt is not None:
-        Logger.info("Keeping only the %d closest retention times per peptide, rows before filtering: %d", keep_closet_rt, peaks_result_merged_dict.shape[0])
-        peaks_result_merged_dict.sort_values(by=["rt_diff"], inplace=True, ascending = True)
-        peaks_result_merged_dict = peaks_result_merged_dict.groupby("mz_rank").head(keep_closet_rt).reset_index(drop=True)
+        Logger.info(
+            "Keeping only the %d closest retention times per peptide, rows before filtering: %d",
+            keep_closet_rt,
+            peaks_result_merged_dict.shape[0],
+        )
+        peaks_result_merged_dict.sort_values(
+            by=["rt_diff"], inplace=True, ascending=True
+        )
+        peaks_result_merged_dict = (
+            peaks_result_merged_dict.groupby("mz_rank")
+            .head(keep_closet_rt)
+            .reset_index(drop=True)
+        )
         Logger.info("Rows after filtering: %d", peaks_result_merged_dict.shape[0])
     if keep_closet_int is not None:
-        Logger.info("Keeping only the %d closest intensities per peptide, rows before filtering: %d", keep_closet_int, peaks_result_merged_dict.shape[0])
-        peaks_result_merged_dict.sort_values(by=["log_int_diff"], inplace=True, ascending = True)
-        peaks_result_merged_dict = peaks_result_merged_dict.groupby("mz_rank").head(keep_closet_int).reset_index(drop=True)
+        Logger.info(
+            "Keeping only the %d closest intensities per peptide, rows before filtering: %d",
+            keep_closet_int,
+            peaks_result_merged_dict.shape[0],
+        )
+        peaks_result_merged_dict.sort_values(
+            by=["log_int_diff"], inplace=True, ascending=True
+        )
+        peaks_result_merged_dict = (
+            peaks_result_merged_dict.groupby("mz_rank")
+            .head(keep_closet_int)
+            .reset_index(drop=True)
+        )
         Logger.info("Rows after filtering: %d", peaks_result_merged_dict.shape[0])
     return peaks_result_merged_dict

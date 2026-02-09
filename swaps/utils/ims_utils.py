@@ -124,7 +124,7 @@ def combine_3d_act_and_detect_peak(  # TODO: integrate res coo
     im_ref: str = "exp",
     n_cpu: int = 1,
     chunk_size: int = 1000,
-    rt_group: int = 1
+    rt_group: int = 1,
 ):
     """
     Combine peptide blocks of 3D activation intensity data, \
@@ -148,10 +148,8 @@ def combine_3d_act_and_detect_peak(  # TODO: integrate res coo
         maxquant_result_ref_sorted = maxquant_result_ref.copy()
         maxquant_result_ref_sorted.sort_values("mz_rank", inplace=True)
 
-    maxquant_result_ref['RT_group'] = pd.qcut(
-        maxquant_result_ref['MS1_frame_idx_center_ref'],
-        q=rt_group,
-        labels=False
+    maxquant_result_ref["RT_group"] = pd.qcut(
+        maxquant_result_ref["MS1_frame_idx_center_ref"], q=rt_group, labels=False
     )
     # assert n_blocks_by_pept > 1
     # pept_act_sum_all_array = np.array([])
@@ -592,8 +590,6 @@ def detect_2d_peak_with_watershed(
     - labels: 2D numpy array
         Labeled regions corresponding to detected peaks.
     """
-
-
     # 2. Compute distance (to background) transform inside signal
     distance = image
 
