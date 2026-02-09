@@ -1437,3 +1437,71 @@ def plot_frame_act_and_mono_mz(
 
     plt.tight_layout()
     plt.show()
+
+
+def plot_image_comparison(
+    fig_a,
+    fig_b,
+    rt_exp_start=None,
+    rt_exp_end=None,
+    im_exp_start=None,
+    im_exp_end=None,
+    fig_dir=None,
+    fig_name=None,
+):
+    """
+    Compare two figures side by side with highlighted experimental region.
+    Parameters:
+    fig_a: 2D array-like
+        First figure to display.
+    fig_b: 2D array-like
+        Second figure to display.
+    rt_exp_start: int, optional
+        Start index of the experimental region in the RT dimension.
+    rt_exp_end: int, optional
+        End index of the experimental region in the RT dimension.
+    im_exp_start: int, optional
+        Start index of the experimental region in the IM dimension.
+    im_exp_end: int, optional
+        End index of the experimental region in the IM dimension.
+    fig_dir: str, optional
+        Directory to save the figure.
+    fig_name: str, optional
+        Name of the figure file.
+
+    """
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharex=True, sharey=True)
+
+    im0 = axes[0].imshow(fig_a, aspect="auto", cmap="viridis")
+    axes[0].set_title(fig_name)
+    fig.colorbar(im0, ax=axes[0])
+    im1 = axes[1].imshow(fig_b, aspect="auto", cmap="viridis")
+    axes[1].set_title(fig_name)
+    fig.colorbar(im1, ax=axes[1])
+    if None not in (im_exp_start, rt_exp_start, im_exp_end, rt_exp_end):
+        axes[0].add_patch(
+            Rectangle(
+                (im_exp_start, rt_exp_start),
+                im_exp_end - im_exp_start,
+                rt_exp_end - rt_exp_start,
+                fill=False,
+                edgecolor="red",
+                linewidth=2,
+            )
+        )
+        axes[1].add_patch(
+            Rectangle(
+                (im_exp_start, rt_exp_start),
+                im_exp_end - im_exp_start,
+                rt_exp_end - rt_exp_start,
+                fill=False,
+                edgecolor="red",
+                linewidth=2,
+            )
+        )
+
+    plt.tight_layout()
+    if fig_dir and fig_name:
+        os.makedirs(fig_dir, exist_ok=True)
+        plt.savefig(os.path.join(fig_dir, fig_name), dpi=300)
+        plt.close()
