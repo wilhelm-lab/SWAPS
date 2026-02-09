@@ -628,7 +628,7 @@ def detect_2d_peak_with_watershed(
 def calculate_peak_property_from_labels_and_image(
     labels,
     image_2d,
-    grad_mag,
+    grad_mag: Optional[np.ndarray] = None,
     image_res_2d: Optional[np.ndarray] = None,
     min_peak_area=10,
     min_peak_sum_intensity=1000,
@@ -655,9 +655,8 @@ def calculate_peak_property_from_labels_and_image(
     """
     num_labels = labels.max()
     if num_labels == 0:
-        Logger.info("No peaks detected after watershed.")
+        # Logger.debug("No peaks detected after watershed.")
         return None
-
 
     # Region properties from skimage (fast, C-based)
     props = regionprops_table(
@@ -712,19 +711,19 @@ def calculate_peak_property_from_labels_and_image(
         df = df.merge(df_res, on="label", how="left", suffixes=("", "_res"))
         # df.drop(columns=["label_res"], inplace=True)
 
-    # Compute row-based smoothness
+    # Compute row-based smoothness if gradient magnitude is provided
+    if grad_mag is not None:
+        row_smoothness_df = compute_row_smoothness_and_apex_index(
+            labels=labels,
+            dy=grad_mag,
+            pept_act=image_2d,
+            label_values=df["label"].values,
+            apply_gaussian_smoothing=False,
+        )
 
-    row_smoothness_df = compute_row_smoothness_and_apex_index(
-        labels=labels,
-        dy=grad_mag,
-        pept_act=image_2d,
-        label_values=df["label"].values,
-        apply_gaussian_smoothing=False,
-    )
-
-    df = df.merge(row_smoothness_df, on="label", how="left")
-    if return_dy:
-        return df, grad_mag
+        df = df.merge(row_smoothness_df, on="label", how="left")
+        if return_dy:
+            return df, grad_mag
     else:
         return df
 
