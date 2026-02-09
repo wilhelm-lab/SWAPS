@@ -826,7 +826,7 @@ def detect_2d_peak_and_calculate_peak_property(
     start_mz_idx: int,
     end_mz_idx: int,
     im_rt_pept_res_coo: Optional[sparse.COO] = None,
-    filter: Literal["gaussian", "uniform", None] = "gaussian",
+    filter: Literal["gaussian", "uniform", None] = "uniform",
     detect_kwargs=None,
     calc_kwargs=None,
 ):
@@ -847,33 +847,33 @@ def detect_2d_peak_and_calculate_peak_property(
     :rtype: pd.DataFrame
     """
     dict_ref_filtered = ref_dict[
-        (ref_dict["mz_rank"] >= start_mz_idx)
-        & (ref_dict["mz_rank"] < end_mz_idx)
+        (ref_dict["mz_rank"] >= start_mz_idx) & (ref_dict["mz_rank"] < end_mz_idx)
     ]
-    im_min = max(dict_ref_filtered['IM_search_idx_left'].min()-25, 0)
-    im_max = dict_ref_filtered['IM_search_idx_right'].max()+25
+    im_min = max(dict_ref_filtered["IM_search_idx_left"].min() - 25, 0)
+    im_max = dict_ref_filtered["IM_search_idx_right"].max() + 25
 
     all_peak_properties_in_chunk = []
 
     detect_kwargs = detect_kwargs or {}
     calc_kwargs = calc_kwargs or {}
 
-    for g in dict_ref_filtered['RT_group'].unique():
-        group_df = dict_ref_filtered[dict_ref_filtered['RT_group'] == g]
-        mz_idx = group_df['mz_rank'].unique()
+    for g in dict_ref_filtered["RT_group"].unique():
+        group_df = dict_ref_filtered[dict_ref_filtered["RT_group"] == g]
+        mz_idx = group_df["mz_rank"].unique()
         if len(mz_idx) == 0:
             Logger.info("No mz ranks found for RT group %s, skipping.", g)
             continue
-        rt_min = group_df['MS1_frame_idx_left_ref'].min()
-        rt_max = group_df['MS1_frame_idx_right_ref'].max()+1
+        rt_min = group_df["MS1_frame_idx_left_ref"].min()
+        rt_max = group_df["MS1_frame_idx_right_ref"].max() + 1
         Logger.info("Processing RT group %s with RT range %s - %s", g, rt_min, rt_max)
         im_rt_pept_act_coo_dense = np.atleast_3d(
             im_rt_pept_act_coo[rt_min:rt_max, im_min:im_max, mz_idx].todense()
         )  # Convert to dense for easier indexing
-        Logger.debug("Original COO shape: %s, dense array shape: %s", im_rt_pept_act_coo.shape, im_rt_pept_act_coo_dense.shape)
         if im_rt_pept_res_coo is not None:
             im_rt_pept_res_coo_dense = np.abs(
-                np.atleast_3d(im_rt_pept_res_coo[rt_min:rt_max, im_min:im_max, mz_idx].todense())
+                np.atleast_3d(
+                    im_rt_pept_res_coo[rt_min:rt_max, im_min:im_max, mz_idx].todense()
+                )
             )  # sometimes residue is negative
         else:
             im_rt_pept_res_coo_dense = None
@@ -881,7 +881,9 @@ def detect_2d_peak_and_calculate_peak_property(
             pept_act = im_rt_pept_act_coo_dense[:, :, rel_idx]
 
             # pept_act = im_rt_pept_act_coo[rt_start:rt_end, im_start:im_end, pept_idx].todense()
-            cleaned_mask = remove_small_objects(pept_act>=10, min_size=9) # TODO: hardcoded threshold
+            cleaned_mask = remove_small_objects(
+                pept_act >= 10, min_size=9
+            )  # TODO: hardcoded threshold
             match filter:
                 case "gaussian":
                     pept_act_smoothed = gaussian_filter(pept_act, sigma=1.0)
@@ -893,7 +895,6 @@ def detect_2d_peak_and_calculate_peak_property(
             pept_act_smoothed = pept_act_smoothed * cleaned_mask
             pept_act_smoothed_log = np.log10(1 + pept_act_smoothed)
 
-
             # Calculate gradient mask
             dy, dx = np.gradient(pept_act_smoothed)
             grad_mag = np.sqrt(dx**2 + dy**2)
@@ -901,10 +902,10 @@ def detect_2d_peak_and_calculate_peak_property(
 
             # Detect peaks with flexible kwargs
             coordinates, labels, distance = detect_2d_peak_with_watershed(
-                pept_act_smoothed_log, 
-                int_threshold=1, 
-                threshold_rel = 0.2, 
-                min_distance=10
+                pept_act_smoothed_log,
+                int_threshold=1,
+                threshold_rel=0.2,
+                min_distance=10,
             )
             # Calculate peak properties with flexible kwargs
             peak_properties = calculate_peak_property_from_labels_and_image(
@@ -913,8 +914,8 @@ def detect_2d_peak_and_calculate_peak_property(
 
             if isinstance(peak_properties, pd.DataFrame) and not peak_properties.empty:
                 peak_properties["mz_rank"] = mz_rank
-                peak_properties['rt_apex_index'] += rt_min
-                peak_properties['im_apex_index'] += im_min
+                peak_properties["rt_apex_index"] += rt_min
+                peak_properties["im_apex_index"] += im_min
                 all_peak_properties_in_chunk.append(peak_properties)
             else:
                 Logger.debug("No peaks detected for mz_rank %s", mz_rank)
