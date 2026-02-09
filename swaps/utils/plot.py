@@ -9,6 +9,7 @@ import pandas as pd
 import plotly.express as px
 import seaborn as sns
 from matplotlib_venn import venn2, venn3
+from matplotlib.patches import Rectangle
 from scipy import stats
 from sparse import SparseArray
 from utils.tools import ExtractPeak
@@ -1154,10 +1155,10 @@ def plot_pept_act_align_channels(
     im_exp_start,
     im_exp_center,
     im_exp_end,
-    coordinates = None,
-    labels = None,
+    coordinates=None,
+    labels=None,
     peak_properties=None,
-    sub_fig3 = None,
+    sub_fig3=None,
     figsize=(15, 5),
     annotate=True,
     title: Optional[str] = None,
@@ -1188,17 +1189,17 @@ def plot_pept_act_align_channels(
 
     ax = axes[1]
     im1 = ax.imshow(act_log, cmap="viridis", aspect="auto", interpolation="nearest")
-    ax.set_title("Log-Transformed")
+    ax.set_title("Raw, Log")
     fig.colorbar(im1, ax=ax)
 
     ax = axes[2]
-    im2 = ax.imshow(act_transformed_log, cmap="viridis", aspect="auto", interpolation="nearest")
+    im2 = ax.imshow(
+        act_transformed_log, cmap="viridis", aspect="auto", interpolation="nearest"
+    )
     if coordinates is not None and len(coordinates) > 0:
         ax.scatter(coordinates[:, 1], coordinates[:, 0], color="r", s=20)
-    ax.set_title("Transformed, Log + Local Max")
+    ax.set_title("Transformed(smoothed, cleaned up), Log + Local Max")
     fig.colorbar(im2, ax=ax)
-
-
 
     if sub_fig3 is None:
         # right: watershed labels (only plot labels present in peak_properties)
@@ -1215,14 +1216,14 @@ def plot_pept_act_align_channels(
     )
     ax.set_title("Watershed Segmentation")
     fig.colorbar(im5, ax=ax)
-    
+
     # annotate each detected coordinate with its watershed label and row_smoothness
     if annotate and not peak_properties.empty:
         # use centroid coords and row_smoothness from peak_properties
         cols = ["centroid-0", "centroid-1", "intensity_sum"]
         # guard if some columns missing
         if all(c in peak_properties.columns for c in cols):
-            for (r, c, s) in peak_properties[cols].values:
+            for r, c, s in peak_properties[cols].values:
                 rr, cc = int(round(r)), int(round(c))
                 # ensure indices are inside bounds
                 if 0 <= rr < labels.shape[0] and 0 <= cc < labels.shape[1]:
@@ -1251,22 +1252,48 @@ def plot_pept_act_align_channels(
                 )
         # middle: gradient magnitude
     ax = axes[4]
-    im3 = ax.imshow(grad_mag, cmap = "gray", aspect="auto", interpolation="nearest")
+    im3 = ax.imshow(grad_mag, cmap="gray", aspect="auto", interpolation="nearest")
     ax.set_title("Gradient Magnitude")
     fig.colorbar(im3, ax=ax)
 
-     # right: smoothed gradient magnitude
+    # right: smoothed gradient magnitude
     ax = axes[5]
-    im4 = ax.imshow(grad_mag_smoothed, cmap = "gray", aspect="auto", interpolation="nearest")
+    im4 = ax.imshow(
+        grad_mag_smoothed, cmap="gray", aspect="auto", interpolation="nearest"
+    )
     ax.set_title("Smoothed Gradient Magnitude")
     fig.colorbar(im4, ax=ax)
 
     for ax in axes:
         xlim = ax.get_xlim()
-        ax.hlines([rt_exp_start, rt_exp_end], xmin=xlim[0], xmax=xlim[1], colors="white", linestyles="dashed")
-        ax.vlines([im_exp_start,im_exp_end], ymin=ax.get_ylim()[0], ymax=ax.get_ylim()[1], colors="white", linestyles="dashed")
-        ax.hlines([rt_exp_center], xmin=xlim[0], xmax=xlim[1], colors="white", linestyles="solid")
-        ax.vlines([im_exp_center], ymin=ax.get_ylim()[0], ymax=ax.get_ylim()[1], colors="white", linestyles="solid")
+        ax.hlines(
+            [rt_exp_start, rt_exp_end],
+            xmin=xlim[0],
+            xmax=xlim[1],
+            colors="white",
+            linestyles="dashed",
+        )
+        ax.vlines(
+            [im_exp_start, im_exp_end],
+            ymin=ax.get_ylim()[0],
+            ymax=ax.get_ylim()[1],
+            colors="white",
+            linestyles="dashed",
+        )
+        ax.hlines(
+            [rt_exp_center],
+            xmin=xlim[0],
+            xmax=xlim[1],
+            colors="white",
+            linestyles="solid",
+        )
+        ax.vlines(
+            [im_exp_center],
+            ymin=ax.get_ylim()[0],
+            ymax=ax.get_ylim()[1],
+            colors="white",
+            linestyles="solid",
+        )
     if title is not None:
         fig.suptitle(title)
     plt.tight_layout()
@@ -1281,7 +1308,15 @@ def plot_pept_act_align_channels(
         plt.show()
 
 
-def plot_heat(ax, heat_df, title, filtered_precursor, rows, match_col="mz_rank", mark_col="mobility_values_index_center_exp"):
+def plot_heat(
+    ax,
+    heat_df,
+    title,
+    filtered_precursor,
+    rows,
+    match_col="mz_rank",
+    mark_col="mobility_values_index_center_exp",
+):
     sns.heatmap(heat_df, cmap="viridis", ax=ax)
     ax.set_title(title)
     ax.tick_params(axis="y", labelrotation=0)
@@ -1302,7 +1337,14 @@ def plot_heat(ax, heat_df, title, filtered_precursor, rows, match_col="mz_rank",
         ax.scatter(col_pos + 0.5, y_pos + 0.5, marker="x", color="red", s=20)
 
 
-def plot_frame_act_and_mono_mz(frame_data, filtered_precursor, act_3d_dict, ppm_tol=20, log_int= False,log_act=False):
+def plot_frame_act_and_mono_mz(
+    frame_data,
+    filtered_precursor,
+    act_3d_dict,
+    ppm_tol=20,
+    log_int=False,
+    log_act=False,
+):
     """
     Plot side-by-side heatmaps:
       1. Experimental mobility–intensity map
@@ -1337,37 +1379,61 @@ def plot_frame_act_and_mono_mz(frame_data, filtered_precursor, act_3d_dict, ppm_
         if not np.any(mask):
             continue
         df_sub = (
-            pd.DataFrame({
-                "mobility_values": scans[mask],
-                "intensity_values": intensities[mask]
-            })
-            .groupby("mobility_values", as_index=False)["intensity_values"].sum()
+            pd.DataFrame(
+                {"mobility_values": scans[mask], "intensity_values": intensities[mask]}
+            )
+            .groupby("mobility_values", as_index=False)["intensity_values"]
+            .sum()
         )
         df_sub["center_mz"] = c
         records.append(df_sub)
 
     result_df = pd.concat(records, ignore_index=True)
-    heat_exp = result_df.pivot(index="center_mz", columns="mobility_values", values="intensity_values")
+    heat_exp = result_df.pivot(
+        index="center_mz", columns="mobility_values", values="intensity_values"
+    )
     left_title = f"Experimental MonoM/Z (ppm={ppm_tol}) - 1/K0 - Intensity"
     if log_int:
         heat_exp = np.log1p(heat_exp)
         left_title += " (log-scaled)"
     # --- Activation data ---
     act_3d_df = pd.DataFrame(act_3d_dict)
-    act_3d_df = act_3d_df[act_3d_df["coord_pept_indices"].isin(filtered_precursor["mz_rank"].values)]
+    act_3d_df = act_3d_df[
+        act_3d_df["coord_pept_indices"].isin(filtered_precursor["mz_rank"].values)
+    ]
     right_title = "Activation Map"
     if log_act:
         act_3d_df["data"] = np.log1p(act_3d_df["data"])
         right_title += " (log-scaled)"
-    heat_act = act_3d_df.pivot(index="coord_pept_indices", columns="coord_im_indices", values="data").fillna(0)
+    heat_act = act_3d_df.pivot(
+        index="coord_pept_indices", columns="coord_im_indices", values="data"
+    ).fillna(0)
 
     # --- Plot ---
     fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-    filtered_precursor['mono_mz'] = np.array([mz[0] for mz in filtered_precursor["IsoMZ"].values])
+    filtered_precursor["mono_mz"] = np.array(
+        [mz[0] for mz in filtered_precursor["IsoMZ"].values]
+    )
     # Left: experimental
-    plot_heat(axes[0], heat_exp, left_title, filtered_precursor, heat_exp.index.values, "mono_mz", "1/K0")
+    plot_heat(
+        axes[0],
+        heat_exp,
+        left_title,
+        filtered_precursor,
+        heat_exp.index.values,
+        "mono_mz",
+        "1/K0",
+    )
     # Right: activation
-    plot_heat(axes[1], heat_act, right_title, filtered_precursor, heat_act.index.values, "mz_rank", "mobility_values_index_center_exp")
+    plot_heat(
+        axes[1],
+        heat_act,
+        right_title,
+        filtered_precursor,
+        heat_act.index.values,
+        "mz_rank",
+        "mobility_values_index_center_exp",
+    )
 
     plt.tight_layout()
     plt.show()
