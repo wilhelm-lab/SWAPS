@@ -572,7 +572,7 @@ def detect_2d_peak_with_watershed(
     int_threshold=0.5,
     min_distance=5,
     threshold_rel=0.2,
-
+    coordinates: Optional[np.ndarray] = None,
 ):
     """
     Detect peaks in a 2D image using the watershed algorithm.
@@ -597,27 +597,32 @@ def detect_2d_peak_with_watershed(
     mask_signal = distance > int_threshold
     if not mask_signal.any():
         distance[~mask_signal] = 0
-        return np.empty((0, 2), dtype=int), np.zeros_like(distance, dtype=int), np.zeros_like(distance, dtype=float)
-    
-    # distance = ndi.distance_transform_edt(mask_signal)
-    # 3. Find local maxima in distance map
-
-    coordinates = peak_local_max(
-        distance,
-        min_distance=min_distance,
-        threshold_rel=threshold_rel,
-        labels=mask_signal,
-    )
+        return (
+            np.empty((0, 2), dtype=int),
+            np.zeros_like(distance, dtype=int),
+            np.zeros_like(distance, dtype=float),
+        )
+    if coordinates is None:
+        # 3. Find local maxima in distance map
+        coordinates = peak_local_max(
+            distance,
+            min_distance=min_distance,
+            threshold_rel=threshold_rel,
+            labels=mask_signal,
+        )
     if coordinates.size == 0:
-        return coordinates, np.zeros_like(image, dtype=int), np.zeros_like(image, dtype=float)
-    mask = np.zeros(distance.shape, dtype=bool)
+        return (
+            coordinates,
+            np.zeros_like(image, dtype=int),
+            np.zeros_like(image, dtype=float),
+        )
+    mask = np.zeros(image.shape, dtype=bool)
     mask[tuple(coordinates.T)] = True
     markers, _ = ndi.label(mask)  # type: ignore
-
     # 4. Watershed on *negative distance*
-    labels = watershed(-image, markers, mask=mask_signal, compactness=10) #type: ignore
-    
-    return coordinates, labels, distance
+    labels = watershed(-image, markers, mask=mask_signal, compactness=20)  # type: ignore
+
+    return coordinates, labels, image
 
 
 def calculate_peak_property_from_labels_and_image(
