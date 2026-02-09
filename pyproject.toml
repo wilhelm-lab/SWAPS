@@ -42,6 +42,9 @@ tqdm = "4.66.5"
 yacs = "0.1.8"
 mokapot = "^0.10.0"
 nbformat = "^5.10.4"
+zarr = "<3.0"
+duckdb = "^1.4.4"
+opencv-python = "4.10.0.84"
 
 [tool.poetry.scripts]
 sbs_runner_ims = "sbs_runner_ims:main"
