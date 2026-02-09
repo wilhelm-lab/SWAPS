@@ -180,7 +180,7 @@ def brew_with_mokapot(
     psms = result.confidence_estimates["psms"]
     psms_decoy = result.decoy_confidence_estimates["psms"]
     psms = pd.concat([psms, psms_decoy], ignore_index=True)
-    psms["peak_label"] = psms["specid"].str.split("_").str[1].astype(int)
+    # psms["peak_label"] = psms["specid"].str.split("_").str[1].astype(int)
 
     sns.histplot(data=psms, x="mokapot score", bins=100, hue="label")
     plt.savefig(
