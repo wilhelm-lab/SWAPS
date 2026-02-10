@@ -1,20 +1,223 @@
 import logging
 from typing import Tuple, Literal
 import numpy as np
+import pandas as pd
+import tqdm
 from scipy.ndimage import gaussian_filter, distance_transform_edt, uniform_filter
 from skimage.registration import phase_cross_correlation
 from skimage.morphology import remove_small_objects
 from skimage.metrics import structural_similarity as ssim
 from scipy.ndimage import shift as ndi_shift
-import numpy as np
 import cv2
-
+from concurrent.futures import ProcessPoolExecutor
 from ..utils.ims_utils import (
     detect_2d_peak_with_watershed,
     calculate_peak_property_from_labels_and_image,
 )
+from .helper import (
+    load_peptide_batch_df_from_partquet,
+    get_pept_act_from_parquet,
+)
 
 Logger = logging.getLogger(__name__)
+
+
+def match_features_batches_parallel(
+    dict_ref,
+    parquet_a_path,
+    parquet_b_path,
+    peptide_indicies: np.ndarray | None = None,
+    batch_size: int = 100,
+    max_workers: int = 4,
+    smooth_kwargs: dict | None = None,
+    peak_kwargs: dict | None = None,
+    align_kwargs: dict | None = None,
+):
+    if peptide_indicies is None:
+        peptide_indicies = dict_ref["mz_rank"].values
+        Logger.info("No peptide indices provided, using all mz_rank from dict_ref.")
+    else:
+        Logger.info(
+            "Using provided peptide indices. Total count: %d", len(peptide_indicies)
+        )
+    peptide_batches = np.array_split(
+        peptide_indicies, max(1, len(peptide_indicies) // batch_size)
+    )
+    results_target, results_decoy = [], []
+    pp_a_target_list, pp_b_target_list = [], []
+    pp_b_decoy_list = []
+    no_quant_log = []
+    no_match_log = []
+
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                match_features_batch,
+                dict_ref,
+                parquet_a_path,
+                parquet_b_path,
+                batch,
+                smooth_kwargs,
+                peak_kwargs,
+                align_kwargs,
+            )
+            for batch in peptide_batches
+        ]
+
+        for future in tqdm.tqdm(futures, desc="Processing batches", unit="batch"):
+            (
+                res_target,
+                res_decoy,
+                pp_a_target,
+                pp_b_target,
+                pp_b_decoy,
+                no_quant,
+                no_match,
+            ) = future.result()
+            results_target.extend(res_target)
+            results_decoy.extend(res_decoy)
+            pp_a_target_list.extend(pp_a_target)
+            pp_b_target_list.extend(pp_b_target)
+            pp_b_decoy_list.extend(pp_b_decoy)
+            no_quant_log.extend(no_quant)
+            no_match_log.extend(no_match)
+    # Final Data Assembly
+    df_target = pd.DataFrame(results_target)
+    df_decoy = pd.DataFrame(results_decoy)
+    pp_a_target = (
+        pd.concat(pp_a_target_list, ignore_index=True)
+        if pp_a_target_list
+        else pd.DataFrame()
+    )
+    pp_b_target = (
+        pd.concat(pp_b_target_list, ignore_index=True)
+        if pp_b_target_list
+        else pd.DataFrame()
+    )
+    pp_b_decoy = (
+        pd.concat(pp_b_decoy_list, ignore_index=True)
+        if pp_b_decoy_list
+        else pd.DataFrame()
+    )
+    df_no_quant = pd.DataFrame(no_quant_log)
+    df_no_match = pd.DataFrame(no_match_log)
+    return (
+        df_target,
+        df_decoy,
+        pp_a_target,
+        pp_b_target,
+        pp_b_decoy,
+        df_no_quant,
+        df_no_match,
+    )
+
+
+def match_features_batch(
+    dict_ref,
+    parquet_a_path,
+    parquet_b_path,
+    batch,
+    smooth_kwargs: dict | None = None,
+    peak_kwargs: dict | None = None,
+    align_kwargs: dict | None = None,
+):
+    results_target, results_decoy = [], []
+    pp_a_target_list, pp_b_target_list = [], []
+    pp_b_decoy_list = []
+    no_quant_log = []
+    no_match_log = []
+
+    act_a_df = load_peptide_batch_df_from_partquet(parquet_a_path, batch)
+    act_b_df = load_peptide_batch_df_from_partquet(parquet_b_path, batch)
+
+    for pept_idx in batch:
+        # 1. Load Data for Target A/B
+        # Logger.info("Processing mz_rank %d in batch with size %d", pept_idx, len(batch))
+        pept_act_a, rt_center, im_center = get_pept_act_from_parquet(
+            act_a_df.loc[act_a_df["mz_rank"] == pept_idx], pept_idx, dict_ref
+        )
+        pept_act_b_target, _, _ = get_pept_act_from_parquet(
+            act_b_df.loc[act_b_df["mz_rank"] == pept_idx], pept_idx, dict_ref
+        )
+
+        # 2. Select and Load Decoy B
+        batch_exclude = batch[batch != pept_idx]
+        decoy_pept_idx = np.random.choice(batch_exclude)
+        pept_act_b_decoy, _, _ = get_pept_act_from_parquet(
+            act_b_df.loc[act_b_df["mz_rank"] == decoy_pept_idx],
+            decoy_pept_idx,
+            dict_ref,
+            shape=pept_act_a.shape,
+        )
+
+        # Boundary Check
+        if rt_center >= pept_act_a.shape[0] or im_center >= pept_act_a.shape[1]:
+            logging.warning("Skipping mz_rank %s due to center out of bounds", pept_idx)
+            continue
+
+        # 3. Quantify Features
+        # Target quantification
+        smooth_a, prop_a = quantify_from_coords(
+            pept_act_a, anchor=(rt_center, im_center), patch_size=min(pept_act_a.shape)
+        )
+        _, prop_b_t = quantify_from_coords(
+            pept_act_b_target,
+            anchor=(rt_center, im_center),
+            reference_image=smooth_a,
+            patch_size=min(pept_act_b_target.shape),
+            smooth_kwargs=smooth_kwargs,
+            peak_kwargs=peak_kwargs,
+            align_kwargs=align_kwargs,
+        )
+
+        # Decoy quantification
+        _, prop_b_d = quantify_from_coords(
+            pept_act_b_decoy,
+            anchor=(rt_center, im_center),
+            reference_image=smooth_a,
+            patch_size=min(pept_act_b_decoy.shape),
+            smooth_kwargs=smooth_kwargs,
+            peak_kwargs=peak_kwargs,
+            align_kwargs=align_kwargs,
+        )
+
+        # 4. Append individual properties to respective lists with mz_rank info
+        if prop_a is not None:
+            prop_a["mz_rank"] = pept_idx
+            pp_a_target_list.append(prop_a)
+        else:
+            no_quant_log.append({"mz_rank": pept_idx, "type": "target"})
+        if prop_b_t is not None:
+            prop_b_t["mz_rank"] = pept_idx
+            pp_b_target_list.append(prop_b_t)
+        else:
+            no_match_log.append({"mz_rank": pept_idx, "type": "target"})
+        if prop_b_d is not None:
+            prop_b_d["mz_rank"] = pept_idx
+            prop_b_d["decoy_mz_rank"] = decoy_pept_idx
+            pp_b_decoy_list.append(prop_b_d)
+        else:
+            no_match_log.append({"mz_rank": pept_idx, "type": "decoy"})
+
+        # 5. Process Matches
+        if prop_a is not None and prop_b_t is not None:
+            match_t = compare_peak_properties(prop_a, prop_b_t)
+            match_t["mz_rank"] = pept_idx
+            results_target.append(match_t)
+        if prop_a is not None and prop_b_d is not None:
+            match_d = compare_peak_properties(prop_a, prop_b_d)
+            match_d["mz_rank"] = pept_idx
+            match_d["decoy_mz_rank"] = decoy_pept_idx
+            results_decoy.append(match_d)
+    return (
+        results_target,
+        results_decoy,
+        pp_a_target_list,
+        pp_b_target_list,
+        pp_b_decoy_list,
+        no_quant_log,
+        no_match_log,
+    )
 
 
 def quantify_from_coords(
