@@ -182,9 +182,24 @@ def brew_with_mokapot(
     psms = pd.concat([psms, psms_decoy], ignore_index=True)
     # psms["peak_label"] = psms["specid"].str.split("_").str[1].astype(int)
 
-    sns.histplot(data=psms, x="mokapot score", bins=100, hue="label")
+    sns.histplot(data=psms, x="mokapot score", bins=100, hue="label", multiple="dodge")
     plt.savefig(
         os.path.join(work_dir, "mokapot_score_distr.png"), dpi=300, bbox_inches="tight"
+    )
+    plt.close()
+
+    sns.histplot(
+        data=psms,
+        x="mokapot score",
+        hue="label",
+        bins=100,
+        multiple="dodge",
+        log_scale=(True, False),
+    )
+    plt.savefig(
+        os.path.join(work_dir, "mokapot_score_distr_log.png"),
+        dpi=300,
+        bbox_inches="tight",
     )
     plt.close()
     return result, model, psms
