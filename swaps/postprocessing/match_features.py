@@ -1,5 +1,5 @@
 import logging
-from typing import Tuple, Literal
+from typing import Tuple, Literal, Optional
 import numpy as np
 import pandas as pd
 import tqdm
@@ -24,8 +24,7 @@ Logger = logging.getLogger(__name__)
 
 def match_features_batches_parallel(
     dict_ref,
-    parquet_a_path,
-    parquet_b_path,
+    raw_file_parquet_map,
     peptide_indicies: np.ndarray | None = None,
     batch_size: int = 100,
     max_workers: int = 4,
@@ -44,8 +43,9 @@ def match_features_batches_parallel(
         peptide_indicies, max(1, len(peptide_indicies) // batch_size)
     )
     results_target, results_decoy = [], []
-    pp_a_target_list, pp_b_target_list = [], []
-    pp_b_decoy_list = []
+    pp_reference_list, pp_match_target_list = [], []
+    pp_quant_only_list = []
+    pp_match_decoy_list = []
     no_quant_log = []
     no_match_log = []
 
@@ -54,8 +54,7 @@ def match_features_batches_parallel(
             executor.submit(
                 match_features_batch,
                 dict_ref,
-                parquet_a_path,
-                parquet_b_path,
+                raw_file_parquet_map,
                 batch,
                 smooth_kwargs,
                 peak_kwargs,
@@ -68,153 +67,334 @@ def match_features_batches_parallel(
             (
                 res_target,
                 res_decoy,
-                pp_a_target,
-                pp_b_target,
-                pp_b_decoy,
+                pp_reference_target,
+                pp_quant_only,
+                pp_match_target,
+                pp_match_decoy,
                 no_quant,
                 no_match,
             ) = future.result()
             results_target.extend(res_target)
             results_decoy.extend(res_decoy)
-            pp_a_target_list.extend(pp_a_target)
-            pp_b_target_list.extend(pp_b_target)
-            pp_b_decoy_list.extend(pp_b_decoy)
+            pp_reference_list.extend(pp_reference_target)
+            pp_quant_only_list.extend(pp_quant_only)
+            pp_match_target_list.extend(pp_match_target)
+            pp_match_decoy_list.extend(pp_match_decoy)
             no_quant_log.extend(no_quant)
             no_match_log.extend(no_match)
     # Final Data Assembly
-    df_target = pd.DataFrame(results_target)
-    df_decoy = pd.DataFrame(results_decoy)
-    pp_a_target = (
-        pd.concat(pp_a_target_list, ignore_index=True)
-        if pp_a_target_list
+    matches_target = pd.DataFrame(results_target)
+    matches_decoy = pd.DataFrame(results_decoy)
+    pp_reference_target = (
+        pd.concat(pp_reference_list, ignore_index=True)
+        if pp_reference_list
         else pd.DataFrame()
     )
-    pp_b_target = (
-        pd.concat(pp_b_target_list, ignore_index=True)
-        if pp_b_target_list
+    pp_quant_only = (
+        pd.concat(pp_quant_only_list, ignore_index=True)
+        if pp_quant_only_list
         else pd.DataFrame()
     )
-    pp_b_decoy = (
-        pd.concat(pp_b_decoy_list, ignore_index=True)
-        if pp_b_decoy_list
+    pp_match_target = (
+        pd.concat(pp_match_target_list, ignore_index=True)
+        if pp_match_target_list
+        else pd.DataFrame()
+    )
+    pp_match_decoy = (
+        pd.concat(pp_match_decoy_list, ignore_index=True)
+        if pp_match_decoy_list
         else pd.DataFrame()
     )
     df_no_quant = pd.DataFrame(no_quant_log)
     df_no_match = pd.DataFrame(no_match_log)
     return (
-        df_target,
-        df_decoy,
-        pp_a_target,
-        pp_b_target,
-        pp_b_decoy,
+        matches_target,
+        matches_decoy,
+        pp_reference_target,
+        pp_quant_only,
+        pp_match_target,
+        pp_match_decoy,
         df_no_quant,
         df_no_match,
     )
 
 
+def process_pept_run(
+    act_df,
+    pept_idx,
+    dict_ref,
+    run_name,
+    case: Literal = ["Reference", "Quant_Only", "Match"],
+    decoy_pept_idx: Optional[int] = None,
+    rt_ref: Optional[int] = None,
+    im_ref: Optional[int] = None,
+    smooth_ref: Optional[np.ndarray] = None,
+    prop_ref: Optional[pd.DataFrame] = None,
+    smooth_kwargs=None,
+    peak_kwargs=None,
+    align_kwargs=None,
+):
+    pept_act, rt_center, im_center = get_pept_act_from_parquet(
+        act_df.loc[act_df["mz_rank"] == pept_idx], pept_idx, dict_ref, run_name
+    )
+
+    match case:
+        case "Reference":
+            # Boundary Check
+            if rt_center >= pept_act.shape[0] or im_center >= pept_act.shape[1]:
+                logging.warning(
+                    "Skipping reference for mz_rank %s due to center out of bounds",
+                    pept_idx,
+                )
+                return None, None, None, None
+            smooth_a, prop_a = quantify_from_coords(
+                pept_act,
+                anchor=(rt_center, im_center),
+                patch_size=min(pept_act.shape),
+            )
+            if prop_a is not None:
+                prop_a["Run_name"] = run_name
+                prop_a["mz_rank"] = pept_idx
+            return smooth_a, prop_a, rt_center, im_center
+        case "Quant_Only":
+            # Boundary Check
+            if rt_center >= pept_act.shape[0] or im_center >= pept_act.shape[1]:
+                logging.warning(
+                    "Skipping quant only for mz_rank %s due to center out of bounds",
+                    pept_idx,
+                )
+                return None
+            prop_a = quantify_from_coords(
+                pept_act,
+                anchor=(rt_center, im_center),
+                patch_size=min(pept_act.shape),
+            )[1]
+            if prop_a is not None:
+                prop_a["Run_name"] = run_name
+                prop_a["mz_rank"] = pept_idx
+            return prop_a
+        case "Match":
+            assert all(
+                param is not None
+                for param in [decoy_pept_idx, rt_ref, im_ref, smooth_ref, prop_ref]
+            ), "All parameters must be provided for 'Match' case"
+            if rt_ref >= pept_act.shape[0] or im_ref >= pept_act.shape[1]:
+                logging.warning(
+                    "Skipping matches for mz_rank %s due to reference center out of bounds",
+                    pept_idx,
+                )
+                return None, None, None, None
+            pept_act_decoy, _, _ = get_pept_act_from_parquet(
+                act_df.loc[act_df["mz_rank"] == decoy_pept_idx],
+                decoy_pept_idx,
+                dict_ref,
+                run_name,
+                shape=pept_act.shape,
+            )
+
+            # Target quantification
+            _, prop_t = quantify_from_coords(
+                pept_act,
+                anchor=(rt_ref, im_ref),
+                reference_image=smooth_ref,
+                patch_size=min(pept_act.shape),
+                smooth_kwargs=smooth_kwargs,
+                peak_kwargs=peak_kwargs,
+                align_kwargs=align_kwargs,
+            )
+
+            # Decoy quantification
+            _, prop_d = quantify_from_coords(
+                pept_act_decoy,
+                anchor=(rt_ref, im_ref),
+                reference_image=smooth_ref,
+                patch_size=min(pept_act.shape),
+                smooth_kwargs=smooth_kwargs,
+                peak_kwargs=peak_kwargs,
+                align_kwargs=align_kwargs,
+            )
+            # 5. Process Matches
+            if prop_ref is not None and prop_t is not None:
+                prop_t["Run_name"] = run_name
+                prop_t["mz_rank"] = pept_idx
+                match_t = compare_peak_properties(prop_ref, prop_t)
+                match_t["mz_rank"] = pept_idx
+
+            else:
+                match_t = None
+            if prop_ref is not None and prop_d is not None:
+                prop_d["Run_name"] = run_name
+                prop_d["mz_rank"] = pept_idx
+                prop_d["decoy_mz_rank"] = decoy_pept_idx
+                match_d = compare_peak_properties(prop_ref, prop_d)
+                match_d["mz_rank"] = pept_idx
+                match_d["decoy_mz_rank"] = decoy_pept_idx
+
+            else:
+                match_d = None
+            return prop_t, prop_d, match_t, match_d
+
+
 def match_features_batch(
     dict_ref,
-    parquet_a_path,
-    parquet_b_path,
+    raw_file_parquet_map: dict,
     batch,
     smooth_kwargs: dict | None = None,
     peak_kwargs: dict | None = None,
     align_kwargs: dict | None = None,
 ):
     results_target, results_decoy = [], []
-    pp_a_target_list, pp_b_target_list = [], []
-    pp_b_decoy_list = []
+    pp_reference_list, pp_match_target_list = [], []
+    pp_quant_only_list = []
+    pp_match_decoy_list = []
     no_quant_log = []
     no_match_log = []
-
-    act_a_df = load_peptide_batch_df_from_partquet(parquet_a_path, batch)
-    act_b_df = load_peptide_batch_df_from_partquet(parquet_b_path, batch)
+    act_dfs = {}
+    for raw_file, parquet_path in raw_file_parquet_map.items():
+        act_dfs[raw_file] = load_peptide_batch_df_from_partquet(parquet_path, batch)
 
     for pept_idx in batch:
-        # 1. Load Data for Target A/B
-        # Logger.info("Processing mz_rank %d in batch with size %d", pept_idx, len(batch))
-        pept_act_a, rt_center, im_center = get_pept_act_from_parquet(
-            act_a_df.loc[act_a_df["mz_rank"] == pept_idx], pept_idx, dict_ref
+        # Extract the single row as a Series to make index filtering easier
+        row_series = dict_ref.loc[dict_ref["mz_rank"] == pept_idx, :].iloc[0]
+
+        # 1. Create masks using the Series
+        is_ref_mask = row_series.map(
+            lambda x: x == "Reference" if isinstance(x, str) else False
         )
-        pept_act_b_target, _, _ = get_pept_act_from_parquet(
-            act_b_df.loc[act_b_df["mz_rank"] == pept_idx], pept_idx, dict_ref
+        is_quant_only_mask = row_series.map(
+            lambda x: x == "Quant_Only" if isinstance(x, str) else False
+        )
+        is_match_mask = row_series.map(
+            lambda x: "Match" in x if isinstance(x, str) else False
         )
 
-        # 2. Select and Load Decoy B
-        batch_exclude = batch[batch != pept_idx]
-        decoy_pept_idx = np.random.choice(batch_exclude)
-        pept_act_b_decoy, _, _ = get_pept_act_from_parquet(
-            act_b_df.loc[act_b_df["mz_rank"] == decoy_pept_idx],
-            decoy_pept_idx,
+        # 2. Get the Reference (String)
+        # idxmax on a Series returns the index label (column name) of the True value
+        reference_raw_file = str(is_ref_mask.idxmax())
+        # 3. Get the Quant_Only and Match (Flat Lists of strings)
+        # We simply filter the index of the series by the boolean mask
+        quant_only_raw_file = is_quant_only_mask.index[is_quant_only_mask].tolist()
+        match_raw_file = is_match_mask.index[is_match_mask].tolist()
+        # Logger.info(
+        #     f"Raw files for reference, quant_only, match for mz_rank {pept_idx}: {reference_raw_file}, {quant_only_raw_file}, {match_raw_file}"
+        # )
+        # Get reference
+        smooth_a, prop_a, rt_center, im_center = process_pept_run(
+            act_dfs[reference_raw_file].loc[
+                act_dfs[reference_raw_file]["mz_rank"] == pept_idx
+            ],
+            pept_idx,
             dict_ref,
-            shape=pept_act_a.shape,
+            run_name=reference_raw_file,
+            case="Reference",
         )
-
-        # Boundary Check
-        if rt_center >= pept_act_a.shape[0] or im_center >= pept_act_a.shape[1]:
-            logging.warning("Skipping mz_rank %s due to center out of bounds", pept_idx)
-            continue
-
-        # 3. Quantify Features
-        # Target quantification
-        smooth_a, prop_a = quantify_from_coords(
-            pept_act_a, anchor=(rt_center, im_center), patch_size=min(pept_act_a.shape)
-        )
-        _, prop_b_t = quantify_from_coords(
-            pept_act_b_target,
-            anchor=(rt_center, im_center),
-            reference_image=smooth_a,
-            patch_size=min(pept_act_b_target.shape),
-            smooth_kwargs=smooth_kwargs,
-            peak_kwargs=peak_kwargs,
-            align_kwargs=align_kwargs,
-        )
-
-        # Decoy quantification
-        _, prop_b_d = quantify_from_coords(
-            pept_act_b_decoy,
-            anchor=(rt_center, im_center),
-            reference_image=smooth_a,
-            patch_size=min(pept_act_b_decoy.shape),
-            smooth_kwargs=smooth_kwargs,
-            peak_kwargs=peak_kwargs,
-            align_kwargs=align_kwargs,
-        )
-
-        # 4. Append individual properties to respective lists with mz_rank info
         if prop_a is not None:
-            prop_a["mz_rank"] = pept_idx
-            pp_a_target_list.append(prop_a)
+            pp_reference_list.append(prop_a)
         else:
-            no_quant_log.append({"mz_rank": pept_idx, "type": "target"})
-        if prop_b_t is not None:
-            prop_b_t["mz_rank"] = pept_idx
-            pp_b_target_list.append(prop_b_t)
-        else:
-            no_match_log.append({"mz_rank": pept_idx, "type": "target"})
-        if prop_b_d is not None:
-            prop_b_d["mz_rank"] = pept_idx
-            prop_b_d["decoy_mz_rank"] = decoy_pept_idx
-            pp_b_decoy_list.append(prop_b_d)
-        else:
-            no_match_log.append({"mz_rank": pept_idx, "type": "decoy"})
+            no_quant_log.append(
+                {
+                    "mz_rank": pept_idx,
+                    "run_name": reference_raw_file,
+                    "type": "reference",
+                }
+            )
 
-        # 5. Process Matches
-        if prop_a is not None and prop_b_t is not None:
-            match_t = compare_peak_properties(prop_a, prop_b_t)
-            match_t["mz_rank"] = pept_idx
-            results_target.append(match_t)
-        if prop_a is not None and prop_b_d is not None:
-            match_d = compare_peak_properties(prop_a, prop_b_d)
-            match_d["mz_rank"] = pept_idx
-            match_d["decoy_mz_rank"] = decoy_pept_idx
-            results_decoy.append(match_d)
+        # Quant only
+        if len(quant_only_raw_file) > 0:
+            for raw_file in quant_only_raw_file:
+                prop_a = process_pept_run(
+                    act_dfs[raw_file].loc[act_dfs[raw_file]["mz_rank"] == pept_idx],
+                    pept_idx,
+                    dict_ref,
+                    run_name=raw_file,
+                    case="Quant_Only",
+                    smooth_kwargs=smooth_kwargs,
+                    peak_kwargs=peak_kwargs,
+                    align_kwargs=align_kwargs,
+                )
+                if prop_a is not None:
+                    pp_quant_only_list.append(prop_a)
+                else:
+                    no_quant_log.append(
+                        {
+                            "mz_rank": pept_idx,
+                            "run_name": raw_file,
+                            "type": "quant_only",
+                        }
+                    )
+
+        # Matches
+        if len(match_raw_file) > 0 and smooth_a is not None and prop_a is not None:
+
+            for raw_file in match_raw_file:
+                batch_exclude = batch[batch != pept_idx]
+                decoy_pept_idx = np.random.choice(batch_exclude)
+                prop_t, prop_d, match_t, match_d = process_pept_run(
+                    act_dfs[raw_file].loc[
+                        act_dfs[raw_file]["mz_rank"].isin([pept_idx, decoy_pept_idx])
+                    ],
+                    pept_idx,
+                    dict_ref,
+                    run_name=raw_file,
+                    case="Match",
+                    decoy_pept_idx=decoy_pept_idx,
+                    rt_ref=rt_center,
+                    im_ref=im_center,
+                    smooth_ref=smooth_a,
+                    prop_ref=prop_a,
+                    smooth_kwargs=smooth_kwargs,
+                    peak_kwargs=peak_kwargs,
+                    align_kwargs=align_kwargs,
+                )
+                if prop_t is not None:
+                    pp_match_target_list.append(prop_t)
+                else:
+                    no_quant_log.append(
+                        {
+                            "mz_rank": pept_idx,
+                            "run_name": raw_file,
+                            "type": "match_target",
+                        }
+                    )
+                if prop_d is not None:
+                    pp_match_decoy_list.append(prop_d)
+
+                else:
+                    no_quant_log.append(
+                        {
+                            "mz_rank": pept_idx,
+                            "run_name": raw_file,
+                            "type": "match_decoy",
+                        }
+                    )
+                if match_t is not None:
+                    results_target.append(match_t)
+                else:
+                    no_match_log.append(
+                        {
+                            "mz_rank": pept_idx,
+                            "run_name": raw_file,
+                            "type": "match_target",
+                        }
+                    )
+                if match_d is not None:
+                    results_decoy.append(match_d)
+                else:
+                    no_match_log.append(
+                        {
+                            "mz_rank": pept_idx,
+                            "run_name": raw_file,
+                            "type": "match_decoy",
+                        }
+                    )
+
     return (
         results_target,
         results_decoy,
-        pp_a_target_list,
-        pp_b_target_list,
-        pp_b_decoy_list,
+        pp_reference_list,
+        pp_quant_only_list,
+        pp_match_target_list,
+        pp_match_decoy_list,
         no_quant_log,
         no_match_log,
     )
@@ -325,6 +505,8 @@ def compare_peak_properties(peak_properties_a, peak_properties_b):
             peak_properties_a["area"].values[0] - peak_properties_b["area"].values[0]
         )
         / peak_properties_a["area"].values[0],
+        "reference_run": peak_properties_a["Run_name"].values[0],
+        "matched_run": peak_properties_b["Run_name"].values[0],
     }
 
 

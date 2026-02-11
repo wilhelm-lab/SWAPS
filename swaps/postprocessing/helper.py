@@ -27,7 +27,7 @@ def load_peptide_batch_df_from_partquet(parquet_path, pept_indicies: List):
 
 
 def get_pept_act_from_parquet(
-    act_df, pept_idx, dict_ref, shape: Optional[tuple] = None
+    act_df, pept_idx, dict_ref, run_name, shape: Optional[tuple] = None
 ):
     # con = duckdb.connect()
     row = dict_ref.loc[dict_ref["mz_rank"] == pept_idx, :]
@@ -37,15 +37,15 @@ def get_pept_act_from_parquet(
     im_end = row["mobility_values_index_right_ref"].values[0]
     # rt_exp_start = row["MS1_frame_idx_left_exp"].values[0] - rt_start
     rt_exp_center = (
-        (row["MS1_frame_idx_center_exp"].values[0] - rt_start)
-        if row["MS1_frame_idx_center_exp"].values[0] > rt_start
+        (row[f"{run_name}_MS1_frame_idx_exp"].values[0] - rt_start)
+        if row[f"{run_name}_MS1_frame_idx_exp"].values[0] > rt_start
         else ((rt_start + rt_end) // 2 - rt_start)
     )
     # rt_exp_end = row["MS1_frame_idx_right_exp"].values[0] - rt_start
     # im_exp_start = row["mobility_values_index_left_exp"].values[0] - im_start
     im_exp_center = (
-        (row["mobility_values_index_center_exp"].values[0] - im_start)
-        if row["mobility_values_index_center_exp"].values[0] > im_start
+        (row[f"{run_name}_mobility_values_index_exp"].values[0] - im_start)
+        if row[f"{run_name}_mobility_values_index_exp"].values[0] > im_start
         else ((im_start + im_end) // 2 - im_start)
     )
 
