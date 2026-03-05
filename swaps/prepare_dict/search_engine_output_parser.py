@@ -2,6 +2,7 @@ import pandas as pd
 import logging
 import numpy as np
 from typing import Optional
+
 Logger = logging.getLogger(__name__)
 sage_rename_dict = {
     "psm_id": "id",
@@ -29,18 +30,27 @@ sage_rename_dict = {
 }
 
 fragpipe_rename_dict = {
+    "Peptide": "Sequence",
     "Peptide Sequence": "Sequence",
     "Modified Sequence": "Modified sequence",
+    "Modified Peptide": "Modified sequence",
     "Peptide Length": "Length",
+    "Observed M/Z": "m/z",
     "M/Z": "m/z",
     "Protein": "Proteins",
     "Apex Retention Time": "Calibrated retention time",
     "Retention Time Start": "Calibrated retention time start",
     "Retention Time End": "Calibrated retention time finish",
-    "Apex Ion Mobility": "1/K0",
+    # "Apex Ion Mobility": "1/K0",
+    "Ion Mobility": "1/K0",
     "Ion Mobility Start": "1/K0 start",
     "Ion Mobility End": "1/K0 finish",
+    "Assigned Modifications": "Modifications",
+    "Retention": "Retention time",
+    "Hyperscore": "Score",
 }
+
+
 def sage_parser(
     sage_output: pd.DataFrame, sage_rename_dict: dict = sage_rename_dict
 ) -> pd.DataFrame:
@@ -79,8 +89,9 @@ def sage_parser(
     sage_output["Sequence"] = sage_output["Modified sequence"].str.replace(
         r"\[.*?\]", "", regex=True
     )
-    sage_output['Retention time calibration'] = 0
+    sage_output["Retention time calibration"] = 0
     return sage_output
+
 
 def get_median_from_reps(df, rep_cols):
     """
@@ -93,11 +104,56 @@ def get_median_from_reps(df, rep_cols):
     arr = arr.replace(0, np.nan)
     # Compute row-wise median, skipping NaN (i.e., zeros)
     med = arr.median(axis=1, skipna=True)
-    
+
     # Replace NaN (all zeros) with 0
     return med.fillna(np.nan)
 
-def fragpipe_parser(
+
+def fragpipe_psm_parser(fragpipe_output: pd.DataFrame) -> pd.DataFrame:
+    """
+    Parse the FragPipe output DataFrame and rename columns based on the provided dictionary.
+
+    Args:
+        fragpipe_output (pd.DataFrame): The FragPipe output DataFrame.
+        exp_name (Optional[str]): The experiment name to filter columns. If None, prepares a reference dictionary.
+    Returns:
+        pd.DataFrame: The parsed DataFrame with renamed columns.
+    """
+    fragpipe_output_copy = fragpipe_output.copy(deep=True)
+    fragpipe_output_copy["Modified Peptide"] = fragpipe_output_copy[
+        "Modified Peptide"
+    ].fillna(fragpipe_output_copy["Peptide"])
+    fragpipe_output_copy.rename(columns=fragpipe_rename_dict, inplace=True)
+    fragpipe_output_copy["Raw file"] = fragpipe_output["Spectrum"].str.split(".").str[0]
+    fragpipe_output_copy["Reverse"] = np.where(
+        fragpipe_output_copy["Is Decoy"],
+        "+",
+        np.nan,
+    )
+    fragpipe_output_copy["Type"] = "TIMS-MULTI-MSMS"
+    # Convert Retention time to minute
+    for rt_col in [
+        "Calibrated retention time",
+        "Calibrated retention time start",
+        "Calibrated retention time finish",
+        "Retention time",
+    ]:
+        fragpipe_output_copy[rt_col] = fragpipe_output_copy[rt_col] / 60.0
+
+    fragpipe_output_copy["Retention length"] = (
+        fragpipe_output_copy["Calibrated retention time finish"]
+        - fragpipe_output_copy["Calibrated retention time start"]
+    )
+    fragpipe_output_copy["1/K0 length"] = (
+        fragpipe_output_copy["1/K0 finish"] - fragpipe_output_copy["1/K0 start"]
+    )
+    fragpipe_output_copy["Modifications"] = fragpipe_output_copy[
+        "Modifications"
+    ].fillna("-")
+    return fragpipe_output_copy
+
+
+def fragpipe_combined_parser(
     fragpipe_output: pd.DataFrame,
     exp_name: Optional[str] = None,
     remove_not_quantified: bool = True,
@@ -112,36 +168,42 @@ def fragpipe_parser(
         pd.DataFrame: The parsed DataFrame with renamed columns.
     """
     fragpipe_output_copy = fragpipe_output.copy(deep=True)
-    fragpipe_output_copy['Raw file'] = exp_name
+    fragpipe_output_copy["Raw file"] = exp_name
     mbr_feature_cols = [
-            "Apex Retention Time",
-            "Apex Scan Number",
-            "Retention Time Start", 
-            "Retention Time End",
-            "Apex Ion Mobility",
-            "Ion Mobility Start",
-            "Ion Mobility End",
-            "Intensity",
-            "Traced Scans",
-            "Ion Mobility FWHM",
-            "Retention Time FWHM",
-            "Spectral Count",
-        ]
+        "Apex Retention Time",
+        "Apex Scan Number",
+        "Retention Time Start",
+        "Retention Time End",
+        "Apex Ion Mobility",
+        "Ion Mobility Start",
+        "Ion Mobility End",
+        "Intensity",
+        "Traced Scans",
+        "Ion Mobility FWHM",
+        "Retention Time FWHM",
+        "Spectral Count",
+    ]
 
     for col_kw in ["Localization"]:
         fragpipe_output_copy = fragpipe_output_copy.drop(
             columns=[col for col in fragpipe_output_copy.columns if col_kw in col]
         )
-    if exp_name is None: # Prepare reference dictionary
+    if exp_name is None:  # Prepare reference dictionary
         Logger.info("Preparing reference dictionary...")
-        match_type_col = [col for col in fragpipe_output_copy.columns if "Match Type" in col]
+        match_type_col = [
+            col for col in fragpipe_output_copy.columns if "Match Type" in col
+        ]
         for col_kw in mbr_feature_cols:
-            cols_to_check = [col for col in fragpipe_output_copy.columns if col_kw in col]
+            cols_to_check = [
+                col for col in fragpipe_output_copy.columns if col_kw in col
+            ]
             if len(cols_to_check) == 0:
                 Logger.warning("No columns found for keyword: %s", col_kw)
             for i, col in enumerate(cols_to_check):
                 # only keep values from MS/MS IDs
-                non_msms_mask = fragpipe_output_copy[fragpipe_output_copy[match_type_col[i]] != "MS/MS"].index
+                non_msms_mask = fragpipe_output_copy[
+                    fragpipe_output_copy[match_type_col[i]] != "MS/MS"
+                ].index
                 fragpipe_output_copy.loc[non_msms_mask, col] = np.nan
                 # Logger.info("non MS/MS rows count for column %s: %s, na values: %s", col, len(non_msms_mask), fragpipe_output_copy[col].isna().sum())
             fragpipe_output_copy[col_kw] = get_median_from_reps(
@@ -166,17 +228,27 @@ def fragpipe_parser(
         exp_im_end = [col for col in exp_col if "Ion Mobility End" in col]
         exp_intensity = [col for col in exp_col if "Intensity" in col]
         exp_match_type = [col for col in exp_col if "Match Type" in col]
-        fragpipe_output_copy["Calibrated retention time"] = fragpipe_exp_values[exp_rt_apex]
-        fragpipe_output_copy["Calibrated retention time start"] = fragpipe_exp_values[exp_rt_start]
-        fragpipe_output_copy["Calibrated retention time finish"] = fragpipe_exp_values[exp_rt_end]
+        fragpipe_output_copy["Retention time"] = fragpipe_exp_values[exp_rt_apex]
+        fragpipe_output_copy["Calibrated retention time"] = fragpipe_exp_values[
+            exp_rt_apex
+        ]
+        fragpipe_output_copy["Calibrated retention time start"] = fragpipe_exp_values[
+            exp_rt_start
+        ]
+        fragpipe_output_copy["Calibrated retention time finish"] = fragpipe_exp_values[
+            exp_rt_end
+        ]
         fragpipe_output_copy["1/K0 start"] = fragpipe_exp_values[exp_im_start]
         fragpipe_output_copy["1/K0 finish"] = fragpipe_exp_values[exp_im_end]
-        fragpipe_output_copy["1/K0 length"] = fragpipe_output_copy["1/K0 finish"] - fragpipe_output_copy["1/K0 start"]
+        fragpipe_output_copy["1/K0 length"] = (
+            fragpipe_output_copy["1/K0 finish"] - fragpipe_output_copy["1/K0 start"]
+        )
         fragpipe_output_copy["1/K0"] = fragpipe_exp_values[exp_im_apex]
         fragpipe_output_copy["Intensity"] = fragpipe_exp_values[exp_intensity]
-        fragpipe_output_copy['Match Type'] = fragpipe_exp_values[exp_match_type]
-        fragpipe_output_copy = fragpipe_output_copy.loc[fragpipe_output_copy['Match Type'] == "MS/MS"]
-
+        fragpipe_output_copy["Match Type"] = fragpipe_exp_values[exp_match_type]
+        fragpipe_output_copy = fragpipe_output_copy.loc[
+            fragpipe_output_copy["Match Type"] == "MS/MS"
+        ]
 
         # Logger.info("fragpipe_output_copy columns after filtering: %s", fragpipe_output_copy.columns)
     fragpipe_output_copy.rename(columns=fragpipe_rename_dict, inplace=True)
@@ -184,14 +256,26 @@ def fragpipe_parser(
     fragpipe_output_copy["Reverse"] = np.nan
     fragpipe_output_copy["Is_Decoy"] = False
     fragpipe_output_copy.loc[fragpipe_output_copy["Is_Decoy"], "Reverse"] = "+"
-    fragpipe_output_copy['Retention time calibration'] = 0
-    fragpipe_output_copy['Retention time'] = fragpipe_output_copy["Calibrated retention time"]
-    fragpipe_output_copy['Ion mobility length'] = 80 # FIXME: very dirty fix
+    fragpipe_output_copy["Retention time calibration"] = 0
+    fragpipe_output_copy["Retention time"] = fragpipe_output_copy[
+        "Calibrated retention time"
+    ]
+    fragpipe_output_copy["Ion mobility length"] = 80  # FIXME: very dirty fix
     # Convert Retention time to minute
-    for rt_col in ["Calibrated retention time", "Calibrated retention time start", "Calibrated retention time finish", "Retention time"]:
+    for rt_col in [
+        "Calibrated retention time",
+        "Calibrated retention time start",
+        "Calibrated retention time finish",
+        "Retention time",
+    ]:
         fragpipe_output_copy[rt_col] = fragpipe_output_copy[rt_col] / 60.0
     if remove_not_quantified:
         initial_count = len(fragpipe_output_copy)
-        fragpipe_output_copy = fragpipe_output_copy.loc[fragpipe_output_copy["Intensity"] > 0]
-        Logger.info("Removed %s not quantified entries", initial_count - len(fragpipe_output_copy))
+        fragpipe_output_copy = fragpipe_output_copy.loc[
+            fragpipe_output_copy["Intensity"] > 0
+        ]
+        Logger.info(
+            "Removed %s not quantified entries",
+            initial_count - len(fragpipe_output_copy),
+        )
     return fragpipe_output_copy

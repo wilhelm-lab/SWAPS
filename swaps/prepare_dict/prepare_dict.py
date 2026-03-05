@@ -690,10 +690,16 @@ def calculate_modpept_isopattern(
     # account for extra atoms from modification and water
     # count extra atoms
     n_H = 2 + charge  # 2 from water and others from charge (proton)
-    n_Mox = modpept.count("M(ox)") + modpept.count("Oxidation (M)")
+    n_Mox = (
+        modpept.count("M(ox)") + modpept.count("Oxidation (M)") + modpept.count("[147]")
+    )
     modpept = modpept.replace("(ox)", "")
     modpept = modpept.replace("(Oxidation (M))", "")
-    n_acetylN = modpept.count("(ac)") + modpept.count("(Acetyl (Protein N-term))")
+    n_acetylN = (
+        modpept.count("(ac)")
+        + modpept.count("(Acetyl (Protein N-term))")
+        + modpept.count("[43]")
+    )
     modpept = modpept.replace("(Acetyl (Protein N-term))", "")
     modpept = modpept.replace("(ac)", "")
 
