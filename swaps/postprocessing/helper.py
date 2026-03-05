@@ -31,10 +31,10 @@ def get_pept_act_from_parquet(
 ):
     # con = duckdb.connect()
     row = dict_ref.loc[dict_ref["mz_rank"] == pept_idx, :]
-    rt_start = row["MS1_frame_idx_left_ref"].values[0]
-    rt_end = row["MS1_frame_idx_right_ref"].values[0]
-    im_start = row["mobility_values_index_left_ref"].values[0]
-    im_end = row["mobility_values_index_right_ref"].values[0]
+    rt_start = row[f"MS1_frame_idx_left_ref_{run_name}"].values[0]
+    rt_end = row[f"MS1_frame_idx_right_ref_{run_name}"].values[0]
+    im_start = row[f"mobility_values_index_left_ref_{run_name}"].values[0]
+    im_end = row[f"mobility_values_index_right_ref_{run_name}"].values[0]
     # rt_exp_start = row["MS1_frame_idx_left_exp"].values[0] - rt_start
     rt_exp_center = (
         (row[f"{run_name}_MS1_frame_idx_exp"].values[0] - rt_start)
@@ -48,7 +48,16 @@ def get_pept_act_from_parquet(
         if row[f"{run_name}_mobility_values_index_exp"].values[0] > im_start
         else ((im_start + im_end) // 2 - im_start)
     )
-
+    # Logger.info(
+    #     "Peptide %d: RT [%d, %d], IM [%d, %d], RT_exp_center %d, IM_exp_center %d",
+    #     pept_idx,
+    #     rt_start,
+    #     rt_end,
+    #     im_start,
+    #     im_end,
+    #     rt_exp_center,
+    #     im_exp_center,
+    # )
     pept_act = parquet_df_to_dense_frame(act_df, (rt_start, rt_end), (im_start, im_end))
     if shape is not None:
         target_h, target_w = shape
@@ -93,7 +102,7 @@ def convert_sparse_to_parquet(npz_path):
 
     # sparse.COO.coords is shape (ndim, nnz)
     # Typically: [0]=frame, [1]=im, [2]=mz_rank
-    coords = s_matrix.coords
+    coords = s_matrix.coords  # type: ignore
 
     # 2. Build the columnar dictionary
     # We use uint32 for all indices to safely handle large datasets
@@ -148,3 +157,48 @@ def parquet_df_to_dense_frame(
     grid[rows, cols] = vals
 
     return grid.T
+
+
+def build_pivot(pp_all, dict_ref):
+    """
+    Create a pivoted dataframe with mz_rank as index and Run_name-specific
+    Match Type and Intensity columns.
+
+    Parameters
+    ----------
+    pp_all : pd.DataFrame
+        DataFrame containing ['mz_rank', 'Run_name', 'Match Type', 'intensity_sum'].
+    dict_ref : dict or pd.DataFrame
+        Reference containing mz_rank values to enforce full index coverage.
+
+    Returns
+    -------
+    pd.DataFrame
+        Pivoted dataframe with '{Run} Match Type' and '{Run} Intensity' columns.
+    """
+
+    pivot = pp_all.pivot_table(
+        index="mz_rank",
+        columns="Run_name",
+        values=["Match Type", "intensity_sum"],
+        aggfunc="first",
+    )
+
+    # Rename intensity column level
+    pivot = pivot.rename(columns={"intensity_sum": "Intensity"})
+
+    # Fill missing match types
+    pivot["Match Type"] = pivot["Match Type"].fillna("unmatched")
+
+    # Flatten column names
+    pivot.columns = [f"{run} {metric}" for metric, run in pivot.columns]
+
+    # Ensure all mz_rank from dict_ref exist
+    pivot = pivot.reindex(dict_ref["mz_rank"])
+
+    # Fill missing Match Type again after reindexing
+    for col in pivot.columns:
+        if "Match Type" in col:
+            pivot[col] = pivot[col].fillna("unmatched")
+
+    return pivot.reset_index()

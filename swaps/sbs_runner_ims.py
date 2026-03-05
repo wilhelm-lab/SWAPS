@@ -5,9 +5,7 @@ import os
 from datetime import datetime
 import time
 import argparse
-import numpy as np
 import pandas as pd
-import pickle
 import torch
 
 # Disable cuDNN globally BEFORE anything else
@@ -16,31 +14,28 @@ torch.backends.cudnn.enabled = False
 from utils.ims_utils import (
     load_dotd_data,
     export_im_and_ms1scans,
-    combine_3d_act_and_detect_peak,
 )
-from utils.tools import load_mzml
 from utils.config import get_cfg_defaults
 from utils.singleton_swaps_optimization import swaps_optimization_cfg
 from optimization.inference import process_frames_parallel, generate_id_partitions
-from peak_detection_2d.dataset.prepare_dataset import prepare_training_dataset
-from peak_detection_2d.infer_on_pept_act import infer_on_pept_act
-from peak_detection_2d.train import train
-from peak_detection_2d.utils import (
-    compete_target_decoy_pair,
-    plot_target_decoy_distr,
-    plot_roc_auc,
-    calc_fdr_and_thres,
+from prepare_dict.prepare_dict import (
+    construct_dict_from_search_pivoted,
+    dict_add_index_to_raw_file,
+    dict_add_im_index,
+    dict_add_rt_index,
 )
-from result_analysis import result_analysis
-from prepare_dict.prepare_dict import construct_dict, get_mzrank_batch_cutoff
-from prepare_dict.search_engine_output_parser import sage_parser
-from postprocessing.rescore import merge_peaks_result_and_dict, brew_with_mokapot
-from postprocessing.fdr import (
-    generate_signal_compete_pairs,
-    get_isolated_decoys_from_pairs,
-    get_isolated_decoy_from_mzbins,
+from prepare_dict.search_engine_output_parser import sage_parser, fragpipe_psm_parser
+from postprocessing.rescore import (
+    brew_with_mokapot,
+    normalize_shift_by_runs,
+    combine_matches_target_decoy,
 )
-from postprocessing.compete_signal import compete_candidates_for_signal
+from postprocessing.match_features import (
+    match_features_batches_parallel,
+    calc_quant_corr,
+    plot_match_type_from_combined,
+)
+from postprocessing.helper import build_pivot
 
 # Clear existing logging handlers
 for handler in logging.root.handlers[:]:
@@ -54,7 +49,8 @@ logging.basicConfig(
 def opt_scan_by_scan(config_path: str):
     """Scan by scan optimization for joint identification and quantification."""
 
-    cfg = get_cfg_defaults(swaps_optimization_cfg)
+    # --------------Load config-----------------#
+    cfg = get_cfg_defaults(swaps_optimization_cfg)  # type: ignore
     name_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     if config_path is not None:
         cfg.merge_from_file(config_path)
@@ -62,246 +58,122 @@ def opt_scan_by_scan(config_path: str):
     if cfg.ADD_TIMESTAMP_TO_RESULT_PATH:
         cfg.RESULT_PATH = cfg.RESULT_PATH + "_" + name_timestamp
         cfg.ADD_TIMESTAMP_TO_RESULT_PATH = False  # in case of reuse of config file
-    act_dir = os.path.join(cfg.RESULT_PATH, "results", "activation")
-    logging.info("==================Load data==================")
     os.makedirs(cfg.RESULT_PATH, exist_ok=True)
     if cfg.N_CPU < 0:
-        cfg.N_CPU = int(os.getenv("SLURM_CPUS_PER_TASK", 1))
+        cfg.N_CPU = int(
+            os.getenv("SLURM_CPUS_PER_TASK", 1)
+        )  # TODO: only work in slurm jobs
         logging.info("Number of CPUs: %s", cfg.N_CPU)
     if cfg.OPTIMIZATION.N_BATCH < 0:
         cfg.OPTIMIZATION.N_BATCH = cfg.N_CPU  # set batches as the same as N_CPU
-    # Load data
-    if cfg.USE_IMS:
-        data, hdf_file_name = load_dotd_data(
-            cfg.DATA_PATH, swaps_result_dir=cfg.EXPORT_DATA_HDF5_DIR
-        )
-    else:
-        mzml_data = load_mzml(cfg.DATA_PATH, unify_format=True)
-    if cfg.DICT_PICKLE_PATH != "":
-        maxquant_result_ref = pd.read_pickle(filepath_or_buffer=cfg.DICT_PICKLE_PATH)
-        maxquant_target_result_ref = maxquant_result_ref.loc[
-            ~maxquant_result_ref["Decoy"]
-        ]
-        maxquant_decoy_result_ref = maxquant_result_ref.loc[
-            maxquant_result_ref["Decoy"]
-        ]
-        ms1scans = pd.read_csv(os.path.join(cfg.RESULT_PATH, "ms1scans.csv"))
-        mobility_values_df = pd.read_csv(
-            os.path.join(cfg.RESULT_PATH, "mobility_values.csv")
-        )
-    else:
-        # Get the lowest level directory name with .d extension
-        dir_with_extension = os.path.basename(os.path.normpath(cfg.DATA_PATH))
-        dir_wo_extension = dir_with_extension.split(".")[0]
-        if (
-            len(cfg.FILTER_EXP_BY_RAW_FILE) == 0
-        ):  # if not specified, get the lowest level directory name with .d extension, by default None
-            cfg.FILTER_EXP_BY_RAW_FILE.append(dir_wo_extension)
-        if dir_with_extension.endswith(".d"):
-            ms1scans, mobility_values_df = export_im_and_ms1scans(
-                data=data,  # type: ignore
-                swaps_result_dir=cfg.RESULT_PATH,
-            )
-        elif dir_with_extension.endswith(".mzML"):
-            ms1scans = mzml_data
-            mobility_values_df = None
-        # maxquant_result_ref_ori = pd.read_csv(cfg.MQ_REF_PATH, sep="\t", low_memory=False)
-        if cfg.FP_COMBINE_PATH != "":
-            logging.info(
-                "Loading FragPipe combined_ion.tsv from %s", cfg.FP_COMBINE_PATH
-            )
-            combined_ion = pd.read_csv(cfg.FP_COMBINE_PATH, sep="\t", low_memory=False)
-            from prepare_dict.search_engine_output_parser import fragpipe_parser
 
-            maxquant_result_ref_ori = fragpipe_parser(combined_ion)
-            maxquant_result_exp = fragpipe_parser(
-                combined_ion, exp_name=dir_wo_extension
+    # -------------Prepare general dictionary---------#
+    try:
+        dict_ref = pd.read_pickle(os.path.join(cfg.RESULT_PATH, "dict_ref.pkl"))
+    except FileNotFoundError:
+        logging.info("==================Prepare Dictionary==================")
+
+        match cfg.PREPARE_DICT.SEARCH_ENGINE.lower():
+            case "maxquant":
+                evidence = pd.read_csv(
+                    cfg.SEARCH_OUTPUT_PATH, sep="\t", low_memory=False
+                )
+            case "sage":
+                evidence = pd.read_csv(
+                    cfg.SEARCH_OUTPUT_PATH, sep="\t", low_memory=False
+                )
+                evidence = sage_parser(evidence)
+            case "fragpipe":
+                evidence = pd.DataFrame()
+                for exp_dir in os.listdir(cfg.SEARCH_OUTPUT_PATH):
+                    if (
+                        os.path.isdir(os.path.join(cfg.SEARCH_OUTPUT_PATH, exp_dir))
+                        and exp_dir != "MSBooster"
+                    ):
+                        tmp = pd.read_csv(
+                            os.path.join(cfg.SEARCH_OUTPUT_PATH, exp_dir, "psm.tsv"),
+                            sep="\t",
+                        )
+                        evidence = pd.concat([evidence, tmp], ignore_index=True)
+                        logging.info(
+                            "Loaded evidence with %s rows from %s", len(tmp), exp_dir
+                        )
+
+                evidence = fragpipe_psm_parser(evidence)
+        dict_ref = construct_dict_from_search_pivoted(
+            cfg_prepare_dict=cfg.PREPARE_DICT,
+            evidence=evidence,
+            n_blocks_by_pept=1,
+        )
+        dict_ref.to_pickle(os.path.join(cfg.RESULT_PATH, "dict_ref.pkl"))
+
+    # -------------Scan-Wise Activation for each .d dataset------------#
+    # added_im_and_rt_index = False
+    for dot_d_dir in os.listdir(cfg.DATA_PATH):
+        logging.info("process dataset: %s", dot_d_dir)
+        if dot_d_dir.endswith(".d"):
+            logging.info(
+                "============Scan-Wise Activation for dataset: %s============",
+                dot_d_dir,
             )
-            maxquant_result_exp.to_csv(
-                os.path.join(cfg.RESULT_PATH, "fragpipe_parsed_exp.tsv"),
-                index=False,
-                sep="\t",
+            logging.info(
+                "--------------------------Load Data--------------------------"
             )
-            cfg.MQ_EXP_PATH = os.path.join(cfg.RESULT_PATH, "fragpipe_parsed_exp.tsv")
-        else:
-            maxquant_result_ref_ori = pd.read_csv(
-                cfg.MQ_REF_PATH, sep="\t", low_memory=False
-            )
-        if len(cfg.FILTER_REF_BY_RAW_FILE) > 0:
-            if cfg.FILTER_REF_BY_RAW_FILE[0] == "data":
-                maxquant_result_ref_ori = maxquant_result_ref_ori[
-                    maxquant_result_ref_ori["Raw file"].isin([dir_wo_extension])
-                ]
-                logging.info(
-                    "Filtered reference maxquant result by raw file: %s, resulting ref rows: %s",
+            # Get the lowest level directory name with .d extension
+            dir_wo_extension = dot_d_dir.split(".")[0]
+            act_dir = os.path.join(cfg.RESULT_PATH, dir_wo_extension, "activation")
+            os.makedirs(act_dir, exist_ok=True)
+
+            # Load data
+            if cfg.USE_IMS:
+                data, hdf_file_name = load_dotd_data(
+                    os.path.join(cfg.DATA_PATH, dot_d_dir),
+                    swaps_result_dir=cfg.EXPORT_DATA_HDF5_DIR,
+                )
+                ms1scans, mobility_values_df = export_im_and_ms1scans(
+                    data=data,  # type: ignore
+                    swaps_result_dir=os.path.join(cfg.RESULT_PATH, dir_wo_extension),
+                )
+                dict_ref = dict_add_index_to_raw_file(
+                    dict_ref,
+                    mobility_values_df,
+                    ms1scans,
                     dir_wo_extension,
-                    maxquant_result_ref_ori.shape[0],
+                )
+                # if not added_im_and_rt_index:
+                dict_ref = dict_add_im_index(
+                    dict_ref,
+                    mobility_values_df,
+                    "IM_search_left",
+                    "IM_search_center",
+                    "IM_search_right",
+                    idx_suffix=f"_ref_{dir_wo_extension}",
+                )
+                dict_ref = dict_add_rt_index(
+                    dict_ref,
+                    ms1scans,
+                    idx_suffix=f"_ref_{dir_wo_extension}",
+                )
+                # added_im_and_rt_index = True
+
+                # Save the updated dict_ref with added activation info to the result directory for downstream processing
+                dict_ref.to_pickle(
+                    os.path.join(cfg.RESULT_PATH, "dict_ref_with_activation.pkl")
                 )
             else:
-                maxquant_result_ref_ori = maxquant_result_ref_ori[
-                    maxquant_result_ref_ori["Raw file"].isin(cfg.FILTER_REF_BY_RAW_FILE)
-                ]
-                logging.info(
-                    "Filtered reference maxquant result by raw file: %s",
-                    cfg.FILTER_REF_BY_RAW_FILE,
+                raise NotImplementedError(
+                    "Currently only support IMS data. Please set USE_IMS to True."
                 )
-        if (
-            "sage_discriminant_score" in maxquant_result_ref_ori.columns
-        ):  # infer search engine, remap column names
-            maxquant_result_ref_ori = sage_parser(maxquant_result_ref_ori)
-        (
-            maxquant_result_ref,
-            maxquant_target_result_ref,
-            maxquant_decoy_result_ref,
-            dict_target_pickle_path,
-            dict_decoy_pickle_path,
-            dict_pickle_path,
-            cfg_prepare_dict,
-        ) = construct_dict(
-            cfg_prepare_dict=cfg.PREPARE_DICT,
-            filter_exp_by_raw_file=cfg.FILTER_EXP_BY_RAW_FILE,
-            maxquant_exp_path=cfg.MQ_EXP_PATH,
-            # maxquant_exp_df=maxquant_result_exp,
-            use_ims=cfg.USE_IMS,
-            maxquant_ref_df=maxquant_result_ref_ori,
-            result_dir=os.path.join(cfg.RESULT_PATH),
-            mobility_values_df=mobility_values_df,
-            rt_values_df=ms1scans,
-            random_seed=cfg.RANDOM_SEED,
-            n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
-            ref_type=cfg.PREPARE_DICT.REF_TYPE,
-            keep_matched_precursors=cfg.PREPARE_DICT.KEEP_MATCHED_PRECURSORS,
-        )
-        logging.info(
-            "Peptide batch index: %s", maxquant_result_ref["pept_batch_idx"].unique()
-        )
-        if cfg.USE_IMS:
-            assert mobility_values_df is not None
-            peptact_shape = (
-                (
-                    len(ms1scans.index.values)
-                    + 1,  # this index is rank, starting from 1, add 1 for the last frame
-                    len(mobility_values_df),
-                    len(maxquant_target_result_ref.mz_rank)
-                    + 1,  # this index is rank, starting from 1, add 1 for the last frame
-                ),
-            )
-        else:
-            peptact_shape = (
-                len(ms1scans.index.values) + 1,  # this index is rank, starting from 1
-                len(maxquant_target_result_ref.mz_rank)
-                + 1,  # this index is rank, starting from 1
-            )
-        cfg.PREPARE_DICT = cfg_prepare_dict
-        cfg.DICT_PICKLE_PATH = dict_pickle_path
-        cfg.OPTIMIZATION.PEPTACT_SHAPE = peptact_shape
-        cfg.dump(
-            stream=open(
-                os.path.join(cfg.RESULT_PATH, f"config_{name_timestamp}.yaml"),
-                "w",
-                encoding="utf-8",
-            )
-        )
-        logging.info(
-            "Finished dictionary preparation and saved config to %s",
-            os.path.join(cfg.RESULT_PATH, f"config_{name_timestamp}.yaml"),
-        )
-    logging.info("==================try and read results==================")
-    try:
-        pept_act_sum_df = pd.read_csv(
-            os.path.join(act_dir, "target", "pept_act_sum.csv"), index_col=0
-        )
-        peak_property_all_pept_batches = pd.read_csv(
-            os.path.join(act_dir, "target", "all_pept_batches_peak_properties.csv"),
-            index_col=False,
-        )
-        if cfg.PREPARE_DICT.GENERATE_DECOY:
-            pept_act_sum_df_decoy = pd.read_csv(
-                os.path.join(act_dir, "decoy", "pept_act_sum_decoy.csv"), index_col=0
-            )
-            pept_act_sum_df = pd.concat(
-                [pept_act_sum_df, pept_act_sum_df_decoy], ignore_index=True
-            )
-            peak_property_all_pept_batches_decoy = pd.read_csv(
-                os.path.join(act_dir, "decoy", "all_pept_batches_peak_properties.csv"),
-                index_col=False,
-            )
-            peak_property_all_pept_batches = pd.concat(
-                [peak_property_all_pept_batches, peak_property_all_pept_batches_decoy],
-                ignore_index=True,
-            )
-        if cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM:
-            pept_act_sum_filter_by_im_df = pd.read_csv(
-                os.path.join(act_dir, "target", "pept_act_sum_filter_by_im.csv"),
-                index_col=0,
-            )
-            if cfg.PREPARE_DICT.GENERATE_DECOY:
-                pept_act_sum_filter_by_im_df_decoy = pd.read_csv(
-                    os.path.join(
-                        act_dir, "decoy", "pept_act_sum_filter_by_im_decoy.csv"
-                    ),
-                    index_col=0,
-                )
-                pept_act_sum_filter_by_im_df = pd.concat(
-                    [pept_act_sum_filter_by_im_df, pept_act_sum_filter_by_im_df_decoy],
-                    ignore_index=True,
-                )
-        logging.info("Loaded pre-calculated optimization.")
-    except FileNotFoundError:
-        try:
-            if "peak_property_all_pept_batches" not in locals():
-                logging.info(
-                    "Precalculated target peak properties not found, start post processing."
-                )
-                peak_property_all_pept_batches = combine_3d_act_and_detect_peak(
-                    n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
-                    n_batch=cfg.OPTIMIZATION.N_BATCH,
-                    act_dir=os.path.join(act_dir, "target"),
-                    remove_batch_file=True,
-                    calc_pept_act_sum_filter_by_im=cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM,
-                    maxquant_result_ref=maxquant_target_result_ref,
-                    use_ims=cfg.USE_IMS,
-                    im_ref=cfg.PREPARE_DICT.IM_REF,
-                    n_cpu=cfg.N_CPU,
-                    chunk_size=cfg.RESULT_ANALYSIS.POST_PROCESSING.PEAK_DETECTION_CHUNK_SIZE,
-                    rt_group=cfg.RESULT_ANALYSIS.POST_PROCESSING.RT_GROUP,
-                )
-            if cfg.PREPARE_DICT.GENERATE_DECOY:
-                peak_property_all_pept_batches_decoy = combine_3d_act_and_detect_peak(
-                    n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
-                    n_batch=cfg.OPTIMIZATION.N_BATCH,
-                    act_dir=os.path.join(act_dir, "decoy"),
-                    remove_batch_file=True,
-                    calc_pept_act_sum_filter_by_im=False,
-                    maxquant_result_ref=maxquant_decoy_result_ref,
-                    use_ims=cfg.USE_IMS,
-                    im_ref=cfg.PREPARE_DICT.IM_REF,
-                    n_cpu=cfg.N_CPU,
-                    chunk_size=cfg.RESULT_ANALYSIS.POST_PROCESSING.PEAK_DETECTION_CHUNK_SIZE,
-                    rt_group=cfg.RESULT_ANALYSIS.POST_PROCESSING.RT_GROUP,
-                )
-                peak_property_all_pept_batches = pd.concat(
-                    [
-                        peak_property_all_pept_batches,
-                        peak_property_all_pept_batches_decoy,
-                    ],
-                    ignore_index=True,
-                )
-            logging.info("Loaded pre-calculated activation")
-        except FileNotFoundError:
-            logging.info("Precalculated activation not found, start Scan By Scan.")
-
-            logging.info("==================Scan By Scan==================")
-            # act_dir = os.path.join(cfg.RESULT_PATH, "results", "activation")
-            os.makedirs(act_dir, exist_ok=True)
-            os.makedirs(os.path.join(act_dir, "target"), exist_ok=True)
+                # mzml_data = load_mzml(cfg.DATA_PATH, unify_format=True)
+                # ms1scans = mzml_data
+                # mobility_values_df = None
 
             # Optimization
             start_time = time.time()
             logging.info("-----------------Scan by Scan Optimization-----------------")
 
             n_batch = cfg.OPTIMIZATION.N_BATCH
-            max_mz_rank = maxquant_result_ref.mz_rank.max()
+            max_mz_rank = dict_ref.mz_rank.max()
             logging.info("Number of batches: %s", n_batch)
             batch_scan_indices = generate_id_partitions(
                 n_batch=n_batch,
@@ -310,410 +182,140 @@ def opt_scan_by_scan(config_path: str):
             )  # for small scale testing: ms1scans["Id"].iloc[0:500]
             logging.debug("indices in first batch: %s", batch_scan_indices[0])
             # process scans
-            cutoff = get_mzrank_batch_cutoff(maxquant_target_result_ref)
             process_frames_parallel(
                 data=data,
                 n_jobs=cfg.N_CPU,
                 ms1scans=ms1scans,
+                parquet_file_stem=os.path.join(act_dir, "swa"),
                 batch_scan_indices=batch_scan_indices,
-                maxquant_result_ref_with_im_index_sortmz=maxquant_target_result_ref,
+                maxquant_result_ref_with_im_index_sortmz=dict_ref,
                 mobility_values=mobility_values_df,
-                cutoff=cutoff,
+                # cutoff=cutoff,
                 delta_mobility_thres=cfg.OPTIMIZATION.DELTA_MOBILITY_INDEX_THRES,
                 ppm_tol=cfg.PREPARE_DICT.PPM_TOL,
                 bin_width=cfg.PREPARE_DICT.BIN_WIDTH,
                 process_in_blocks=True,
                 width=cfg.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH,
-                save_dir=os.path.join(act_dir, "target"),
+                # save_dir=os.path.join(act_dir, "target"),
                 extract_im_peak=False,
                 use_ims=cfg.USE_IMS,
-                return_res_coo_dict=cfg.OPTIMIZATION.RETURN_ACT_RES,
+                return_res_coo_dict=False,
                 max_mz_rank=max_mz_rank,
             )
-            if cfg.PREPARE_DICT.GENERATE_DECOY:
-                os.makedirs(os.path.join(act_dir, "decoy"), exist_ok=True)
-                process_frames_parallel(
-                    data=data,
-                    n_jobs=cfg.N_CPU,
-                    ms1scans=ms1scans,
-                    batch_scan_indices=batch_scan_indices,
-                    maxquant_result_ref_with_im_index_sortmz=maxquant_decoy_result_ref,
-                    mobility_values=mobility_values_df,
-                    cutoff=cutoff,
-                    delta_mobility_thres=cfg.OPTIMIZATION.DELTA_MOBILITY_INDEX_THRES,
-                    ppm_tol=cfg.PREPARE_DICT.PPM_TOL,
-                    bin_width=cfg.PREPARE_DICT.BIN_WIDTH,
-                    process_in_blocks=True,
-                    width=cfg.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH,
-                    save_dir=os.path.join(act_dir, "decoy"),
-                    extract_im_peak=False,
-                    use_ims=cfg.USE_IMS,
-                    return_res_coo_dict=cfg.OPTIMIZATION.RETURN_ACT_RES,
-                    max_mz_rank=max_mz_rank,
-                )
-            minutes, seconds = divmod(time.time() - start_time, 60)
-            logging.info(
-                "Process scans - Script execution time: %dm %ds",
-                int(minutes),
-                int(seconds),
-            )
 
-            logging.info("=================Post Processing==================")
-            # TODO: test when pept_batch_number > 1
-            peak_property_all_pept_batches = combine_3d_act_and_detect_peak(
-                n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
-                n_batch=cfg.OPTIMIZATION.N_BATCH,
-                act_dir=os.path.join(act_dir, "target"),
-                remove_batch_file=True,
-                calc_pept_act_sum_filter_by_im=cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM,
-                maxquant_result_ref=maxquant_target_result_ref,
-                use_ims=cfg.USE_IMS,
-                im_ref=cfg.PREPARE_DICT.IM_REF,
-                n_cpu=cfg.N_CPU,
-                chunk_size=cfg.RESULT_ANALYSIS.POST_PROCESSING.PEAK_DETECTION_CHUNK_SIZE,
-                rt_group=cfg.RESULT_ANALYSIS.POST_PROCESSING.RT_GROUP,
-            )
-            if cfg.PREPARE_DICT.GENERATE_DECOY:
-                peak_property_all_pept_batches_decoy = combine_3d_act_and_detect_peak(
-                    n_blocks_by_pept=cfg.OPTIMIZATION.N_BLOCKS_BY_PEPT,
-                    n_batch=cfg.OPTIMIZATION.N_BATCH,
-                    act_dir=os.path.join(act_dir, "decoy"),
-                    remove_batch_file=True,
-                    calc_pept_act_sum_filter_by_im=False,
-                    maxquant_result_ref=maxquant_decoy_result_ref,
-                    use_ims=cfg.USE_IMS,
-                    im_ref=cfg.PREPARE_DICT.IM_REF,
-                    n_cpu=cfg.N_CPU,
-                    chunk_size=cfg.RESULT_ANALYSIS.POST_PROCESSING.PEAK_DETECTION_CHUNK_SIZE,
-                    rt_group=cfg.RESULT_ANALYSIS.POST_PROCESSING.RT_GROUP,
-                )
-                peak_property_all_pept_batches = pd.concat(
-                    [
-                        peak_property_all_pept_batches,
-                        peak_property_all_pept_batches_decoy,
-                    ],
-                    ignore_index=True,
-                )
+    # Once finished, write the updated dict_ref with added activation info to the result directory for downstream processing
 
-    logging.info("==================Rescoring==================")
-    ms1_scan_gap = ms1scans["Time_minute"].diff().mode()[0]
-    peaks_result_merged_dict = merge_peaks_result_and_dict(
-        peaks_result=peak_property_all_pept_batches,
-        dict_ref=maxquant_result_ref,  # TODO: here uses both target and decoy
-        ms1_scan_gap=ms1_scan_gap,
-        remove_bias=True,
-        log_int_bias=1,
-        keep_closet_int=3,
+    # -----------------Quantification and Feature-Feature Match--------------#
+    logging.info(
+        "==================Quantification and Feature-Feature Match=================="
+    )
+    (
+        matches_target,
+        matches_decoy,
+        pp_reference,
+        pp_quant_only,
+        pp_match_target,
+        pp_match_decoy,
+        df_no_quant,
+        df_no_match,
+    ) = match_features_batches_parallel(
+        dict_ref=dict_ref,
+        raw_file_list=[
+            d
+            for d in os.listdir(cfg.RESULT_PATH)
+            if os.path.isdir(os.path.join(cfg.RESULT_PATH, d))
+        ],
+        result_dir=cfg.RESULT_PATH,
+        peptide_indicies=dict_ref["mz_rank"].values,  # type: ignore
+        batch_size=100,
+        max_workers=cfg.N_CPU,
+    )
+    quant_dir = os.path.join(cfg.RESULT_PATH, "quantification")
+    os.makedirs(quant_dir, exist_ok=True)
+    dfs_to_save = {
+        "matches_target.csv": matches_target,
+        "matches_decoy.csv": matches_decoy,
+        "pp_reference.csv": pp_reference,
+        "pp_quant_only.csv": pp_quant_only,
+        "pp_match_target.csv": pp_match_target,
+        "pp_match_decoy.csv": pp_match_decoy,
+        "no_quant_log.csv": df_no_quant,
+        "no_match_log.csv": df_no_match,
+    }
+
+    for filename, df in dfs_to_save.items():
+        df.to_csv(os.path.join(quant_dir, filename), index=False)
+
+    logging.info("=================FDR control==================")
+    matches_target_normalized, matches_decoy_normalized = normalize_shift_by_runs(
+        matches_target, matches_decoy
+    )
+    tdc_df = combine_matches_target_decoy(
+        matches_target_normalized, matches_decoy_normalized, dict_ref
     )
     result, model, psms = brew_with_mokapot(
-        peaks_result_merged_dict,
-        feature_cols=[
-            "intensity_cv",
-            "solidity",
-            "within_row_consistency",
-            "across_row_score_smoothness",
-            # "row_smoothness",
-            "rt_diff",
-            "im_diff",
-            "im_length_diff",
-            "rt_length_diff",
-            "log_int_diff",
-        ],
+        tdc_df,
+        feature_cols=tdc_df.columns.difference(
+            [
+                "mz_rank",
+                "decoy_mz_rank",
+                "IsTarget",
+                "Sequence",
+                "Proteins",
+                "Decoy",
+                "label",
+                "reference_run",
+                "matched_run",
+                "Sequence_with_runs",
+            ]
+        ).tolist(),
+        normalize_features=False,
+        psmid_col="Sequence_with_runs",
         peptide_col="Sequence",
         protein_col="Proteins",
         decoy_col="Decoy",
-        train_fdr=cfg.RESULT_ANALYSIS.POST_PROCESSING.MOKAPOT.TRAIN_FDR,
-        test_fdr=cfg.RESULT_ANALYSIS.POST_PROCESSING.MOKAPOT.TEST_FDR,
-        scannr_col="mz_rank",
-        work_dir=os.path.join(cfg.RESULT_PATH, "results", "mokapot"),
+        model=None,
+        train_fdr=0.05,
+        test_fdr=0.01,
+        filename_col="matched_run",
+        work_dir=quant_dir,
     )
-
-    peaks_result_merged_dict_merged_conf = pd.merge(
-        peaks_result_merged_dict,
-        psms[
-            ["mokapot q-value", "mokapot PEP", "mokapot score", "peak_label", "scannr"]
-        ],
-        left_on=["mz_rank", "label"],
-        right_on=["scannr", "peak_label"],
+    # Filter for the columns passed the makopot filter
+    psms_filtered = psms.loc[(psms["mokapot q-value"] < 0.01) & (psms["label"] == True)]
+    psms_filtered["mz_rank"] = psms_filtered["scannr"].str.split("_").str[0].astype(int)
+    pp_match_target_filtered = pp_match_target.merge(
+        psms_filtered[["filename", "mz_rank"]],
+        left_on=["mz_rank", "Run_name"],
+        right_on=["mz_rank", "filename"],
         how="inner",
-        suffixes=("_swaps", "_mokapot"),
     )
-    peaks_result_merged_dict_merged_conf["fdr"] = peaks_result_merged_dict_merged_conf[
-        "mokapot q-value"
-    ]
-    peaks_result_merged_dict_merged_conf.to_csv(
-        os.path.join(
-            act_dir,
-            "peaks_result_merged_dict_merged_conf.csv",
-        ),
+    pp_match_target_filtered.to_csv(
+        os.path.join(quant_dir, "pp_match_target_filtered.csv"), index=False
+    )
+    dfs_to_concat = {
+        "MBR": pp_match_target_filtered.drop(columns=["filename"]),
+        "MS/MS Ref": pp_reference,
+        "MS/MS Quant": pp_quant_only,
+    }
+    pp_all = pd.DataFrame()
+    for df_type, df in dfs_to_concat.items():
+        df["Match Type"] = df_type
+        pp_all = pd.concat([pp_all, df], ignore_index=True)
+    pp_all.to_csv(
+        os.path.join(quant_dir, "pp_reference_quant_only_match_target_filtered.csv"),
         index=False,
     )
-    if cfg.PEAK_SELECTION.ENABLE:
-        logging.info("==================Peak Selection==================")
-        if len(cfg.PEAK_SELECTION.TRAINING_DATA) == 0:
-            logging.info("No training data provided, start preparing training data.")
-            training_file_paths = prepare_training_dataset(
-                result_dir=cfg.RESULT_PATH,
-                maxquant_dict=maxquant_result_ref,
-                n_workers=cfg.N_CPU,
-                include_decoys=cfg.PEAK_SELECTION.INCLUDE_DECOYS,
-                source=cfg.PEAK_SELECTION.TRAINING_DATA_SOURCE,
-                resample=cfg.PEAK_SELECTION.TRAINING_DATA_RESAMPLE.ENABLE,
-                sample_by=cfg.PEAK_SELECTION.TRAINING_DATA_RESAMPLE.SAMPLE_BY,
-                random_state=cfg.RANDOM_SEED,
-                arg_min=cfg.PEAK_SELECTION.TRAINING_DATA_RESAMPLE.ARG_MIN,
-                arg_sample=cfg.PEAK_SELECTION.TRAINING_DATA_RESAMPLE.ARG_SAMPLE,
-            )
-            cfg.PEAK_SELECTION.TRAINING_DATA = training_file_paths
-            cfg.dump(
-                stream=open(
-                    os.path.join(
-                        cfg.RESULT_PATH,
-                        f"config_{name_timestamp}.yaml",
-                    ),
-                    "w",
-                    encoding="utf-8",
-                )
-            )
-            logging.info(
-                "Finished peak selection dataset preparation and saved config to %s",
-                os.path.join(cfg.RESULT_PATH, f"config_{name_timestamp}.yaml"),
-            )
-        if cfg.PEAK_SELECTION.EXP_DIR_NAME != "":
-            ps_exp_dir = os.path.join(
-                cfg.RESULT_PATH, "peak_selection", cfg.PEAK_SELECTION.EXP_DIR_NAME
-            )
-        else:
-            train_name_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            ps_exp_dir = os.path.join(
-                cfg.RESULT_PATH, "peak_selection", "exp_" + train_name_timestamp
-            )
-            cfg.PEAK_SELECTION.EXP_DIR_NAME = "exp_" + train_name_timestamp
-        if not os.path.exists(ps_exp_dir):
-            os.mkdir(ps_exp_dir)
-        best_seg_model_path, best_cls_model_path = train(
-            cfg_peak_selection=cfg.PEAK_SELECTION,
-            ps_exp_dir=ps_exp_dir,
-            random_state=cfg.RANDOM_SEED,
-            maxquant_dict=maxquant_result_ref,
-            show_decoy=cfg.PREPARE_DICT.GENERATE_DECOY,
-        )
+    pivot = build_pivot(pp_all, dict_ref)
+    pivot.to_csv(os.path.join(quant_dir, "swaps_combined_ions.csv"))
 
-        # Inference
-        if not os.path.exists(os.path.join(ps_exp_dir, "pept_act_sum_ps.csv")):
-            logging.info("Finished training peak selection model, start inference...")
-            infer_on_pept_act(
-                cfg=cfg,
-                best_seg_model_path=best_seg_model_path,
-                best_cls_model_path=best_cls_model_path,
-                maxquant_dict=maxquant_result_ref,
-                ps_exp_dir=ps_exp_dir,
-                sigmoid_cls_score=True,
-            )
-
-        # Inference eval
-        if cfg.PREPARE_DICT.GENERATE_DECOY:
-            logging.info(
-                "==================Peak Selection and FDR eval on full dataset=================="
-            )
-            pept_act_sum_ps = pd.read_csv(
-                os.path.join(ps_exp_dir, "pept_act_sum_ps.csv")
-            )
-            pept_act_sum_ps["target_decoy_score"].fillna(
-                pept_act_sum_ps["target_decoy_score"].min(), inplace=True
-            )  # fillna with min score
-            # compete target decoy pairs
-            pept_act_sum_ps_full, pept_act_sum_ps_full_tdc = compete_target_decoy_pair(
-                pept_act_sum_ps,
-                maxquant_result_ref,
-            )
-            # compete signal
-            maxquant_result_ref_tdc = pd.merge(
-                left=pept_act_sum_ps_full_tdc,
-                right=maxquant_result_ref,
-                on=["mz_rank", "Decoy"],
-            )
-            signal_compete_tdc = generate_signal_compete_pairs(
-                maxquant_dict=maxquant_result_ref_tdc, groupby_columns="mz_bin"
-            )
-            pept_act_sum_ps_tdc_all, result_after_compete, result_filtered = (
-                compete_candidates_for_signal(
-                    result=signal_compete_tdc,
-                    pept_act_sum_ps=pept_act_sum_ps_full_tdc,
-                    log_sum_intensity_thres=2,
-                    delta_log_sum_intensity_thres=0.01,
-                )
-            )
-            # get isolated decoys
-            signal_compete_all = generate_signal_compete_pairs(
-                maxquant_dict=maxquant_result_ref, groupby_columns="mz_bin"
-            )
-            decoy_mz_ranks = set(
-                maxquant_result_ref.loc[maxquant_result_ref["Decoy"], "mz_rank"]
-            )
-            isolated_decoys_set_pairs_all = get_isolated_decoys_from_pairs(
-                result=signal_compete_all, decoy_mz_ranks=list(decoy_mz_ranks)
-            )
-            isolated_decoys_mzbins_set = get_isolated_decoy_from_mzbins(
-                maxquant_result_ref=maxquant_result_ref,
-            )
-            isolated_decoys_all = isolated_decoys_set_pairs_all.union(
-                isolated_decoys_mzbins_set
-            )
-
-            variables = {
-                "isolated_decoys_all": isolated_decoys_all,
-                "isolated_decoys_mzbins_set": isolated_decoys_mzbins_set,
-                "isolated_decoys_set_pairs_all": isolated_decoys_set_pairs_all,
-            }
-            with open(os.path.join(cfg.RESULT_PATH, "isolated_decoys.pkl"), "wb") as f:
-                pickle.dump(variables, f)
-
-            pept_act_sum_ps_tdc_all_no_loser = pept_act_sum_ps_tdc_all.loc[
-                pept_act_sum_ps_tdc_all["competition"] != "loser"
-            ]
-            pept_act_sum_ps_tdc_all_no_loser_int_filter = (
-                pept_act_sum_ps_tdc_all_no_loser.loc[
-                    pept_act_sum_ps_tdc_all_no_loser["log_sum_intensity"] >= 2
-                ]
-            )
-            # Number of decoys and targets
-            td_count = pept_act_sum_ps_tdc_all_no_loser_int_filter[
-                "Decoy"
-            ].value_counts()
-            # Number of isolated decoys
-            n_filtered_isolated_decoys = (
-                pept_act_sum_ps_tdc_all_no_loser_int_filter.loc[
-                    pept_act_sum_ps_tdc_all_no_loser_int_filter["Decoy"], "mz_rank"
-                ]
-                .isin(isolated_decoys_all)
-                .sum()
-            )
-            logging.info(
-                "Final FDR: %s%%", np.round(td_count[True] / td_count[False] * 100, 2)
-            )
-            logging.info(
-                "Final FDR, percentage of isolated decoys in all decoys: %s%%",
-                np.round(len(isolated_decoys_all) / len(decoy_mz_ranks) * 100, 2),
-            )
-            logging.info(
-                "Final FDR, percentage of isolated decoys in filtered decoys: %s%%",
-                np.round(n_filtered_isolated_decoys / td_count[True] * 100, 2),
-            )
-
-            ## Full set w/o TDC
-            plot_target_decoy_distr(
-                pept_act_sum_ps_full,
-                threshold=None,
-                save_dir=os.path.join(ps_exp_dir, "results"),
-                dataset_name="fullset",
-                main_plot_type="scatter",
-            )
-            plot_roc_auc(
-                pept_act_sum_ps_full,
-                save_dir=os.path.join(ps_exp_dir, "results"),
-                dataset_name="fullset",
-            )
-            pept_act_sum_ps_full_new = calc_fdr_and_thres(
-                pept_act_sum_ps_full,
-                score_col="target_decoy_score",
-                filter_dict={"log_sum_intensity": [2, 100]},
-                return_plot=True,
-                save_dir=os.path.join(ps_exp_dir, "results"),
-                dataset_name="fullset",
-            )
-            pept_act_sum_ps_full_new.to_csv(
-                os.path.join(ps_exp_dir, "pept_act_sum_ps_full_fdr_thres.csv")
-            )
-
-            ## Full set w TDC
-            plot_target_decoy_distr(
-                pept_act_sum_ps_tdc_all_no_loser_int_filter,
-                threshold=None,
-                save_dir=os.path.join(ps_exp_dir, "results"),
-                dataset_name="fullset_tdc",
-                main_plot_type="scatter",
-            )
-            plot_roc_auc(
-                pept_act_sum_ps_tdc_all_no_loser_int_filter,
-                save_dir=os.path.join(ps_exp_dir, "results"),
-                dataset_name="fullset_tdc",
-            )
-            pept_act_sum_ps_full_tdc_new = calc_fdr_and_thres(
-                pept_act_sum_ps_tdc_all_no_loser_int_filter,
-                score_col="target_decoy_score",
-                filter_dict={"log_sum_intensity": [2, 100]},
-                return_plot=True,
-                save_dir=os.path.join(ps_exp_dir, "results"),
-                dataset_name="fullset_tdc",
-            )
-            pept_act_sum_ps_full_tdc_new.to_csv(
-                os.path.join(ps_exp_dir, "pept_act_sum_ps_full_tdc_fdr_thres.csv")
-            )
-
-    if cfg.RESULT_ANALYSIS.ENABLE:  # TODO: haven't cleaned up the code
-        logging.info("==================Result Analaysis==================")
-        if cfg.PEAK_SELECTION.ENABLE:
-            eval_dir = os.path.join(ps_exp_dir, "results", "evaluation")
-        else:
-            eval_dir = os.path.join(cfg.RESULT_PATH, "results", "evaluation")
-        os.makedirs(eval_dir, exist_ok=True)
-
-        pept_act_sum_df = pd.read_csv(
-            os.path.join(act_dir, "peaks_result_merged_dict_merged_conf.csv")
-        )
-        infer_int_col = "intensity_sum"
-        # TODO: fix im filter config
-        if cfg.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM:
-            pept_act_sum_filter_by_im_df = pd.read_csv(
-                os.path.join(act_dir, "pept_act_sum_filter_by_im.csv")
-            )
-            pept_act_sum_df = pd.merge(
-                left=pept_act_sum_df,
-                right=pept_act_sum_filter_by_im_df,
-                on=["mz_rank"],
-                how="left",
-                suffixes=("", "_filter_by_im"),
-            )
-            infer_int_col = "pept_act_sum_filter_by_im"
-
-        if cfg.PEAK_SELECTION.ENABLE:
-            if cfg.PREPARE_DICT.GENERATE_DECOY:
-                pept_act_sum_ps = pd.read_csv(
-                    os.path.join(ps_exp_dir, "pept_act_sum_ps_full_tdc_fdr_thres.csv")
-                )
-            else:
-                pept_act_sum_ps = pd.read_csv(
-                    os.path.join(ps_exp_dir, "pept_act_sum_ps.csv")
-                )
-            pept_act_sum_ps = pept_act_sum_ps.rename(
-                {"sum_intensity": "sum_intensity_ps"}, axis=1
-            )
-            pept_act_sum_df = pd.merge(
-                left=pept_act_sum_df,
-                right=pept_act_sum_ps,
-                on=["mz_rank"],
-                how="left",
-                suffixes=("", "_ps"),
-            )
-            infer_int_col = "sum_intensity_ps"
-
-        swaps_result = result_analysis.SWAPSResult(
-            maxquant_dict=maxquant_result_ref,
-            pept_act_sum_df=pept_act_sum_df,
-            infer_intensity_col=infer_int_col,
-            fdr_thres=cfg.RESULT_ANALYSIS.FDR_THRESHOLD,
-            log_sum_intensity_thres=cfg.RESULT_ANALYSIS.LOG_SUM_INTENSITY_THRESHOLD,
-            save_dir=eval_dir,
-            include_decoys=cfg.PREPARE_DICT.GENERATE_DECOY,
-            score_col="mokapot score",
-            fdr_col="mokapot q-value",
-        )
-        swaps_result.plot_intensity_corr()
-        # swaps_result.plot_intensity_corr(contour=True)
-        swaps_result.plot_overlap_with_MQ(show_ref=False, level="precursor")
-        swaps_result.plot_overlap_with_MQ(show_ref=False, level="peptide")
-        swaps_result.plot_overlap_with_MQ(show_ref=False, level="protein")
+    logging.info("=================Result Analysis==================")
+    calc_quant_corr(
+        pp_quant_only,
+        pp_reference,
+        pp_match_target_filtered,
+        quant_dir,
+    )
+    plot_match_type_from_combined(df=pp_all, fig_dir=quant_dir)
 
 
 def main():

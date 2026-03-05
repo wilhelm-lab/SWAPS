@@ -373,3 +373,74 @@ def merge_peaks_result_and_dict(
         )
         Logger.info("Rows after filtering: %d", peaks_result_merged_dict.shape[0])
     return peaks_result_merged_dict
+
+
+def combine_matches_target_decoy(matches_target, matches_decoy, dict_ref):
+
+    ## Target Decoy Competition
+    matches_target["IsTarget"] = True
+    matches_decoy["IsTarget"] = False
+    matches_target["decoy_mz_rank"] = -1
+    tdc_df = pd.concat([matches_target, matches_decoy], ignore_index=True)
+    tdc_df = pd.merge(tdc_df, dict_ref[["mz_rank", "Sequence", "Proteins"]])
+    tdc_df.loc[~tdc_df["IsTarget"], "Sequence"] = (
+        "DECOY_" + tdc_df.loc[tdc_df["IsTarget"], "Sequence"]
+    )
+    tdc_df.loc[~tdc_df["IsTarget"], "Proteins"] = (
+        "DECOY_" + tdc_df.loc[tdc_df["IsTarget"], "Proteins"]
+    )
+    tdc_df["Decoy"] = ~tdc_df["IsTarget"]
+    tdc_df["label"] = tdc_df["IsTarget"]
+    tdc_df["Sequence_with_runs"] = tdc_df["Sequence"] + "_" + tdc_df["matched_run"]
+    return tdc_df
+
+
+def normalize_shift_by_runs(
+    matches_target, matches_decoy, cols_to_scale=["rt_shift", "im_shift"]
+):
+    """
+    Normalize rt_shift and im_shift per run-pair using target statistics,
+    apply normalization to both target and decoy,
+    and return them separately.
+    """
+
+    # Compute mean/std per run-pair from target only
+    stats = matches_target.groupby(["reference_run", "matched_run"])[cols_to_scale].agg(
+        ["mean", "std"]
+    )
+
+    # Flatten MultiIndex columns
+    stats.columns = [f"{col}_{agg}" for col, agg in stats.columns]
+
+    def apply_normalization(df):
+        # Merge stats onto the dataframe
+        df_norm = df.merge(
+            stats,
+            how="left",
+            left_on=["reference_run", "matched_run"],
+            right_index=True,
+        )
+
+        for col in cols_to_scale:
+            mean_col = f"{col}_mean"
+            std_col = f"{col}_std"
+
+            # Avoid division by zero
+            df_norm[f"{col}_scaled"] = (df_norm[col] - df_norm[mean_col]) / df_norm[
+                std_col
+            ].replace(0, 1)
+            df_norm[f"{col}_abs_scaled"] = df_norm[f"{col}_scaled"].abs()
+
+        # Drop temporary columns
+        df_norm = df_norm.drop(
+            columns=[
+                c for c in df_norm.columns if c.endswith("_mean") or c.endswith("_std")
+            ]
+        )
+        return df_norm
+
+    # Apply normalization separately
+    matches_target_norm = apply_normalization(matches_target)
+    matches_decoy_norm = apply_normalization(matches_decoy)
+
+    return matches_target_norm, matches_decoy_norm

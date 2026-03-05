@@ -13,8 +13,8 @@ __C.RESULT_PATH = ""  # path to save all intermediate and final results
 __C.ADD_TIMESTAMP_TO_RESULT_PATH = False  # disenble when reusing the same result path
 __C.EXPORT_DATA_HDF5_DIR = ""  # empty string for export to data directory
 __C.MQ_EXP_PATH = ""  # path to MaxQuant experiment evidence file
-__C.MQ_REF_PATH = ""  # path to MaxQuant reference file, pickle
-__C.FP_COMBINE_PATH = "" # path to FragPipe combined_ion.tsv file
+__C.SEARCH_OUTPUT_PATH = ""  # path to MaxQuant reference file, pickle
+__C.FP_COMBINE_PATH = ""  # path to FragPipe combined_ion.tsv file
 __C.FILTER_EXP_BY_RAW_FILE = (
     []
 )  # None for not filtering, "" for filtering by raw file that shares the same name with the data directory
@@ -33,6 +33,7 @@ __C.N_CPU = (
 # prepare dictionary
 __C.PREPARE_DICT = ConfigurationNode()
 __C.PREPARE_DICT.DICT_PICKLE_PATH = ""
+__C.PREPARE_DICT.SEARCH_ENGINE = "maxquant"  # one of ["maxquant", "fragpipe", "sage"]
 __C.PREPARE_DICT.UPDATED_RT_MODEL_PATH = ""
 __C.PREPARE_DICT.UPDATED_IM_MODEL_PATH = ""
 __C.PREPARE_DICT.REF_TYPE = "MQ"  # the source of dictionary / library / reference, shoud be one of ["MQ", "pred"]; "MQ" for MaxQuant search result, "pred" for predicted library
@@ -48,6 +49,7 @@ __C.PREPARE_DICT.IM_REF = (
 __C.PREPARE_DICT.RT_TOL = (
     -0.1
 )  # RT tolerance in minutes, negative means calc from data, float
+__C.PREPARE_DICT.SUMMARIZE_WITHOUT_MATCH = False
 __C.PREPARE_DICT.IM_LENGTH = (
     -1
 )  # IM elution length in mobility index, negative means calc from data, int
@@ -56,7 +58,7 @@ __C.PREPARE_DICT.DELTA_IM_95 = (
 )  # delta IM for 95% of the data, only used if IM_REF == "pred"
 __C.PREPARE_DICT.FILTER_TRAIN_BY_RAW_FILE = ""  # None for not filtering, "" for filtering by raw file that shares the same name with the data directory
 __C.PREPARE_DICT.FILTER_PRED_BY_RAW_FILE = ""  # None for not filtering, "" for filtering by raw file that shares the same name with the data directory
-__C.PREPARE_DICT.MZ_BIN_DIGITS = 2 # legacy, not used
+__C.PREPARE_DICT.MZ_BIN_DIGITS = 2  # legacy, not used
 __C.PREPARE_DICT.ISO_MIN_AB_THRES = 0.01
 __C.PREPARE_DICT.GENERATE_DECOY = False
 __C.PREPARE_DICT.RT_MAX = 0.0
@@ -351,7 +353,7 @@ __C.RESULT_ANALYSIS.POST_PROCESSING = ConfigurationNode()
 __C.RESULT_ANALYSIS.POST_PROCESSING.FILTER_BY_IM = False
 __C.RESULT_ANALYSIS.POST_PROCESSING.PEAK_DETECTION_CHUNK_SIZE = 1000
 __C.RESULT_ANALYSIS.POST_PROCESSING.RT_GROUP = 1
-  # number of RT groups for calculating delta IM 95%
+# number of RT groups for calculating delta IM 95%
 __C.RESULT_ANALYSIS.POST_PROCESSING.MOKAPOT = ConfigurationNode()
 __C.RESULT_ANALYSIS.POST_PROCESSING.MOKAPOT.TRAIN_FDR = 0.4
 __C.RESULT_ANALYSIS.POST_PROCESSING.MOKAPOT.TEST_FDR = 0.4

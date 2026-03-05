@@ -1,4 +1,5 @@
 import logging
+import os
 from typing import Tuple, Literal, Optional
 import numpy as np
 import pandas as pd
@@ -10,7 +11,7 @@ from skimage.metrics import structural_similarity as ssim
 from scipy.ndimage import shift as ndi_shift
 import cv2
 from concurrent.futures import ProcessPoolExecutor
-from ..utils.ims_utils import (
+from swaps.utils.ims_utils import (
     detect_2d_peak_with_watershed,
     calculate_peak_property_from_labels_and_image,
 )
@@ -18,13 +19,16 @@ from .helper import (
     load_peptide_batch_df_from_partquet,
     get_pept_act_from_parquet,
 )
+import seaborn as sns
+import matplotlib.pyplot as plt
 
 Logger = logging.getLogger(__name__)
 
 
 def match_features_batches_parallel(
     dict_ref,
-    raw_file_parquet_map,
+    raw_file_list,
+    result_dir,
     peptide_indicies: np.ndarray | None = None,
     batch_size: int = 100,
     max_workers: int = 4,
@@ -54,7 +58,8 @@ def match_features_batches_parallel(
             executor.submit(
                 match_features_batch,
                 dict_ref,
-                raw_file_parquet_map,
+                raw_file_list,
+                result_dir,
                 batch,
                 smooth_kwargs,
                 peak_kwargs,
@@ -124,7 +129,7 @@ def process_pept_run(
     pept_idx,
     dict_ref,
     run_name,
-    case: Literal = ["Reference", "Quant_Only", "Match"],
+    case: Literal["Reference", "Quant_Only", "Match"],
     decoy_pept_idx: Optional[int] = None,
     rt_ref: Optional[int] = None,
     im_ref: Optional[int] = None,
@@ -142,6 +147,12 @@ def process_pept_run(
         case "Reference":
             # Boundary Check
             if rt_center >= pept_act.shape[0] or im_center >= pept_act.shape[1]:
+                logging.info(
+                    "Pept_act shape: %s, rt_center: %s, im_center: %s",
+                    pept_act.shape,
+                    rt_center,
+                    im_center,
+                )
                 logging.warning(
                     "Skipping reference for mz_rank %s due to center out of bounds",
                     pept_idx,
@@ -237,7 +248,8 @@ def process_pept_run(
 
 def match_features_batch(
     dict_ref,
-    raw_file_parquet_map: dict,
+    raw_file_list,
+    result_dir,
     batch,
     smooth_kwargs: dict | None = None,
     peak_kwargs: dict | None = None,
@@ -250,7 +262,8 @@ def match_features_batch(
     no_quant_log = []
     no_match_log = []
     act_dfs = {}
-    for raw_file, parquet_path in raw_file_parquet_map.items():
+    for raw_file in raw_file_list:
+        parquet_path = os.path.join(result_dir, raw_file, "activation", "*.parquet")
         act_dfs[raw_file] = load_peptide_batch_df_from_partquet(parquet_path, batch)
 
     for pept_idx in batch:
@@ -718,3 +731,149 @@ def compare_sift_descriptors(des1, des2):
     # SIFT distances for a match are usually < 200
     similarity = np.exp(-dist / 100.0)
     return similarity
+
+
+def calc_quant_corr(pp_quant_only, pp_reference, pp_match_target, quant_dir):
+    os.makedirs(quant_dir, exist_ok=True)
+    pp_quant_only_pivoted = pp_quant_only.pivot(
+        index="mz_rank",
+        columns="Run_name",
+        values="intensity_sum",
+    ).reset_index()
+    pp_reference_pivoted = pp_reference.pivot(
+        index="mz_rank",
+        columns="Run_name",
+        values="intensity_sum",
+    ).reset_index()
+    # Log-transform numeric columns and compute pairwise Pearson correlations (pairwise complete cases)
+    pp_match_target_pivoted = pp_match_target.pivot(
+        index="mz_rank",
+        columns="Run_name",
+        values="intensity_sum",
+    ).reset_index()
+    # Log-transform numeric columns and compute pairwise Pearson correlations (pairwise complete cases)
+    num_cols = pp_match_target_pivoted.select_dtypes(
+        include=[np.number]
+    ).columns.difference(["mz_rank"])
+    pp_log = pp_match_target_pivoted.copy()
+    pp_log[num_cols] = np.log2(pp_log[num_cols] + 1)
+
+    corr_matrix = pp_log[num_cols].corr(method="pearson", min_periods=1)
+    corr_matrix.to_csv(
+        os.path.join(
+            quant_dir, "pp_match_target_filtered_log_intensity_correlation_matrix.csv"
+        )
+    )
+
+    # 1. Concatenate with MultiIndex
+    pp_all_pivoted = pd.concat(
+        [
+            pp_reference_pivoted.set_index("mz_rank"),
+            pp_quant_only_pivoted.set_index("mz_rank"),
+            pp_match_target_pivoted.set_index("mz_rank"),
+        ],
+        axis=1,
+        keys=["reference", "quant_only", "match_target"],
+    )
+
+    # 2. Identify numeric columns (excluding the index 'mz_rank')
+    # Since mz_rank is the index now, we just take all columns
+    num_cols = pp_all_pivoted.select_dtypes(include=[np.number]).columns
+
+    # 3. Log transformation (using log2(x+1) to handle zeros)
+    pp_log = np.log2(pp_all_pivoted[num_cols] + 1)
+
+    # 4. Correlation Matrix
+    # min_periods=1 ensures you get a value even if there's only one overlapping point
+    corr_matrix = pp_log.corr(method="pearson", min_periods=1)
+    corr_matrix.to_csv(
+        os.path.join(quant_dir, "pp_all_log_intensity_correlation_matrix.csv")
+    )
+    # Optional: Flatten the MultiIndex for easier viewing if it's too cluttered
+
+    count_matrix = pp_log.notna().astype(int).T.dot(pp_log.notna().astype(int))
+    sns.heatmap(corr_matrix)
+    ax = plt.gca()
+    for i in range(count_matrix.shape[0]):
+        for j in range(count_matrix.shape[1]):
+            _ = ax.text(
+                j + 0.5,
+                i + 0.5,
+                str(int(count_matrix.iloc[i, j])),
+                ha="center",
+                va="center",
+                fontsize=7,
+                color="white",
+            )
+    plt.savefig(
+        os.path.join(
+            quant_dir,
+            "correlation_matrix_of_log_intensity_with_counts.png",
+        ),
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+
+def plot_match_type_from_combined(
+    df, colors=None, labels=None, stack_order=None, fig_dir=None
+):
+    if colors is None:
+        colors = {
+            "MS/MS": "#55A868",
+            "MS/MS Quant": "#55A868",
+            "MS/MS Ref": "#4C72B0",
+            "MBR": "#C44E52",
+            "unmatched": "#BBBBBB",
+        }
+
+    if stack_order is None:
+        stack_order = ["MS/MS", "MS/MS Quant", "MS/MS Ref", "MBR", "unmatched"]
+
+    match_type_cols = [col for col in df.columns if "Match Type" in col]
+
+    counts_dict = {}
+    for col in match_type_cols:
+        counts_dict[col] = df[col].value_counts(dropna=True)
+
+    counts = pd.DataFrame(counts_dict).T.fillna(0)
+
+    # Reorder columns to control stack and legend order
+    ordered_cols = [c for c in stack_order if c in counts.columns]
+    counts = counts[ordered_cols]
+
+    if labels is None:
+        labels = [f"Run{i+1}" for i in range(len(counts.index))]
+
+    plt.figure(figsize=(10, 8))
+    ax = counts.plot(kind="bar", stacked=True, color=colors)
+
+    plt.xlabel("Match Type Column")
+    plt.ylabel("Count")
+    plt.title("Entry Counts per Match Type Column")
+    plt.xticks(rotation=45, ticks=range(len(counts.index)), labels=labels)
+
+    for container in ax.containers:
+        for bar in container:
+            height = bar.get_height()
+            if height > 0:
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_y() + height / 2,
+                    f"{int(height)}",
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                )
+
+    plt.legend(title="Entry", bbox_to_anchor=(1.02, 1), loc="upper left")
+    plt.tight_layout()
+    if fig_dir is not None:
+        plt.savefig(
+            os.path.join(fig_dir, "match_type_counts.png"),
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close()
+    plt.show()
