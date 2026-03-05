@@ -1608,16 +1608,23 @@ def generate_id_partitions(
 
     elif how == "block":
         Logger.info("Generate id partitions by block.")
-        block_size = (len(id_array) - 2 * n_edge_counts) // n_batch
+
+        total = len(id_array)
+        core_size = total - 2 * n_edge_counts
+        block_size = core_size // n_batch
+
+        start = 0
+
         for i in range(n_batch):
             if i == 0:
-                mark = block_size + n_edge_counts
-                id_partitions[i] = id_array[:mark].tolist()
+                end = block_size + n_edge_counts
             elif i == n_batch - 1:
-                id_partitions[i] = id_array[mark:].tolist()
+                end = total
             else:
-                id_partitions[i] = id_array[mark : mark + block_size].tolist()
-                mark = block_size * (i + 1) + n_edge_counts
+                end = start + block_size
+
+            id_partitions[i] = id_array[start:end].tolist()
+            start = end
 
     return id_partitions
 
@@ -1644,7 +1651,7 @@ def process_frames_parallel(
         Parallel(n_jobs=n_jobs)(
             delayed(process_batch_frame_save_parquet)(
                 batch_scan_idx=batch,
-                parquet_file=f"{parquet_file_stem}_frame_batch_{i}.parquet",
+                parquet_file=f"{parquet_file_stem}_frame_batch_{i}",
                 **kwargs,
             )
             for i, batch in enumerate(batch_scan_indices)
