@@ -85,8 +85,9 @@ def cleanup_maxquant(
     maxquant_df: pd.DataFrame,
     remove_decoys: bool = True,
     how_duplicates: Literal[
-        "keep_all", "keep_highest_int", "keep_one"
+        "keep_all", "keep_highest_int", "keep_one", "keep_highest_score"
     ] = "keep_highest_int",
+    id_cols=["Modified sequence", "Charge"],
 ):
     """clean up the maxquant experiment file, remove decoys and duplicates"""
     if remove_decoys:
@@ -105,8 +106,8 @@ def cleanup_maxquant(
         case "keep_highest_int":
             n_pre_clean = maxquant_df.shape[0]
             maxquant_df = maxquant_df.sort_values(
-                by=["Modified sequence", "Charge", "Intensity"], ascending=False
-            ).drop_duplicates(subset=["Modified sequence", "Charge"], keep="first")
+                by=id_cols + ["Intensity"], ascending=False
+            ).drop_duplicates(subset=id_cols, keep="first")
             n_post_clean = maxquant_df.shape[0]
             Logger.info(
                 "Removing %s duplicate entries from experiment file, %s entries left.",
@@ -114,8 +115,20 @@ def cleanup_maxquant(
                 n_post_clean,
             )
         case "keep_one":
-            maxquant_df = maxquant_df.drop_duplicates(
-                subset=["Modified sequence", "Charge"]
+            maxquant_df = maxquant_df.drop_duplicates(subset=id_cols)
+        case "keep_highest_score":
+            n_pre_clean = maxquant_df.shape[0]
+            maxquant_df["Score"].fillna(
+                -1, inplace=True
+            )  # Fill NaN scores with 0 for comparison
+            maxquant_df = maxquant_df.sort_values(
+                by=id_cols + ["Score"], ascending=False
+            ).drop_duplicates(subset=id_cols, keep="first")
+            n_post_clean = maxquant_df.shape[0]
+            Logger.info(
+                "Removing %s duplicate entries from experiment file, %s entries left.",
+                n_pre_clean - n_post_clean,
+                n_post_clean,
             )
         case _:
             raise ValueError(f"Unknown option {how_duplicates}")
