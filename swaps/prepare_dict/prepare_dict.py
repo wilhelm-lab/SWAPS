@@ -10,7 +10,7 @@ Options:
     --version              show version
 """
 
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Dict
 import re
 import os
 import logging
@@ -29,7 +29,7 @@ from alphabase.psm_reader import psm_reader_provider
 from sklearn.model_selection import train_test_split
 from sklearn.linear_model import LinearRegression
 from peptdeep.pretrained_models import ModelManager
-from .search_engine_output_parser import sage_parser, fragpipe_parser
+from .search_engine_output_parser import sage_parser
 
 Logger = logging.getLogger(__name__)
 
@@ -405,6 +405,46 @@ def _check_td_pair_mass(maxquant_result_ref: pd.DataFrame):
     return result
 
 
+def dict_add_index_to_raw_file(
+    maxquant_df: pd.DataFrame,
+    mobility_values_df: pd.DataFrame,
+    rt_values_df: pd.DataFrame,
+    raw_file: str,
+):
+    maxquant_df = maxquant_df.sort_values(f"{raw_file}_RT")
+    maxquant_df_with_rt_index = pd.merge_asof(
+        left=maxquant_df,
+        right=rt_values_df[["Time_minute", "MS1_frame_idx"]],
+        left_on=f"{raw_file}_RT",
+        right_on="Time_minute",
+        direction="nearest",
+    )
+    maxquant_df_with_rt_index = maxquant_df.merge(
+        maxquant_df_with_rt_index[["mz_rank", "MS1_frame_idx"]],
+        on="mz_rank",
+        how="left",
+    )
+    for col in ["Time_minute", "MS1_frame_idx"]:
+        if col in maxquant_df_with_rt_index.columns:
+            maxquant_df_with_rt_index.rename(
+                {col: f"{raw_file}_{col}_exp"}, axis=1, inplace=True
+            )
+    maxquant_df_with_rt_index = maxquant_df_with_rt_index.sort_values(f"{raw_file}_1K0")
+    maxquant_df_with_rt_index = pd.merge_asof(
+        left=maxquant_df_with_rt_index,
+        right=mobility_values_df[["mobility_values_index", "mobility_values"]],
+        left_on=f"{raw_file}_1K0",
+        right_on="mobility_values",
+        direction="nearest",
+    )
+    for col in ["mobility_values_index", "mobility_values"]:
+        if col in maxquant_df_with_rt_index.columns:
+            maxquant_df_with_rt_index.rename(
+                {col: f"{raw_file}_{col}_exp"}, axis=1, inplace=True
+            )
+    return maxquant_df_with_rt_index
+
+
 def dict_add_im_index(
     maxquant_df: pd.DataFrame,
     mobility_values_df: pd.DataFrame,
@@ -547,7 +587,9 @@ def dict_add_rt_index(
         )
         for col in ["Time_minute", "MS1_frame_idx"]:
             if col in maxquant_df.columns:
-                maxquant_df.rename({col: col + "_left" + idx_suffix}, axis=1, inplace=True)
+                maxquant_df.rename(
+                    {col: col + "_left" + idx_suffix}, axis=1, inplace=True
+                )
     if mq_rt_right_col is not None:
         maxquant_df = maxquant_df.sort_values(mq_rt_right_col)
         maxquant_df = pd.merge_asof(
@@ -560,7 +602,9 @@ def dict_add_rt_index(
         )
         for col in ["Time_minute", "MS1_frame_idx"]:
             if col in maxquant_df.columns:
-                maxquant_df.rename({col: col + "_right" + idx_suffix}, axis=1, inplace=True)
+                maxquant_df.rename(
+                    {col: col + "_right" + idx_suffix}, axis=1, inplace=True
+                )
 
     Logger.debug("dict_add_rt_index columns: %s", maxquant_df.columns)
     return maxquant_df
@@ -777,15 +821,16 @@ def _define_rt_search_range(
             raise ValueError(f"RT reference {rt_ref} not supported")
     maxquant_result_dict["RT_search_center"] = maxquant_result_dict[rt_ref_act_peak]
     if maxquant_result_dict["RT_search_center"].isna().sum() > 0:
-        Logger.warning(maxquant_result_dict.loc[
-            maxquant_result_dict["RT_search_center"].isna()])
+        Logger.warning(
+            maxquant_result_dict.loc[maxquant_result_dict["RT_search_center"].isna()]
+        )
     Logger.debug(
         "NaN values, before clipping, in RT_search_left, right and center: %s, %s, %s",
         maxquant_result_dict["RT_search_left"].isna().sum(),
         maxquant_result_dict["RT_search_right"].isna().sum(),
         maxquant_result_dict["RT_search_center"].isna().sum(),
     )
-    
+
     maxquant_result_dict[
         ["RT_search_left", "RT_search_center", "RT_search_right"]
     ].clip(rt_range[0], rt_range[1], inplace=True)
@@ -1270,9 +1315,7 @@ def dict_add_rt_align_lowess(
         exog=both_train["Retention time_ref"],
         frac=0.05,
         return_sorted=False,
-        xvals=maxquant_dict.loc[
-            maxquant_dict["source"] != "exp", "Retention time_ref"
-        ],
+        xvals=maxquant_dict.loc[maxquant_dict["source"] != "exp", "Retention time_ref"],
     )
     # maxquant_dict.loc[maxquant_dict["source"] == "exp", "predicted_RT"] = (
     #     maxquant_dict.loc[
@@ -1283,9 +1326,7 @@ def dict_add_rt_align_lowess(
     # For the columns where the ref RT is NaN, use the exp RT with additional noise by boostrapping residuals
     lowess_fit_residuals = (
         maxquant_dict.loc[maxquant_dict["source"] == "both", "predicted_RT"]
-        - maxquant_dict.loc[
-            maxquant_dict["source"] == "both", "Retention time_exp"
-        ]
+        - maxquant_dict.loc[maxquant_dict["source"] == "both", "Retention time_exp"]
     )
     noise = np.random.choice(
         lowess_fit_residuals,
@@ -1295,9 +1336,7 @@ def dict_add_rt_align_lowess(
         "RT Noise size: %s, mean: %s, std: %s", len(noise), noise.mean(), noise.std()
     )
     maxquant_dict.loc[maxquant_dict["source"] == "exp", "predicted_RT"] = (
-        maxquant_dict.loc[
-            maxquant_dict["source"] == "exp", "Retention time_exp"
-        ]
+        maxquant_dict.loc[maxquant_dict["source"] == "exp", "Retention time_exp"]
         + noise
     )
 
@@ -1347,6 +1386,67 @@ def filter_maxquant_by_ok(
         evidence_rescore_001fdr["Proteins_mq"]
     )  # fill in missing proteins
     return evidence_rescore_001fdr
+
+
+def construct_dict_from_search_pivoted(
+    cfg_prepare_dict,
+    evidence: pd.DataFrame,
+    # rt_values_df: pd.DataFrame,
+    # mobility_values_df: pd.DataFrame,
+    n_blocks_by_pept: int = 1,
+):
+
+    evidence_cleaned = cleanup_maxquant(
+        evidence,
+        id_cols=["Sequence", "Modifications", "Charge", "Raw file", "Proteins"],
+        how_duplicates="keep_highest_int",
+    )
+    evidence_pivoted = pivot_psm_by_mz_rank(evidence_cleaned)
+    evidence_group_summary = get_rt_im_range(
+        evidence_cleaned,
+        id_cols=["Sequence", "Modifications", "Charge", "Proteins"],
+        summarize_without_match=cfg_prepare_dict.SUMMARIZE_WITHOUT_MATCH,
+    )
+    # add extra columns
+    evidence_group_summary = dict_add_iso_pattern(
+        evidence_group_summary, ab_thres=cfg_prepare_dict.ISO_MIN_AB_THRES
+    )
+    evidence_group_summary = dict_add_mz_rank(maxquant_dict_df=evidence_group_summary)
+
+    evidence_group_summary = dict_add_mz_bin(
+        maxquant_dict_df=evidence_group_summary,
+        mz_bin_digits=cfg_prepare_dict.MZ_BIN_DIGITS,
+    )
+    evidence_group_summary = dict_add_mz_len(maxquant_dict_df=evidence_group_summary)
+
+    pept_batch_size = ceil(evidence_group_summary.shape[0] / n_blocks_by_pept) + 1
+    evidence_group_summary["pept_batch_idx"] = (
+        evidence_group_summary["mz_rank"] // pept_batch_size
+    ).astype(int)
+    # evidence_group_summary = dict_add_rt_index(
+    #     evidence_group_summary,
+    #     rt_values_df,
+    #     "RT_search_left",
+    #     "RT_search_center",
+    #     "RT_search_right",
+    #     idx_suffix="_ref",
+    # )
+    # evidence_group_summary = dict_add_im_index(
+    #     evidence_group_summary,
+    #     mobility_values_df,
+    #     "IM_search_left",
+    #     "IM_search_center",
+    #     "IM_search_right",
+    #     idx_suffix="_ref",
+    # )
+    dict_ref = pd.merge(
+        evidence_pivoted,
+        evidence_group_summary,
+        on=["Sequence", "Modifications", "Charge"],
+        how="left",
+    )
+    Logger.info("Total entries in dictionary: %s", dict_ref.shape)
+    return dict_ref
 
 
 def construct_dict(
@@ -1522,11 +1622,21 @@ def construct_dict(
         else:
             Logger.info("Using existing IM model")
             delta_im_95 = cfg_prepare_dict.DELTA_IM_95
-    
-    maxquant_exp_df['Retention time start'] = maxquant_exp_df['Calibrated retention time start'] - maxquant_exp_df['Retention time calibration']
-    maxquant_exp_df['Retention time finish'] = maxquant_exp_df['Calibrated retention time finish'] - maxquant_exp_df['Retention time calibration']
-    maxquant_exp_df['Retention time start'].fillna(maxquant_exp_df['Calibrated retention time start'], inplace=True) # if rt calibration is missing that rt should be the same before and after calib
-    maxquant_exp_df['Retention time finish'].fillna(maxquant_exp_df['Calibrated retention time finish'], inplace=True) # if rt calibration is missing that rt should be the same before and after calib
+
+    maxquant_exp_df["Retention time start"] = (
+        maxquant_exp_df["Calibrated retention time start"]
+        - maxquant_exp_df["Retention time calibration"]
+    )
+    maxquant_exp_df["Retention time finish"] = (
+        maxquant_exp_df["Calibrated retention time finish"]
+        - maxquant_exp_df["Retention time calibration"]
+    )
+    maxquant_exp_df["Retention time start"].fillna(
+        maxquant_exp_df["Calibrated retention time start"], inplace=True
+    )  # if rt calibration is missing that rt should be the same before and after calib
+    maxquant_exp_df["Retention time finish"].fillna(
+        maxquant_exp_df["Calibrated retention time finish"], inplace=True
+    )  # if rt calibration is missing that rt should be the same before and after calib
     # get idx of exp RT and IM values
     maxquant_exp_df = dict_add_rt_index(
         maxquant_df=maxquant_exp_df,
@@ -1557,11 +1667,21 @@ def construct_dict(
             idx_suffix="_ref",
             im_idx_length=None,
         )
-    
-    maxquant_ref_df['Retention time start'] = maxquant_ref_df['Calibrated retention time start'] - maxquant_ref_df['Retention time calibration']
-    maxquant_ref_df['Retention time finish'] = maxquant_ref_df['Calibrated retention time finish'] - maxquant_ref_df['Retention time calibration']
-    maxquant_ref_df['Retention time start'].fillna(maxquant_ref_df['Calibrated retention time start'], inplace=True) # if rt calibration is missing that rt should be the same before and after calib
-    maxquant_ref_df['Retention time finish'].fillna(maxquant_ref_df['Calibrated retention time finish'], inplace=True) # if rt calibration is missing that rt should be the same before and after calib 
+
+    maxquant_ref_df["Retention time start"] = (
+        maxquant_ref_df["Calibrated retention time start"]
+        - maxquant_ref_df["Retention time calibration"]
+    )
+    maxquant_ref_df["Retention time finish"] = (
+        maxquant_ref_df["Calibrated retention time finish"]
+        - maxquant_ref_df["Retention time calibration"]
+    )
+    maxquant_ref_df["Retention time start"].fillna(
+        maxquant_ref_df["Calibrated retention time start"], inplace=True
+    )  # if rt calibration is missing that rt should be the same before and after calib
+    maxquant_ref_df["Retention time finish"].fillna(
+        maxquant_ref_df["Calibrated retention time finish"], inplace=True
+    )  # if rt calibration is missing that rt should be the same before and after calib
     # merge reference and experiment
     maxquant_dict = merge_ref_and_exp(
         maxquant_ref_df=maxquant_ref_df,
@@ -1717,9 +1837,7 @@ def construct_dict(
     # save results
     dict_pickle_path = os.path.join(result_dir, "maxquant_result_dict.pkl")
     dict_target_pickle_path = os.path.join(result_dir, "maxquant_result_target_ref.pkl")
-    dict_decoy_pickle_path = os.path.join(
-        result_dir, "maxquant_result_decoy_ref.pkl"
-    )
+    dict_decoy_pickle_path = os.path.join(result_dir, "maxquant_result_decoy_ref.pkl")
     maxquant_dict_target.to_pickle(dict_target_pickle_path)
     maxquant_dict_decoy.to_pickle(dict_decoy_pickle_path)
     maxquant_dict.to_pickle(dict_pickle_path)
@@ -1728,7 +1846,15 @@ def construct_dict(
         maxquant_dict.shape,
     )
     Logger.debug("Columns in maxquant_dict: %s", maxquant_dict.columns)
-    return maxquant_dict,maxquant_dict_target, maxquant_dict_decoy, dict_target_pickle_path, dict_decoy_pickle_path, dict_pickle_path, cfg_prepare_dict
+    return (
+        maxquant_dict,
+        maxquant_dict_target,
+        maxquant_dict_decoy,
+        dict_target_pickle_path,
+        dict_decoy_pickle_path,
+        dict_pickle_path,
+        cfg_prepare_dict,
+    )
 
 
 def get_mzrank_batch_cutoff(maxquant_dict_df: pd.DataFrame):
@@ -1746,18 +1872,26 @@ def get_mzrank_batch_cutoff(maxquant_dict_df: pd.DataFrame):
     )  # end at the last, +1 to include the last
     return cutoff
 
-def align_rt_from_multiple_source(original_dict: pd.DataFrame, target_col: str) -> pd.DataFrame:
+
+def align_rt_from_multiple_source(
+    original_dict: pd.DataFrame, target_col: str
+) -> pd.DataFrame:
     # Filter first
     filtered = original_dict[original_dict["Type"] == "TIMS-MULTI-MSMS"]
 
     # Group and keep only the row with the highest Intensity in each group
-    original_dict_agg_int_max = (
-        filtered.loc[
-            filtered.groupby(["Modified sequence", "Charge", "Raw file"])["Intensity"].idxmax()
-        ]
-    )
+    original_dict_agg_int_max = filtered.loc[
+        filtered.groupby(["Modified sequence", "Charge", "Raw file"])[
+            "Intensity"
+        ].idxmax()
+    ]
     # pivot rt table
-    rt_pivot = original_dict_agg_int_max.pivot_table(index=["Modified sequence", "Charge"],columns=["Raw file"], values="Retention time", aggfunc="mean")
+    rt_pivot = original_dict_agg_int_max.pivot_table(
+        index=["Modified sequence", "Charge"],
+        columns=["Raw file"],
+        values="Retention time",
+        aggfunc="mean",
+    )
 
     # New DataFrame for aligned results
     aligned_df = pd.DataFrame(index=rt_pivot.index)
@@ -1767,13 +1901,13 @@ def align_rt_from_multiple_source(original_dict: pd.DataFrame, target_col: str) 
         if col == target_col:
             aligned_df[col] = rt_pivot[col]  # keep original reference as-is
             continue
-        
+
         # Get non-missing pairs between reference and current column
         valid = rt_pivot[[target_col, col]].dropna()
         if len(valid) < 3:
             aligned_df[col] = np.nan  # too few points to fit LOWESS
             continue
-        
+
         xvals = rt_pivot[col]  # your x values (may have NaN)
         mask_valid_x = xvals.notna()  # remember where xvals are valid
 
@@ -1786,7 +1920,7 @@ def align_rt_from_multiple_source(original_dict: pd.DataFrame, target_col: str) 
             exog=valid[col],
             frac=0.05,
             return_sorted=False,
-            xvals=xvals[mask_valid_x]
+            xvals=xvals[mask_valid_x],
         )
 
         # Insert fitted values only where xvals were valid
@@ -1797,3 +1931,239 @@ def align_rt_from_multiple_source(original_dict: pd.DataFrame, target_col: str) 
     ref_rt = aligned_df.drop(columns=[target_col]).mean(axis=1)
     ref_rt.fillna(aligned_df[target_col], inplace=True)
     return ref_rt.reset_index().rename(columns={0: "Retention time_ref"})
+
+
+def get_rt_im_range(
+    evidence: pd.DataFrame,
+    match_col: str = "Type",
+    id_cols: List[str] = ["Sequence", "Modifications", "Charge"],
+    rt_col: str = "Retention time",
+    # rt_start_col: str = "Calibrated retention time start",
+    # rt_finish_col: str = "Calibrated retention time finish",
+    rt_length_col: str = "Retention length",
+    mobility_col: str = "1/K0",
+    mobility_length_col: str = "1/K0 length",
+    summarize_without_match: bool = False,
+):
+    # --- Step 7: Get rt and ion mobility experimental statistic
+    if summarize_without_match:
+        evidence = evidence[
+            ~evidence[match_col].str.contains("MATCH", na=False)
+        ]  # only keep matched for summary
+    evidence_group_summary = (
+        evidence.groupby(id_cols)
+        .agg(
+            modified_sequence=(
+                "Modified sequence",
+                lambda x: x.dropna().iloc[0] if x.notna().any() else np.nan,
+            ),
+            mz=("m/z", "mean"),
+            count=(rt_col, "count"),
+            rt_apex_mean=(rt_col, "mean"),
+            rt_apex_std=(rt_col, "std"),
+            rt_apex_min=(rt_col, "min"),
+            rt_apex_max=(rt_col, "max"),
+            mobility_exp_mean=(mobility_col, "mean"),
+            mobility_exp_std=(mobility_col, "std"),
+            mobility_exp_min=(mobility_col, "min"),
+            mobility_exp_max=(mobility_col, "max"),
+            # rt_start_mean=(rt_start_col, "mean"),
+            # rt_start_std=(rt_start_col, "std"),
+            # rt_start_min=(rt_start_col, "min"),
+            # rt_finish_mean=(rt_finish_col, "mean"),
+            # rt_finish_std=(rt_finish_col, "std"),
+            # rt_finish_max=(rt_finish_col, "max"),
+            rt_length_mean=(rt_length_col, "mean"),
+            rt_length_std=(rt_length_col, "std"),
+            rt_length_min=(rt_length_col, "min"),
+            rt_length_max=(rt_length_col, "max"),
+            mobility_length_mean=(mobility_length_col, "mean"),
+            mobility_length_std=(mobility_length_col, "std"),
+        )
+        .reset_index()
+    )
+    evidence_group_summary = evidence_group_summary.rename(
+        columns={"modified_sequence": "Modified sequence", "mz": "m/z"}
+    )
+    evidence_group_summary["rt_apex_std"] = evidence_group_summary[
+        "rt_apex_std"
+    ].fillna(evidence_group_summary["rt_apex_std"].mean())
+    evidence_group_summary["rt_length_std"] = evidence_group_summary[
+        "rt_length_std"
+    ].fillna(evidence_group_summary["rt_length_std"].mean())
+    evidence_group_summary["mobility_exp_std"] = evidence_group_summary[
+        "mobility_exp_std"
+    ].fillna(evidence_group_summary["mobility_exp_std"].mean())
+    evidence_group_summary["mobility_length_std"] = evidence_group_summary[
+        "mobility_length_std"
+    ].fillna(evidence_group_summary["mobility_length_std"].mean())
+    evidence_group_summary["RT_search_left"] = (
+        evidence_group_summary["rt_apex_min"]
+        - evidence_group_summary["rt_apex_std"]
+        - evidence_group_summary["rt_length_mean"]
+        - evidence_group_summary["rt_length_std"]
+    )
+    evidence_group_summary["RT_search_center"] = evidence_group_summary["rt_apex_mean"]
+    evidence_group_summary["RT_search_right"] = (
+        evidence_group_summary["rt_apex_max"]
+        + evidence_group_summary["rt_apex_std"]
+        + evidence_group_summary["rt_length_mean"]
+        + evidence_group_summary["rt_length_std"]
+    )
+    evidence_group_summary["IM_search_left"] = (
+        evidence_group_summary["mobility_exp_min"]
+        - evidence_group_summary["mobility_exp_std"]
+        - evidence_group_summary["mobility_length_mean"]
+        - evidence_group_summary["mobility_length_std"]
+    )
+    evidence_group_summary["IM_search_right"] = (
+        evidence_group_summary["mobility_exp_max"]
+        + evidence_group_summary["mobility_exp_std"]
+        + evidence_group_summary["mobility_length_mean"]
+        + evidence_group_summary["mobility_length_std"]
+    )
+    evidence_group_summary["IM_search_center"] = evidence_group_summary[
+        "mobility_exp_mean"
+    ]
+    return evidence_group_summary
+
+
+def pivot_psm_by_mz_rank(
+    evidence: pd.DataFrame,
+    match_keyword: str = "MATCH",
+    msms_keyword: str = "MSMS",
+    metric_col: str = "Score",
+    intensity_col: str = "Intensity",
+    rt_col: str = "Retention time",
+    mobility_col: str = "1/K0",
+    higher_is_better: bool = True,
+    id_cols: List[str] = ["Sequence", "Modifications", "Charge"],
+    # summarize_with_match: bool = True,
+):
+    """
+    Pivot the evidence dataframe to have one row per peptide (defined by id_cols) and one column per raw file, with values indicating the status of that peptide in that raw file (Match, Quant_Only, Reference, Other).
+    Arguments:
+    - evidence: pd.DataFrame, the input evidence dataframe
+    - match_keyword: str, the keyword to identify matched PSMs in the "Type" column
+    - msms_keyword: str, the keyword to identify MS/MS PSMs in the
+    "Type" column
+    - metric_col: str, the column name of the metric used to determine global best (e.g., "Score")
+    - intensity_col: str, the column name of the intensity used for tie-breaking when determining global best
+    - higher_is_better: bool, whether a higher value of the metric indicates a better PSM (default True, e.g., for Score)
+    - id_cols: List[str], the columns that define a unique peptide (default ["Sequence", "Modifications", "Charge"])
+    Returns:
+    - result_df: pd.DataFrame, the pivoted dataframe with one row per peptide and columns for each raw file indicating the status, as well as pivoted RT and mobility values.
+    """
+    # --- Step 1: Global Best Identification ---
+    sorted_ev = evidence.sort_values(
+        by=id_cols + [metric_col, intensity_col],
+        ascending=[True] * len(id_cols) + [not higher_is_better, False],
+    )
+    evidence["is_global_best"] = False
+    evidence.loc[sorted_ev.groupby(id_cols).head(1).index, "is_global_best"] = True
+
+    # --- Step 2: Status Labeling ---
+    def label_logic(row):
+        if match_keyword.upper() in str(row["Type"]).upper():
+            return 3
+        elif row["is_global_best"]:
+            return 1
+        elif msms_keyword.upper() in str(row["Type"]).upper():
+            return 2
+        else:
+            return 0
+
+    evidence["Status_Val"] = evidence.apply(label_logic, axis=1)
+
+    # --- Step 3: Pivot Status ---
+    # We use min() here as per your logic to prioritize the '1' (Reference) label
+    # if a file has multiple entries for the same peptide.
+    summary = evidence.groupby(id_cols + ["Raw file"])["Status_Val"].min().reset_index()
+
+    pivot_status = summary.pivot(index=id_cols, columns="Raw file", values="Status_Val")
+    mapping = {3: "Match", 2: "Quant_Only", 1: "Reference", 0: "Other"}
+    pivot_status = pivot_status.map(lambda x: mapping.get(x, "Not_Match"))
+
+    # --- Step 4: Pivot Metrics (RT and 1/K0) ---
+    # We take the mean or first if multiple entries exist per raw file
+    metrics_summary = (
+        evidence.groupby(id_cols + ["Raw file"])[[rt_col, mobility_col]]
+        .mean()
+        .reset_index()
+    )
+
+    pivot_rt = metrics_summary.pivot(index=id_cols, columns="Raw file", values=rt_col)
+    pivot_rt.columns = [f"{col}_RT" for col in pivot_rt.columns]
+    pivot_rt.fillna(
+        0, inplace=True
+    )  # fill missing RT with 0, can be changed to other value if needed
+    pivot_mobility = metrics_summary.pivot(
+        index=id_cols, columns="Raw file", values=mobility_col
+    )
+    pivot_mobility.columns = [f"{col}_1K0" for col in pivot_mobility.columns]
+    pivot_mobility.fillna(
+        0, inplace=True
+    )  # fill missing mobility with 0, can be changed to other value if needed
+    # --- Step 5: Combine everything ---
+    # join=inner ensures we keep only rows consistent across pivots
+    result_df = pd.concat([pivot_status, pivot_rt, pivot_mobility], axis=1)
+
+    # --- Step 6: Validation ---
+    ref_counts = (pivot_status == "Reference").sum(axis=1)
+    if not (ref_counts == 1).all():
+        raise AssertionError(
+            f"Validation failed: {sum(ref_counts != 1)} rows don't have exactly 1 Reference."
+        )
+
+    return result_df
+
+
+def add_rt_index_to_pivot(
+    raw_file_swaps_dir_map: Dict[str, str],
+    pivot_df: pd.DataFrame,
+    swaps_parent_dir: str,
+):
+    for raw_file, swaps_dir in raw_file_swaps_dir_map.items():
+        ms1scans = pd.read_csv(
+            os.path.join(swaps_parent_dir, swaps_dir, "ms1scans.csv")
+        )
+
+        pivot_df.sort_values(by=f"{raw_file}_RT", inplace=True)
+        pivot_df = pd.merge_asof(
+            left=pivot_df,
+            right=ms1scans[["Time_minute", "MS1_frame_idx"]],
+            left_on=f"{raw_file}_RT",
+            right_on="Time_minute",
+            direction="nearest",
+        )
+        pivot_df.rename(
+            columns={"MS1_frame_idx": f"{raw_file}_MS1_frame_idx_exp"}, inplace=True
+        )
+        pivot_df.drop(columns=["Time_minute"], inplace=True)
+
+    return pivot_df
+
+
+def add_im_index_to_pivot(
+    raw_file_swaps_dir_map: Dict[str, str],
+    pivot_df: pd.DataFrame,
+    swaps_parent_dir: str,
+):
+    for raw_file, swaps_dir in raw_file_swaps_dir_map.items():
+        mobility_values = pd.read_csv(
+            os.path.join(swaps_parent_dir, swaps_dir, "mobility_values.csv")
+        )
+        pivot_df.sort_values(by=f"{raw_file}_1K0", inplace=True)
+        pivot_df = pd.merge_asof(
+            left=pivot_df,
+            right=mobility_values[["mobility_values_index", "mobility_values"]],
+            left_on=f"{raw_file}_1K0",
+            right_on="mobility_values",
+            direction="nearest",
+        )
+        pivot_df.rename(
+            columns={"mobility_values_index": f"{raw_file}_mobility_values_index_exp"},
+            inplace=True,
+        )
+        pivot_df.drop(columns=["mobility_values"], inplace=True)
+    return pivot_df
