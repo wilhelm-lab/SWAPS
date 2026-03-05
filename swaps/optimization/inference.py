@@ -429,15 +429,15 @@ def process_one_frame_ims(
         candidate_precursor_by_rt = maxquant_result_ref_with_im_index_sortmz.loc[
             (maxquant_result_ref_with_im_index_sortmz["RT_search_left"] <= scan_time)
             & (maxquant_result_ref_with_im_index_sortmz["RT_search_right"] >= scan_time)
-        ]
-        Logger.info(
+        ].copy()
+        Logger.debug(
             "Finished filtering candidate precursors. Number of candidates by RT in frame %s: %s",
             ms1_frame_idx,
             candidate_precursor_by_rt.shape[0],
         )
         if candidate_precursor_by_rt.shape[0] > 0:
-            candidate_precursor_by_rt.sort_values(
-                "mz_rank", ascending=True, inplace=True
+            candidate_precursor_by_rt = candidate_precursor_by_rt.sort_values(
+                "mz_rank", ascending=True
             )
             all_frame_pept_idx = candidate_precursor_by_rt.mz_rank.values
             (
@@ -455,7 +455,7 @@ def process_one_frame_ims(
             )
             if frame_array is None:
                 im_pept_act = None
-                Logger.warning("No sparse matrices reutrn for frame %s", ms1_frame_idx)
+                Logger.warning("No sparse matrices return for frame %s", ms1_frame_idx)
             else:
                 Logger.debug(
                     "Finished preparing sparse matrix. Start optimization with sparse encoding."
@@ -941,82 +941,82 @@ def process_batch_frame_save_parquet(
                 os.remove(path_res)  # remove residue parquet if not return res coo dict
 
 
-def process_batch_frame_save_zarr(
-    data: pd.DataFrame,
-    ms1scans: pd.DataFrame,
-    batch_scan_idx: list,
-    zarr_path: str,
-    maxquant_result_ref_with_im_index_sortmz: pd.DataFrame,
-    mobility_values: Optional[pd.DataFrame],
-    delta_mobility_thres: int = 100,
-    extract_im_peak: bool = False,
-    use_ims: bool = True,
-    return_res_coo_dict: bool = False,
-    max_mz_rank: Optional[int] = None,
-    zarr_chunks: tuple = (256, 256, 1),
-    **process_frame_kwargs,
-):
-    # TODO: only ims so far
-    batch_peaks_df = []
-    if max_mz_rank is None:
-        max_mz_rank = maxquant_result_ref_with_im_index_sortmz.mz_rank.max()
-    z = zarr.open(
-        zarr_path,
-        mode="a",
-        shape=(
-            len(ms1scans.index.values)
-            + 1,  # this index is rank, starting from 1, add 1 for the last frame
-            len(mobility_values) if mobility_values is not None else 1,
-            max_mz_rank
-            + 1,  # this index is rank, starting from 1, add 1 for the last frame
-        ),
-        chunks=zarr_chunks,
-        dtype=np.float32,
-        compressor=zarr.Blosc(cname="zstd", clevel=5, shuffle=2),
-    )
-    writer = RTChunkWriter(z)
-    for scan_idx in tqdm.tqdm(
-        batch_scan_idx, desc="Processing frames in batch", total=len(batch_scan_idx)
-    ):
-        Logger.debug("Start processing frame index %s", scan_idx)
-        if use_ims:
-            assert mobility_values is not None
-            one_frame_results = process_one_frame_ims(  # type: ignore[assignment]
-                data=data,
-                ms1scans=ms1scans,
-                ms1_frame_idx=scan_idx,
-                maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
-                mobility_values=mobility_values,
-                delta_mobility_thres=delta_mobility_thres,
-                extract_im_peak=extract_im_peak,
-                debug=False,
-                return_res_coo_dict=return_res_coo_dict,
-                writer=writer,
-                # zarr_path=zarr_path,
-                # zarr_chunks=zarr_chunks,
-                # zarr_shape=(
-                #     len(ms1scans.index.values)
-                #     + 1,  # this index is rank, starting from 1, add 1 for the last frame
-                #     len(mobility_values),
-                #     max_mz_rank
-                #     + 1,  # this index is rank, starting from 1, add 1 for the last frame
-                # ),
-                **process_frame_kwargs,
-            )
+# def process_batch_frame_save_zarr(
+#     data: pd.DataFrame,
+#     ms1scans: pd.DataFrame,
+#     batch_scan_idx: list,
+#     zarr_path: str,
+#     maxquant_result_ref_with_im_index_sortmz: pd.DataFrame,
+#     mobility_values: Optional[pd.DataFrame],
+#     delta_mobility_thres: int = 100,
+#     extract_im_peak: bool = False,
+#     use_ims: bool = True,
+#     return_res_coo_dict: bool = False,
+#     max_mz_rank: Optional[int] = None,
+#     zarr_chunks: tuple = (256, 256, 1),
+#     **process_frame_kwargs,
+# ):
+#     # TODO: only ims so far
+#     batch_peaks_df = []
+#     if max_mz_rank is None:
+#         max_mz_rank = maxquant_result_ref_with_im_index_sortmz.mz_rank.max()
+#     z = zarr.open(
+#         zarr_path,
+#         mode="a",
+#         shape=(
+#             len(ms1scans.index.values)
+#             + 1,  # this index is rank, starting from 1, add 1 for the last frame
+#             len(mobility_values) if mobility_values is not None else 1,
+#             max_mz_rank
+#             + 1,  # this index is rank, starting from 1, add 1 for the last frame
+#         ),
+#         chunks=zarr_chunks,
+#         dtype=np.float32,
+#         compressor=zarr.Blosc(cname="zstd", clevel=5, shuffle=2),
+#     )
+#     writer = RTChunkWriter(z)
+#     for scan_idx in tqdm.tqdm(
+#         batch_scan_idx, desc="Processing frames in batch", total=len(batch_scan_idx)
+#     ):
+#         Logger.debug("Start processing frame index %s", scan_idx)
+#         if use_ims:
+#             assert mobility_values is not None
+#             one_frame_results = process_one_frame_ims(  # type: ignore[assignment]
+#                 data=data,
+#                 ms1scans=ms1scans,
+#                 ms1_frame_idx=scan_idx,
+#                 maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
+#                 mobility_values=mobility_values,
+#                 delta_mobility_thres=delta_mobility_thres,
+#                 extract_im_peak=extract_im_peak,
+#                 debug=False,
+#                 return_res_coo_dict=return_res_coo_dict,
+#                 writer=writer,
+#                 # zarr_path=zarr_path,
+#                 # zarr_chunks=zarr_chunks,
+#                 # zarr_shape=(
+#                 #     len(ms1scans.index.values)
+#                 #     + 1,  # this index is rank, starting from 1, add 1 for the last frame
+#                 #     len(mobility_values),
+#                 #     max_mz_rank
+#                 #     + 1,  # this index is rank, starting from 1, add 1 for the last frame
+#                 # ),
+#                 **process_frame_kwargs,
+#             )
 
-        else:
-            # TODO: fixme
-            peaks_df, frame_im_pept_act_coo = process_one_frame(  # type: ignore[assignment]
-                ms1scans=ms1scans,
-                ms1_frame_idx=scan_idx,
-                maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
-                debug=False,
-                **process_frame_kwargs,
-            )
+#         else:
+#             # TODO: fixme
+#             peaks_df, frame_im_pept_act_coo = process_one_frame(  # type: ignore[assignment]
+#                 ms1scans=ms1scans,
+#                 ms1_frame_idx=scan_idx,
+#                 maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
+#                 debug=False,
+#                 **process_frame_kwargs,
+#             )
 
-            for key in batch_rt_pept_act_coo_dict.keys():
-                batch_rt_pept_act_coo_dict[key].extend(frame_im_pept_act_coo[key])
-    writer.flush()
+#             for key in batch_rt_pept_act_coo_dict.keys():
+#                 batch_rt_pept_act_coo_dict[key].extend(frame_im_pept_act_coo[key])
+#     writer.flush()
 
 
 def _match_candidate_mz_and_binned_frame_mz_by_ppm(
