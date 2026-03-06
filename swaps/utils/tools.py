@@ -11,7 +11,7 @@ import pandas as pd
 from Bio.SeqIO.FastaIO import SimpleFastaParser
 from scipy.sparse import csr_matrix
 from scipy.signal import find_peaks, peak_widths
-from scipy.spatial import cKDTree
+from scipy.spatial import cKDTree  # type: ignore
 
 Logger = logging.getLogger(__name__)
 

@@ -138,6 +138,7 @@ def process_pept_run(
     smooth_kwargs=None,
     peak_kwargs=None,
     align_kwargs=None,
+    visualize_dir: str | None = None,
 ):
     pept_act, rt_center, im_center = get_pept_act_from_parquet(
         act_df.loc[act_df["mz_rank"] == pept_idx], pept_idx, dict_ref, run_name
@@ -162,6 +163,8 @@ def process_pept_run(
                 pept_act,
                 anchor=(rt_center, im_center),
                 patch_size=min(pept_act.shape),
+                visualize_dir=visualize_dir,
+                visualize_filename=f"mz{pept_idx}_{run_name}_reference.png",
             )
             if prop_a is not None:
                 prop_a["Run_name"] = run_name
@@ -179,6 +182,8 @@ def process_pept_run(
                 pept_act,
                 anchor=(rt_center, im_center),
                 patch_size=min(pept_act.shape),
+                visualize_dir=visualize_dir,
+                visualize_filename=f"mz{pept_idx}_{run_name}_quant_only.png",
             )[1]
             if prop_a is not None:
                 prop_a["Run_name"] = run_name
@@ -212,6 +217,8 @@ def process_pept_run(
                 smooth_kwargs=smooth_kwargs,
                 peak_kwargs=peak_kwargs,
                 align_kwargs=align_kwargs,
+                visualize_dir=visualize_dir,
+                visualize_filename=f"mz{pept_idx}_{run_name}_match_target.png",
             )
 
             # Decoy quantification
@@ -223,6 +230,8 @@ def process_pept_run(
                 smooth_kwargs=smooth_kwargs,
                 peak_kwargs=peak_kwargs,
                 align_kwargs=align_kwargs,
+                visualize_dir=visualize_dir,
+                visualize_filename=f"mz{pept_idx}_decoy{decoy_pept_idx}_{run_name}_match_decoy.png",
             )
             # 5. Process Matches
             if prop_ref is not None and prop_t is not None:
@@ -254,6 +263,7 @@ def match_features_batch(
     smooth_kwargs: dict | None = None,
     peak_kwargs: dict | None = None,
     align_kwargs: dict | None = None,
+    visualize_dir: str | None = None,
 ):
     results_target, results_decoy = [], []
     pp_reference_list, pp_match_target_list = [], []
@@ -265,7 +275,6 @@ def match_features_batch(
     for raw_file in raw_file_list:
         parquet_path = os.path.join(result_dir, raw_file, "activation", "*.parquet")
         act_dfs[raw_file] = load_peptide_batch_df_from_partquet(parquet_path, batch)
-
     for pept_idx in batch:
         # Extract the single row as a Series to make index filtering easier
         row_series = dict_ref.loc[dict_ref["mz_rank"] == pept_idx, :].iloc[0]
@@ -292,7 +301,7 @@ def match_features_batch(
         #     f"Raw files for reference, quant_only, match for mz_rank {pept_idx}: {reference_raw_file}, {quant_only_raw_file}, {match_raw_file}"
         # )
         # Get reference
-        smooth_a, prop_a, rt_center, im_center = process_pept_run(
+        smooth_a, prop_a, rt_center, im_center = process_pept_run(  # type: ignore
             act_dfs[reference_raw_file].loc[
                 act_dfs[reference_raw_file]["mz_rank"] == pept_idx
             ],
@@ -300,7 +309,8 @@ def match_features_batch(
             dict_ref,
             run_name=reference_raw_file,
             case="Reference",
-        )
+            visualize_dir=visualize_dir,
+        )  # type: ignore
         if prop_a is not None:
             pp_reference_list.append(prop_a)
         else:
@@ -315,7 +325,7 @@ def match_features_batch(
         # Quant only
         if len(quant_only_raw_file) > 0:
             for raw_file in quant_only_raw_file:
-                prop_a = process_pept_run(
+                prop_a = process_pept_run(  # type: ignore
                     act_dfs[raw_file].loc[act_dfs[raw_file]["mz_rank"] == pept_idx],
                     pept_idx,
                     dict_ref,
@@ -324,6 +334,7 @@ def match_features_batch(
                     smooth_kwargs=smooth_kwargs,
                     peak_kwargs=peak_kwargs,
                     align_kwargs=align_kwargs,
+                    visualize_dir=visualize_dir,
                 )
                 if prop_a is not None:
                     pp_quant_only_list.append(prop_a)
@@ -358,6 +369,7 @@ def match_features_batch(
                     smooth_kwargs=smooth_kwargs,
                     peak_kwargs=peak_kwargs,
                     align_kwargs=align_kwargs,
+                    visualize_dir=visualize_dir,
                 )
                 if prop_t is not None:
                     pp_match_target_list.append(prop_t)
@@ -413,6 +425,75 @@ def match_features_batch(
     )
 
 
+def _visualize_quantify_from_coords(
+    reference_image,
+    pept_act_image,
+    pept_act_image_smoothed,
+    pept_act_image_aligned,
+    pept_act_image_smoothed_aligned,
+    anchor,
+    save_dir: str,
+    filename: str = "quantify_from_coords.png",
+    labels: np.ndarray | None = None,
+):
+    # labels apply to the aligned panels (watershed ran on smoothed_aligned)
+    images = [
+        (reference_image, "reference_image", None),
+        (pept_act_image, "pept_act_image", None),
+        (pept_act_image_smoothed, "pept_act_image_smoothed", None),
+        (pept_act_image_aligned, "pept_act_image_aligned", labels),
+        (pept_act_image_smoothed_aligned, "pept_act_image_smoothed_aligned", labels),
+    ]
+    n_cols = 6 if labels is not None else 5
+    fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 5))
+    for ax, (img, title, lbl) in zip(axes, images):
+        ax.set_title(title, fontsize=9)
+        if img is None:
+            ax.set_facecolor("#f0f0f0")
+            ax.text(
+                0.5,
+                0.5,
+                "N/A",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+                fontsize=12,
+                color="gray",
+            )
+            ax.set_xticks([])
+            ax.set_yticks([])
+        else:
+            ax.imshow(img, aspect="auto", origin="lower")
+            ax.plot(anchor[0][1], anchor[0][0], "r+", markersize=10, markeredgewidth=2)
+            if lbl is not None:
+                masked_labels = np.ma.masked_where(lbl == 0, lbl)
+                ax.imshow(
+                    masked_labels,
+                    aspect="auto",
+                    origin="lower",
+                    alpha=0.35,
+                    cmap="tab10",
+                    interpolation="nearest",
+                )
+    if labels is not None:
+        ax_lbl = axes[-1]
+        ax_lbl.set_title("watershed_labels", fontsize=9)
+        masked_labels = np.ma.masked_where(labels == 0, labels)
+        ax_lbl.imshow(np.zeros_like(labels), aspect="auto", origin="lower", cmap="gray")
+        ax_lbl.imshow(
+            masked_labels,
+            aspect="auto",
+            origin="lower",
+            cmap="tab10",
+            interpolation="nearest",
+        )
+        ax_lbl.plot(anchor[0][1], anchor[0][0], "r+", markersize=10, markeredgewidth=2)
+    fig.tight_layout()
+    os.makedirs(save_dir, exist_ok=True)
+    fig.savefig(os.path.join(save_dir, filename), dpi=150, bbox_inches="tight")
+    plt.close(fig)
+
+
 def quantify_from_coords(
     pept_act_image,
     anchor,
@@ -421,6 +502,8 @@ def quantify_from_coords(
     peak_kwargs: dict | None = None,
     align_kwargs: dict | None = None,
     patch_size: int | None = None,
+    visualize_dir: str | None = None,
+    visualize_filename: str = "quantify_from_coords.png",
 ):
     assert (
         anchor[0] < pept_act_image.shape[0] and anchor[1] < pept_act_image.shape[1]
@@ -457,6 +540,18 @@ def quantify_from_coords(
         labels, pept_act_image_aligned, min_peak_sum_intensity=500
     )
     if peak_properties is None:
+        if visualize_dir is not None:
+            _visualize_quantify_from_coords(
+                reference_image,
+                pept_act_image,
+                pept_act_image_smoothed,
+                pept_act_image_aligned,
+                pept_act_image_smoothed_aligned,
+                anchor,
+                save_dir=visualize_dir,
+                filename=visualize_filename,
+                labels=labels,
+            )
         return pept_act_image_smoothed_aligned, None
     else:
         peak_properties["orb_des"] = None
@@ -469,6 +564,18 @@ def quantify_from_coords(
         else:
             peak_properties["shift_rt"] = 0
             peak_properties["shift_im"] = 0
+        if visualize_dir is not None:
+            _visualize_quantify_from_coords(
+                reference_image,
+                pept_act_image,
+                pept_act_image_smoothed,
+                pept_act_image_aligned,
+                pept_act_image_smoothed_aligned,
+                anchor,
+                save_dir=visualize_dir,
+                filename=visualize_filename,
+                labels=labels,
+            )
         return pept_act_image_smoothed_aligned, peak_properties
 
 
@@ -817,7 +924,7 @@ def calc_quant_corr(pp_quant_only, pp_reference, pp_match_target, quant_dir):
 
 
 def plot_match_type_from_combined(
-    df, colors=None, labels=None, stack_order=None, fig_dir=None
+    df, colors=None, labels=None, stack_order=None, fig_dir=None, fig_name_suffix=""
 ):
     if colors is None:
         colors = {
@@ -871,7 +978,7 @@ def plot_match_type_from_combined(
     plt.tight_layout()
     if fig_dir is not None:
         plt.savefig(
-            os.path.join(fig_dir, "match_type_counts.png"),
+            os.path.join(fig_dir, f"match_type_counts{fig_name_suffix}.png"),
             dpi=300,
             bbox_inches="tight",
         )
