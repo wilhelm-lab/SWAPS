@@ -701,8 +701,8 @@ def align_images(reference_image, aligned_image, mask_threshold=25, upsample_fac
     mask1 = reference_image > np.percentile(reference_image, mask_threshold)
     mask2 = aligned_image > np.percentile(aligned_image, mask_threshold)
     shift, _, phasediff = phase_cross_correlation(
-        reference_image,
-        aligned_image,
+        mask1,
+        mask2,
         reference_mask=mask1,
         moving_mask=mask2,
         upsample_factor=upsample_factor,

@@ -573,6 +573,7 @@ def detect_2d_peak_with_watershed(
     min_distance=5,
     threshold_rel=0.2,
     coordinates: Optional[np.ndarray] = None,
+    seed_radius: int = 4,
 ):
     """
     Detect peaks in a 2D image using the watershed algorithm.
@@ -619,6 +620,9 @@ def detect_2d_peak_with_watershed(
     mask = np.zeros(image.shape, dtype=bool)
     mask[tuple(coordinates.T)] = True
     markers, _ = ndi.label(mask)  # type: ignore
+    if seed_radius > 0:
+        dist, (ri, ci) = ndi.distance_transform_edt(~mask, return_indices=True)  # type: ignore
+        markers = np.where(dist <= seed_radius, markers[ri, ci], 0)
     # 4. Watershed on *negative distance*
     labels = watershed(-image, markers, mask=mask_signal, compactness=20)  # type: ignore
 
