@@ -315,7 +315,7 @@ def opt_scan_by_scan(config_path: str):
         pp_match_target_filtered,
         quant_dir,
     )
-    plot_match_type_from_combined(df=pp_all, fig_dir=quant_dir)
+    plot_match_type_from_combined(df=pivot, fig_dir=quant_dir)
 
 
 def main():
