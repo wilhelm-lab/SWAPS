@@ -12,6 +12,7 @@ from scipy import ndimage as ndi
 from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
 from skimage.measure import regionprops_table
+from skimage.filters import sobel
 from scipy.ndimage import gaussian_filter1d, uniform_filter, gaussian_filter
 from skimage.morphology import h_minima, remove_small_objects
 import alphatims.bruker
@@ -570,10 +571,12 @@ def _sum_3d_act_filter_by_im_fast(
 def detect_2d_peak_with_watershed(
     image,
     int_threshold=0.5,
-    min_distance=5,
+    min_distance=15,
     threshold_rel=0.2,
     coordinates: Optional[np.ndarray] = None,
     seed_radius: int = 4,
+    use_competing_peaks: bool = True,  # new: enable/disable the feature
+    min_distance_to_true_seed: int = 20,  # new: minimum distance from competing peaks to the true seed
 ):
     """
     Detect peaks in a 2D image using the watershed algorithm.
@@ -593,9 +596,8 @@ def detect_2d_peak_with_watershed(
     """
     # 2. Compute distance (to background) transform inside signal
     distance = image
-
-    # 1. Create mask of signal regions
     mask_signal = distance > int_threshold
+
     if not mask_signal.any():
         distance[~mask_signal] = 0
         return (
@@ -603,28 +605,56 @@ def detect_2d_peak_with_watershed(
             np.zeros_like(distance, dtype=int),
             np.zeros_like(distance, dtype=float),
         )
+
     if coordinates is None:
-        # 3. Find local maxima in distance map
+        # --- original behavior unchanged ---
         coordinates = peak_local_max(
             distance,
             min_distance=min_distance,
             threshold_rel=threshold_rel,
             labels=mask_signal,
         )
+
     if coordinates.size == 0:
         return (
             coordinates,
             np.zeros_like(image, dtype=int),
             np.zeros_like(image, dtype=float),
         )
+
     mask = np.zeros(image.shape, dtype=bool)
     mask[tuple(coordinates.T)] = True
-    markers, _ = ndi.label(mask)  # type: ignore
+
+    # --- new: inject competing background seeds when true seed is provided ---
+    if use_competing_peaks and coordinates.shape[0] == 1:
+        gradient = sobel(image)
+
+        bg_peaks = peak_local_max(
+            gradient,
+            min_distance=min_distance,
+            threshold_rel=threshold_rel,
+        )
+
+        true_seed = coordinates[0]  # shape (2,)
+        for bg_peak in bg_peaks:
+            dist = np.linalg.norm(bg_peak - true_seed)
+            if dist >= min_distance_to_true_seed:
+                mask[tuple(bg_peak)] = True
+    # -------------------------------------------------------------------------
+
+    markers, _ = ndi.label(mask)
+
     if seed_radius > 0:
-        dist, (ri, ci) = ndi.distance_transform_edt(~mask, return_indices=True)  # type: ignore
+        dist, (ri, ci) = ndi.distance_transform_edt(~mask, return_indices=True)
         markers = np.where(dist <= seed_radius, markers[ri, ci], 0)
-    # 4. Watershed on *negative distance*
-    labels = watershed(-image, markers, mask=mask_signal, compactness=20)  # type: ignore
+
+    labels = watershed(-image, markers, mask=mask_signal, compactness=0.001)
+
+    # --- new: when competing peaks were used, only return true seed's region ---
+    if use_competing_peaks and coordinates.shape[0] == 1:
+        true_marker = markers[tuple(coordinates[0])]
+        labels = np.where(labels == true_marker, true_marker, 0)
+    # --------------------------------------------------------------------------
 
     return coordinates, labels, image
 

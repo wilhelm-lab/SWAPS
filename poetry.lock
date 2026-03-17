@@ -2281,6 +2281,64 @@ html5 = ["html5lib"]
 htmlsoup = ["BeautifulSoup4"]
 
 [[package]]
+name = "mahotas"
+version = "1.4.18"
+description = "Mahotas: Computer Vision Library"
+optional = false
+python-versions = "*"
+groups = ["main"]
+files = [
+    {file = "mahotas-1.4.18-cp310-cp310-macosx_10_9_x86_64.whl", hash = "sha256:0238a4665d55f936c6dfb26293e7348482cf9c71bd1caec3a896bfb988b6623b"},
+    {file = "mahotas-1.4.18-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:a33ef7e8bd0ff08990d08274a7d7aaaf1143540983de3e036295d6668ce12cb6"},
+    {file = "mahotas-1.4.18-cp310-cp310-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:9f890b79891184a4a6dcc274da847fbf54fe4b8fa8839705af677cdb63536f22"},
+    {file = "mahotas-1.4.18-cp310-cp310-win32.whl", hash = "sha256:e1804359325ebd5a08998c7d3837ea10883a66678007662e4c849013f7d084ea"},
+    {file = "mahotas-1.4.18-cp310-cp310-win_amd64.whl", hash = "sha256:43a605408b2e9fd77f4adb0ff301bc5c096979cab06da32788fc18c3b06378db"},
+    {file = "mahotas-1.4.18-cp311-cp311-macosx_10_9_x86_64.whl", hash = "sha256:974050ee67913ac2396b4889247577f7202038dc328b50a07f83887c56ca9774"},
+    {file = "mahotas-1.4.18-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:28c93bdfefd4cf271bf2b30b69c130ab3cac5d840dcd3b5ae6e7f6d3648533aa"},
+    {file = "mahotas-1.4.18-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:8f4a41dd3b49bc2e5240b265b9ab35a6793c20ddcb3b392f3ba27a0940086de6"},
+    {file = "mahotas-1.4.18-cp311-cp311-win32.whl", hash = "sha256:a4e70ead2a2bf6e8ad9a70f9c33fe0e752edeeea1fc5e8e934efcf29d90d69f2"},
+    {file = "mahotas-1.4.18-cp311-cp311-win_amd64.whl", hash = "sha256:7a9a7b2a9e3e9d9818a901232fc68a2f7bef31483150ac39acb7d56f86e0754c"},
+    {file = "mahotas-1.4.18-cp312-cp312-macosx_10_9_x86_64.whl", hash = "sha256:5314778e8154fb69ddb299e07c48d1998eb3e9567724e93d5018940854975204"},
+    {file = "mahotas-1.4.18-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:fe05bf5ee3498cd9411adf7c9fb8e6278194a04a1491c1a6d807658d4af36bb4"},
+    {file = "mahotas-1.4.18-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:17b6a5420fd71227cd3e875e42a01818b3d94cacb075f93afed36fab63390b75"},
+    {file = "mahotas-1.4.18-cp312-cp312-win32.whl", hash = "sha256:839787784f916c4f03a43e92bb22184920213e5ece0fa0c826f5bdf92eaaff4b"},
+    {file = "mahotas-1.4.18-cp312-cp312-win_amd64.whl", hash = "sha256:579e6f48549b06eb32cfa9501e320194a9d8a97fe35a7832b6b1f3fa104cfb16"},
+    {file = "mahotas-1.4.18-cp36-cp36m-macosx_10_9_x86_64.whl", hash = "sha256:a5a268e7cf950acb95949a5351c7c9c7752866611acc1e8ddad232ef659d4934"},
+    {file = "mahotas-1.4.18-cp36-cp36m-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:85f327e13e9445cf65000429b7ae82c2f1700a3d3031686e17a3f392eb0dfac7"},
+    {file = "mahotas-1.4.18-cp36-cp36m-win32.whl", hash = "sha256:0df6d5d63039764dd32d3e5e172ec7e9490ac81af9a5b8965ad58752451061aa"},
+    {file = "mahotas-1.4.18-cp36-cp36m-win_amd64.whl", hash = "sha256:a419b07e56e4a33a56880e68bddfdd7f1c8b87721b8f2e20058e771cfc9be65e"},
+    {file = "mahotas-1.4.18-cp37-cp37m-macosx_10_9_x86_64.whl", hash = "sha256:682eb0d3df01f0b18e5287f3a6b9c3787ee0e3d0fdad3d4952e6d865ffb13684"},
+    {file = "mahotas-1.4.18-cp37-cp37m-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:12762f32fb2bf34f072ee410e533c60d0301ca9a507eec5fe039cac6d1ff3273"},
+    {file = "mahotas-1.4.18-cp37-cp37m-win32.whl", hash = "sha256:20e3398eae2af20b6e64ee48865b2811e670346091fc2e8080f40ed190222c3a"},
+    {file = "mahotas-1.4.18-cp37-cp37m-win_amd64.whl", hash = "sha256:1b7dc6d5f435fdff39b6baafdbb2a953907c6c5c1137ceb60f7fe1032f32e012"},
+    {file = "mahotas-1.4.18-cp38-cp38-macosx_10_9_x86_64.whl", hash = "sha256:f6b20d22bb2a30e2ffc599e8f1009c060045e0acf0642378528fc65c908ac730"},
+    {file = "mahotas-1.4.18-cp38-cp38-macosx_11_0_arm64.whl", hash = "sha256:8b3963b320bf7b771f4ac18473be2791ff2f4a249c3aac774f0ae8fe87beb260"},
+    {file = "mahotas-1.4.18-cp38-cp38-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:2c47def3e69ea667a40ba1ad9352b5c0ac8ac8b12d9996d8e8c34d6ed2f98555"},
+    {file = "mahotas-1.4.18-cp38-cp38-win32.whl", hash = "sha256:35a33c165ad6afabddd839eee252ab8fe6f6e5e276c70449048034c218c91e01"},
+    {file = "mahotas-1.4.18-cp38-cp38-win_amd64.whl", hash = "sha256:b5325a1774cf9d1d45d0492339ca8df34ee61d42d41ee12b988b6de41ef48338"},
+    {file = "mahotas-1.4.18-cp39-cp39-macosx_10_9_x86_64.whl", hash = "sha256:94efd28e96cb47891b168f06513b329140deca175f3dee6a68b60af239b02d64"},
+    {file = "mahotas-1.4.18-cp39-cp39-macosx_11_0_arm64.whl", hash = "sha256:c3ab43c6ee731ed71c2a0defd3f5bc619ad151fa72792cd1d0af4258e59b3f55"},
+    {file = "mahotas-1.4.18-cp39-cp39-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:6a7fcce88073fc540495bb9db71af675da227562a6cb485e31c5c1ecf2cab8c6"},
+    {file = "mahotas-1.4.18-cp39-cp39-win32.whl", hash = "sha256:31a3bb0d899b611aeed101ff3718ac55df764f6562528d457bd3c18f765bbb04"},
+    {file = "mahotas-1.4.18-cp39-cp39-win_amd64.whl", hash = "sha256:bd35f2e7f70da27e27c995821203c1fadccf4d0a2600383aad7a97ba014559a5"},
+    {file = "mahotas-1.4.18-pp38-pypy38_pp73-macosx_10_9_x86_64.whl", hash = "sha256:29880589cf567468af5b186581736609f8916656d37806dc03f5a1be57766d08"},
+    {file = "mahotas-1.4.18-pp38-pypy38_pp73-macosx_11_0_arm64.whl", hash = "sha256:e341bad751bf21ceb6366b54bcdd8c2e011359d4176429f91dc9c3ed4ad3e71e"},
+    {file = "mahotas-1.4.18-pp38-pypy38_pp73-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:8b5ab55982dcbe6664c090ca1b58ac8820735d6e166ee81b380f2eec2307ce08"},
+    {file = "mahotas-1.4.18-pp38-pypy38_pp73-win_amd64.whl", hash = "sha256:c260450a28eed8abfcf861dd8752151ab7a9bfaeedd93be50f5a1b79ba82a1f0"},
+    {file = "mahotas-1.4.18-pp39-pypy39_pp73-macosx_10_15_x86_64.whl", hash = "sha256:16aaa64cfb09782212ecb1072c5367f5d8d4c8494dd9bae1d4af7243ebebd07e"},
+    {file = "mahotas-1.4.18-pp39-pypy39_pp73-macosx_11_0_arm64.whl", hash = "sha256:72a98e4b22238e3cc5598b07ee8f4955f4d8cd4c3cb40388cfef96968079f813"},
+    {file = "mahotas-1.4.18-pp39-pypy39_pp73-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:ccd7d857ad59ee33f2359c8dab56b5d93d8476b7228f3cc00465f6d804c14015"},
+    {file = "mahotas-1.4.18-pp39-pypy39_pp73-win_amd64.whl", hash = "sha256:bb9e75ee04420dacd06129039d6618dfec19604ba8bef6aba596f54a19f9a91e"},
+    {file = "mahotas-1.4.18.tar.gz", hash = "sha256:e6bd2eea4143a24f381b30c64078503cd8ffa20ca493e39ffa29f9d024d9cf8b"},
+]
+
+[package.dependencies]
+numpy = "*"
+
+[package.extras]
+tests = ["coveralls", "matplotlib", "pillow", "pip", "pytest (<=8.1.1)", "scipy"]
+
+[[package]]
 name = "markdown"
 version = "3.9"
 description = "Python implementation of John Gruber's Markdown."
@@ -5979,4 +6037,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "5b5979016c00b12e756e974d63024fb8ef6d5e583d68e3d88ad38fb7857265f8"
+content-hash = "fc4abbe336eef10ff10b6371eb5d6ac354fa544fd7d39c800a4795bc289d5bd0"

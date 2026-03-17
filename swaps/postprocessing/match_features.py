@@ -1,6 +1,7 @@
 import logging
 import os
 from typing import Tuple, Literal, Optional
+from mahotas import zernike
 import numpy as np
 import pandas as pd
 import tqdm
@@ -8,9 +9,12 @@ from scipy.ndimage import gaussian_filter, distance_transform_edt, uniform_filte
 from skimage.registration import phase_cross_correlation
 from skimage.morphology import remove_small_objects
 from skimage.metrics import structural_similarity as ssim
+from skimage.feature import match_template
 from scipy.ndimage import shift as ndi_shift
 import cv2
 from concurrent.futures import ProcessPoolExecutor
+from mahotas.features import zernike_moments
+from scipy.spatial.distance import cosine
 from swaps.utils.ims_utils import (
     detect_2d_peak_with_watershed,
     calculate_peak_property_from_labels_and_image,
@@ -169,7 +173,23 @@ def process_pept_run(
             if prop_a is not None:
                 prop_a["Run_name"] = run_name
                 prop_a["mz_rank"] = pept_idx
-            return smooth_a, prop_a, rt_center, im_center
+                # Logger.info("Prop_a columns: %s", prop_a.columns)
+            return (
+                smooth_a,
+                prop_a,
+                rt_center,
+                im_center,
+                # (
+                #     prop_a["centroid-0"].iloc[0].astype(int)
+                #     if prop_a is not None
+                #     else rt_center
+                # ),
+                # (
+                #     prop_a["centroid-1"].iloc[0].astype(int)
+                #     if prop_a is not None
+                #     else im_center
+                # ),
+            )
         case "Quant_Only":
             # Boundary Check
             if rt_center >= pept_act.shape[0] or im_center >= pept_act.shape[1]:
@@ -213,6 +233,7 @@ def process_pept_run(
                 pept_act,
                 anchor=(rt_ref, im_ref),
                 reference_image=smooth_ref,
+                propA=prop_ref,
                 patch_size=min(pept_act.shape),
                 smooth_kwargs=smooth_kwargs,
                 peak_kwargs=peak_kwargs,
@@ -226,6 +247,7 @@ def process_pept_run(
                 pept_act_decoy,
                 anchor=(rt_ref, im_ref),
                 reference_image=smooth_ref,
+                propA=prop_ref,
                 patch_size=min(pept_act.shape),
                 smooth_kwargs=smooth_kwargs,
                 peak_kwargs=peak_kwargs,
@@ -431,8 +453,10 @@ def _visualize_quantify_from_coords(
     pept_act_image_smoothed,
     pept_act_image_aligned,
     pept_act_image_smoothed_aligned,
-    anchor,
+    bbox_center,
     save_dir: str,
+    msms_pos: Optional[Tuple[int, int]] = None,
+    template_box: Optional[Tuple[int, int, int, int]] = None,
     filename: str = "quantify_from_coords.png",
     labels: np.ndarray | None = None,
 ):
@@ -464,7 +488,13 @@ def _visualize_quantify_from_coords(
             ax.set_yticks([])
         else:
             ax.imshow(img, aspect="auto", origin="lower")
-            ax.plot(anchor[0][1], anchor[0][0], "r+", markersize=10, markeredgewidth=2)
+            ax.plot(
+                bbox_center[0][1],
+                bbox_center[0][0],
+                "r+",
+                markersize=10,
+                markeredgewidth=2,
+            )
             if lbl is not None:
                 masked_labels = np.ma.masked_where(lbl == 0, lbl)
                 ax.imshow(
@@ -487,7 +517,29 @@ def _visualize_quantify_from_coords(
             cmap="tab10",
             interpolation="nearest",
         )
-        ax_lbl.plot(anchor[0][1], anchor[0][0], "r+", markersize=10, markeredgewidth=2)
+        ax_lbl.plot(
+            bbox_center[0][1], bbox_center[0][0], "r+", markersize=10, markeredgewidth=2
+        )
+    if template_box is not None:
+        axes[0].add_patch(
+            plt.Rectangle(
+                (template_box[1], template_box[0]),
+                template_box[3] - template_box[1],
+                template_box[2] - template_box[0],
+                fill=False,
+                edgecolor="red",
+                linewidth=2,
+            )
+        )
+    if msms_pos is not None:
+        axes[0].plot(
+            msms_pos[1],
+            msms_pos[0],
+            "*",
+            markersize=10,
+            markeredgewidth=2,
+            color="white",
+        )  # white * for MS/MS position
     fig.tight_layout()
     os.makedirs(save_dir, exist_ok=True)
     fig.savefig(os.path.join(save_dir, filename), dpi=150, bbox_inches="tight")
@@ -497,7 +549,12 @@ def _visualize_quantify_from_coords(
 def quantify_from_coords(
     pept_act_image,
     anchor,
-    reference_image: np.ndarray | None = None,
+    reference_image: (
+        np.ndarray | None
+    ) = None,  # should be a "template" (cropped) when using template matching
+    propA: (
+        pd.DataFrame | None
+    ) = None,  # only used for template matching to calculate shift
     smooth_kwargs: dict | None = None,
     peak_kwargs: dict | None = None,
     align_kwargs: dict | None = None,
@@ -520,22 +577,57 @@ def quantify_from_coords(
         peak_kwargs["min_distance"] = 10
 
     pept_act_image_smoothed = smooth_and_denoise_image(pept_act_image, **smooth_kwargs)
-
-    if reference_image is not None:
-        pept_act_image_smoothed_aligned, shift, phasediff = align_images(
-            aligned_image=pept_act_image_smoothed,
-            reference_image=reference_image,
-            **align_kwargs,
+    pept_act_image_smoothed_aligned = pept_act_image_smoothed
+    if reference_image is not None and propA is not None:
+        template = reference_image[
+            propA["bbox-0"]
+            .values[0]
+            .astype(int) : propA["bbox-2"]
+            .values[0]
+            .astype(int)
+            - 1,
+            propA["bbox-1"]
+            .values[0]
+            .astype(int) : propA["bbox-3"]
+            .values[0]
+            .astype(int)
+            - 1,
+        ]
+        template_match_result = match_template(pept_act_image_smoothed, template)
+        ij = np.unravel_index(
+            np.argmax(template_match_result), template_match_result.shape
         )
-        pept_act_image_aligned = ndi_shift(pept_act_image, shift)
-    else:
-        pept_act_image_smoothed_aligned = pept_act_image_smoothed
+        box_im_topleft, box_rt_topleft = ij[::-1]
+        shift = (
+            box_rt_topleft - propA["bbox-0"].values[0],
+            box_im_topleft - propA["bbox-1"].values[0],
+        )
+        h_template, w_template = template.shape
+        bbox_mask = np.zeros(pept_act_image_smoothed.shape, dtype=int)
+        bbox_mask[
+            box_rt_topleft : box_rt_topleft + h_template,
+            box_im_topleft : box_im_topleft + w_template,
+        ] = 1
+        labels = ((pept_act_image_smoothed != 0) & bbox_mask.astype(bool)).astype(int)
         pept_act_image_aligned = pept_act_image
-    _, labels, _ = detect_2d_peak_with_watershed(
-        pept_act_image_smoothed_aligned,
-        **peak_kwargs,
-        coordinates=anchor,
-    )
+        sift_center = np.array(
+            [(box_rt_topleft + h_template // 2, box_im_topleft + w_template // 2)]
+        )
+        cropped_roi = pept_act_image_smoothed_aligned[
+            box_rt_topleft : box_rt_topleft + h_template,
+            box_im_topleft : box_im_topleft + w_template,
+        ]
+        template_matching_score_max = np.max(template_match_result)
+    else:
+        pept_act_image_aligned = pept_act_image
+        _, labels, _ = detect_2d_peak_with_watershed(
+            pept_act_image_smoothed_aligned,
+            **peak_kwargs,
+            coordinates=anchor,
+        )
+        sift_center = None
+        cropped_roi = None
+        template_matching_score_max = np.nan
     peak_properties = calculate_peak_property_from_labels_and_image(
         labels, pept_act_image_aligned, min_peak_sum_intensity=500
     )
@@ -547,17 +639,53 @@ def quantify_from_coords(
                 pept_act_image_smoothed,
                 pept_act_image_aligned,
                 pept_act_image_smoothed_aligned,
-                anchor,
+                sift_center,
                 save_dir=visualize_dir,
+                msms_pos=anchor[0],
                 filename=visualize_filename,
                 labels=labels,
+                template_box=(
+                    (
+                        propA["bbox-0"].values[0].astype(int),
+                        propA["bbox-1"].values[0].astype(int),
+                        propA["bbox-2"].values[0].astype(int),
+                        propA["bbox-3"].values[0].astype(int),
+                    )
+                    if propA is not None
+                    else None
+                ),
             )
         return pept_act_image_smoothed_aligned, None
     else:
-        peak_properties["orb_des"] = None
-        peak_properties.at[0, "orb_des"] = get_sift_descriptor(
-            pept_act_image_aligned, anchor[0], patch_size=patch_size
+        if sift_center is None:
+            sift_center = np.array(
+                [(peak_properties[["centroid-0", "centroid-1"]].values[0].astype(int))]
+            )
+        if cropped_roi is None:
+            cropped_roi = pept_act_image_smoothed_aligned[
+                peak_properties["bbox-0"]
+                .values[0]
+                .astype(int) : peak_properties["bbox-2"]
+                .values[0]
+                .astype(int),
+                peak_properties["bbox-1"]
+                .values[0]
+                .astype(int) : peak_properties["bbox-3"]
+                .values[0]
+                .astype(int),
+            ]
+        # Logger.info("Sift center is at: %s", sift_center)
+        peak_properties["sift_des"] = None
+        peak_properties.at[0, "sift_des"] = get_sift_descriptor(
+            np.log1p(pept_act_image_aligned), sift_center[0], patch_size=patch_size
         )
+        hu, zernike = get_roi_descriptor(
+            cropped_roi,
+        )
+        peak_properties["hu"] = None
+        peak_properties["zernike"] = None
+        peak_properties.at[0, "hu"] = hu
+        peak_properties.at[0, "zernike"] = zernike
         if reference_image is not None:
             peak_properties["shift_rt"] = shift[0]
             peak_properties["shift_im"] = shift[1]
@@ -571,19 +699,53 @@ def quantify_from_coords(
                 pept_act_image_smoothed,
                 pept_act_image_aligned,
                 pept_act_image_smoothed_aligned,
-                anchor,
+                sift_center,
+                msms_pos=anchor[0],
                 save_dir=visualize_dir,
                 filename=visualize_filename,
                 labels=labels,
+                template_box=(
+                    (
+                        propA["bbox-0"].values[0].astype(int),
+                        propA["bbox-1"].values[0].astype(int),
+                        propA["bbox-2"].values[0].astype(int),
+                        propA["bbox-3"].values[0].astype(int),
+                    )
+                    if propA is not None
+                    else None
+                ),
             )
+        peak_properties["template_matching_score"] = template_matching_score_max
+
         return pept_act_image_smoothed_aligned, peak_properties
 
 
 def compare_peak_properties(peak_properties_a, peak_properties_b):
     return {
-        "orb_similarity": compare_sift_descriptors(
-            peak_properties_a["orb_des"].values[0],
-            peak_properties_b["orb_des"].values[0],
+        "template_matching_score": peak_properties_b["template_matching_score"].values[
+            0
+        ],
+        "sift_similarities": compare_sift_descriptors(
+            peak_properties_a["sift_des"].values[0],
+            peak_properties_b["sift_des"].values[0],
+        ),
+        "hu_similarities": compare_image_descriptors_cosine(
+            peak_properties_a["hu"].values[0], peak_properties_b["hu"].values[0]
+        ),
+        "zernike_similarities": compare_image_descriptors_cosine(
+            peak_properties_a["zernike"].values[0],
+            peak_properties_b["zernike"].values[0],
+        ),
+        "sift_distance": compare_image_descriptors_euclidean(
+            peak_properties_a["sift_des"].values[0],
+            peak_properties_b["sift_des"].values[0],
+        ),
+        "hu_distance": compare_image_descriptors_euclidean(
+            peak_properties_a["hu"].values[0], peak_properties_b["hu"].values[0]
+        ),
+        "zernike_distance": compare_image_descriptors_euclidean(
+            peak_properties_a["zernike"].values[0],
+            peak_properties_b["zernike"].values[0],
         ),
         "rt_shift": abs(
             peak_properties_a["shift_rt"].values[0]
@@ -683,7 +845,7 @@ def smooth_and_denoise_image(
     return image_smoothed
 
 
-def align_images(reference_image, aligned_image, mask_threshold=25, upsample_factor=10):
+def align_images(reference_image, aligned_image, mask_threshold=25):
     """Align two images using phase cross-correlation and return the aligned image and the calculated shift.
     Parameters
     ----------
@@ -703,9 +865,10 @@ def align_images(reference_image, aligned_image, mask_threshold=25, upsample_fac
     shift, _, phasediff = phase_cross_correlation(
         mask1,
         mask2,
-        reference_mask=mask1,
-        moving_mask=mask2,
-        upsample_factor=upsample_factor,
+        reference_mask=mask1.astype(bool),
+        moving_mask=mask2.astype(bool),
+        upsample_factor=1,
+        normalization=None,
     )
 
     aligned_image_b = ndi_shift(aligned_image, shift)
@@ -819,6 +982,54 @@ def get_sift_descriptor(img, peak_coords, patch_size=31):
     _, des = sift.compute(img_8bit, kp)
 
     return des
+
+
+def get_roi_descriptor(roi, radius=None):
+    roi_norm = (roi - roi.min()) / (roi.max() - roi.min())
+
+    # Hu Moments
+    moments = cv2.moments(roi_norm)
+    hu = cv2.HuMoments(moments).flatten()
+    # Log transform Hu moments (they span huge ranges)
+    hu = -np.sign(hu) * np.log10(np.abs(hu))
+
+    # Zernike Moments
+    roi_uint8 = (roi_norm * 255).astype(np.uint8)
+    radius = radius if radius is not None else max(roi.shape) // 2
+    zernike = zernike_moments(
+        roi_uint8, radius, cm=(roi.shape[1] // 2, roi.shape[0] // 2), degree=8
+    )
+    return hu, zernike
+
+
+def compare_image_descriptors_cosine(des1, des2):
+    if des1 is None or des2 is None:
+        return 0.0
+
+    # SIFT descriptors must be float32 for NORM_L2
+    # This line prevents the "Assertion failed" error
+    d1 = des1.astype(np.float32).flatten()
+    d2 = des2.astype(np.float32).flatten()
+
+    # Option 2: rescale from [-1, 1] to [0, 1] (preserves information)
+    similarity = (1 - cosine(d1, d2) + 1) / 2
+    return similarity
+
+
+def compare_image_descriptors_euclidean(des1, des2):
+    if des1 is None or des2 is None:
+        return 0.0
+
+    # SIFT descriptors must be float32 for NORM_L2
+    # This line prevents the "Assertion failed" error
+    d1 = des1.astype(np.float32).flatten()
+    d2 = des2.astype(np.float32).flatten()
+
+    dist = np.linalg.norm(d1 - d2)
+
+    # # Convert distance to similarity (example using exponential decay)
+    # similarity = np.exp(-dist / 100.0)  # Adjust the denominator as needed
+    return dist
 
 
 def compare_sift_descriptors(des1, des2):
