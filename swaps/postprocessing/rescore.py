@@ -146,7 +146,22 @@ def brew_with_mokapot(
         peptide_info_dataframe,
         **kwargs,
     )
-
+    for col in kwargs.get("feature_cols", []):
+        if col in mokapot_input.columns:
+            for label, group in mokapot_input.groupby("label"):
+                group[col].hist(bins=100, alpha=0.5, label=label)
+            plt.legend()
+            plt.savefig(
+                os.path.join(work_dir, f"feature_{col}_distr.png"),
+                dpi=300,
+                bbox_inches="tight",
+            )
+            plt.close()
+        else:
+            Logger.info(
+                "Feature column %s not found in mokapot input, skipping distribution plot.",
+                col,
+            )
     # mokapot_input['peptide'] = mokapot_input['proteins']
     Logger.info("Mokapot input columns: %s", mokapot_input.columns.tolist())
     # Use a temporary file to write the input .pin
