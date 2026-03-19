@@ -347,7 +347,7 @@ def match_features_batch(
         # Quant only
         if len(quant_only_raw_file) > 0:
             for raw_file in quant_only_raw_file:
-                prop_a = process_pept_run(  # type: ignore
+                prop_q = process_pept_run(  # type: ignore
                     act_dfs[raw_file].loc[act_dfs[raw_file]["mz_rank"] == pept_idx],
                     pept_idx,
                     dict_ref,
@@ -358,8 +358,8 @@ def match_features_batch(
                     align_kwargs=align_kwargs,
                     visualize_dir=visualize_dir,
                 )
-                if prop_a is not None:
-                    pp_quant_only_list.append(prop_a)
+                if prop_q is not None:
+                    pp_quant_only_list.append(prop_q)
                 else:
                     no_quant_log.append(
                         {
