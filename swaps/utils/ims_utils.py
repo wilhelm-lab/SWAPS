@@ -574,9 +574,9 @@ def detect_2d_peak_with_watershed(
     min_distance=15,
     threshold_rel=0.2,
     coordinates: Optional[np.ndarray] = None,
-    seed_radius: int = 4,
+    seed_radius: int = 0,
     use_competing_peaks: bool = True,  # new: enable/disable the feature
-    min_distance_to_true_seed: int = 20,  # new: minimum distance from competing peaks to the true seed
+    # min_distance_to_true_seed: int = 15,  # new: minimum distance from competing peaks to the true seed
 ):
     """
     Detect peaks in a 2D image using the watershed algorithm.
@@ -597,13 +597,15 @@ def detect_2d_peak_with_watershed(
     # 2. Compute distance (to background) transform inside signal
     distance = image
     mask_signal = distance > int_threshold
-
+    snapped_seed = coordinates[0]
     if not mask_signal.any():
         distance[~mask_signal] = 0
         return (
             np.empty((0, 2), dtype=int),
-            np.zeros_like(distance, dtype=int),
-            np.zeros_like(distance, dtype=float),
+            np.zeros_like(image, dtype=int),
+            np.zeros_like(image, dtype=float),
+            np.zeros_like(image, dtype=int),
+            np.empty((0, 2), dtype=int),
         )
 
     if coordinates is None:
@@ -620,6 +622,8 @@ def detect_2d_peak_with_watershed(
             coordinates,
             np.zeros_like(image, dtype=int),
             np.zeros_like(image, dtype=float),
+            np.zeros_like(image, dtype=int),
+            coordinates,
         )
 
     mask = np.zeros(image.shape, dtype=bool)
@@ -627,19 +631,45 @@ def detect_2d_peak_with_watershed(
 
     # --- new: inject competing background seeds when true seed is provided ---
     if use_competing_peaks and coordinates.shape[0] == 1:
-        gradient = sobel(image)
+        # gradient = sobel(image)
 
         bg_peaks = peak_local_max(
-            gradient,
+            image,
             min_distance=min_distance,
             threshold_rel=threshold_rel,
         )
 
-        true_seed = coordinates[0]  # shape (2,)
-        for bg_peak in bg_peaks:
-            dist = np.linalg.norm(bg_peak - true_seed)
-            if dist >= min_distance_to_true_seed:
-                mask[tuple(bg_peak)] = True
+        if len(bg_peaks) > 0:
+            true_seed = coordinates[0]
+
+            # Label connected components in the signal mask
+            connected_components, _ = ndi.label(mask_signal)
+            true_seed_component = connected_components[tuple(true_seed)]
+
+            # Filter peaks to only those in the same connected component
+            same_component_mask = np.array(
+                [
+                    connected_components[tuple(p)] == true_seed_component
+                    for p in bg_peaks
+                ]
+            )
+
+            if same_component_mask.any():
+                same_component_peaks = bg_peaks[same_component_mask]
+                distances = np.linalg.norm(same_component_peaks - true_seed, axis=1)
+                closest_idx = np.argmin(distances)
+                snapped_seed = same_component_peaks[closest_idx]
+            else:
+                # No peak in same component, fall back to true seed
+                snapped_seed = true_seed
+
+            mask[tuple(snapped_seed)] = True  # foreground anchor (snapped)
+
+            for bg_peak in bg_peaks:
+                if np.array_equal(bg_peak, snapped_seed):
+                    continue
+                mask[tuple(bg_peak)] = True  # background competitors
+
     # -------------------------------------------------------------------------
 
     markers, _ = ndi.label(mask)
@@ -648,15 +678,18 @@ def detect_2d_peak_with_watershed(
         dist, (ri, ci) = ndi.distance_transform_edt(~mask, return_indices=True)
         markers = np.where(dist <= seed_radius, markers[ri, ci], 0)
 
-    labels = watershed(-image, markers, mask=mask_signal, compactness=0.001)
+    labels_multi_markers = watershed(
+        -image, markers, mask=mask_signal, compactness=0.001
+    )
 
     # --- new: when competing peaks were used, only return true seed's region ---
     if use_competing_peaks and coordinates.shape[0] == 1:
-        true_marker = markers[tuple(coordinates[0])]
-        labels = np.where(labels == true_marker, true_marker, 0)
+        true_marker = markers[tuple(snapped_seed)]
+        labels = np.where(labels_multi_markers == true_marker, true_marker, 0)
     # --------------------------------------------------------------------------
-
-    return coordinates, labels, image
+    else:
+        labels = labels_multi_markers
+    return coordinates, labels, image, labels_multi_markers, snapped_seed
 
 
 def calculate_peak_property_from_labels_and_image(
@@ -934,11 +967,13 @@ def detect_2d_peak_and_calculate_peak_property(
             # grad_mag_smooth = gaussian_filter(grad_mag, sigma=2.0)
 
             # Detect peaks with flexible kwargs
-            coordinates, labels, distance = detect_2d_peak_with_watershed(
-                pept_act_smoothed_log,
-                int_threshold=1,
-                threshold_rel=0.2,
-                min_distance=10,
+            coordinates, labels, distance, labels_multi_markers = (
+                detect_2d_peak_with_watershed(
+                    pept_act_smoothed_log,
+                    int_threshold=1,
+                    threshold_rel=0.2,
+                    min_distance=10,
+                )
             )
             # Calculate peak properties with flexible kwargs
             peak_properties = calculate_peak_property_from_labels_and_image(
