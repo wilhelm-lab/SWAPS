@@ -724,8 +724,8 @@ def calculate_peak_property_from_labels_and_image(
     # Derived properties
 
     df["intensity_cv"] = df["intensity_std"] / (df["intensity_mean"] + 1e-8)
-    df["im_length"] = df["bbox-2"] - df["bbox-0"]
-    df["rt_length"] = df["bbox-3"] - df["bbox-1"]
+    df["im_length"] = df["bbox-3"] - df["bbox-1"]
+    df["rt_length"] = df["bbox-2"] - df["bbox-0"]
 
     # Logger.info("Unique label values after filtering: %s", df["label"].values)
     if image_res_2d is not None:
