@@ -1,7 +1,6 @@
 import logging
 import os
 from typing import Tuple, Literal, Optional
-from mahotas import zernike
 import numpy as np
 import pandas as pd
 import tqdm
@@ -173,7 +172,7 @@ def process_pept_run(
             if prop_a is not None:
                 prop_a["Run_name"] = run_name
                 prop_a["mz_rank"] = pept_idx
-                # Logger.info("Prop_a columns: %s", prop_a.columns)
+
             return (
                 smooth_a,
                 prop_a,
@@ -319,9 +318,7 @@ def match_features_batch(
         # We simply filter the index of the series by the boolean mask
         quant_only_raw_file = is_quant_only_mask.index[is_quant_only_mask].tolist()
         match_raw_file = is_match_mask.index[is_match_mask].tolist()
-        # Logger.info(
-        #     f"Raw files for reference, quant_only, match for mz_rank {pept_idx}: {reference_raw_file}, {quant_only_raw_file}, {match_raw_file}"
-        # )
+
         # Get reference
         smooth_a, prop_a, rt_center, im_center = process_pept_run(  # type: ignore
             act_dfs[reference_raw_file].loc[
@@ -384,8 +381,8 @@ def match_features_batch(
                     run_name=raw_file,
                     case="Match",
                     decoy_pept_idx=decoy_pept_idx,
-                    rt_ref=rt_center,
-                    im_ref=im_center,
+                    rt_ref=prop_a["snap_rt"].values[0].astype(int),
+                    im_ref=prop_a["snap_im"].values[0].astype(int),
                     smooth_ref=smooth_a,
                     prop_ref=prop_a,
                     smooth_kwargs=smooth_kwargs,
@@ -453,9 +450,10 @@ def _visualize_quantify_from_coords(
     pept_act_image_smoothed,
     pept_act_image_aligned,
     pept_act_image_smoothed_aligned,
-    bbox_center,
     save_dir: str,
+    bbox_center: Optional[Tuple[int, int]] = None,
     msms_pos: Optional[Tuple[int, int]] = None,
+    snapped_msms_pos: Optional[Tuple[int, int]] = None,
     template_box: Optional[Tuple[int, int, int, int]] = None,
     filename: str = "quantify_from_coords.png",
     labels: np.ndarray | None = None,
@@ -488,22 +486,42 @@ def _visualize_quantify_from_coords(
             ax.set_yticks([])
         else:
             ax.imshow(img, aspect="auto", origin="lower")
-            ax.plot(
-                bbox_center[0][1],
-                bbox_center[0][0],
-                "r+",
-                markersize=10,
-                markeredgewidth=2,
-            )
-            if lbl is not None:
-                masked_labels = np.ma.masked_where(lbl == 0, lbl)
-                ax.imshow(
-                    masked_labels,
-                    aspect="auto",
-                    origin="lower",
-                    alpha=0.35,
-                    cmap="tab10",
-                    interpolation="nearest",
+            if bbox_center is not None:
+                ax.plot(
+                    bbox_center[0][1],
+                    bbox_center[0][0],
+                    "r+",
+                    markersize=10,
+                    markeredgewidth=2,
+                )
+            if msms_pos is not None:
+                ax.plot(
+                    msms_pos[1],
+                    msms_pos[0],
+                    "*",
+                    markersize=10,
+                    markeredgewidth=2,
+                    color="white",
+                )  # white * for MS/MS position
+            if snapped_msms_pos is not None:
+                ax.plot(
+                    snapped_msms_pos[1],
+                    snapped_msms_pos[0],
+                    "*",
+                    markersize=10,
+                    markeredgewidth=2,
+                    color="yellow",
+                )  # yellow * for snapped MS/MS position
+            if template_box is not None:
+                ax.add_patch(
+                    plt.Rectangle(
+                        (template_box[1], template_box[0]),
+                        template_box[3] - template_box[1],
+                        template_box[2] - template_box[0],
+                        fill=False,
+                        edgecolor="red",
+                        linewidth=2,
+                    )
                 )
     if labels is not None:
         ax_lbl = axes[-1]
@@ -517,29 +535,35 @@ def _visualize_quantify_from_coords(
             cmap="tab10",
             interpolation="nearest",
         )
-        ax_lbl.plot(
-            bbox_center[0][1], bbox_center[0][0], "r+", markersize=10, markeredgewidth=2
-        )
-    if template_box is not None:
-        axes[0].add_patch(
-            plt.Rectangle(
-                (template_box[1], template_box[0]),
-                template_box[3] - template_box[1],
-                template_box[2] - template_box[0],
-                fill=False,
-                edgecolor="red",
-                linewidth=2,
+        if bbox_center is not None:
+            ax_lbl.plot(
+                bbox_center[0][1],
+                bbox_center[0][0],
+                "r+",
+                markersize=10,
+                markeredgewidth=2,
             )
-        )
-    if msms_pos is not None:
-        axes[0].plot(
-            msms_pos[1],
-            msms_pos[0],
-            "*",
-            markersize=10,
-            markeredgewidth=2,
-            color="white",
-        )  # white * for MS/MS position
+        if msms_pos is not None:
+            ax_lbl.plot(
+                msms_pos[1],
+                msms_pos[0],
+                "*",
+                markersize=10,
+                markeredgewidth=2,
+                color="white",
+            )  # white * for MS/MS position
+        if template_box is not None:
+            axes[0].add_patch(
+                plt.Rectangle(
+                    (template_box[1], template_box[0]),
+                    template_box[3] - template_box[1],
+                    template_box[2] - template_box[0],
+                    fill=False,
+                    edgecolor="red",
+                    linewidth=2,
+                )
+            )
+
     fig.tight_layout()
     os.makedirs(save_dir, exist_ok=True)
     fig.savefig(os.path.join(save_dir, filename), dpi=150, bbox_inches="tight")
@@ -577,59 +601,84 @@ def quantify_from_coords(
         peak_kwargs["min_distance"] = 10
 
     pept_act_image_smoothed = smooth_and_denoise_image(pept_act_image, **smooth_kwargs)
-    pept_act_image_smoothed_aligned = pept_act_image_smoothed
     if reference_image is not None and propA is not None:
+        template_im_start = max(
+            (anchor[0][1] - propA["im_length"].values[0]).astype(int), 0
+        )
+        template_im_end = min(
+            (anchor[0][1] + propA["im_length"].values[0]).astype(int),
+            pept_act_image.shape[1],
+        )
+        template_rt_start = max(
+            (anchor[0][0] - propA["rt_length"].values[0]).astype(int), 0
+        )
+        template_rt_end = min(
+            (anchor[0][0] + propA["rt_length"].values[0]).astype(int),
+            pept_act_image.shape[0],
+        )
         template = reference_image[
-            propA["bbox-0"]
-            .values[0]
-            .astype(int) : propA["bbox-2"]
-            .values[0]
-            .astype(int)
-            - 1,
-            propA["bbox-1"]
-            .values[0]
-            .astype(int) : propA["bbox-3"]
-            .values[0]
-            .astype(int)
-            - 1,
-        ]
+            template_rt_start:template_rt_end,
+            # template_rt_start:template_rt_end,
+            template_im_start:template_im_end,
+        ]  # template is larger than the segementation to make template matching more robust
+
         template_match_result = match_template(pept_act_image_smoothed, template)
-        ij = np.unravel_index(
+        max_score_index = np.unravel_index(
             np.argmax(template_match_result), template_match_result.shape
         )
-        box_im_topleft, box_rt_topleft = ij[::-1]
+        match_box_im_topleft, match_box_rt_topleft = max_score_index[::-1]
         shift = (
-            box_rt_topleft - propA["bbox-0"].values[0],
-            box_im_topleft - propA["bbox-1"].values[0],
+            match_box_rt_topleft - template_rt_start,
+            match_box_im_topleft - template_im_start,
         )
         h_template, w_template = template.shape
-        bbox_mask = np.zeros(pept_act_image_smoothed.shape, dtype=int)
-        bbox_mask[
-            box_rt_topleft : box_rt_topleft + h_template,
-            box_im_topleft : box_im_topleft + w_template,
+        match_bbox_mask = np.zeros(pept_act_image_smoothed.shape, dtype=int)
+        match_bbox_mask[
+            propA["bbox-0"].values[0].astype(int)
+            + shift[0] : propA["bbox-2"].values[0].astype(int)
+            + shift[0],
+            propA["bbox-1"].values[0].astype(int)
+            + shift[1] : propA["bbox-3"].values[0].astype(int)
+            + shift[1],
         ] = 1
-        labels = ((pept_act_image_smoothed != 0) & bbox_mask.astype(bool)).astype(int)
-        pept_act_image_aligned = pept_act_image
-        sift_center = np.array(
-            [(box_rt_topleft + h_template // 2, box_im_topleft + w_template // 2)]
+        labels = ((pept_act_image_smoothed != 0) & match_bbox_mask.astype(bool)).astype(
+            int
         )
-        cropped_roi = pept_act_image_smoothed_aligned[
-            box_rt_topleft : box_rt_topleft + h_template,
-            box_im_topleft : box_im_topleft + w_template,
-        ]
+        anchor = np.array(
+            [
+                (
+                    np.clip(
+                        anchor[0][0] + shift[0], 0, pept_act_image_smoothed.shape[0] - 1
+                    ),
+                    np.clip(
+                        anchor[0][1] + shift[1], 0, pept_act_image_smoothed.shape[1] - 1
+                    ),
+                )
+            ]
+        )
+        # cropped_roi = pept_act_image_smoothed[
+        #     match_box_rt_topleft : match_box_rt_topleft + h_template,
+        #     match_box_im_topleft : match_box_im_topleft + w_template,
+        # ]
         template_matching_score_max = np.max(template_match_result)
+        # _, labels, _, labels_with_multi_marker = detect_2d_peak_with_watershed(
+        #     pept_act_image_smoothed,
+        #     **peak_kwargs,
+        #     coordinates=anchor,
+        # )
+        labels_with_multi_marker = labels
     else:
-        pept_act_image_aligned = pept_act_image
-        _, labels, _ = detect_2d_peak_with_watershed(
-            pept_act_image_smoothed_aligned,
-            **peak_kwargs,
-            coordinates=anchor,
+        _, labels, _, labels_with_multi_marker, snapped_anchor = (
+            detect_2d_peak_with_watershed(
+                pept_act_image_smoothed,
+                **peak_kwargs,
+                coordinates=anchor,
+            )
         )
-        sift_center = None
-        cropped_roi = None
+        # cropped_roi = None
         template_matching_score_max = np.nan
     peak_properties = calculate_peak_property_from_labels_and_image(
-        labels, pept_act_image_aligned, min_peak_sum_intensity=500
+        labels, pept_act_image, min_peak_sum_intensity=500
     )
     if peak_properties is None:
         if visualize_dir is not None:
@@ -637,55 +686,59 @@ def quantify_from_coords(
                 reference_image,
                 pept_act_image,
                 pept_act_image_smoothed,
-                pept_act_image_aligned,
-                pept_act_image_smoothed_aligned,
-                sift_center,
+                pept_act_image,
+                pept_act_image_smoothed,
+                bbox_center=None,
                 save_dir=visualize_dir,
                 msms_pos=anchor[0],
+                snapped_msms_pos=(
+                    snapped_anchor if "snapped_anchor" in locals() else None
+                ),
                 filename=visualize_filename,
-                labels=labels,
+                labels=labels_with_multi_marker,
                 template_box=(
                     (
-                        propA["bbox-0"].values[0].astype(int),
-                        propA["bbox-1"].values[0].astype(int),
-                        propA["bbox-2"].values[0].astype(int),
-                        propA["bbox-3"].values[0].astype(int),
+                        template_rt_start,
+                        template_im_start,
+                        template_rt_end,
+                        template_im_end,
                     )
                     if propA is not None
                     else None
                 ),
             )
-        return pept_act_image_smoothed_aligned, None
+        return pept_act_image_smoothed, None
     else:
-        if sift_center is None:
-            sift_center = np.array(
-                [(peak_properties[["centroid-0", "centroid-1"]].values[0].astype(int))]
-            )
-        if cropped_roi is None:
-            cropped_roi = pept_act_image_smoothed_aligned[
-                peak_properties["bbox-0"]
-                .values[0]
-                .astype(int) : peak_properties["bbox-2"]
-                .values[0]
-                .astype(int),
-                peak_properties["bbox-1"]
-                .values[0]
-                .astype(int) : peak_properties["bbox-3"]
-                .values[0]
-                .astype(int),
-            ]
-        # Logger.info("Sift center is at: %s", sift_center)
+        seg_bbox = pept_act_image_smoothed[
+            peak_properties["bbox-0"]
+            .values[0]
+            .astype(int) : peak_properties["bbox-2"]
+            .values[0]
+            .astype(int),
+            peak_properties["bbox-1"]
+            .values[0]
+            .astype(int) : peak_properties["bbox-3"]
+            .values[0]
+            .astype(int),
+        ]
+
         peak_properties["sift_des"] = None
         peak_properties.at[0, "sift_des"] = get_sift_descriptor(
-            np.log1p(pept_act_image_aligned), sift_center[0], patch_size=patch_size
+            np.log1p(pept_act_image), anchor[0], patch_size=patch_size
         )
         hu, zernike = get_roi_descriptor(
-            cropped_roi,
+            seg_bbox,
         )
         peak_properties["hu"] = None
         peak_properties["zernike"] = None
         peak_properties.at[0, "hu"] = hu
         peak_properties.at[0, "zernike"] = zernike
+        peak_properties["snap_rt"] = (
+            snapped_anchor[0] if "snapped_anchor" in locals() else anchor[0][0]
+        )
+        peak_properties["snap_im"] = (
+            snapped_anchor[1] if "snapped_anchor" in locals() else anchor[0][1]
+        )
         if reference_image is not None:
             peak_properties["shift_rt"] = shift[0]
             peak_properties["shift_im"] = shift[1]
@@ -697,19 +750,29 @@ def quantify_from_coords(
                 reference_image,
                 pept_act_image,
                 pept_act_image_smoothed,
-                pept_act_image_aligned,
-                pept_act_image_smoothed_aligned,
-                sift_center,
+                pept_act_image,
+                pept_act_image_smoothed,
+                bbox_center=np.array(
+                    [
+                        (
+                            peak_properties["centroid-0"].values[0],
+                            peak_properties["centroid-1"].values[0],
+                        )
+                    ]
+                ),
                 msms_pos=anchor[0],
+                snapped_msms_pos=(
+                    snapped_anchor if "snapped_anchor" in locals() else None
+                ),
                 save_dir=visualize_dir,
                 filename=visualize_filename,
-                labels=labels,
+                labels=labels_with_multi_marker,
                 template_box=(
                     (
-                        propA["bbox-0"].values[0].astype(int),
-                        propA["bbox-1"].values[0].astype(int),
-                        propA["bbox-2"].values[0].astype(int),
-                        propA["bbox-3"].values[0].astype(int),
+                        template_rt_start,
+                        template_im_start,
+                        template_rt_end,
+                        template_im_end,
                     )
                     if propA is not None
                     else None
@@ -717,7 +780,7 @@ def quantify_from_coords(
             )
         peak_properties["template_matching_score"] = template_matching_score_max
 
-        return pept_act_image_smoothed_aligned, peak_properties
+        return pept_act_image_smoothed, peak_properties
 
 
 def compare_peak_properties(peak_properties_a, peak_properties_b):
