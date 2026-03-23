@@ -575,12 +575,8 @@ def _visualize_quantify_from_coords(
 def quantify_from_coords(
     pept_act_image,
     anchor,
-    reference_image: (
-        np.ndarray | None
-    ) = None,  # should be a "template" (cropped) when using template matching
-    propA: (
-        pd.DataFrame | None
-    ) = None,  # only used for template matching to calculate shift
+    reference_image: np.ndarray | None = None,
+    propA: pd.DataFrame | None = None,
     smooth_kwargs: dict | None = None,
     peak_kwargs: dict | None = None,
     align_kwargs: dict | None = None,
@@ -588,6 +584,36 @@ def quantify_from_coords(
     visualize_dir: str | None = None,
     visualize_filename: str = "quantify_from_coords.png",
 ):
+    """
+    Quantify features from a peptide activity image given anchor coordinates and optional reference information.
+    Parameters
+    ----------
+    pept_act_image : np.ndarray
+        The peptide activity image.
+    anchor : tuple
+        The anchor coordinates (row, column).
+    reference_image : np.ndarray | None, optional
+        The reference image for template matching.
+    propA : pd.DataFrame | None, optional
+        The properties dataframe for template matching.
+    smooth_kwargs : dict | None, optional
+        Keyword arguments for smoothing the image.
+    peak_kwargs : dict | None, optional
+        Keyword arguments for peak detection.
+    align_kwargs : dict | None, optional
+        Keyword arguments for alignment.
+    patch_size : int | None, optional
+        The size of the patch to extract.
+    visualize_dir : str | None, optional
+        The directory to save visualizations.
+    visualize_filename : str, optional
+        The filename for the visualization.
+
+    Returns
+    -------
+    pd.DataFrame | None
+        The quantified properties dataframe or None if no features are found.
+    """
     assert (
         anchor[0] < pept_act_image.shape[0] and anchor[1] < pept_act_image.shape[1]
     ), "Anchor coordinates are out of bounds of the image dimensions."
@@ -603,24 +629,26 @@ def quantify_from_coords(
         peak_kwargs["min_distance"] = 10
 
     pept_act_image_smoothed = smooth_and_denoise_image(pept_act_image, **smooth_kwargs)
+    # Case "Match": perform template matching to find the best match for the reference peak
+    # and then run watershed with the matched position as (updated) anchor
     if reference_image is not None and propA is not None:
+        # Getting template for "Match" case
         template_im_start = max(
-            (anchor[0][1] - propA["im_length"].values[0]).astype(int), 0
+            (anchor[0][1] - 0.3 * reference_image.shape[1]).astype(int), 0
         )
         template_im_end = min(
-            (anchor[0][1] + propA["im_length"].values[0]).astype(int),
+            (anchor[0][1] + 0.3 * reference_image.shape[1]).astype(int),
             pept_act_image.shape[1],
         )
         template_rt_start = max(
-            (anchor[0][0] - propA["rt_length"].values[0]).astype(int), 0
+            (anchor[0][0] - 0.3 * reference_image.shape[0]).astype(int), 0
         )
         template_rt_end = min(
-            (anchor[0][0] + propA["rt_length"].values[0]).astype(int),
+            (anchor[0][0] + 0.3 * reference_image.shape[0]).astype(int),
             pept_act_image.shape[0],
-        )
+        )  # Use up to 36% of the image size as the template size to make sure the template can cover the peak region even when the anchor is not very accurate, which can be common for low abundance peptides with weak MS/MS signal
         template = reference_image[
             template_rt_start:template_rt_end,
-            # template_rt_start:template_rt_end,
             template_im_start:template_im_end,
         ]  # template is larger than the segementation to make template matching more robust
 
@@ -628,12 +656,13 @@ def quantify_from_coords(
         max_score_index = np.unravel_index(
             np.argmax(template_match_result), template_match_result.shape
         )
-        match_box_im_topleft, match_box_rt_topleft = max_score_index[::-1]
+        match_box_im_topleft, match_box_rt_topleft = max_score_index[
+            ::-1
+        ]  # template box top left, not the bounding box of segmentation
         shift = (
             match_box_rt_topleft - template_rt_start,
             match_box_im_topleft - template_im_start,
         )
-        h_template, w_template = template.shape
         match_bbox_mask = np.zeros(pept_act_image_smoothed.shape, dtype=int)
         match_bbox_mask[
             propA["bbox-0"].values[0].astype(int)
@@ -642,10 +671,8 @@ def quantify_from_coords(
             propA["bbox-1"].values[0].astype(int)
             + shift[1] : propA["bbox-3"].values[0].astype(int)
             + shift[1],
-        ] = 1
-        labels = ((pept_act_image_smoothed != 0) & match_bbox_mask.astype(bool)).astype(
-            int
-        )
+        ] = 1  # matched bounding box calculated as original bbox plus shift
+
         anchor = np.array(
             [
                 (
@@ -657,18 +684,25 @@ def quantify_from_coords(
                     ),
                 )
             ]
+        )  # anchor is updated: shifted anchor for the matched image
+        labels = ((pept_act_image_smoothed != 0) & match_bbox_mask.astype(bool)).astype(
+            int
         )
-        # cropped_roi = pept_act_image_smoothed[
-        #     match_box_rt_topleft : match_box_rt_topleft + h_template,
-        #     match_box_im_topleft : match_box_im_topleft + w_template,
-        # ]
-        template_matching_score_max = np.max(template_match_result)
-        # _, labels, _, labels_with_multi_marker = detect_2d_peak_with_watershed(
-        #     pept_act_image_smoothed,
-        #     **peak_kwargs,
-        #     coordinates=anchor,
+        labels_with_multi_marker = (
+            labels  # Only one label is available in matched images
+        )
+        # alternatively, get match labels from watershed with the shifted anchor, which will be more robust to noise but may fail when the shift is large and there are multiple local maximum in the shifted region
+        # _, labels, _, labels_with_multi_marker, snapped_anchor = (
+        #     detect_2d_peak_with_watershed(
+        #         pept_act_image_smoothed,
+        #         **peak_kwargs,
+        #         coordinates=anchor,
+        #     )
         # )
-        labels_with_multi_marker = labels
+        template_matching_score_max = np.max(template_match_result)
+
+    # Case quantification without template matching, directly run watershed with the original anchor
+    # Which will be snapped into the nearest connected local maximum if the anchor is not already a local maximum
     else:
         _, labels, _, labels_with_multi_marker, snapped_anchor = (
             detect_2d_peak_with_watershed(
@@ -677,7 +711,6 @@ def quantify_from_coords(
                 coordinates=anchor,
             )
         )
-        # cropped_roi = None
         template_matching_score_max = np.nan
     peak_properties = calculate_peak_property_from_labels_and_image(
         labels, pept_act_image, min_peak_sum_intensity=500
@@ -786,7 +819,6 @@ def quantify_from_coords(
                     else None
                 ),
             )
-        peak_properties["template_matching_score"] = template_matching_score_max
 
         return pept_act_image_smoothed, peak_properties
 
@@ -896,7 +928,7 @@ def smooth_and_denoise_image(
     if "sigma" not in gaussian_kwargs:
         gaussian_kwargs["sigma"] = 2
     if "size" not in uniform_kwargs:
-        uniform_kwargs["size"] = (1, 10)
+        uniform_kwargs["size"] = (1, 5)
     if "min_size" not in remove_kwargs:
         remove_kwargs["min_size"] = 5
 
