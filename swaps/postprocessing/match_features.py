@@ -143,28 +143,28 @@ def process_pept_run(
     align_kwargs=None,
     visualize_dir: str | None = None,
 ):
-    pept_act, rt_center, im_center = get_pept_act_from_parquet(
+    pept_act, rt_msms_pos, im_msms_pos = get_pept_act_from_parquet(
         act_df.loc[act_df["mz_rank"] == pept_idx], pept_idx, dict_ref, run_name
     )
 
     match case:
         case "Reference":
             # Boundary Check
-            if rt_center >= pept_act.shape[0] or im_center >= pept_act.shape[1]:
+            if rt_msms_pos >= pept_act.shape[0] or im_msms_pos >= pept_act.shape[1]:
                 logging.info(
                     "Pept_act shape: %s, rt_center: %s, im_center: %s",
                     pept_act.shape,
-                    rt_center,
-                    im_center,
+                    rt_msms_pos,
+                    im_msms_pos,
                 )
                 logging.warning(
                     "Skipping reference for mz_rank %s due to center out of bounds",
                     pept_idx,
                 )
-                return None, None, None, None
+                return None, None
             smooth_a, prop_a = quantify_from_coords(
                 pept_act,
-                anchor=(rt_center, im_center),
+                anchor=(rt_msms_pos, im_msms_pos),
                 patch_size=min(pept_act.shape),
                 visualize_dir=visualize_dir,
                 visualize_filename=f"mz{pept_idx}_{run_name}_reference.png",
@@ -176,38 +176,26 @@ def process_pept_run(
             return (
                 smooth_a,
                 prop_a,
-                rt_center,
-                im_center,
-                # (
-                #     prop_a["centroid-0"].iloc[0].astype(int)
-                #     if prop_a is not None
-                #     else rt_center
-                # ),
-                # (
-                #     prop_a["centroid-1"].iloc[0].astype(int)
-                #     if prop_a is not None
-                #     else im_center
-                # ),
             )
         case "Quant_Only":
             # Boundary Check
-            if rt_center >= pept_act.shape[0] or im_center >= pept_act.shape[1]:
+            if rt_msms_pos >= pept_act.shape[0] or im_msms_pos >= pept_act.shape[1]:
                 logging.warning(
                     "Skipping quant only for mz_rank %s due to center out of bounds",
                     pept_idx,
                 )
                 return None
-            prop_a = quantify_from_coords(
+            prop_q = quantify_from_coords(
                 pept_act,
-                anchor=(rt_center, im_center),
+                anchor=(rt_msms_pos, im_msms_pos),
                 patch_size=min(pept_act.shape),
                 visualize_dir=visualize_dir,
                 visualize_filename=f"mz{pept_idx}_{run_name}_quant_only.png",
             )[1]
-            if prop_a is not None:
-                prop_a["Run_name"] = run_name
-                prop_a["mz_rank"] = pept_idx
-            return prop_a
+            if prop_q is not None:
+                prop_q["Run_name"] = run_name
+                prop_q["mz_rank"] = pept_idx
+            return prop_q
         case "Match":
             assert all(
                 param is not None
@@ -251,7 +239,7 @@ def process_pept_run(
                 smooth_kwargs=smooth_kwargs,
                 peak_kwargs=peak_kwargs,
                 align_kwargs=align_kwargs,
-                visualize_dir=visualize_dir,
+                visualize_dir=None,  # Do not plot decoy quantification to save time, as the decoy is randomly selected and may not have meaningful features
                 visualize_filename=f"mz{pept_idx}_decoy{decoy_pept_idx}_{run_name}_match_decoy.png",
             )
             # 5. Process Matches
@@ -320,7 +308,7 @@ def match_features_batch(
         match_raw_file = is_match_mask.index[is_match_mask].tolist()
 
         # Get reference
-        smooth_a, prop_a, rt_center, im_center = process_pept_run(  # type: ignore
+        smooth_a, prop_a = process_pept_run(  # type: ignore
             act_dfs[reference_raw_file].loc[
                 act_dfs[reference_raw_file]["mz_rank"] == pept_idx
             ],
@@ -341,7 +329,7 @@ def match_features_batch(
                 }
             )
 
-        # Quant only
+        # Quant only TODO: multi-coordinates from quant_only runs
         if len(quant_only_raw_file) > 0:
             for raw_file in quant_only_raw_file:
                 prop_q = process_pept_run(  # type: ignore
@@ -368,16 +356,16 @@ def match_features_batch(
 
         # Matches
         if len(match_raw_file) > 0 and smooth_a is not None and prop_a is not None:
-
+            # TODO: if ref doesn't exists, the failed matches do not enter no_match_log and no_quant_log
             for raw_file in match_raw_file:
                 batch_exclude = batch[batch != pept_idx]
                 decoy_pept_idx = np.random.choice(batch_exclude)
                 prop_t, prop_d, match_t, match_d = process_pept_run(
-                    act_dfs[raw_file].loc[
+                    act_df=act_dfs[raw_file].loc[
                         act_dfs[raw_file]["mz_rank"].isin([pept_idx, decoy_pept_idx])
                     ],
-                    pept_idx,
-                    dict_ref,
+                    pept_idx=pept_idx,
+                    dict_ref=dict_ref,
                     run_name=raw_file,
                     case="Match",
                     decoy_pept_idx=decoy_pept_idx,

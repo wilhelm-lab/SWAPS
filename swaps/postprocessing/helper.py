@@ -41,23 +41,11 @@ def get_pept_act_from_parquet(
         if row[f"{run_name}_MS1_frame_idx_exp"].values[0] > rt_start
         else ((rt_start + rt_end) // 2 - rt_start)
     )
-    # rt_exp_end = row["MS1_frame_idx_right_exp"].values[0] - rt_start
-    # im_exp_start = row["mobility_values_index_left_exp"].values[0] - im_start
     im_exp_center = (
         (row[f"{run_name}_mobility_values_index_exp"].values[0] - im_start)
         if row[f"{run_name}_mobility_values_index_exp"].values[0] > im_start
         else ((im_start + im_end) // 2 - im_start)
     )
-    # Logger.info(
-    #     "Peptide %d: RT [%d, %d], IM [%d, %d], RT_exp_center %d, IM_exp_center %d",
-    #     pept_idx,
-    #     rt_start,
-    #     rt_end,
-    #     im_start,
-    #     im_end,
-    #     rt_exp_center,
-    #     im_exp_center,
-    # )
     pept_act = parquet_df_to_dense_frame(act_df, (rt_start, rt_end), (im_start, im_end))
     if shape is not None:
         target_h, target_w = shape
