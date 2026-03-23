@@ -8,6 +8,7 @@ swaps_optimization_cfg = __C
 # general setup
 __C.DESCRIPTION = "Default config from the Singleton"
 __C.DEBUG = False
+__C.SWA = True  # whether to perform scan-wise activation, if False, the code will skip the SWA part and directly save the dict_ref with empty activation for downstream processing, which is useful for debugging and testing downstream steps without running SWA
 __C.DATA_PATH = ""  # different results depending on data ending with .mzml or .d
 __C.RESULT_PATH = ""  # path to save all intermediate and final results
 __C.ADD_TIMESTAMP_TO_RESULT_PATH = False  # disenble when reusing the same result path
