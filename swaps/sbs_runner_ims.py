@@ -272,20 +272,21 @@ def opt_scan_by_scan(config_path: str):
     )
     result, model, psms = brew_with_mokapot(
         tdc_df,
-        feature_cols=tdc_df.columns.difference(
-            [
-                "mz_rank",
-                "decoy_mz_rank",
-                "IsTarget",
-                "Sequence",
-                "Proteins",
-                "Decoy",
-                "label",
-                "reference_run",
-                "matched_run",
-                "Sequence_with_runs",
-            ]
-        ).tolist(),
+        feature_cols=[
+            "im_shift_abs_scaled",
+            "rt_shift_abs_scaled",
+            "rt_shift",
+            "im_shift",
+            "im_shift_scaled",
+            "rt_shift_scaled",
+            "sift_similarities",
+            "hu_similarities",
+            "zernike_similarities",
+            "sift_distance",
+            "hu_distance",
+            "zernike_distance",
+            "template_matching_score",
+        ],
         normalize_features=False,
         psmid_col="Sequence_with_runs",
         peptide_col="Sequence",
