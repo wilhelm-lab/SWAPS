@@ -577,6 +577,7 @@ def detect_2d_peak_with_watershed(
     seed_radius: int = 0,
     use_competing_peaks: bool = True,  # new: enable/disable the feature
     # min_distance_to_true_seed: int = 15,  # new: minimum distance from competing peaks to the true seed
+    visualize: bool = False,
 ):
     """
     Detect peaks in a 2D image using the watershed algorithm.
@@ -590,10 +591,23 @@ def detect_2d_peak_with_watershed(
         Minimum distance between detected peaks.
     - threshold_rel: float
         Minimum intensity of peaks, calculated as max(image) * threshold_rel.
+    - visualize: bool
+        If True, show a step-by-step matplotlib figure of each stage.
     Returns:
     - labels: 2D numpy array
         Labeled regions corresponding to detected peaks.
     """
+
+    def _viz_step(ax, data, title, cmap="viridis", points=None, point_styles=None):
+        """Helper to draw one panel. points is a list of (coords_array, kwargs) tuples."""
+        ax.imshow(data, origin="lower", cmap=cmap, aspect="auto")
+        ax.set_title(title, fontsize=8)
+        ax.axis("off")
+        if points:
+            for coords, kwargs in points:
+                if len(coords):
+                    ax.scatter(coords[:, 1], coords[:, 0], **kwargs)
+
     # 2. Compute distance (to background) transform inside signal
     distance = image
     mask_signal = distance > int_threshold
@@ -627,7 +641,10 @@ def detect_2d_peak_with_watershed(
         )
 
     mask = np.zeros(image.shape, dtype=bool)
-    mask[tuple(coordinates.T)] = True
+    # mask[tuple(coordinates.T)] = True
+
+    # Visualization state collected throughout
+    _viz = {}
 
     # --- new: inject competing background seeds when true seed is provided ---
     if use_competing_peaks and coordinates.shape[0] == 1:
@@ -637,6 +654,7 @@ def detect_2d_peak_with_watershed(
             image,
             min_distance=min_distance,
             threshold_rel=threshold_rel,
+            labels=mask_signal,
         )
 
         if len(bg_peaks) > 0:
@@ -661,19 +679,36 @@ def detect_2d_peak_with_watershed(
                 snapped_seed = same_component_peaks[closest_idx]
             else:
                 # No peak in same component, fall back to true seed
+                same_component_peaks = np.empty(
+                    (0, bg_peaks.shape[1]), dtype=bg_peaks.dtype
+                )
                 snapped_seed = true_seed
 
             mask[tuple(snapped_seed)] = True  # foreground anchor (snapped)
 
-            for bg_peak in bg_peaks:
+            for bg_peak in same_component_peaks:
                 if np.array_equal(bg_peak, snapped_seed):
                     continue
                 mask[tuple(bg_peak)] = True  # background competitors
 
+            if visualize:
+                _viz["true_seed"] = true_seed
+                _viz["bg_peaks"] = bg_peaks
+                _viz["connected_components"] = connected_components
+                _viz["same_component_peaks"] = same_component_peaks
+                _viz["snapped_seed"] = snapped_seed
+                competitors = np.array(
+                    [
+                        p
+                        for p in same_component_peaks
+                        if not np.array_equal(p, snapped_seed)
+                    ]
+                )
+                _viz["competitors"] = competitors
+
     # -------------------------------------------------------------------------
 
     markers, _ = ndi.label(mask)
-
     if seed_radius > 0:
         dist, (ri, ci) = ndi.distance_transform_edt(~mask, return_indices=True)
         markers = np.where(dist <= seed_radius, markers[ri, ci], 0)
@@ -689,6 +724,126 @@ def detect_2d_peak_with_watershed(
     # --------------------------------------------------------------------------
     else:
         labels = labels_multi_markers
+
+    # ---- stepwise visualization ----
+    if visualize:
+        n_cols = 6
+        fig, axes = plt.subplots(1, n_cols, figsize=(4 * n_cols, 4))
+
+        # Step 1: raw image + input coordinates
+        _viz_step(
+            axes[0],
+            image,
+            "1. Image + input seed",
+            points=[
+                (
+                    coordinates,
+                    dict(c="red", s=40, marker="x", label="input seed", zorder=5),
+                )
+            ],
+        )
+
+        # Step 2: signal mask
+        _viz_step(
+            axes[1],
+            mask_signal.astype(np.uint8),
+            "2. Signal mask (> threshold)",
+            cmap="gray",
+        )
+
+        # Step 3: bg peaks + true seed (competing peaks mode)
+        if _viz:
+            bg_all = _viz["bg_peaks"]
+            ts = _viz["true_seed"][np.newaxis]
+            _viz_step(
+                axes[2],
+                image,
+                "3. All bg peaks (same cpt filtered)",
+                points=[
+                    (
+                        bg_all,
+                        dict(
+                            c="orange", s=30, marker="o", label="all bg peaks", zorder=4
+                        ),
+                    ),
+                    (
+                        _viz["same_component_peaks"],
+                        dict(
+                            c="cyan", s=40, marker="^", label="same component", zorder=5
+                        ),
+                    ),
+                    (ts, dict(c="red", s=60, marker="x", label="true seed", zorder=6)),
+                ],
+            )
+            # Step 4: connected components + snapped seed
+            _viz_step(
+                axes[3],
+                _viz["connected_components"],
+                "4. Connected components + snapped seed",
+                cmap="tab20",
+                points=[
+                    (
+                        _viz["same_component_peaks"],
+                        dict(c="cyan", s=40, marker="^", zorder=4),
+                    ),
+                    (
+                        _viz["snapped_seed"][np.newaxis],
+                        dict(
+                            c="lime", s=80, marker="*", label="snapped seed", zorder=6
+                        ),
+                    ),
+                ],
+            )
+        else:
+            _viz_step(axes[2], image, "3. (no competing peaks)", cmap="gray")
+            _viz_step(axes[3], image, "4. (no competing peaks)", cmap="gray")
+
+        # Step 5: markers (seeds passed to watershed)
+        snapped = (
+            _viz.get("snapped_seed", coordinates[0])
+            if coordinates.shape[0] == 1
+            else None
+        )
+        seed_pts = np.array([snapped]) if snapped is not None else coordinates
+        _viz_step(
+            axes[4],
+            markers,
+            "5. Markers for watershed",
+            cmap="tab20",
+            points=[
+                (
+                    seed_pts,
+                    dict(c="lime", s=80, marker="*", label="snapped seed", zorder=5),
+                )
+            ],
+        )
+
+        # Step 6: final labels vs all-marker watershed
+        _viz_step(
+            axes[5],
+            labels_multi_markers,
+            "6. All-marker watershed  |  final (outline)",
+            cmap="tab20",
+        )
+        # overlay final region as contour
+        from skimage.segmentation import find_boundaries
+
+        boundary = find_boundaries(labels > 0, mode="outer")
+        axes[5].contour(boundary, levels=[0.5], colors="white", linewidths=1)
+
+        for ax in axes:
+            ax.legend(fontsize=6, loc="upper right", markerscale=0.8)
+
+        fig.suptitle(
+            f"detect_2d_peak_with_watershed  |  int_threshold={int_threshold}  "
+            f"min_distance={min_distance}  threshold_rel={threshold_rel}  "
+            f"seed_radius={seed_radius}",
+            fontsize=9,
+        )
+        fig.tight_layout()
+        plt.show()
+    # --------------------------------
+
     return coordinates, labels, image, labels_multi_markers, snapped_seed
 
 
@@ -738,6 +893,7 @@ def calculate_peak_property_from_labels_and_image(
             "intensity_max",
             "intensity_mean",
             "intensity_std",
+            # "intensity_median",
             "solidity",
         ),
     )
@@ -759,7 +915,7 @@ def calculate_peak_property_from_labels_and_image(
     df["intensity_cv"] = df["intensity_std"] / (df["intensity_mean"] + 1e-8)
     df["im_length"] = df["bbox-3"] - df["bbox-1"]
     df["rt_length"] = df["bbox-2"] - df["bbox-0"]
-
+    df["image_total_intensity"] = image_2d.sum()
     # Logger.info("Unique label values after filtering: %s", df["label"].values)
     if image_res_2d is not None:
         res_act_ratio = np.log1p(image_res_2d / (image_2d + 1e-6))
