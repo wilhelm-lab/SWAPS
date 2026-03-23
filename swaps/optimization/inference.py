@@ -72,18 +72,14 @@ def sparse_encode_divide_and_conquer_with_residual_stats(
     reconstruction = np.zeros_like(frame_array, dtype=np.float32)
 
     # Precompute offsets for placing peptide activations
-    block_sizes = [cb.shape[1] for cb in candidate_coo_blocks]
+    block_sizes = [cb.shape[0] for cb in candidate_coo_blocks]
     col_offsets = np.cumsum([0] + block_sizes[:-1])
 
     # --- Encoding loop ---
     for idx, candidate_block in enumerate(candidate_coo_blocks):
         start, end = col_start[idx], col_end[idx]  # m/z row slice for this block
         frame_block = frame_array[:, start:end]  # (m_z_block, im)
-        Logger.debug(
-            "Frame block shape: %s, candidate block shape: %s",
-            frame_block.shape,
-            candidate_block.shape,
-        )
+
         # sparse_encode expects: frame_block (m_z_block, im), candidate_block (m_z_block, pept_block)
         im_pept_act = sparse_encode(
             frame_block,
@@ -92,17 +88,29 @@ def sparse_encode_divide_and_conquer_with_residual_stats(
             alpha=0,
             positive=True,
         )  # returns (im, pept_block)
-        Logger.debug("im_pept_act shape: %s", im_pept_act.shape)
+
         # Place activations in correct columns
         col_offset = col_offsets[idx]
-        Logger.debug(
-            "Processing block %s: m/z rows %s-%s, col offset %s",
-            idx,
-            start,
-            end,
-            col_offset,
-        )
-        frame_act[:, col_offset : col_offset + candidate_block.shape[1]] += im_pept_act
+
+        try:
+            frame_act[
+                :, col_offset : col_offset + candidate_block.shape[1]
+            ] += im_pept_act
+        except:
+            Logger.info(
+                "Processing block %s: m/z rows %s-%s, col offset %s",
+                idx,
+                start,
+                end,
+                col_offset,
+            )
+            Logger.info("start and end of frame block %s %s", start, end)
+            Logger.info(
+                "Frame block shape: %s, candidate block shape: %s",
+                frame_block.shape,
+                candidate_block.shape,
+            )
+            Logger.info("im_pept_act shape: %s", im_pept_act.shape)
 
         if return_act_res:
             # Add reconstruction contribution for residual computation
