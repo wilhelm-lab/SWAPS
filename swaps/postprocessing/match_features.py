@@ -523,6 +523,20 @@ def _visualize_quantify_from_coords(
             cmap="tab10",
             interpolation="nearest",
         )
+        for lbl_val in np.unique(labels):
+            if lbl_val == 0:
+                continue
+            ys, xs = np.where(labels == lbl_val)
+            ax_lbl.text(
+                xs.mean(),
+                ys.mean(),
+                str(lbl_val),
+                ha="center",
+                va="center",
+                fontsize=7,
+                color="white",
+                fontweight="bold",
+            )
         if bbox_center is not None:
             ax_lbl.plot(
                 bbox_center[0][1],
@@ -678,9 +692,9 @@ def quantify_from_coords(
                 pept_act_image_smoothed,
                 bbox_center=None,
                 save_dir=visualize_dir,
-                msms_pos=anchor[0],
+                msms_pos=anchor[0] if reference_image is None else None,
                 snapped_msms_pos=(
-                    snapped_anchor if "snapped_anchor" in locals() else None
+                    snapped_anchor if "snapped_anchor" in locals() else anchor[0]
                 ),
                 filename=visualize_filename,
                 labels=labels_with_multi_marker,
@@ -708,11 +722,22 @@ def quantify_from_coords(
             .astype(int) : peak_properties["bbox-3"]
             .values[0]
             .astype(int),
-        ]
-
+        ]  # Centers around the updated anchor
+        peak_properties["snap_rt"] = (
+            snapped_anchor[0] if "snapped_anchor" in locals() else anchor[0][0]
+        )
+        peak_properties["snap_im"] = (
+            snapped_anchor[1] if "snapped_anchor" in locals() else anchor[0][1]
+        )
+        peak_properties["template_matching_score"] = template_matching_score_max
         peak_properties["sift_des"] = None
         peak_properties.at[0, "sift_des"] = get_sift_descriptor(
-            np.log1p(pept_act_image), anchor[0], patch_size=patch_size
+            np.log1p(pept_act_image),
+            (
+                peak_properties["snap_rt"].values[0],
+                peak_properties["snap_im"].values[0],
+            ),
+            patch_size=patch_size,
         )
         hu, zernike = get_roi_descriptor(
             seg_bbox,
@@ -721,12 +746,7 @@ def quantify_from_coords(
         peak_properties["zernike"] = None
         peak_properties.at[0, "hu"] = hu
         peak_properties.at[0, "zernike"] = zernike
-        peak_properties["snap_rt"] = (
-            snapped_anchor[0] if "snapped_anchor" in locals() else anchor[0][0]
-        )
-        peak_properties["snap_im"] = (
-            snapped_anchor[1] if "snapped_anchor" in locals() else anchor[0][1]
-        )
+
         if reference_image is not None:
             peak_properties["shift_rt"] = shift[0]
             peak_properties["shift_im"] = shift[1]
@@ -748,9 +768,9 @@ def quantify_from_coords(
                         )
                     ]
                 ),
-                msms_pos=anchor[0],
+                msms_pos=anchor[0] if reference_image is None else None,
                 snapped_msms_pos=(
-                    snapped_anchor if "snapped_anchor" in locals() else None
+                    snapped_anchor if "snapped_anchor" in locals() else anchor[0]
                 ),
                 save_dir=visualize_dir,
                 filename=visualize_filename,
