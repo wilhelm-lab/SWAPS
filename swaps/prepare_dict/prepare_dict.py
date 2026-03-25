@@ -1986,6 +1986,8 @@ def get_rt_im_range(
             rt_length_max=(rt_length_col, "max"),
             mobility_length_mean=(mobility_length_col, "mean"),
             mobility_length_std=(mobility_length_col, "std"),
+            mobility_length_min=(mobility_length_col, "min"),
+            mobility_length_max=(mobility_length_col, "max"),
         )
         .reset_index()
     )
@@ -2004,29 +2006,63 @@ def get_rt_im_range(
     evidence_group_summary["mobility_length_std"] = evidence_group_summary[
         "mobility_length_std"
     ].fillna(evidence_group_summary["mobility_length_std"].mean())
+    rt_length_max_left_clip = evidence_group_summary.loc[
+        evidence_group_summary["rt_length_max"] > 0, "rt_length_max"
+    ].quantile(0.01)
+    rt_length_max_right_clip = evidence_group_summary.loc[
+        evidence_group_summary["rt_length_max"] > 0, "rt_length_max"
+    ].quantile(0.99)
+    im_length_max_left_clip = evidence_group_summary.loc[
+        evidence_group_summary["mobility_length_max"] > 0, "mobility_length_max"
+    ].quantile(0.01)
+    im_length_max_right_clip = evidence_group_summary.loc[
+        evidence_group_summary["mobility_length_max"] > 0, "mobility_length_max"
+    ].quantile(0.99)
+    Logger.info(
+        f"RT length max left clip: {rt_length_max_left_clip}, RT length max right clip: {rt_length_max_right_clip}"
+    )
+    Logger.info(
+        f"IM length max left clip: {im_length_max_left_clip}, IM length max right clip: {im_length_max_right_clip}"
+    )
     evidence_group_summary["RT_search_left"] = (
         evidence_group_summary["rt_apex_min"]
         - evidence_group_summary["rt_apex_std"]
-        - evidence_group_summary["rt_length_mean"]
+        - np.clip(
+            evidence_group_summary["rt_length_max"],
+            rt_length_max_left_clip,
+            rt_length_max_right_clip,
+        )
         - evidence_group_summary["rt_length_std"]
     )
     evidence_group_summary["RT_search_center"] = evidence_group_summary["rt_apex_mean"]
     evidence_group_summary["RT_search_right"] = (
         evidence_group_summary["rt_apex_max"]
         + evidence_group_summary["rt_apex_std"]
-        + evidence_group_summary["rt_length_mean"]
+        + np.clip(
+            evidence_group_summary["rt_length_max"],
+            rt_length_max_left_clip,
+            rt_length_max_right_clip,
+        )
         + evidence_group_summary["rt_length_std"]
     )
     evidence_group_summary["IM_search_left"] = (
         evidence_group_summary["mobility_exp_min"]
         - evidence_group_summary["mobility_exp_std"]
-        - evidence_group_summary["mobility_length_mean"]
+        - np.clip(
+            evidence_group_summary["mobility_length_max"],
+            im_length_max_left_clip,
+            im_length_max_right_clip,
+        )
         - evidence_group_summary["mobility_length_std"]
     )
     evidence_group_summary["IM_search_right"] = (
         evidence_group_summary["mobility_exp_max"]
         + evidence_group_summary["mobility_exp_std"]
-        + evidence_group_summary["mobility_length_mean"]
+        + np.clip(
+            evidence_group_summary["mobility_length_max"],
+            im_length_max_left_clip,
+            im_length_max_right_clip,
+        )
         + evidence_group_summary["mobility_length_std"]
     )
     evidence_group_summary["IM_search_center"] = evidence_group_summary[
