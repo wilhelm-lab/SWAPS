@@ -354,6 +354,19 @@ def opt_scan_by_scan(config_path: str):
         quant_dir,
     )
     plot_match_type_from_combined(df=pivot, fig_dir=quant_dir)
+    try:
+        # compare with IonQuant results
+        combined_ionquant = pd.read_csv(
+            os.path.join(cfg.SEARCH_OUTPUT_PATH, "combined_ion.csv"),
+            sep="\t",
+        )
+        plot_match_type_from_combined(
+            df=combined_ionquant, fig_dir=quant_dir, fig_name_suffix="_ionquant"
+        )
+    except FileNotFoundError:
+        logging.info(
+            "IonQuant combined_ion.csv not found in search output path. Skipping comparison with IonQuant results. Skipping"
+        )
 
 
 def main():
