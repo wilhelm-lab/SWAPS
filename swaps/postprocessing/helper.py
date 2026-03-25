@@ -27,7 +27,12 @@ def load_peptide_batch_df_from_partquet(parquet_path, pept_indicies: List):
 
 
 def get_pept_act_from_parquet(
-    act_df, pept_idx, dict_ref, run_name, shape: Optional[tuple] = None
+    act_df,
+    pept_idx,
+    dict_ref,
+    run_name,
+    shape: Optional[tuple] = None,
+    return_offset: bool = False,
 ):
     # con = duckdb.connect()
     row = dict_ref.loc[dict_ref["mz_rank"] == pept_idx, :]
@@ -51,8 +56,10 @@ def get_pept_act_from_parquet(
         target_h, target_w = shape
 
         pept_act = sym_pad_crop_2d(pept_act, target_h, target_w)
-
-    return pept_act, rt_exp_center, im_exp_center
+    if return_offset:
+        return pept_act, rt_exp_center, im_exp_center, (rt_start, im_start)
+    else:
+        return pept_act, rt_exp_center, im_exp_center
 
 
 def sym_pad_crop_2d(arr, target_h, target_w):

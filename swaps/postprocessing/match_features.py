@@ -380,7 +380,45 @@ def match_features_batch(
                     if prop_d is not None:
                         pp_match_decoy_list.append(prop_d)
 
-                else:
+                    else:
+                        no_quant_log.append(
+                            {
+                                "mz_rank": pept_idx,
+                                "run_name": raw_file,
+                                "type": "match_decoy",
+                            }
+                        )
+                    if match_t is not None:
+                        results_target.append(match_t)
+                    else:
+                        no_match_log.append(
+                            {
+                                "mz_rank": pept_idx,
+                                "run_name": raw_file,
+                                "type": "match_target",
+                            }
+                        )
+                    if match_d is not None:
+                        results_decoy.append(match_d)
+                    else:
+                        no_match_log.append(
+                            {
+                                "mz_rank": pept_idx,
+                                "run_name": raw_file,
+                                "type": "match_decoy",
+                            }
+                        )
+            else:
+                # log no quantification for both match target and decoy if reference quantification is not available,
+                # as the match processing relies on the reference quantification for alignment and property comparison
+                for raw_file in match_raw_file:
+                    no_quant_log.append(
+                        {
+                            "mz_rank": pept_idx,
+                            "run_name": raw_file,
+                            "type": "match_target",
+                        }
+                    )
                     no_quant_log.append(
                         {
                             "mz_rank": pept_idx,
@@ -388,9 +426,6 @@ def match_features_batch(
                             "type": "match_decoy",
                         }
                     )
-                if match_t is not None:
-                    results_target.append(match_t)
-                else:
                     no_match_log.append(
                         {
                             "mz_rank": pept_idx,
@@ -398,9 +433,6 @@ def match_features_batch(
                             "type": "match_target",
                         }
                     )
-                if match_d is not None:
-                    results_decoy.append(match_d)
-                else:
                     no_match_log.append(
                         {
                             "mz_rank": pept_idx,
@@ -567,6 +599,7 @@ def quantify_from_coords(
     anchor,
     reference_image: np.ndarray | None = None,
     propA: pd.DataFrame | None = None,
+    apply_seg: bool = True,
     smooth_kwargs: dict | None = None,
     peak_kwargs: dict | None = None,
     align_kwargs: dict | None = None,
@@ -642,7 +675,9 @@ def quantify_from_coords(
         template_rt_end = min(
             (anchor[0][0] + 0.3 * reference_image.shape[0]).astype(int),
             pept_act_image.shape[0],
-        )  # Use up to 36% of the image size as the template size to make sure the template can cover the peak region even when the anchor is not very accurate, which can be common for low abundance peptides with weak MS/MS signal
+        )  # Use up to 36% of the image size as the template size to
+        # make sure the template can cover the peak region even when the
+        # anchor is not very accurate, which can be common for low abundance peptides with weak MS/MS signal
         template = reference_image[
             template_rt_start:template_rt_end,
             template_im_start:template_im_end,
@@ -700,13 +735,43 @@ def quantify_from_coords(
     # Case quantification without template matching, directly run watershed with the original anchor
     # Which will be snapped into the nearest connected local maximum if the anchor is not already a local maximum
     else:
-        _, labels, _, labels_with_multi_marker, snapped_anchor = (
-            detect_2d_peak_with_watershed(
-                pept_act_image_smoothed,
-                **peak_kwargs,
-                coordinates=anchor,
+        if apply_seg:
+            _, labels, _, labels_with_multi_marker, snapped_anchor = (
+                detect_2d_peak_with_watershed(
+                    pept_act_image_smoothed,
+                    **peak_kwargs,
+                    coordinates=anchor,
+                )
             )
-        )
+        else:
+            # Getting template for "Match" case
+            template_im_start = max(
+                (anchor[0][1] - 0.3 * pept_act_image_smoothed.shape[1]).astype(int), 0
+            )
+            template_im_end = min(
+                (anchor[0][1] + 0.3 * pept_act_image_smoothed.shape[1]).astype(int),
+                pept_act_image_smoothed.shape[1],
+            )
+            template_rt_start = max(
+                (anchor[0][0] - 0.3 * pept_act_image_smoothed.shape[0]).astype(int), 0
+            )
+            template_rt_end = min(
+                (anchor[0][0] + 0.3 * pept_act_image_smoothed.shape[0]).astype(int),
+                pept_act_image_smoothed.shape[0],
+            )  # Use up to 36% of the image size as the template size to
+            # make sure the template can cover the peak region even when the
+            # anchor is not very accurate, which can be common for low abundance peptides with weak MS/MS signal
+
+            labels = np.zeros(pept_act_image_smoothed.shape, dtype=int)
+            labels[
+                template_rt_start:template_rt_end, template_im_start:template_im_end
+            ] = (
+                pept_act_image_smoothed[
+                    template_rt_start:template_rt_end, template_im_start:template_im_end
+                ]
+                > 0
+            )
+            labels_with_multi_marker = labels  # Only one label is available in this case as well, as watershed is not applied
         template_matching_score_max = np.nan
     peak_properties = calculate_peak_property_from_labels_and_image(
         labels, pept_act_image, **filter_kwargs
