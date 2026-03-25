@@ -1223,9 +1223,21 @@ def calc_quant_corr(pp_quant_only, pp_reference, pp_match_target, quant_dir):
                 str(int(count_matrix.iloc[i, j])),
                 ha="center",
                 va="center",
-                fontsize=7,
+                fontsize=3,
                 color="white",
             )
+    # Logger.info("corr_matrix columns: %s", corr_matrix.columns)
+    plt.xticks(
+        ticks=np.arange(len(corr_matrix.columns)),
+        labels=[c[0] + c[1][-5:] for c in corr_matrix.columns.values],
+        fontsize=5,
+        # rotation=45,
+    )
+    plt.yticks(
+        ticks=np.arange(len(corr_matrix.index)),
+        labels=[c[0] + c[1][-5:] for c in corr_matrix.index.values],
+        fontsize=5,
+    )
     plt.savefig(
         os.path.join(
             quant_dir,
