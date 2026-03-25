@@ -5,6 +5,7 @@ import os
 from datetime import datetime
 import time
 import argparse
+import yaml
 import pandas as pd
 import torch
 
@@ -55,6 +56,26 @@ def opt_scan_by_scan(config_path: str):
     if config_path is not None:
         cfg.merge_from_file(config_path)
         logging.info("merge with cfg file %s", config_path)
+    _default_processing_kwargs = {
+        "smooth_kwargs": {
+            "smooth_filter": "gaussian",
+            "gaussian_kwargs": {"sigma": (1, 2)},
+            "uniform_kwargs": {"size": (3, 5)},
+            "threshold": 3,
+            "remove_kwargs": {"min_size": 3},
+        },
+        "peak_kwargs": {"int_threshold": 0},
+        "filter_kwargs": {"min_peak_area": 5, "min_peak_sum_intensity": 0},
+        "apply_seg": False,
+    }
+    processing_kwargs = _default_processing_kwargs
+    if config_path is not None:
+        with open(config_path) as _f:
+            _raw_cfg = yaml.safe_load(_f)
+        if _raw_cfg and "MATCH_FEATURES_KWARGS" in _raw_cfg:
+            processing_kwargs = _raw_cfg["MATCH_FEATURES_KWARGS"]
+            logging.info("Loaded MATCH_FEATURES_KWARGS from config file")
+
     if cfg.ADD_TIMESTAMP_TO_RESULT_PATH:
         cfg.RESULT_PATH = cfg.RESULT_PATH + "_" + name_timestamp
         cfg.ADD_TIMESTAMP_TO_RESULT_PATH = False  # in case of reuse of config file
@@ -246,6 +267,7 @@ def opt_scan_by_scan(config_path: str):
         peptide_indicies=dict_ref["mz_rank"].values,  # type: ignore
         batch_size=100,
         max_workers=cfg.N_CPU,
+        processing_kwargs=processing_kwargs,
     )
     quant_dir = os.path.join(cfg.RESULT_PATH, "quantification")
     os.makedirs(quant_dir, exist_ok=True)

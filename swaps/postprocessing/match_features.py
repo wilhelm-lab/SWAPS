@@ -35,9 +35,7 @@ def match_features_batches_parallel(
     peptide_indicies: np.ndarray | None = None,
     batch_size: int = 100,
     max_workers: int = 4,
-    smooth_kwargs: dict | None = None,
-    peak_kwargs: dict | None = None,
-    align_kwargs: dict | None = None,
+    processing_kwargs: dict | None = None,
 ):
     if peptide_indicies is None:
         peptide_indicies = dict_ref["mz_rank"].values
@@ -64,9 +62,7 @@ def match_features_batches_parallel(
                 raw_file_list,
                 result_dir,
                 batch,
-                smooth_kwargs,
-                peak_kwargs,
-                align_kwargs,
+                processing_kwargs,
             )
             for batch in peptide_batches
         ]
@@ -138,9 +134,7 @@ def process_pept_run(
     im_ref: Optional[int] = None,
     smooth_ref: Optional[np.ndarray] = None,
     prop_ref: Optional[pd.DataFrame] = None,
-    smooth_kwargs=None,
-    peak_kwargs=None,
-    align_kwargs=None,
+    processing_kwargs: dict | None = None,
     visualize_dir: str | None = None,
 ):
     pept_act, rt_msms_pos, im_msms_pos = get_pept_act_from_parquet(
@@ -166,6 +160,7 @@ def process_pept_run(
                 pept_act,
                 anchor=(rt_msms_pos, im_msms_pos),
                 patch_size=min(pept_act.shape),
+                **(processing_kwargs or {}),
                 visualize_dir=visualize_dir,
                 visualize_filename=f"mz{pept_idx}_{run_name}_reference.png",
             )
@@ -189,6 +184,7 @@ def process_pept_run(
                 pept_act,
                 anchor=(rt_msms_pos, im_msms_pos),
                 patch_size=min(pept_act.shape),
+                **(processing_kwargs or {}),
                 visualize_dir=visualize_dir,
                 visualize_filename=f"mz{pept_idx}_{run_name}_quant_only.png",
             )[1]
@@ -222,10 +218,8 @@ def process_pept_run(
                 reference_image=smooth_ref,
                 propA=prop_ref,
                 patch_size=min(pept_act.shape),
-                smooth_kwargs=smooth_kwargs,
-                peak_kwargs=peak_kwargs,
-                align_kwargs=align_kwargs,
-                visualize_dir=visualize_dir,
+                **(processing_kwargs or {}),
+                visualize_dir=None,  # Do not plot target quantification to save time, as the main focus is on the match comparison results rather than the individual quantification quality for each match, and we already have the reference quantification visualization to show the feature quality of the reference
                 visualize_filename=f"mz{pept_idx}_{run_name}_match_target.png",
             )
 
@@ -236,9 +230,7 @@ def process_pept_run(
                 reference_image=smooth_ref,
                 propA=prop_ref,
                 patch_size=min(pept_act.shape),
-                smooth_kwargs=smooth_kwargs,
-                peak_kwargs=peak_kwargs,
-                align_kwargs=align_kwargs,
+                **(processing_kwargs or {}),
                 visualize_dir=None,  # Do not plot decoy quantification to save time, as the decoy is randomly selected and may not have meaningful features
                 visualize_filename=f"mz{pept_idx}_decoy{decoy_pept_idx}_{run_name}_match_decoy.png",
             )
@@ -269,9 +261,7 @@ def match_features_batch(
     raw_file_list,
     result_dir,
     batch,
-    smooth_kwargs: dict | None = None,
-    peak_kwargs: dict | None = None,
-    align_kwargs: dict | None = None,
+    processing_kwargs: dict | None = None,
     visualize_dir: str | None = None,
 ):
     results_target, results_decoy = [], []
@@ -316,6 +306,7 @@ def match_features_batch(
             dict_ref,
             run_name=reference_raw_file,
             case="Reference",
+            processing_kwargs=processing_kwargs,
             visualize_dir=visualize_dir,
         )  # type: ignore
         if prop_a is not None:
@@ -338,9 +329,7 @@ def match_features_batch(
                     dict_ref,
                     run_name=raw_file,
                     case="Quant_Only",
-                    smooth_kwargs=smooth_kwargs,
-                    peak_kwargs=peak_kwargs,
-                    align_kwargs=align_kwargs,
+                    processing_kwargs=processing_kwargs,
                     visualize_dir=visualize_dir,
                 )
                 if prop_q is not None:
@@ -355,41 +344,41 @@ def match_features_batch(
                     )
 
         # Matches
-        if len(match_raw_file) > 0 and smooth_a is not None and prop_a is not None:
-            # TODO: if ref doesn't exists, the failed matches do not enter no_match_log and no_quant_log
-            for raw_file in match_raw_file:
-                batch_exclude = batch[batch != pept_idx]
-                decoy_pept_idx = np.random.choice(batch_exclude)
-                prop_t, prop_d, match_t, match_d = process_pept_run(
-                    act_df=act_dfs[raw_file].loc[
-                        act_dfs[raw_file]["mz_rank"].isin([pept_idx, decoy_pept_idx])
-                    ],
-                    pept_idx=pept_idx,
-                    dict_ref=dict_ref,
-                    run_name=raw_file,
-                    case="Match",
-                    decoy_pept_idx=decoy_pept_idx,
-                    rt_ref=prop_a["snap_rt"].values[0].astype(int),
-                    im_ref=prop_a["snap_im"].values[0].astype(int),
-                    smooth_ref=smooth_a,
-                    prop_ref=prop_a,
-                    smooth_kwargs=smooth_kwargs,
-                    peak_kwargs=peak_kwargs,
-                    align_kwargs=align_kwargs,
-                    visualize_dir=visualize_dir,
-                )
-                if prop_t is not None:
-                    pp_match_target_list.append(prop_t)
-                else:
-                    no_quant_log.append(
-                        {
-                            "mz_rank": pept_idx,
-                            "run_name": raw_file,
-                            "type": "match_target",
-                        }
+        if len(match_raw_file) > 0:
+            if smooth_a is not None and prop_a is not None:
+                for raw_file in match_raw_file:
+                    batch_exclude = batch[batch != pept_idx]
+                    decoy_pept_idx = np.random.choice(batch_exclude)
+                    prop_t, prop_d, match_t, match_d = process_pept_run(
+                        act_df=act_dfs[raw_file].loc[
+                            act_dfs[raw_file]["mz_rank"].isin(
+                                [pept_idx, decoy_pept_idx]
+                            )
+                        ],
+                        pept_idx=pept_idx,
+                        dict_ref=dict_ref,
+                        run_name=raw_file,
+                        case="Match",
+                        decoy_pept_idx=decoy_pept_idx,
+                        rt_ref=prop_a["snap_rt"].values[0].astype(int),
+                        im_ref=prop_a["snap_im"].values[0].astype(int),
+                        smooth_ref=smooth_a,
+                        prop_ref=prop_a,
+                        processing_kwargs=processing_kwargs,
+                        visualize_dir=visualize_dir,
                     )
-                if prop_d is not None:
-                    pp_match_decoy_list.append(prop_d)
+                    if prop_t is not None:
+                        pp_match_target_list.append(prop_t)
+                    else:
+                        no_quant_log.append(
+                            {
+                                "mz_rank": pept_idx,
+                                "run_name": raw_file,
+                                "type": "match_target",
+                            }
+                        )
+                    if prop_d is not None:
+                        pp_match_decoy_list.append(prop_d)
 
                 else:
                     no_quant_log.append(
@@ -491,7 +480,8 @@ def _visualize_quantify_from_coords(
                     markeredgewidth=2,
                     color="white",
                 )  # white * for MS/MS position
-            if snapped_msms_pos is not None:
+            if snapped_msms_pos is not None and len(snapped_msms_pos) == 2:
+                # Logger.info("snapped_msms_pos: %s", snapped_msms_pos)
                 ax.plot(
                     snapped_msms_pos[1],
                     snapped_msms_pos[0],
@@ -580,6 +570,7 @@ def quantify_from_coords(
     smooth_kwargs: dict | None = None,
     peak_kwargs: dict | None = None,
     align_kwargs: dict | None = None,
+    filter_kwargs: dict | None = None,
     patch_size: int | None = None,
     visualize_dir: str | None = None,
     visualize_filename: str = "quantify_from_coords.png",
@@ -621,6 +612,11 @@ def quantify_from_coords(
     smooth_kwargs = {} if smooth_kwargs is None else dict(smooth_kwargs)
     peak_kwargs = {} if peak_kwargs is None else dict(peak_kwargs)
     align_kwargs = {} if align_kwargs is None else dict(align_kwargs)
+    filter_kwargs = {} if filter_kwargs is None else dict(filter_kwargs)
+    if "min_peak_area" not in filter_kwargs:
+        filter_kwargs["min_peak_area"] = 10
+    if "min_peak_sum_intensity" not in filter_kwargs:
+        filter_kwargs["min_peak_sum_intensity"] = 500
     if "int_threshold" not in peak_kwargs:
         peak_kwargs["int_threshold"] = 1
     if "threshold_rel" not in peak_kwargs:
@@ -713,7 +709,7 @@ def quantify_from_coords(
         )
         template_matching_score_max = np.nan
     peak_properties = calculate_peak_property_from_labels_and_image(
-        labels, pept_act_image, min_peak_sum_intensity=500
+        labels, pept_act_image, **filter_kwargs
     )
     if peak_properties is None:
         if visualize_dir is not None:
@@ -926,7 +922,8 @@ def smooth_and_denoise_image(
     remove_kwargs = {} if remove_kwargs is None else dict(remove_kwargs)
 
     if "sigma" not in gaussian_kwargs:
-        gaussian_kwargs["sigma"] = 2
+        gaussian_kwargs["sigma"] = 2  # (rt, im)
+        gaussian_kwargs["mode"] = "nearest"
     if "size" not in uniform_kwargs:
         uniform_kwargs["size"] = (1, 5)
     if "min_size" not in remove_kwargs:
