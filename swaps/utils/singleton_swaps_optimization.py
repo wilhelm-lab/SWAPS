@@ -358,3 +358,24 @@ __C.RESULT_ANALYSIS.POST_PROCESSING.RT_GROUP = 1
 __C.RESULT_ANALYSIS.POST_PROCESSING.MOKAPOT = ConfigurationNode()
 __C.RESULT_ANALYSIS.POST_PROCESSING.MOKAPOT.TRAIN_FDR = 0.4
 __C.RESULT_ANALYSIS.POST_PROCESSING.MOKAPOT.TEST_FDR = 0.4
+
+# match features kwargs (postprocessing peak detection/matching parameters)
+__C.MATCH_FEATURES_KWARGS = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.smooth_kwargs = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.smooth_kwargs.smooth_filter = "gaussian"
+__C.MATCH_FEATURES_KWARGS.smooth_kwargs.gaussian_kwargs = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.smooth_kwargs.gaussian_kwargs.sigma = [2, 2]
+__C.MATCH_FEATURES_KWARGS.smooth_kwargs.gaussian_kwargs.model = "nearest"
+__C.MATCH_FEATURES_KWARGS.smooth_kwargs.uniform_kwargs = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.smooth_kwargs.uniform_kwargs.size = [1, 5]
+__C.MATCH_FEATURES_KWARGS.smooth_kwargs.threshold = 10
+__C.MATCH_FEATURES_KWARGS.smooth_kwargs.remove_kwargs = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.smooth_kwargs.remove_kwargs.min_size = 5
+__C.MATCH_FEATURES_KWARGS.peak_kwargs = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.peak_kwargs.int_threshold = 1
+__C.MATCH_FEATURES_KWARGS.peak_kwargs.min_distance = 10
+__C.MATCH_FEATURES_KWARGS.peak_kwargs.threshold_rel = 0.2
+__C.MATCH_FEATURES_KWARGS.filter_kwargs = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.filter_kwargs.min_peak_area = 10
+__C.MATCH_FEATURES_KWARGS.filter_kwargs.min_peak_sum_intensity = 500
+__C.MATCH_FEATURES_KWARGS.apply_seg = True

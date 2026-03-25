@@ -47,6 +47,20 @@ logging.basicConfig(
 )
 
 
+def _save_effective_cfg(cfg, processing_kwargs: dict, result_path: str):
+    """Write the fully-resolved config (YACS + processing_kwargs) to result_path."""
+    import yaml as _yaml
+
+    cfg.defrost()
+    out = _yaml.safe_load(cfg.dump())  # convert YACS to plain dict
+    cfg.freeze()
+    out["MATCH_FEATURES_KWARGS"] = processing_kwargs
+    save_path = os.path.join(result_path, "effective_config.yaml")
+    with open(save_path, "w") as f:
+        _yaml.dump(out, f, default_flow_style=False, sort_keys=False)
+    logging.info("Saved effective config to %s", save_path)
+
+
 def opt_scan_by_scan(config_path: str):
     """Scan by scan optimization for joint identification and quantification."""
 
@@ -56,25 +70,7 @@ def opt_scan_by_scan(config_path: str):
     if config_path is not None:
         cfg.merge_from_file(config_path)
         logging.info("merge with cfg file %s", config_path)
-    _default_processing_kwargs = {
-        "smooth_kwargs": {
-            "smooth_filter": "gaussian",
-            "gaussian_kwargs": {"sigma": (1, 2)},
-            "uniform_kwargs": {"size": (3, 5)},
-            "threshold": 3,
-            "remove_kwargs": {"min_size": 3},
-        },
-        "peak_kwargs": {"int_threshold": 0},
-        "filter_kwargs": {"min_peak_area": 5, "min_peak_sum_intensity": 0},
-        "apply_seg": False,
-    }
-    processing_kwargs = _default_processing_kwargs
-    if config_path is not None:
-        with open(config_path) as _f:
-            _raw_cfg = yaml.safe_load(_f)
-        if _raw_cfg and "MATCH_FEATURES_KWARGS" in _raw_cfg:
-            processing_kwargs = _raw_cfg["MATCH_FEATURES_KWARGS"]
-            logging.info("Loaded MATCH_FEATURES_KWARGS from config file")
+    processing_kwargs = yaml.safe_load(cfg.MATCH_FEATURES_KWARGS.dump())
 
     if cfg.ADD_TIMESTAMP_TO_RESULT_PATH:
         cfg.RESULT_PATH = cfg.RESULT_PATH + "_" + name_timestamp
@@ -87,6 +83,8 @@ def opt_scan_by_scan(config_path: str):
         logging.info("Number of CPUs: %s", cfg.N_CPU)
     if cfg.OPTIMIZATION.N_BATCH < 0:
         cfg.OPTIMIZATION.N_BATCH = cfg.N_CPU  # set batches as the same as N_CPU
+
+    _save_effective_cfg(cfg, processing_kwargs, cfg.RESULT_PATH)
 
     # -------------Prepare general dictionary---------#
     try:
