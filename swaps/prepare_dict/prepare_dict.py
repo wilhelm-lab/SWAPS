@@ -553,6 +553,7 @@ def dict_add_rt_index(
     mq_rt_left_col: Optional[str] = "RT_search_left",
     mq_rt_center_col: Optional[str] = "RT_search_center",
     mq_rt_right_col: Optional[str] = "RT_search_right",
+    rt_values_col: str = "Time_minute",
     idx_suffix: str = "",
 ):
     """Get RT index of RT_search_left, RT_search_center and RT_search_right/
@@ -564,13 +565,13 @@ def dict_add_rt_index(
         maxquant_df = maxquant_df.sort_values(mq_rt_center_col)
         maxquant_df = pd.merge_asof(
             left=maxquant_df,
-            right=rt_values_df[["Time_minute", "MS1_frame_idx"]],
+            right=rt_values_df[[rt_values_col, "MS1_frame_idx"]],
             left_on=mq_rt_center_col,
-            right_on="Time_minute",
+            right_on=rt_values_col,
             direction="nearest",
             suffixes=("", "_center" + idx_suffix),
         )
-        for col in ["Time_minute", "MS1_frame_idx"]:
+        for col in [rt_values_col, "MS1_frame_idx"]:
             if col in maxquant_df.columns:
                 maxquant_df.rename(
                     {col: col + "_center" + idx_suffix}, axis=1, inplace=True
@@ -579,13 +580,13 @@ def dict_add_rt_index(
         maxquant_df = maxquant_df.sort_values(mq_rt_left_col)
         maxquant_df = pd.merge_asof(
             left=maxquant_df,
-            right=rt_values_df[["Time_minute", "MS1_frame_idx"]],
+            right=rt_values_df[[rt_values_col, "MS1_frame_idx"]],
             left_on=mq_rt_left_col,
-            right_on="Time_minute",
+            right_on=rt_values_col,
             direction="nearest",
             suffixes=("", "_left" + idx_suffix),
         )
-        for col in ["Time_minute", "MS1_frame_idx"]:
+        for col in [rt_values_col, "MS1_frame_idx"]:
             if col in maxquant_df.columns:
                 maxquant_df.rename(
                     {col: col + "_left" + idx_suffix}, axis=1, inplace=True
@@ -594,13 +595,13 @@ def dict_add_rt_index(
         maxquant_df = maxquant_df.sort_values(mq_rt_right_col)
         maxquant_df = pd.merge_asof(
             left=maxquant_df,
-            right=rt_values_df[["Time_minute", "MS1_frame_idx"]],
+            right=rt_values_df[[rt_values_col, "MS1_frame_idx"]],
             left_on=mq_rt_right_col,
-            right_on="Time_minute",
+            right_on=rt_values_col,
             direction="nearest",
             suffixes=("", "_right" + idx_suffix),
         )
-        for col in ["Time_minute", "MS1_frame_idx"]:
+        for col in [rt_values_col, "MS1_frame_idx"]:
             if col in maxquant_df.columns:
                 maxquant_df.rename(
                     {col: col + "_right" + idx_suffix}, axis=1, inplace=True
