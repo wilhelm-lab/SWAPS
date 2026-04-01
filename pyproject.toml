@@ -54,10 +54,39 @@ sbs_runner_ims = "sbs_runner_ims:main"
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
 
-[dependency-groups]
-dev = [
-    "ipython (<9.5)",
-    "scikit-image (>=0.25.2,<0.26.0)",
-    "line-profiler (>=5.0.0,<6.0.0)",
-    "nbformat (>=4.2.0)"
+[tool.poetry.group.dev.dependencies]
+ipython = "<9.5"
+scikit-image = ">=0.25.2,<0.26.0"
+line-profiler = ">=5.0.0,<6.0.0"
+nbformat = ">=4.2.0"
+pytest = ">=7.0"
+pytest-cov = "^7.1.0"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Run unit tests by default; exclude slow integration tests:
+#   pytest                          → all non-slow tests
+#   pytest -m integration           → integration tests (need env vars)
+#   pytest -m slow                  → full-pipeline tests
+#   pytest -m "not slow"            → unit + fast integration
+addopts = "-m 'not slow'"
+markers = [
+    "integration: tests that require real data (set SWAPS_TEST_* env vars)",
+    "slow: full-pipeline tests that take minutes to run",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:plotly",
+]
+
+[tool.coverage.run]
+# Modules are imported without the 'swaps.' prefix because conftest.py adds
+# swaps/ to sys.path. List the sub-packages that are actually used by the pipeline.
+source_pkgs = ["utils", "optimization", "prepare_dict", "postprocessing"]
+
+[tool.coverage.report]
+show_missing = true
+omit = [
+    "*/test_*",
+    "*/peak_detection_2d/*",
+    "*/result_analysis/*",
 ]
