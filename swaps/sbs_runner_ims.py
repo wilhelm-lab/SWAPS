@@ -130,9 +130,14 @@ def opt_scan_by_scan(config_path: str):
     # -------------Scan-Wise Activation for each .d dataset------------#
     # added_im_and_rt_index = False
     if cfg.SWA:
+        logging.info(
+            "Processing Scan-Wise Activation for each .d dataset in %s excluding %s",
+            cfg.DATA_PATH,
+            cfg.EXCLUDE_DATASET_NAME,
+        )
         for dot_d_dir in os.listdir(cfg.DATA_PATH):
             logging.info("process dataset: %s", dot_d_dir)
-            if dot_d_dir.endswith(".d"):
+            if dot_d_dir.endswith(".d") and dot_d_dir not in cfg.EXCLUDE_DATASET_NAME:
                 logging.info(
                     "============Scan-Wise Activation for dataset: %s============",
                     dot_d_dir,
@@ -357,7 +362,7 @@ def opt_scan_by_scan(config_path: str):
     try:
         # compare with IonQuant results
         combined_ionquant = pd.read_csv(
-            os.path.join(cfg.SEARCH_OUTPUT_PATH, "combined_ion.csv"),
+            os.path.join(cfg.SEARCH_OUTPUT_PATH, "combined_ion.tsv"),
             sep="\t",
         )
         plot_match_type_from_combined(
