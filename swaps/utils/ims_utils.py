@@ -58,7 +58,7 @@ def export_im_and_ms1scans(
     :return: mobility_values_df: pd.DataFrame, mobility values
     """
     # ms1scans
-    ms1scans = data.frames.loc[data.frames.MsMsType == 0]
+    ms1scans = data.frames.loc[data.frames.MsMsType == 0].copy()
     ms1scans["Time_minute"] = ms1scans["Time"] / 60
     ms1scans["MS1_frame_idx"] = (
         ms1scans["Time"].rank(axis=0, method="first", ascending=True).astype(int) - 1

@@ -73,7 +73,7 @@ def sage_parser(
     )
     sage_output = sage_output.loc[
         (sage_output["peptide_q"] <= 0.01) & (sage_output["spectrum_q"] <= 0.01)
-    ]
+    ].copy()
     Logger.info(
         "After filtering at 0.01 peptide and spectrum q-value: %s", len(sage_output)
     )
