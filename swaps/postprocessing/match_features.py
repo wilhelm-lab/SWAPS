@@ -219,7 +219,7 @@ def process_pept_run(
                 propA=prop_ref,
                 patch_size=min(pept_act.shape),
                 **(processing_kwargs or {}),
-                visualize_dir=None,  # Do not plot target quantification to save time, as the main focus is on the match comparison results rather than the individual quantification quality for each match, and we already have the reference quantification visualization to show the feature quality of the reference
+                visualize_dir=visualize_dir,  # Do not plot target quantification to save time, as the main focus is on the match comparison results rather than the individual quantification quality for each match, and we already have the reference quantification visualization to show the feature quality of the reference
                 visualize_filename=f"mz{pept_idx}_{run_name}_match_target.png",
             )
 
