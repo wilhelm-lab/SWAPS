@@ -21,3 +21,6 @@ swaps/peak_detection_2d/config/*
 pipreqs.txt
 swaps/utils/exp_configs/configs/*
 swaps/utils/exp_configs/config_jigsaw_*
+.coverage
+temp_config.yaml
+pyrightconfig.json
