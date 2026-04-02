@@ -16,7 +16,7 @@ from utils.ims_utils import (
     load_dotd_data,
     export_im_and_ms1scans,
 )
-from utils.config import get_cfg_defaults
+from utils.config import get_cfg_defaults, merge_cfg_from_file
 from utils.singleton_swaps_optimization import swaps_optimization_cfg
 from optimization.inference import process_frames_parallel, generate_id_partitions
 from prepare_dict.prepare_dict import (
@@ -68,7 +68,7 @@ def opt_scan_by_scan(config_path: str):
     cfg = get_cfg_defaults(swaps_optimization_cfg)  # type: ignore
     name_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     if config_path is not None:
-        cfg.merge_from_file(config_path)
+        merge_cfg_from_file(cfg, config_path)
         logging.info("merge with cfg file %s", config_path)
     processing_kwargs = yaml.safe_load(cfg.MATCH_FEATURES_KWARGS.dump())
 
