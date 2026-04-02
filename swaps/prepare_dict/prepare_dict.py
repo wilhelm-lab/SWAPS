@@ -377,34 +377,6 @@ def generate_decoy_df(maxquant_df, mutation_method):
     return maxquant_decoy_df
 
 
-def _check_td_pair_mass(maxquant_result_ref: pd.DataFrame):
-    # Assuming maxquant_result_ref is your DataFrame
-
-    # Group by 'TD pair id'
-    grouped = maxquant_result_ref.groupby("TD pair id")
-
-    # Ensure each group has exactly 2 rows
-    # This will return groups with exactly 2 rows
-    filtered_groups = grouped.filter(lambda x: len(x) == 2)
-
-    # Calculate the difference between the two 'mz_bin' values in each group
-    # We can use the diff function to get the difference, then take the absolute value
-    filtered_groups["mz_bin_difference"] = (
-        filtered_groups.groupby("TD pair id")["mz_bin"].diff().abs()
-    )
-
-    # Drop the NaN values that arise from the diff (because it shifts the series)
-    result = filtered_groups.dropna(subset=["mz_bin_difference"])
-
-    # If you want the result as a new DataFrame with 'TD pair id' and the difference
-    result = result[["TD pair id", "mz_bin_difference"]].drop_duplicates()
-    Logger.info(
-        "TD pair id with mz_bin difference > 0: %s",
-        result.loc[result["mz_bin_difference"] > 0].shape[0],
-    )
-    return result
-
-
 def dict_add_index_to_raw_file(
     maxquant_df: pd.DataFrame,
     mobility_values_df: pd.DataFrame,

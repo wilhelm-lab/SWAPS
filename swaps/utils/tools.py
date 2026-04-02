@@ -8,8 +8,6 @@ from matplotlib.patches import Rectangle
 from pyteomics import mzml
 import numpy as np
 import pandas as pd
-from Bio.SeqIO.FastaIO import SimpleFastaParser
-from scipy.sparse import csr_matrix
 from scipy.signal import find_peaks, peak_widths
 from scipy.spatial import cKDTree  # type: ignore
 
@@ -135,48 +133,6 @@ def cleanup_maxquant(
     return maxquant_df
 
 
-def _merge_activation_results(
-    processed_scan_dict: dict, ref_id: pd.Series, n_ms1scans: int
-):
-    """Merge the activation results."""
-    activation = pd.DataFrame(index=ref_id, columns=range(n_ms1scans))
-    precursor_scan_cos_dist = pd.DataFrame(index=ref_id, columns=range(n_ms1scans))
-    precursor_collinear_sets = pd.DataFrame(index=ref_id, columns=range(n_ms1scans))
-    scan_record_list = []
-    for scan_idx, result_dict_scan in processed_scan_dict.items():
-        if result_dict_scan["activation"] is not None:
-            activation.loc[result_dict_scan["activation"]["precursor"], scan_idx] = (
-                result_dict_scan["activation"]["activation"]
-            )
-        if result_dict_scan["precursor_cos_dist"] is not None:
-            precursor_scan_cos_dist.loc[
-                result_dict_scan["precursor_cos_dist"]["precursor"], scan_idx
-            ] = result_dict_scan["precursor_cos_dist"]["cos_dist"]
-        if result_dict_scan["precursor_collinear_sets"] is not None:
-            precursor_collinear_sets.loc[
-                result_dict_scan["precursor_collinear_sets"]["precursor"], scan_idx
-            ] = result_dict_scan["precursor_collinear_sets"]["collinear_candidates"]
-        scan_record_list.append(result_dict_scan["scans_record"])
-    scan_record = pd.DataFrame(
-        scan_record_list,
-        columns=[
-            "Scan",
-            "Time",
-            "CandidatePrecursorByRT",
-            "FilteredPrecursor",
-            "NumberHighlyCorrDictCandidate",
-            "BestAlpha",
-            "Cosine Dist",
-            "IntensityExplained",
-        ],
-    )
-    return activation, precursor_scan_cos_dist, scan_record, precursor_collinear_sets
-
-
-def _perc_fmt(x, total):
-    return f"{x:.1f}%\n{total * x / 100:.0f}"
-
-
 def ExtractPeak(
     x: np.ndarray,
     y: np.ndarray,
@@ -214,25 +170,6 @@ def ExtractPeak(
         )
     else:
         return peak_result
-
-
-def match_time_to_scan(
-    df: pd.DataFrame, time_cols: List[str], ms1scans_no_array: pd.DataFrame
-):
-    """Match the time values in the dataframe to the scan numbers in the ms1scans_no_array"""
-    # Build a KDTree from the starttime values
-    tree = cKDTree(ms1scans_no_array[["starttime"]])
-
-    for time_col in time_cols:
-        time_scan_col = time_col + "_scan"
-
-        # Query the tree for the nearest neighbor to each time value
-        _, indices = tree.query(df[[time_col]].values)
-
-        # Use the indices to get the corresponding scan numbers
-        df[time_scan_col] = ms1scans_no_array.iloc[indices]["scan_number"].values
-
-    return df
 
 
 def load_mzml(msconvert_file: str, unify_format: bool = False) -> pd.DataFrame:
@@ -302,58 +239,3 @@ def load_mzml(msconvert_file: str, unify_format: bool = False) -> pd.DataFrame:
     return df_ms1
 
 
-def write_df_to_fasta(df: pd.DataFrame, id_col: str, seq_col: str, fasta_path: str):
-    with open(fasta_path, "w", encoding="utf-8") as f:
-        for idx, row in df[[id_col, seq_col]].iterrows():
-            f.write(f">{row[id_col]}\n{row[seq_col]}\n")
-
-
-def write_fasta_to_df(fasta_path: str):
-    with open(fasta_path) as fasta_file:
-        sequence = []
-        for title, seq in SimpleFastaParser(fasta_file):
-            # identifiers.append(title.split(None, 1)[0])  # First word is ID
-            sequence.append(seq)
-
-    df = pd.Series(sequence)
-    return df
-
-
-def save_sparse_csr(filename, array):
-    # note that .npz extension is added automatically
-    np.savez(
-        filename,
-        data=array.data,
-        indices=array.indices,
-        indptr=array.indptr,
-        shape=array.shape,
-    )
-
-
-def load_sparse_csr(filename):
-    # here we need to add .npz extension manually
-    loader = np.load(filename + ".npz")
-    return csr_matrix(
-        (loader["data"], loader["indices"], loader["indptr"]), shape=loader["shape"]
-    )
-
-
-def jaccard_similarity_from_peak_results(row) -> float:
-    seq1 = range(row[["start_scan", "end_scan"]][0], row[["start_scan", "end_scan"]][1])
-    seq2 = range(
-        row[
-            [
-                "Calibrated retention time start_scan",
-                "Calibrated retention time finish_scan",
-            ]
-        ][0],
-        row[
-            [
-                "Calibrated retention time start_scan",
-                "Calibrated retention time finish_scan",
-            ]
-        ][1],
-    )
-    intersection = len(set(seq1).intersection(set(seq2)))
-    union = len(set(seq1).union(set(seq2)))
-    return intersection / union

@@ -12,64 +12,6 @@ from scipy.spatial.distance import euclidean
 Logger = logging.getLogger(__name__)
 
 
-def get_peak_sum_from_pept_slice(
-    pept_mz_rank: int,
-    pept_act_sparse: COO,
-    maxquant_result_dict: pd.DataFrame,
-    ms1scans: pd.DataFrame,
-    mobility_values_df: pd.DataFrame,
-    delta_im: float = 0.04,
-    filter_size: tuple = (5, 75),
-):
-    rt_idx_range, im_idx_range, reference_entry, _ = get_ref_rt_im_range(
-        pept_mz_rank=pept_mz_rank,
-        maxquant_result_dict=maxquant_result_dict,
-        mobility_values_df=mobility_values_df,
-        ms1scans=ms1scans,
-        delta_im=delta_im,
-    )
-    Logger.info("reference values for rt and im %s", reference_entry)
-    slice_pept_act_sparse, rt_idx_range, im_idx_range = slice_pept_act(
-        pept_act_sparse=pept_act_sparse,
-        plot_range="custom",
-        rt_idx_range=rt_idx_range,
-        im_idx_range=im_idx_range,
-    )
-    slice_pept_act_df = prepare_slice_pept_act_df(
-        slice_pept_act_sparse, rt_idx_range, im_idx_range, mobility_values_df, ms1scans
-    )
-    apex_mat, apex_indices = detect_2d_peaks_apex(
-        slice_pept_act_df, filter_size=filter_size
-    )
-    rt_apex, im_apex = get_highest_score_peak_apex(
-        peak_apex_list=apex_indices, reference_entry=reference_entry
-    )
-    Logger.info("Selected peak apex: rt_apex, im_apex %s %s", rt_apex, im_apex)
-    rt_filtered_range, im_filtered_range = get_peak_rt_im_range(
-        peak_apex=(rt_apex, im_apex), pept_ref_slice=slice_pept_act_df
-    )
-    Logger.info(
-        "rt_filtered_range, im_filtered_range %s %s",
-        rt_filtered_range,
-        im_filtered_range,
-    )
-    rt_filtered_idx, im_filtered_idx, _, _ = get_ref_rt_im_range(
-        pept_mz_rank=pept_mz_rank,
-        maxquant_result_dict=maxquant_result_dict,
-        mobility_values_df=mobility_values_df,
-        ms1scans=ms1scans,
-        ref_rt_range=rt_filtered_range,
-        ref_im_range=im_filtered_range,
-    )
-    filter_peak_sparse, _, _ = slice_pept_act(
-        pept_act_sparse=pept_act_sparse,
-        plot_range="custom",
-        rt_idx_range=rt_filtered_idx,
-        im_idx_range=im_filtered_idx,
-    )
-    return filter_peak_sparse.sum(axis=(0, 1))
-
-
 def get_ref_rt_im_range(
     pept_mz_rank: int,
     maxquant_result_dict: pd.DataFrame,
@@ -288,44 +230,3 @@ def get_bbox_from_mq_exp(
     return [min_rt, max_rt, rt_width, min_im, max_im, im_width]
 
 
-def sum_peptbatch_from_act(
-    pept_batch_idx_list: list, result_dir: str, n_act_batch: int = 10
-):
-    for pept_batch_idx, pept_batch_start_idx in enumerate(pept_batch_idx_list):
-        if os.path.exists(
-            os.path.join(
-                result_dir,
-                f"output_im_rt_pept_act_coo_peptbatch{pept_batch_idx}.npz",
-            )
-        ):
-            Logger.info("File exists for peptide batch %s.", pept_batch_idx)
-        else:
-            for act_batch_num in range(n_act_batch):
-                act_3d = sparse.load_npz(
-                    os.path.join(
-                        result_dir,
-                        f"output_im_rt_pept_act_coo_batch{act_batch_num}.npz",
-                    )
-                )
-                Logger.info("NNZ size of batch %s act_3d %s", act_batch_num, act_3d.nnz)
-                try:
-                    pept_batch_slice = act_3d[
-                        :,
-                        :,
-                        pept_batch_start_idx : pept_batch_idx_list[pept_batch_idx + 1],
-                    ]
-                except IndexError:
-                    pept_batch_slice = act_3d[:, :, pept_batch_start_idx:]
-                if act_batch_num == 0:
-                    pept_batch = pept_batch_slice
-                else:
-                    pept_batch += pept_batch_slice
-                del act_3d, pept_batch_slice
-            sparse.save_npz(
-                filename=os.path.join(
-                    result_dir,
-                    f"output_im_rt_pept_act_coo_peptbatch{pept_batch_idx}.npz",
-                ),
-                matrix=pept_batch,
-            )
-            Logger.info("saved pept batch %s", pept_batch_idx)

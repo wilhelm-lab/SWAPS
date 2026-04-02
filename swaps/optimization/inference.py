@@ -1,33 +1,20 @@
 import logging
 import os
 from multiprocessing import cpu_count
-from typing import Callable, List, Literal, Optional
+from typing import List, Literal, Optional
 import itertools
 from operator import itemgetter
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from joblib import Parallel, delayed
-from scipy import spatial
 from sparse import COO
 from scipy.signal import find_peaks
 from sklearn.decomposition import sparse_encode
-from math import floor
-from functools import wraps
 import pyarrow as pa
 import pyarrow.parquet as pq
 import tqdm
 
-# from optimization.dictionary import Dict
-from optimization.custom_models import CustomLinearModel, mean_square_root_error
-from utils.plot import plot_comparison, plot_isopattern_and_obs
-from utils.constants import (
-    _algo,
-    _alpha_criteria,
-    _alpha_opt_metric,
-    _loss,
-    _pp_method,
-)
 import sparse
 
 Logger = logging.getLogger(__name__)
@@ -195,103 +182,6 @@ def slice_candidate_blocks_by_pept(matrix, target_block_size):
 
     assert sum(block.shape[0] for block in blocks) == n_rows, "Row slicing mismatch"
     return blocks, col_cut_indices_start, col_cut_indices_end
-
-
-def _find_first_nonzero(arr, axis, invalid_val=-1):
-    mask = arr != 0
-    return np.where(mask.any(axis=axis), mask.argmax(axis=axis), invalid_val)
-
-
-def _find_last_nonzero(arr, axis, invalid_val=-1):
-    mask = arr != 0
-    val = arr.shape[axis] - np.flip(mask, axis=axis).argmax(axis=axis) - 1
-    return np.where(mask.any(axis=axis), val, invalid_val)
-
-
-def slice_candidate_blocks_by_mz(matrix):
-    # TODO: finding valid slice position not done
-    assert matrix.shape[1] >= 6000
-    Logger.debug("Candidate matrix shape %s", matrix.shape)
-    # slice candidate block by not splitting up isotope envlopes
-    n_blocks = matrix.shape[1] // 3000
-    Logger.debug("Slice candidate blocks into %s blocks.", n_blocks)
-    block_size = matrix.shape[1] // n_blocks
-    ref_col_cut_indices = [block_size * (i + 1) for i in range(n_blocks)]
-
-    col_last_nonzero = _find_last_nonzero(arr=matrix, axis=0, invalid_val=-1)
-    col_first_nonzero = _find_first_nonzero(arr=matrix, axis=0, invalid_val=-1)
-
-    # comparison only starts with index 1, for actual indexing needs to +1
-    valid_slice_pos = np.where(col_last_nonzero[0:-1] < col_first_nonzero[1:])[0] + 1
-    # Logger.debug("valid slice pos %s", valid_slice_pos)
-    col_cut_indices = []
-    for i in range(n_blocks - 1):
-        Logger.debug("column slice idx %s for block %s", ref_col_cut_indices[i], i + 1)
-        idx = (np.abs(valid_slice_pos - ref_col_cut_indices[i])).argmin()
-        col_cut_indices.append(valid_slice_pos[idx])
-        valid_slice_pos = np.delete(valid_slice_pos, list(range(0, idx + 1)))
-    if col_cut_indices[-1] != matrix.shape[1] + 1:
-        col_cut_indices.append(matrix.shape[1] + 1)
-    blocks = []
-    prev_col_cut = 0
-    col_cut_indices_start = []
-    col_cut_indices_end = []
-    Logger.debug("col cut indices: %s", col_cut_indices)
-    for block_idx, col_cut_index in enumerate(col_cut_indices):
-        Logger.debug(
-            "Block %s, col indices start and end %s %s",
-            block_idx,
-            prev_col_cut,
-            col_cut_index,
-        )
-        block_cols = matrix[:, prev_col_cut:col_cut_index]
-        blocks_row_sum = block_cols.sum(axis=1)
-        # get the first and last col with non-zero entries
-        non_zero_indices = np.flatnonzero(blocks_row_sum)
-        Logger.debug("Block row sum shape %s", blocks_row_sum.shape)
-
-        # Find index of the first non-zero value
-        if non_zero_indices.size > 0:
-            row_cut_index_start = non_zero_indices[0]
-            # Find index of the last non-zero value
-            row_cut_index_end = non_zero_indices[-1]
-            Logger.info(
-                "row cut index start and end %s %s",
-                row_cut_index_start,
-                row_cut_index_end,
-            )
-            block = matrix[
-                row_cut_index_start : row_cut_index_end + 1, prev_col_cut:col_cut_index
-            ]
-        else:
-            # No non-zero rows in this column block: create an empty (0-row) block
-            row_cut_index_start = 0
-            row_cut_index_end = -1
-            Logger.info(
-                "No non-zero rows in block cols %s:%s; creating empty block",
-                prev_col_cut,
-                col_cut_index,
-            )
-            block = matrix[0:0, prev_col_cut:col_cut_index]
-
-        blocks.append(block)
-        col_cut_indices_start.append(prev_col_cut)
-        col_cut_indices_end.append(col_cut_index)
-        prev_col_cut = col_cut_index
-        # row_cut_indices_start.append(row_cut_index_start)
-        # row_cut_indices_end.append(row_cut_index_end + 1)
-        Logger.info("block shape %s", block.shape)
-    assert sum([block.shape[0] for block in blocks]) == matrix.shape[0]
-    return blocks, col_cut_indices_start, col_cut_indices_end
-
-
-def slice_frame_data_blocks(frame_data, col_cut_indices_start, col_cut_indices_end):
-    frame_data_blocks = []
-    for start, end in zip(col_cut_indices_start, col_cut_indices_end):
-        frame_data_block = frame_data[:, start:end]
-        frame_data_blocks.append(frame_data_block)
-        # Logger.info(frame_data_block.shape)
-    return frame_data_blocks
 
 
 def process_one_frame(
@@ -949,84 +839,6 @@ def process_batch_frame_save_parquet(
                 os.remove(path_res)  # remove residue parquet if not return res coo dict
 
 
-# def process_batch_frame_save_zarr(
-#     data: pd.DataFrame,
-#     ms1scans: pd.DataFrame,
-#     batch_scan_idx: list,
-#     zarr_path: str,
-#     maxquant_result_ref_with_im_index_sortmz: pd.DataFrame,
-#     mobility_values: Optional[pd.DataFrame],
-#     delta_mobility_thres: int = 100,
-#     extract_im_peak: bool = False,
-#     use_ims: bool = True,
-#     return_res_coo_dict: bool = False,
-#     max_mz_rank: Optional[int] = None,
-#     zarr_chunks: tuple = (256, 256, 1),
-#     **process_frame_kwargs,
-# ):
-#     # TODO: only ims so far
-#     batch_peaks_df = []
-#     if max_mz_rank is None:
-#         max_mz_rank = maxquant_result_ref_with_im_index_sortmz.mz_rank.max()
-#     z = zarr.open(
-#         zarr_path,
-#         mode="a",
-#         shape=(
-#             len(ms1scans.index.values)
-#             + 1,  # this index is rank, starting from 1, add 1 for the last frame
-#             len(mobility_values) if mobility_values is not None else 1,
-#             max_mz_rank
-#             + 1,  # this index is rank, starting from 1, add 1 for the last frame
-#         ),
-#         chunks=zarr_chunks,
-#         dtype=np.float32,
-#         compressor=zarr.Blosc(cname="zstd", clevel=5, shuffle=2),
-#     )
-#     writer = RTChunkWriter(z)
-#     for scan_idx in tqdm.tqdm(
-#         batch_scan_idx, desc="Processing frames in batch", total=len(batch_scan_idx)
-#     ):
-#         Logger.debug("Start processing frame index %s", scan_idx)
-#         if use_ims:
-#             assert mobility_values is not None
-#             one_frame_results = process_one_frame_ims(  # type: ignore[assignment]
-#                 data=data,
-#                 ms1scans=ms1scans,
-#                 ms1_frame_idx=scan_idx,
-#                 maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
-#                 mobility_values=mobility_values,
-#                 delta_mobility_thres=delta_mobility_thres,
-#                 extract_im_peak=extract_im_peak,
-#                 debug=False,
-#                 return_res_coo_dict=return_res_coo_dict,
-#                 writer=writer,
-#                 # zarr_path=zarr_path,
-#                 # zarr_chunks=zarr_chunks,
-#                 # zarr_shape=(
-#                 #     len(ms1scans.index.values)
-#                 #     + 1,  # this index is rank, starting from 1, add 1 for the last frame
-#                 #     len(mobility_values),
-#                 #     max_mz_rank
-#                 #     + 1,  # this index is rank, starting from 1, add 1 for the last frame
-#                 # ),
-#                 **process_frame_kwargs,
-#             )
-
-#         else:
-#             # TODO: fixme
-#             peaks_df, frame_im_pept_act_coo = process_one_frame(  # type: ignore[assignment]
-#                 ms1scans=ms1scans,
-#                 ms1_frame_idx=scan_idx,
-#                 maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
-#                 debug=False,
-#                 **process_frame_kwargs,
-#             )
-
-#             for key in batch_rt_pept_act_coo_dict.keys():
-#                 batch_rt_pept_act_coo_dict[key].extend(frame_im_pept_act_coo[key])
-#     writer.flush()
-
-
 def _match_candidate_mz_and_binned_frame_mz_by_ppm(
     candidate_mz,
     frame_mz,
@@ -1521,24 +1333,6 @@ def _extract_peaks_in_im(
         # Logger.debug("No peak extracted from pept_id %s in this frame.", pept_id)
         peak_properties = None
     return peak_properties
-
-
-def parallel(func=None, args=(), merge_func=lambda x: x, parallelism=cpu_count()):
-    def decorator(func: Callable):
-        def inner(*args, **kwargs):
-            results = Parallel(n_jobs=parallelism)(
-                delayed(func)(*args, **kwargs) for i in range(parallelism)
-            )
-            return merge_func(results)
-
-        return inner
-
-    if func is None:
-        # decorator was used like @parallel(...)
-        return decorator
-    else:
-        # decorator was used like @parallel, without parens
-        return decorator(func)
 
 
 def generate_id_partitions(

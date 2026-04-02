@@ -4,12 +4,9 @@ from typing import Tuple, Literal, Optional
 import numpy as np
 import pandas as pd
 import tqdm
-from scipy.ndimage import gaussian_filter, distance_transform_edt, uniform_filter
-from skimage.registration import phase_cross_correlation
+from scipy.ndimage import gaussian_filter, uniform_filter
 from skimage.morphology import remove_small_objects
-from skimage.metrics import structural_similarity as ssim
 from skimage.feature import match_template
-from scipy.ndimage import shift as ndi_shift
 import cv2
 from concurrent.futures import ProcessPoolExecutor
 from mahotas.features import zernike_moments
@@ -1010,73 +1007,6 @@ def smooth_and_denoise_image(
     return image_smoothed
 
 
-def align_images(reference_image, aligned_image, mask_threshold=25):
-    """Align two images using phase cross-correlation and return the aligned image and the calculated shift.
-    Parameters
-    ----------
-    reference_image : 2D array
-        Reference image to align to.
-    image_b : 2D array
-        Image to be aligned.
-    Returns
-    -------
-    aligned_image_b : 2D array
-        Aligned version of image_b.
-    shift : tuple
-        Calculated shift applied to image_b.
-    """
-    mask1 = reference_image > np.percentile(reference_image, mask_threshold)
-    mask2 = aligned_image > np.percentile(aligned_image, mask_threshold)
-    shift, _, phasediff = phase_cross_correlation(
-        mask1,
-        mask2,
-        reference_mask=mask1.astype(bool),
-        moving_mask=mask2.astype(bool),
-        upsample_factor=1,
-        normalization=None,
-    )
-
-    aligned_image_b = ndi_shift(aligned_image, shift)
-
-    return aligned_image_b, shift, phasediff
-
-
-def compare_windowed_cosine(img1, img2, peak_coords, window_size=21):
-    y, x = peak_coords
-    r = window_size // 2
-
-    # Pad to handle peaks near the boundary
-    pad1 = np.pad(img1, r, mode="edge")
-    pad2 = np.pad(img2, r, mode="edge")
-
-    # Adjust coords for padding
-    py, px = y + r, x + r
-
-    # Extract and flatten patches
-    patch1 = pad1[py - r : py + r + 1, px - r : px + r + 1].ravel()
-    patch2 = pad2[py - r : py + r + 1, px - r : px + r + 1].ravel()
-
-    # Cosine Similarity Formula
-    norm = np.linalg.norm(patch1) * np.linalg.norm(patch2)
-    return np.dot(patch1, patch2) / norm if norm != 0 else 0.0
-
-
-def compare_gaussian_weighted(img1, img2, peak_coords, sigma=15):
-    y, x = peak_coords
-    yy, xx = np.indices(img1.shape)
-
-    # Create Gaussian weight centered at coordinates
-    dist_sq = (yy - y) ** 2 + (xx - x) ** 2
-    weights = np.exp(-dist_sq / (2 * sigma**2))
-
-    # Normalize to 0-1 for SSIM consistency
-    i1_n = cv2.normalize(img1.astype(float), None, 0, 1, cv2.NORM_MINMAX)
-    i2_n = cv2.normalize(img2.astype(float), None, 0, 1, cv2.NORM_MINMAX)
-
-    # Structural Similarity weighted by the Gaussian mask
-    return ssim(i1_n * weights, i2_n * weights, data_range=1.0)
-
-
 def get_orb_peak_descriptor(
     img, peak_coords, patch_size=100
 ):  # This doesn't work well when image is noisy or only one smooth peak exists
@@ -1107,22 +1037,6 @@ def get_orb_peak_descriptor(
     _, des = orb.compute(img_8bit, kp)
 
     return des
-
-
-def compare_orb_descriptors(des1, des2):
-    """
-    Compares two pre-computed descriptors using Hamming distance.
-    Returns a similarity score between 0.0 and 1.0.
-    """
-    if des1 is None or des2 is None:
-        return 0.0
-
-    # Hamming distance: count bit differences
-    # Lower distance = Higher similarity
-    dist = cv2.norm(des1, des2, cv2.NORM_HAMMING)
-
-    # ORB descriptors are 256 bits (32 bytes)
-    return 1.0 - (dist / 256.0)
 
 
 def get_sift_descriptor(img, peak_coords, patch_size=31):
