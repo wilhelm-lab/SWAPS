@@ -51,6 +51,7 @@ def _suppress_alphatims_atexit_logging_error():
     discard handler errors instead of printing a traceback."""
     yield
     import logging
+
     logging.raiseExceptions = False
 
 
@@ -90,8 +91,8 @@ def sage_dir():
     path = os.environ.get(
         "SWAPS_TEST_SAGE_DIR",
         "/cmnfs/proj/ORIGINS/data/random_precursor_sampling/"
-        "jigsaw_bruker_single_cell/sage/test_hela/500SPD/"
-        "jigsawPASEF_a000_IntThres1600_2R_150ms",
+        "jigsaw_bruker_single_cell/sage/search_results/500SPD/"
+        "jigsawPASEF_a000_IntThres1600_2R_150ms/",
     )
     if not path or not os.path.isdir(path):
         pytest.skip(f"SAGE dir not found: {path}")
@@ -103,8 +104,8 @@ def maxquant_dir():
     path = os.environ.get(
         "SWAPS_TEST_MAXQUANT_DIR",
         "/cmnfs/proj/ORIGINS/data/random_precursor_sampling/"
-        "jigsaw_bruker_single_cell/MaxQuant/test_hela/500SPD/"
-        "jigsawPASEF_a000_IntThres1600_2R_150ms",
+        "jigsaw_bruker_single_cell/maxquant/500SPD/"
+        "jigsawPASEF_a000_IntThres1600_2R_150ms/combined/txt/",
     )
     if not path or not os.path.isdir(path):
         pytest.skip(f"MaxQuant dir not found: {path}")

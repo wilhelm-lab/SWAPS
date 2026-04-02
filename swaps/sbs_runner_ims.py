@@ -102,7 +102,11 @@ def opt_scan_by_scan(config_path: str):
                 evidence = pd.read_csv(
                     cfg.SEARCH_OUTPUT_PATH, sep="\t", low_memory=False
                 )
-                evidence = sage_parser(evidence)
+                evidence = sage_parser(
+                    evidence,
+                    rt_window=cfg.PREPARE_DICT.SAGE_RT_WINDOW,
+                    im_window=cfg.PREPARE_DICT.SAGE_IM_WINDOW,
+                )
             case "fragpipe":
                 evidence = pd.DataFrame()
                 for exp_dir in os.listdir(cfg.SEARCH_OUTPUT_PATH):

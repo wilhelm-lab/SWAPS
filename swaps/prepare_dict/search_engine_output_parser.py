@@ -52,7 +52,10 @@ fragpipe_rename_dict = {
 
 
 def sage_parser(
-    sage_output: pd.DataFrame, sage_rename_dict: dict = sage_rename_dict
+    sage_output: pd.DataFrame,
+    sage_rename_dict: dict = sage_rename_dict,
+    rt_window: float = 0.0,
+    im_window: float = 0.0,
 ) -> pd.DataFrame:
     """
     Parse the SAGE output DataFrame and rename columns based on the provided dictionary.
@@ -60,6 +63,10 @@ def sage_parser(
     Args:
         sage_output (pd.DataFrame): The SAGE output DataFrame.
         sage_rename_dict (dict): A dictionary mapping old column names to new column names.
+        rt_window (float): RT elution window in minutes to add as ``Retention length``.
+            0 (default) triggers auto-calculation: 1% of the maximum observed RT.
+        im_window (float): IM elution window in 1/K0 units to add as ``1/K0 length``.
+            0 (default) triggers auto-calculation: 0.1 1/K0 units.
 
     Returns:
         pd.DataFrame: The parsed DataFrame with renamed columns.
@@ -85,10 +92,37 @@ def sage_parser(
     sage_output["Calibrated retention time start"] = sage_output["Retention time"]
     sage_output["Calibrated retention time finish"] = sage_output["Retention time"]
     sage_output["Ion mobility length"] = 80  # FIXME: very dirty fix
+
+    # RT elution window: SAGE reports apex only, so we synthesise a window.
+    if rt_window == 0.0:
+        rt_window = sage_output["Retention time"].max() * 0.01
+        Logger.warning(
+            "SAGE_RT_WINDOW not set; defaulting to 1%% of max RT = %.4f min", rt_window
+        )
+    sage_output["Retention length"] = rt_window
+
+    # IM elution window: SAGE reports apex only, so we use a fixed default.
+    if im_window == 0.0:
+        im_window = 0.1
+        Logger.warning(
+            "SAGE_IM_WINDOW not set; defaulting to %.2f 1/K0 units", im_window
+        )
+    sage_output["1/K0 length"] = im_window
+
     sage_output.loc[sage_output["Is_Decoy"], "Reverse"] = "+"
     sage_output["Sequence"] = sage_output["Modified sequence"].str.replace(
         r"\[.*?\]", "", regex=True
     )
+    # Extract modifications from the modified sequence, e.g. "PEPTM[+15.9949]IK"
+    # → "M+15.9949". Produces "Unmodified" for unmodified peptides so the column
+    # is never NaN (required by cleanup_maxquant/pivot_psm_by_mz_rank groupby).
+    import re as _re
+    def _extract_mods(seq):
+        hits = _re.findall(r"([A-Z])\[([+-]?\d+\.?\d*)\]", str(seq))
+        if not hits:
+            return "Unmodified"
+        return ";".join(f"{aa}{mass}" for aa, mass in hits)
+    sage_output["Modifications"] = sage_output["Modified sequence"].apply(_extract_mods)
     sage_output["Retention time calibration"] = 0
     return sage_output
 

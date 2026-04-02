@@ -63,6 +63,8 @@ __C.PREPARE_DICT.FILTER_PRED_BY_RAW_FILE = ""  # None for not filtering, "" for 
 __C.PREPARE_DICT.MZ_BIN_DIGITS = 2  # legacy, not used
 __C.PREPARE_DICT.ISO_MIN_AB_THRES = 0.01
 __C.PREPARE_DICT.GENERATE_DECOY = False
+__C.PREPARE_DICT.SAGE_RT_WINDOW = 0.0   # RT elution window (min) for SAGE; 0 = auto (1% of max RT)
+__C.PREPARE_DICT.SAGE_IM_WINDOW = 0.0   # IM elution window for SAGE; 0 = auto (0.1 1/K0 units)
 __C.PREPARE_DICT.RT_MAX = 0.0
 __C.PREPARE_DICT.EXP_OK_DIR = ""  # path to the oktoberfest output directory for using rescoring output, then MQ evidence should be 100FDR
 __C.PREPARE_DICT.EXP_OK_OUTPUT = "psms"  # one of ["psms", "peptides"], whether use ok psms or peptides table for filtering

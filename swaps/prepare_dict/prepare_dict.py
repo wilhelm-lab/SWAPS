@@ -1408,12 +1408,41 @@ def construct_dict_from_search_pivoted(
         id_cols=["Sequence", "Modifications", "Charge", "Raw file", "Proteins"],
         how_duplicates="keep_highest_int",
     )
+    # MATCH/MBR rows may carry a null Modified sequence even though the same
+    # peptide was directly identified (MSMS) in another run.  Propagate the
+    # Modified sequence from the MSMS row to all rows in the same
+    # (Sequence, Modifications, Charge) group so the aggregation in
+    # get_rt_im_range always finds a non-null value.
+    evidence_cleaned["Modified sequence"] = (
+        evidence_cleaned
+        .groupby(["Sequence", "Modifications", "Charge"], dropna=False)["Modified sequence"]
+        .transform(lambda x: x.fillna(x.dropna().iloc[0]) if x.notna().any() else x)
+    )
+    # After propagation, rows that are still null are MATCH-only groups with no
+    # MSMS donor present.  Recover unmodified peptides from the bare Sequence;
+    # anything with actual modifications that still has no Modified sequence is
+    # ambiguous — drop it with a warning.
+    still_null = evidence_cleaned["Modified sequence"].isna()
+    if still_null.any():
+        unmod_mask = still_null & (evidence_cleaned["Modifications"] == "Unmodified")
+        evidence_cleaned.loc[unmod_mask, "Modified sequence"] = (
+            "_" + evidence_cleaned.loc[unmod_mask, "Sequence"] + "_"
+        )
+        still_null = evidence_cleaned["Modified sequence"].isna()
+        if still_null.any():
+            Logger.warning(
+                "Dropping %d rows with irrecoverable null 'Modified sequence' "
+                "(modified MATCH-only peptides with no MSMS donor)",
+                still_null.sum(),
+            )
+            evidence_cleaned = evidence_cleaned[~still_null]
     evidence_pivoted = pivot_psm_by_mz_rank(evidence_cleaned)
     evidence_group_summary = get_rt_im_range(
         evidence_cleaned,
         id_cols=["Sequence", "Modifications", "Charge", "Proteins"],
         summarize_without_match=cfg_prepare_dict.SUMMARIZE_WITHOUT_MATCH,
     )
+
     # add extra columns
     evidence_group_summary = dict_add_iso_pattern(
         evidence_group_summary, ab_thres=cfg_prepare_dict.ISO_MIN_AB_THRES
@@ -2098,19 +2127,35 @@ def pivot_psm_by_mz_rank(
     - result_df: pd.DataFrame, the pivoted dataframe with one row per peptide and columns for each raw file indicating the status, as well as pivoted RT and mobility values.
     """
     # --- Step 1: Global Best Identification ---
-    sorted_ev = evidence.sort_values(
+    # Reset index first so that .loc[index] never matches more than one row
+    # (duplicate indices arise when the caller passes a filtered/concatenated df).
+    evidence = evidence.reset_index(drop=True)
+    # Prefer direct MS/MS identifications as global reference candidates.
+    # MATCH/MBR rows are still kept for RT/IM metrics (Steps 3-4).
+    # Use dropna=False so peptides with NaN in any id column are not silently dropped.
+    msms_mask = ~evidence["Type"].str.upper().str.contains(match_keyword.upper(), na=False)
+    msms_only = evidence[msms_mask]
+    sorted_msms = msms_only.sort_values(
         by=id_cols + [metric_col, intensity_col],
         ascending=[True] * len(id_cols) + [not higher_is_better, False],
     )
     evidence["is_global_best"] = False
-    evidence.loc[sorted_ev.groupby(id_cols).head(1).index, "is_global_best"] = True
+    evidence.loc[sorted_msms.groupby(id_cols, dropna=False).head(1).index, "is_global_best"] = True
+
+    # Fallback: for peptides with no MSMS rows at all, use their best row of any type.
+    no_best_mask = ~evidence.groupby(id_cols, dropna=False)["is_global_best"].transform("any")
+    fallback = evidence[no_best_mask].sort_values(
+        by=id_cols + [metric_col, intensity_col],
+        ascending=[True] * len(id_cols) + [not higher_is_better, False],
+    )
+    evidence.loc[fallback.groupby(id_cols, dropna=False).head(1).index, "is_global_best"] = True
 
     # --- Step 2: Status Labeling ---
     def label_logic(row):
-        if match_keyword.upper() in str(row["Type"]).upper():
-            return 3
-        elif row["is_global_best"]:
+        if row["is_global_best"]:
             return 1
+        elif match_keyword.upper() in str(row["Type"]).upper():
+            return 3
         elif msms_keyword.upper() in str(row["Type"]).upper():
             return 2
         else:
@@ -2121,7 +2166,7 @@ def pivot_psm_by_mz_rank(
     # --- Step 3: Pivot Status ---
     # We use min() here as per your logic to prioritize the '1' (Reference) label
     # if a file has multiple entries for the same peptide.
-    summary = evidence.groupby(id_cols + ["Raw file"])["Status_Val"].min().reset_index()
+    summary = evidence.groupby(id_cols + ["Raw file"], dropna=False)["Status_Val"].min().reset_index()
 
     pivot_status = summary.pivot(index=id_cols, columns="Raw file", values="Status_Val")
     mapping = {3: "Match", 2: "Quant_Only", 1: "Reference", 0: "Other"}
