@@ -317,6 +317,7 @@ def opt_scan_by_scan(config_path: str):
             "template_matching_score",
         ],
         normalize_features=False,
+        scannr_col="feature_instance_id",
         psmid_col="Sequence_with_runs",
         peptide_col="Sequence",
         protein_col="Proteins",
@@ -329,11 +330,14 @@ def opt_scan_by_scan(config_path: str):
     )
     # Filter for the columns passed the makopot filter
     psms_filtered = psms.loc[(psms["mokapot q-value"] < 0.01) & (psms["label"] == True)]
-    psms_filtered["mz_rank"] = psms_filtered["scannr"].str.split("_").str[0].astype(int)
+    psms_filtered["feature_instance_id"] = psms_filtered["scannr"]
+    psms_filtered["mz_rank"] = (
+        psms_filtered["feature_instance_id"].str.split("_").str[0].astype(int)
+    )
     pp_match_target_filtered = pp_match_target.merge(
-        psms_filtered[["filename", "mz_rank"]],
-        left_on=["mz_rank", "Run_name"],
-        right_on=["mz_rank", "filename"],
+        psms_filtered[["filename", "mz_rank", "feature_instance_id"]],
+        left_on=["mz_rank", "Run_name", "feature_instance_id"],
+        right_on=["mz_rank", "filename", "feature_instance_id"],
         how="inner",
     )
     pp_match_target_filtered.to_csv(

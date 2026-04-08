@@ -236,7 +236,15 @@ def combine_matches_target_decoy(matches_target, matches_decoy, dict_ref):
     )
     tdc_df["Decoy"] = ~tdc_df["IsTarget"]
     tdc_df["label"] = tdc_df["IsTarget"]
-    tdc_df["Sequence_with_runs"] = tdc_df["Sequence"] + "_" + tdc_df["matched_run"]
+    if "feature_instance_id" not in tdc_df.columns:
+        tdc_df["feature_instance_id"] = tdc_df["mz_rank"].astype(str)
+    tdc_df["Sequence_with_runs"] = (
+        tdc_df["Sequence"]
+        + "_"
+        + tdc_df["matched_run"]
+        + "_"
+        + tdc_df["feature_instance_id"].astype(str)
+    )
     return tdc_df
 
 

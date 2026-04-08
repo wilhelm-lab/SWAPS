@@ -200,9 +200,39 @@ def detect_2d_peak_with_watershed(
 
             if same_component_mask.any():
                 same_component_peaks = bg_peaks[same_component_mask]
-                distances = np.linalg.norm(same_component_peaks - true_seed, axis=1)
-                closest_idx = np.argmin(distances)
-                snapped_seed = same_component_peaks[closest_idx]
+                component_mask = connected_components == true_seed_component
+
+                # Run a provisional watershed using all local maxima in the same
+                # connected component. We only accept a snapped seed if its
+                # watershed region actually contains the true seed.
+                candidate_mask = np.zeros_like(mask, dtype=bool)
+                candidate_mask[tuple(same_component_peaks.T)] = True
+                candidate_markers, _ = ndi.label(candidate_mask)
+                candidate_labels = watershed(
+                    -image,
+                    candidate_markers,
+                    mask=component_mask,
+                    compactness=0.001,
+                )
+                true_seed_label = candidate_labels[tuple(true_seed)]
+
+                if true_seed_label > 0:
+                    snapped_peak_mask = np.array(
+                        [
+                            candidate_markers[tuple(p)] == true_seed_label
+                            for p in same_component_peaks
+                        ]
+                    )
+                    if snapped_peak_mask.any():
+                        snapped_seed = same_component_peaks[
+                            np.flatnonzero(snapped_peak_mask)[0]
+                        ]
+                    else:
+                        snapped_seed = true_seed
+                else:
+                    # Fallback: if the true seed is not captured by any
+                    # candidate watershed region, keep the original seed.
+                    snapped_seed = true_seed
             else:
                 # No peak in same component, fall back to true seed
                 same_component_peaks = np.empty(

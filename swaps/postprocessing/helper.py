@@ -176,7 +176,7 @@ def build_pivot(pp_all, dict_ref):
         index="mz_rank",
         columns="Run_name",
         values=["Match Type", "intensity_sum"],
-        aggfunc="first",
+        aggfunc={"Match Type": "first", "intensity_sum": "max"},
     )
 
     # Rename intensity column level
