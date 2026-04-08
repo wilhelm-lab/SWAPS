@@ -1,4 +1,3 @@
-import io
 import logging
 import yaml
 from yacs.config import CfgNode as ConfigurationNode
@@ -29,7 +28,9 @@ def _filter_cfg_dict(
         if k not in cfg_node:
             unknown.append(full_key)
         elif isinstance(v, dict) and isinstance(cfg_node[k], ConfigurationNode):
-            sub_filtered, sub_unknown = _filter_cfg_dict(cfg_node[k], v, prefix=full_key)
+            sub_filtered, sub_unknown = _filter_cfg_dict(
+                cfg_node[k], v, prefix=full_key
+            )
             filtered[k] = sub_filtered
             unknown.extend(sub_unknown)
         else:
@@ -51,6 +52,4 @@ def merge_cfg_from_file(cfg: ConfigurationNode, cfg_filename: str) -> None:
             len(unknown_keys),
             unknown_keys,
         )
-    cfg.merge_from_other_cfg(
-        ConfigurationNode.load_cfg(io.StringIO(yaml.dump(filtered_dict)))
-    )
+    cfg.merge_from_other_cfg(ConfigurationNode.load_cfg(yaml.dump(filtered_dict)))
