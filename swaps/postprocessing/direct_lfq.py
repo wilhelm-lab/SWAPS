@@ -1,209 +1,629 @@
-# run mq evidence
-import directlfq.lfq_manager as lfq_manager
-import directlfq.benchmarking as lfqbenchmark
-import directlfq.utils as lfqutils
-import fire
+# TODO: move it to helper instead
 import logging
 import pandas as pd
 import os
-from .singleton_direct_lfq import direct_lfq_config
-from utils.config import get_cfg_defaults
 import matplotlib.pyplot as plt
-import shutil
+from matplotlib.gridspec import GridSpec
 import numpy as np
+from typing import Optional
+import seaborn as sns
+
+Logger = logging.getLogger(__name__)
+ALLOWED_ORGANISMS = ("HUMAN", "YEAST", "ECOLI")
+ORGANISM_NAME_MAP = {
+    "HUMAN": "Homo sapiens",
+    "YEAST": "Saccharomyces cerevisiae",
+    "ECOLI": "Escherichia coli",
+}
 
 
-# TODO refactor script
-def direct_lfq(direct_lfq_config_path):
-    cfg = get_cfg_defaults(direct_lfq_config)
-    cfg.merge_from_file(direct_lfq_config_path)
-    assert len(cfg.SWAPS_RESULT_DIR_LIST) > 0
-    os.makedirs(cfg.RESULT_DIR, exist_ok=True)
-
-    samplemap_directlfq = os.path.join(cfg.RESULT_DIR, "samplemap.tsv")
-    directlfq_file = os.path.join(
-        cfg.RESULT_DIR,
-        "evidence_swaps_int.txt.protgroup_annotated.tsv.maxquant_evidence.protein_intensities.tsv",
+def reformat_swaps_combined_for_directlfq(
+    combined_ion, dict_ref, output_dir, ion_id_col="mz_rank", protein_id_col="Proteins"
+):
+    intensity_cols = [col for col in combined_ion.columns if col.endswith("Intensity")]
+    reformatted_df = pd.merge(
+        combined_ion[intensity_cols + [ion_id_col]],
+        dict_ref[[ion_id_col, protein_id_col]],
+        on=ion_id_col,
+        how="left",
     )
+    intensity_cols_rename_map = {col: "run_" + col for col in intensity_cols}
+    intensity_cols_rename_map[protein_id_col] = "protein"
+    intensity_cols_rename_map[ion_id_col] = "ion"
+    reformatted_df = reformatted_df.rename(columns=intensity_cols_rename_map)
+    reformatted_df = reformatted_df[
+        ["protein", "ion"] + list(intensity_cols_rename_map.values())[:-2]
+    ]
+    reformatted_df.to_csv(
+        os.path.join(output_dir, "swaps.aq_reformat.tsv"), index=False, sep="\t"
+    )
+    return reformatted_df
 
-    if os.path.exists(directlfq_file) and os.path.exists(samplemap_directlfq):
-        logging.info("directLFQ results already exist, skipping")
 
+def extract_organism_from_protein_id(protein_id: object) -> str:
+    """Extract organism code from the last '_' token in a protein id."""
+    if not isinstance(protein_id, str) or not protein_id:
+        return ""
+
+    # Keep first accession when multiple ids are concatenated with ';'
+    first_token = protein_id.split(";")[0]
+    if "_" not in first_token:
+        return ""
+    return first_token.rsplit("_", 1)[-1].upper()
+
+
+def add_filtered_organism_column(
+    df: pd.DataFrame,
+    *,
+    protein_col: str = "Protein IDs",
+    organism_col: str = "Species",
+    allowed_species: tuple[str, ...] = ALLOWED_ORGANISMS,
+) -> pd.DataFrame:
+    """
+    Create `organism_col` from `protein_col` and keep only allowed species.
+    """
+    if protein_col not in df.columns:
+        raise ValueError(f"Column '{protein_col}' not found in input dataframe.")
+
+    out = df.copy()
+    out[organism_col] = out[protein_col].map(extract_organism_from_protein_id)
+    out = out[out[organism_col].isin(allowed_species)].copy()
+    return out
+
+
+def resolve_organisms_to_plot(
+    requested_organisms: list[str], available_organisms: set[str]
+) -> list[str]:
+    """
+    Resolve configured organism labels to available labels (code <-> full-name).
+    """
+    inverse_map = {v: k for k, v in ORGANISM_NAME_MAP.items()}
+    resolved = []
+    for org in requested_organisms:
+        if org in available_organisms:
+            resolved.append(org)
+            continue
+        if org in ORGANISM_NAME_MAP and ORGANISM_NAME_MAP[org] in available_organisms:
+            resolved.append(ORGANISM_NAME_MAP[org])
+            continue
+        if org in inverse_map and inverse_map[org] in available_organisms:
+            resolved.append(inverse_map[org])
+            continue
+    return resolved
+
+
+def get_log_fc_ratio_for_entry(
+    df: pd.DataFrame,
+    cond_A_keyword: str = "HYE124_A",
+    cond_B_keyword: str = "HYE124_B",
+) -> pd.DataFrame:
+    """
+    Compute per-row log2 fold-change ratio in the directLFQ results table.
+    This is a helper function for plotting expected vs observed fold changes.
+
+    Parameters
+    ----------
+    df
+        DataFrame containing the directLFQ results with columns for each sample.
+    cond_A_keyword
+        Substring to identify condition A samples in column names.
+    cond_B_keyword
+        Substring to identify condition B samples in column names.
+
+    Returns
+    -------
+    pd.DataFrame
+        Copy of `df` with a new `log2_fc_A_B` column. Each row is calculated as
+        log2(median(cond_B) / median(cond_A)) using matching columns.
+    """
+    cond_A_cols = [col for col in df.columns if cond_A_keyword in col]
+    cond_B_cols = [col for col in df.columns if cond_B_keyword in col]
+    if not cond_A_cols or not cond_B_cols:
+        raise ValueError(
+            "Could not find condition columns with the provided keywords: "
+            f"cond_A_keyword='{cond_A_keyword}', cond_B_keyword='{cond_B_keyword}'."
+        )
+
+    out = df.copy()
+
+    # Convert to numeric, replace zeros with NaN, then aggregate per row.
+    cond_A_values = (
+        out[cond_A_cols].apply(pd.to_numeric, errors="coerce").replace(0, np.nan)
+    )
+    cond_B_values = (
+        out[cond_B_cols].apply(pd.to_numeric, errors="coerce").replace(0, np.nan)
+    )
+    out["median_A"] = cond_A_values.median(axis=1, skipna=True)
+    out["median_B"] = cond_B_values.median(axis=1, skipna=True)
+    median_A = cond_A_values.median(axis=1, skipna=True)
+    median_B = cond_B_values.median(axis=1, skipna=True)
+
+    ratio = median_B / median_A
+    ratio = ratio.where((median_A > 0) & ratio.notna())
+    out["log2_fc_A_B"] = np.log2(ratio)
+
+    return out
+
+
+def plot_quantification_by_run(
+    df: pd.DataFrame,
+    *,
+    id_cols: list[str] | None = None,
+    int_col_keyword: Optional[str] = None,
+    zero_color: str = "#d73027",
+    nonzero_color: str = "#1a9850",
+    sort_columns: bool = False,
+    label_char_range: Optional[tuple[int, int]] = None,
+    dataset_name: Optional[str] = "",
+    fig_dir: Optional[str] = None,
+    ax: Optional[plt.Axes] = None,
+):
+    """
+    Plot one stacked bar per column (excluding `protein_col`) with zero vs non-zero counts.
+
+    Parameters
+    ----------
+    df
+        Input table containing a protein identifier column and intensity/count columns.
+    id_cols
+        Columns to exclude from plotting (default: ["protein"]).
+    int_col_keyword
+        Substring to identify intensity/count columns (default: None). If provided, only columns containing this substring will be plotted.
+    zero_color
+        Color used for zero-value counts.
+    nonzero_color
+        Color used for non-zero-value counts.
+    sort_columns
+        If True, sort bars by total row count (descending).
+    label_char_range
+        If provided, slice each x-axis label as label[m:n].
+    ax
+        Optional matplotlib axis to draw on.
+
+    Returns
+    -------
+    tuple
+        (fig, ax, counts_df) where counts_df has columns:
+        ["column", "zero_count", "nonzero_count", "total_count"].
+    """
+    assert (
+        id_cols or int_col_keyword
+    ), "Must provide either id_cols or int_col_keyword to identify columns to plot."
+    if id_cols is not None:
+        cols_to_plot = [col for col in df.columns if col not in id_cols]
     else:
-        logging.info("Running directLFQ")
-        # prepare inputs
-        evidence_swaps_int = pd.DataFrame()
-        for swap_dir in cfg.SWAPS_RESULT_DIR_LIST:
-            maxquant_result_ref = pd.read_pickle(
-                os.path.join(swap_dir, "maxquant_result_ref.pkl")
-            )
-            maxquant_result_ref = maxquant_result_ref.sort_values("mz_rank")
-            # pept_act_sum_df = pd.read_csv(
-            #     os.path.join(
-            #         swap_dir, "results", "activation", cfg.INTENSITY_COLUMN + ".csv"
-            #     )
-            # )
-            pept_act_sum_df = pd.read_csv(
-                os.path.join(
-                    swap_dir,
-                    "results",
-                    "peak_selection",
-                    "pept_act_sum_ps_full_tdc_fdr_thres.csv",
-                )
-            )
-            pept_act_sum_df = pept_act_sum_df.loc[1:]
-            maxquant_result_ref["Intensity"] = pept_act_sum_df[
-                cfg.INTENSITY_COLUMN
-            ].values
-            # evidence_swaps_int = pd.concat(
-            #     [evidence_swaps_int, maxquant_result_ref], axis=0
-            # )
-            logging.info("Filtering activation results")
-            if "log_sum_intensity" in pept_act_sum_df.columns:
-                pept_act_sum_df["log_sum_intensity"] = np.log10(
-                    pept_act_sum_df["log_sum_intensity"] + 1
-                )
-            pept_act_sum_df = pept_act_sum_df.loc[
-                (pept_act_sum_df["log_sum_intensity"] > cfg.FILTER.LOG_INTENSITY_THRES)
-                & (pept_act_sum_df["target_decoy_score"] > cfg.FILTER.SCORE_THRES)
-                & (pept_act_sum_df["Decoy"] == 0)
-            ]
-            evidence_swaps_int = pd.merge(
-                left=maxquant_result_ref,
-                right=pept_act_sum_df,
-                on="mz_rank",
-                how="inner",
-            )
-            logging.info("evidence_swaps_int shape: %s", evidence_swaps_int.shape)
-        if cfg.RAW_FILE_AS_EXPERIMENT:
-            samplemap = evidence_swaps_int[["Raw file", "Experiment"]].drop_duplicates()
-            samplemap.rename(
-                columns={"Raw file": "sample", "Experiment": "condition"}, inplace=True
-            )
-            evidence_swaps_int["Experiment"] = evidence_swaps_int["Raw file"]
-        else:
-            samplemap = pd.DataFrame(cfg.SAMPLE_MAP, columns=["sample", "condition"])
-        samplemap.to_csv(
-            os.path.join(cfg.RESULT_DIR, "samplemap.tsv"),
-            sep="\t",
-            index=False,
-        )
-        evidence_swaps_int.to_csv(
-            os.path.join(cfg.RESULT_DIR, "evidence_swaps_int.txt"),
-            sep="\t",
-            index=False,
+        cols_to_plot = [
+            col for col in df.columns if int_col_keyword and int_col_keyword in col
+        ]
+    if not cols_to_plot:
+        raise ValueError(
+            f"No columns available for plotting after excluding '{id_cols}'."
         )
 
-        # run direct_lfq
-        lfq_manager.run_lfq(
-            input_file=os.path.join(cfg.RESULT_DIR, "evidence_swaps_int.txt"),
-            mq_protein_groups_txt=cfg.MQ_PROTEIN_GROUP_PATH,
-            input_type_to_use="maxquant_evidence",
-        )
+    values = df[cols_to_plot]
+    zero_counts = values.eq(0).sum(axis=0)
+    na_counts = values.isna().sum(axis=0)
+    nonquant_counts = zero_counts + na_counts
+    nonzero_counts = values.gt(0).sum(axis=0)
 
-    if cfg.REF_RESULT_FILE != "":
-        ref_directlfq_file = os.path.join(
-            cfg.RESULT_DIR,
-            "evidence.txt.protgroup_annotated.tsv.maxquant_evidence.protein_intensities.tsv",
-        )
-        if os.path.exists(ref_directlfq_file):
-            logging.info("Reference directLFQ results already exist, skipping")
-        else:
-            shutil.copy(cfg.REF_RESULT_FILE, cfg.RESULT_DIR)
-            new_ref_path = os.path.join(
-                cfg.RESULT_DIR, os.path.basename(cfg.REF_RESULT_FILE)
-            )
-            logging.info("Running directLFQ on reference data")
-            lfq_manager.run_lfq(
-                input_file=new_ref_path,
-                mq_protein_groups_txt=cfg.MQ_PROTEIN_GROUP_PATH,
-                input_type_to_use="maxquant_evidence",
-            )
-
-    # benchmark results
-    logging.info("Benchmarking directLFQ results")
-    # prepare group protein.txt
-    try:
-        organism_annotator = lfqbenchmark.OrganismAnnotatorMaxQuant(
-            mapping_file=cfg.MQ_PROTEIN_GROUP_PATH, protein_column="Protein IDs"
-        )
-    except (
-        ValueError
-    ):  # if the protein group file does not have the species column, generate it TODO: needs to be updated
-        ori_mq_search = pd.read_csv(
-            cfg.MQ_PROTEIN_GROUP_PATH,
-            sep="\t",
-        )
-        ori_mq_search["Species"] = ori_mq_search["Fasta headers"].apply(
-            lambda x: (
-                "Homo sapiens"
-                if isinstance(x, str) and "HUMAN" in x
-                else (
-                    "Saccharomyces cerevisiae"
-                    if isinstance(x, str) and "YEAST" in x
-                    else (
-                        "Escherichia coli"
-                        if isinstance(x, str) and "ECOLI" in x
-                        else ""
-                    )
-                )
-            )
-        )
-        ori_mq_search.to_csv(
-            os.path.join(cfg.RESULT_DIR, "proteinGroups_added_species.txt"),
-            sep="\t",
-            index=False,
-        )
-        protein_group = os.path.join(cfg.RESULT_DIR, "proteinGroups_added_species.txt")
-        organism_annotator = lfqbenchmark.OrganismAnnotatorMaxQuant(
-            mapping_file=protein_group, protein_column="Protein IDs"
-        )
-    samplemap_df_directlfq = lfqutils.load_samplemap(samplemap_directlfq)
-    samples_used_directlfq = lfqutils.get_samples_used_from_samplemap_df(
-        samplemap_df_directlfq, cond1=cfg.CONDITIONS[0], cond2=cfg.CONDITIONS[1]
+    counts_df = pd.DataFrame(
+        {
+            "column": cols_to_plot,
+            "non_quantified_counts": nonquant_counts.values,
+            "quantified_counts": nonzero_counts.values,
+        }
+    )
+    counts_df["total_count"] = (
+        counts_df["non_quantified_counts"] + counts_df["quantified_counts"]
     )
 
-    restable_directlfq = lfqbenchmark.ResultsTableDirectLFQ(
-        input_file=directlfq_file,
-        input_name="directLFQ",
-        samples_c1=samples_used_directlfq[0],
-        samples_c2=samples_used_directlfq[1],
-    )
-    organism_annotator.annotate_table_with_organism(restable_directlfq)
-    fig, axes = plt.subplots(1, 1)
-    fcplotter_directLFQ = lfqbenchmark.MultiOrganismIntensityFCPlotter(
-        ax=axes,
-        resultstable_w_ratios=restable_directlfq,
-        organisms_to_plot=cfg.FC.PLOT_ORGANISMS,
-        # organisms_to_plot=["Homo sapien", "Yeast", "Ecoli"],
-        fcs_to_expect=cfg.FC.EXPECTATION,
-        title=cfg.FC.TITLE,
-    )
-    fig.savefig(os.path.join(cfg.RESULT_DIR, "FC_plot.png"), dpi=300)
-    if cfg.REF_RESULT_FILE != "":
-        restable_ref_directlfq = lfqbenchmark.ResultsTableDirectLFQ(
-            input_file=ref_directlfq_file,
-            input_name="ref_directLFQ",
-            samples_c1=samples_used_directlfq[0],
-            samples_c2=samples_used_directlfq[1],
+    if sort_columns:
+        counts_df = counts_df.sort_values("total_count", ascending=False)
+
+    if ax is None:
+        fig, ax = plt.subplots(
+            figsize=(max(8, 0.5 * len(counts_df["column"]) + 2), 5),
+            constrained_layout=True,
         )
-        organism_annotator.annotate_table_with_organism(restable_ref_directlfq)
-        fig, axes = plt.subplots(1, 1)
-        fcplotter_directLFQ_ref = lfqbenchmark.MultiOrganismIntensityFCPlotter(
-            ax=axes,
-            resultstable_w_ratios=restable_ref_directlfq,
-            organisms_to_plot=cfg.FC.PLOT_ORGANISMS,
-            # organisms_to_plot=["Homo sapien", "Yeast", "Ecoli"],
-            fcs_to_expect=cfg.FC.EXPECTATION,
-            title=cfg.FC.TITLE + ", Reference",
+    else:
+        fig = ax.figure
+
+    x = np.arange(len(counts_df["column"]))
+    ax.bar(
+        x,
+        counts_df["quantified_counts"],
+        color=nonzero_color,
+        label="Quantified count",
+    )
+    ax.bar(
+        x,
+        counts_df["non_quantified_counts"],
+        bottom=counts_df["quantified_counts"],
+        color=zero_color,
+        label="Non-quantified count",
+    )
+
+    for i, (qc, non_qc) in enumerate(
+        zip(counts_df["quantified_counts"], counts_df["non_quantified_counts"])
+    ):
+        ax.text(
+            i,
+            qc / 2,
+            str(int(qc)),
+            ha="center",
+            va="center",
+            color="black",
+            fontsize=10,
+            fontweight="bold",
+            rotation=45,
         )
-        fig.savefig(os.path.join(cfg.RESULT_DIR, "FC_plot_ref.png"), dpi=300)
+        ax.text(
+            i,
+            qc + non_qc / 2,
+            str(int(non_qc)),
+            ha="center",
+            va="center",
+            color="black",
+            fontsize=10,
+            fontweight="bold",
+            rotation=45,
+        )
+
+    x_labels = counts_df["column"].astype(str)
+    if label_char_range is not None:
+        if len(label_char_range) != 2:
+            raise ValueError("label_char_range must be a tuple of (m, n).")
+        label_start, label_end = label_char_range
+        if not isinstance(label_start, int) or not isinstance(label_end, int):
+            raise ValueError("label_char_range values must be integers.")
+        if label_end <= label_start:
+            raise ValueError("label_char_range must satisfy n > m.")
+        x_labels = x_labels.str.slice(label_start, label_end)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(x_labels, rotation=45, ha="right")
+    ax.set_ylabel("Count")
+    ax.set_xlabel("Columns")
+    ax.set_title(f"Quantification per Run ({dataset_name})")
+    ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+    if fig_dir:
+        fig_name = f"quantification_count_{dataset_name}"
+        _save_fig(fig=fig, fig_dir=fig_dir, fig_name=fig_name)
+        plt.close(fig)
+    else:
+        plt.show()
+    return fig, ax, counts_df.reset_index(drop=True)
 
 
-if __name__ == "__main__":
-    logging.basicConfig(
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-        level=logging.INFO,
+def _save_fig(
+    fig,
+    fig_dir: str,
+    fig_name: str,
+    qdf: pd.DataFrame | None = None,
+    save_svg: bool = True,
+) -> None:
+    """Save figure and underlying table for protein quant plots."""
+    os.makedirs(fig_dir, exist_ok=True)
+    png_path = os.path.join(fig_dir, f"{fig_name}.png")
+    fig.savefig(png_path, dpi=300, bbox_inches="tight")
+    Logger.info("Saved plot to %s", png_path)
+    if save_svg:
+        svg_path = os.path.join(fig_dir, f"{fig_name}.svg")
+        fig.savefig(svg_path, dpi=300, bbox_inches="tight")
+        Logger.info("Saved plot to %s", svg_path)
+
+    if qdf is not None:
+        csv_path = os.path.join(fig_dir, f"{fig_name}.csv")
+        qdf.to_csv(csv_path, index=False)
+        Logger.info("Saved plot table to %s", csv_path)
+
+
+def _prepare_qdf_from_combined_protein(
+    combined_protein: pd.DataFrame,
+    int_col_keyword: str = "MaxLFQ Intensity",
+    filtered_proteins: Optional[list] = None,
+    id_cols: list[str] = ["Protein ID", "Organism"],
+    cond_A_keyword: str = "HYE124_A",
+    cond_B_keyword: str = "HYE124_B",
+) -> tuple[pd.DataFrame, int]:
+    """
+    Prepare a long-form quantification table with columns:
+    `log2_Intensity_ref`, `ratio`, and `Organism`.
+    """
+    if combined_protein.empty:
+        raise ValueError("combined_protein is empty.")
+
+    n_total_proteins = int(combined_protein.shape[0])
+    qdf = combined_protein.copy()
+
+    missing_id_cols = [c for c in id_cols if c not in qdf.columns]
+    if missing_id_cols:
+        raise ValueError(f"Missing required id columns: {missing_id_cols}")
+
+    protein_id_col = id_cols[0]
+    organism_col = id_cols[1]
+    if organism_col != "Organism":
+        qdf = qdf.rename(columns={organism_col: "Organism"})
+
+    if filtered_proteins:
+        qdf = qdf[qdf[protein_id_col].isin(filtered_proteins)].copy()
+
+    intensity_cols = [c for c in qdf.columns if int_col_keyword in c]
+    if not intensity_cols:
+        raise ValueError(f"No columns contain int_col_keyword='{int_col_keyword}'.")
+
+    cond_A_cols = [c for c in intensity_cols if cond_A_keyword in c]
+    cond_B_cols = [c for c in intensity_cols if cond_B_keyword in c]
+
+    # Fallback heuristics for condition columns if explicit keywords are absent.
+    if not cond_A_cols:
+        cond_A_cols = [c for c in intensity_cols if ("_A" in c or "MixA" in c)]
+    if not cond_B_cols:
+        cond_B_cols = [c for c in intensity_cols if ("_B" in c or "MixB" in c)]
+
+    if not cond_A_cols or not cond_B_cols:
+        raise ValueError(
+            "Could not infer condition columns for A/B from intensity columns. "
+            f"Found A={len(cond_A_cols)}, B={len(cond_B_cols)}."
+        )
+
+    cond_A_values = (
+        qdf[cond_A_cols].apply(pd.to_numeric, errors="coerce").replace(0, np.nan)
     )
-    fire.Fire(direct_lfq)
-    # fire.Fire(lfq_manager.run_lfq) # TODO: change to direct_lfq
+    cond_B_values = (
+        qdf[cond_B_cols].apply(pd.to_numeric, errors="coerce").replace(0, np.nan)
+    )
+    median_A = cond_A_values.median(axis=1, skipna=True)
+    median_B = cond_B_values.median(axis=1, skipna=True)
+
+    qdf["log2_Intensity_ref"] = np.log2((median_A + median_B) / 2.0)
+    qdf["ratio"] = np.log2(median_B / median_A)
+
+    qdf = qdf.replace([np.inf, -np.inf], np.nan)
+    qdf = qdf.dropna(subset=["log2_Intensity_ref", "ratio", "Organism"]).copy()
+    return qdf, n_total_proteins
+
+
+def plot_protein_quant(
+    combined_protein: pd.DataFrame,
+    color_map: Optional[dict] = None,
+    fig_dir: Optional[str] = None,
+    dataset_name: str = "",
+    filtered_proteins: Optional[list] = None,
+    annot_fontsize: int = 12,
+    label_map: Optional[dict] = None,
+    int_col_keyword: str = "MaxLFQ Intensity",
+    bar_ylim: tuple[float, float] = (0, 4500),
+    id_cols: list[str] = ["Protein ID", "Organism"],
+    cond_A_keyword: str = "HYE124_A",
+    cond_B_keyword: str = "HYE124_B",
+):
+    plt.rcParams.update({"font.size": annot_fontsize})
+    qdf, n_total_proteins = _prepare_qdf_from_combined_protein(
+        combined_protein=combined_protein,
+        int_col_keyword=int_col_keyword,
+        filtered_proteins=filtered_proteins,
+        id_cols=id_cols,
+        cond_A_keyword=cond_A_keyword,
+        cond_B_keyword=cond_B_keyword,
+    )
+
+    if label_map is None:
+        label_map = {}
+    if color_map is None:
+        orgs = sorted(qdf["Organism"].dropna().unique().tolist())
+        palette = sns.color_palette("tab10", n_colors=max(1, len(orgs)))
+        color_map = {org: palette[i] for i, org in enumerate(orgs)}
+
+    organisms_present = [org for org in color_map.keys() if org in set(qdf["Organism"])]
+    if not organisms_present:
+        organisms_present = sorted(qdf["Organism"].dropna().unique().tolist())
+
+    fig = plt.figure(figsize=(12, 6))
+    gs = GridSpec(1, 3, width_ratios=[1, 3, 1], wspace=0.25)
+    ax_bar = fig.add_subplot(gs[0, 0])
+    ax_scatter = fig.add_subplot(gs[0, 1])
+    ax_kde = fig.add_subplot(gs[0, 2], sharey=ax_scatter)
+
+    # Left: bar plot of quantifiable protein counts per organism.
+    count_df = qdf.groupby("Organism").size().reindex(organisms_present).fillna(0)
+    x_pos = np.arange(len(count_df.index))
+    ax_bar.bar(
+        x_pos,
+        count_df.values,  # type: ignore[union-attr]
+        color=[color_map[o] for o in count_df.index],
+    )
+    ax_bar.set_ylabel("Quantified Proteins Count")
+    ax_bar.set_xticks(x_pos)
+    ax_bar.set_xticklabels([label_map.get(x, x) for x in count_df.index], rotation=90)
+    ax_bar.set_ylim(bar_ylim[0], bar_ylim[1])
+    for i, v in enumerate(count_df.values):
+        ax_bar.text(
+            i, v, str(int(v)), ha="center", va="bottom", fontsize=annot_fontsize * 0.8
+        )
+
+    # Middle: scatter plot (rasterized points to keep vector export lightweight).
+    sns.scatterplot(
+        data=qdf,
+        x="log2_Intensity_ref",
+        y="ratio",
+        hue="Organism",
+        palette=color_map,
+        hue_order=organisms_present,
+        alpha=0.2,
+        legend=False,
+        ax=ax_scatter,
+    )
+    for artist in ax_scatter.collections:
+        artist.set_rasterized(True)
+
+    stats = qdf.groupby("Organism")["ratio"].agg(
+        count="count",
+        q1=lambda x: x.quantile(0.25),
+        median="median",
+        q3=lambda x: x.quantile(0.75),
+    )
+    Logger.info("Quantile stats:\n%s", stats)
+
+    for i, (org, row) in enumerate(stats.iterrows()):
+        c = color_map[org] if org in color_map else "black"
+        display_org = label_map.get(org, org)
+        ax_scatter.axhline(row["median"], linestyle="-", linewidth=1.2, color=c)
+        ax_scatter.axhline(row["q1"], linestyle="--", linewidth=1, color=c)
+        ax_scatter.axhline(row["q3"], linestyle="--", linewidth=1, color=c)
+        text = (
+            f"{display_org}: n={int(row['count'])}, "
+            f"Med={row['median']:.2f}, Q3-Q1={row['q3'] - row['q1']:.2f}"
+        )
+        ax_scatter.text(
+            0.02,
+            0.98 - (i * 0.055),
+            text,
+            transform=ax_scatter.transAxes,
+            fontsize=annot_fontsize * 0.8,
+            verticalalignment="top",
+        )
+
+    ax_scatter.set_xlabel("log2 Intensity, Mean of MixA and MixB")
+    ax_scatter.set_ylabel("log2 Ratio, MixB/MixA")
+    ax_scatter.set_ylim(-5, 5)
+    ax_scatter.set_title(
+        f"{dataset_name} | Total Protein IDs: {n_total_proteins}, Quantifiable: {len(qdf)}"
+    )
+
+    # Right: marginal ratio density per organism.
+    for org in organisms_present:
+        sub = qdf[qdf["Organism"] == org]
+        if sub.empty:
+            continue
+        if sub["ratio"].nunique(dropna=True) > 1:
+            sns.kdeplot(
+                y=sub["ratio"],
+                ax=ax_kde,
+                color=color_map[org],
+                fill=True,
+                alpha=0.4,
+                linewidth=1,
+            )
+        if org in stats.index:
+            ax_kde.axhline(stats.loc[org, "median"], color=color_map[org], linewidth=1)
+
+    ax_kde.set_xlabel("Density")
+    ax_kde.set_ylabel("")
+    ax_kde.tick_params(labelleft=False)
+    plt.tight_layout()
+
+    if fig_dir:
+        fig_name = f"protein_quant_{dataset_name.replace(' ', '_')}"
+        if filtered_proteins:
+            fig_name += "_filtered"
+        _save_fig(fig=fig, qdf=qdf, fig_dir=fig_dir, fig_name=fig_name)
+        plt.close(fig)
+    else:
+        plt.show()
+    return qdf
+
+
+def plot_protein_quant_rolling_quantiles(
+    combined_protein: pd.DataFrame,
+    color_map: Optional[dict] = None,
+    fig_dir: Optional[str] = None,
+    dataset_name: str = "",
+    filtered_proteins: Optional[list] = None,
+    annot_fontsize: int = 12,
+    label_map: Optional[dict] = None,
+    int_col_keyword: str = "MaxLFQ Intensity",
+    id_cols: list[str] = ["Protein ID", "Organism"],
+    window: int = 200,
+    step: int = 50,
+    xlim: Optional[tuple] = None,
+    ylim: Optional[tuple] = None,
+    ref_y_line: Optional[list] = None,
+    cond_A_keyword: str = "HYE124_A",
+    cond_B_keyword: str = "HYE124_B",
+):
+    """Plot rolling window quantiles of log2 ratio vs log2 intensity per organism."""
+    plt.rcParams.update({"font.size": annot_fontsize})
+    qdf, n_total_proteins = _prepare_qdf_from_combined_protein(
+        combined_protein=combined_protein,
+        int_col_keyword=int_col_keyword,
+        filtered_proteins=filtered_proteins,
+        id_cols=id_cols,
+        cond_A_keyword=cond_A_keyword,
+        cond_B_keyword=cond_B_keyword,
+    )
+
+    if label_map is None:
+        label_map = {}
+    if color_map is None:
+        orgs = sorted(qdf["Organism"].dropna().unique().tolist())
+        palette = sns.color_palette("tab10", n_colors=max(1, len(orgs)))
+        color_map = {org: palette[i] for i, org in enumerate(orgs)}
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for org in color_map:
+        sub = (
+            qdf[qdf["Organism"] == org]
+            .sort_values("log2_Intensity_ref")
+            .reset_index(drop=True)
+        )
+        if len(sub) < window:
+            Logger.warning(
+                "Organism %s has fewer proteins (%d) than window size (%d); skipping.",
+                org,
+                len(sub),
+                window,
+            )
+            continue
+
+        centers, medians, q1s, q3s = [], [], [], []
+        for start in range(0, len(sub) - window + 1, step):
+            chunk = sub.iloc[start : start + window]
+            centers.append(chunk["log2_Intensity_ref"].median())
+            medians.append(chunk["ratio"].median())
+            q1s.append(chunk["ratio"].quantile(0.25))
+            q3s.append(chunk["ratio"].quantile(0.75))
+
+        centers = np.array(centers)
+        medians = np.array(medians)
+        q1s = np.array(q1s)
+        q3s = np.array(q3s)
+
+        color = color_map[org]
+        display = label_map.get(org, org)
+        ax.fill_between(centers, q1s, q3s, color=color, alpha=0.25)
+        ax.plot(centers, medians, color=color, linewidth=1.8, label=display)
+        ax.plot(centers, q1s, color=color, linewidth=0.8, linestyle="--")
+        ax.plot(centers, q3s, color=color, linewidth=0.8, linestyle="--")
+
+    ax.axhline(0, color="black", linewidth=0.8, linestyle=":")
+    ax.set_xlabel("log2 Intensity, Mean of MixA and MixB")
+    ax.set_ylabel("log2 Ratio, MixB/MixA")
+    ax.set_title(
+        f"{dataset_name} | Total Protein IDs: {n_total_proteins}, Quantifiable: {len(qdf)}"
+        f"\n(rolling window: {window} proteins, step: {step})"
+    )
+    if xlim is not None:
+        ax.set_xlim(xlim)
+    if ylim is not None:
+        ax.set_ylim(ylim)
+    if ref_y_line is not None:
+        for y in ref_y_line:
+            ax.axhline(y, color="grey", linewidth=0.8, linestyle="--")
+    ax.legend(
+        fontsize=annot_fontsize * 0.85,
+        loc="center left",
+        bbox_to_anchor=(1.01, 0.5),
+        frameon=False,
+    )
+    plt.tight_layout()
+
+    if fig_dir:
+        fig_name = f"protein_quant_rolling_{dataset_name.replace(' ', '_')}"
+        if filtered_proteins:
+            fig_name += "_filtered"
+        _save_fig(fig=fig, qdf=qdf, fig_dir=fig_dir, fig_name=fig_name)
+        plt.close(fig)
+    else:
+        plt.show()
+    return qdf

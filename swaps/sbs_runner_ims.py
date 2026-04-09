@@ -7,7 +7,7 @@ import time
 import argparse
 import yaml
 import pandas as pd
-import torch
+import directlfq.lfq_manager as lfq_manager
 
 # Disable cuDNN globally BEFORE anything else
 torch.backends.cudnn.enabled = False
@@ -37,6 +37,10 @@ from postprocessing.match_features import (
     plot_match_type_from_combined,
 )
 from postprocessing.helper import build_pivot
+from postprocessing.direct_lfq import (
+    reformat_swaps_combined_for_directlfq,
+    plot_quantification_by_run,
+)
 
 # Clear existing logging handlers
 for handler in logging.root.handlers[:]:
@@ -359,6 +363,16 @@ def opt_scan_by_scan(config_path: str):
     pivot = build_pivot(pp_all, dict_ref)
     pivot.to_csv(os.path.join(quant_dir, "swaps_combined_ions.csv"))
 
+    logging.info("=================DirectLFQ Analysis==================")
+    _ = reformat_swaps_combined_for_directlfq(
+        pivot,
+        dict_ref,
+        output_dir=quant_dir,
+        ion_id_col="mz_rank",
+        protein_id_col="Proteins",
+    )
+    lfq_manager.run_lfq(input_file=os.path.join(quant_dir, "swaps.aq_reformat.tsv"))
+
     logging.info("=================Result Analysis==================")
     calc_quant_corr(
         pp_quant_only,
@@ -380,6 +394,34 @@ def opt_scan_by_scan(config_path: str):
         logging.info(
             "IonQuant combined_ion.csv not found in search output path. Skipping comparison with IonQuant results. Skipping"
         )
+    plot_quantification_by_run(
+        pivot,
+        dataset_name="SWAPS_ions_raw",
+        int_col_keyword="Intensity",
+        label_char_range=(0, 10),
+        fig_dir=quant_dir,
+    )
+    lfq_swaps_ion = pd.read_csv(
+        os.path.join(quant_dir, "swaps.aq_reformat.tsv.ion_intensities.tsv"), sep="\t"
+    )
+    plot_quantification_by_run(
+        lfq_swaps_ion,
+        dataset_name="SWAPS_ions_directLFQ",
+        label_char_range=(0, 14),
+        id_cols=["protein", "ion"],
+        fig_dir=quant_dir,
+    )
+    lfq_swaps_protein = pd.read_csv(
+        os.path.join(quant_dir, "swaps.aq_reformat.tsv.protein_intensities.tsv"),
+        sep="\t",
+    )
+    plot_quantification_by_run(
+        lfq_swaps_protein,
+        dataset_name="SWAPS_proteins_directLFQ",
+        label_char_range=(0, 14),
+        id_cols=["protein", "Protein"],
+        fig_dir=quant_dir,
+    )
 
 
 def main():
