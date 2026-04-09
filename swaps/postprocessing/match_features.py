@@ -9,7 +9,7 @@ from scipy.ndimage import gaussian_filter, uniform_filter
 from skimage.morphology import remove_small_objects
 from skimage.feature import match_template
 import cv2
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from mahotas.features import zernike_moments
 from scipy.spatial.distance import cosine
 from swaps.utils.ims_utils import (
@@ -20,10 +20,10 @@ from .helper import (
     load_peptide_batch_df_from_partquet,
     get_pept_act_from_parquet,
 )
-import seaborn as sns
-import matplotlib.pyplot as plt
+import duckdb
 
 Logger = logging.getLogger(__name__)
+_WORKER_CONTEXT: dict[str, Any] = {}
 
 
 @dataclass
@@ -74,7 +74,7 @@ def match_features_batches_parallel(
     raw_file_list,
     result_dir,
     peptide_indicies: np.ndarray | None = None,
-    batch_size: int = 100,
+    batch_size_max: int = 1500,
     max_workers: int = 4,
     processing_kwargs: dict | None = None,
 ):
@@ -85,35 +85,61 @@ def match_features_batches_parallel(
         Logger.info(
             "Using provided peptide indices. Total count: %d", len(peptide_indicies)
         )
-    peptide_batches = np.array_split(
-        peptide_indicies, max(1, len(peptide_indicies) // batch_size)
+
+    # Sort mz_ranks so each batch is a contiguous range — this lets DuckDB skip
+    # row groups in the mz-sorted parquet (produced by build_mz_sorted_activation).
+    sorted_mz = np.sort(peptide_indicies)
+    n_total = len(sorted_mz)
+
+    # Number of batches: enough so every batch ≤ batch_size_max, AND enough for
+    # good load balancing (≥ 2× max_workers so no worker idles at the tail).
+    n_batches = max(
+        max_workers * 2,
+        int(np.ceil(n_total / batch_size_max)),
+    )
+    Logger.info(
+        "Total peptides: %d, Batch size max: %d, Max workers: %d → Using %d batches",
+        n_total,
+        batch_size_max,
+        max_workers,
+        n_batches,
+    )
+    peptide_batches = np.array_split(sorted_mz, n_batches)
+    actual_batch_size = len(peptide_batches[0])
+    Logger.info(
+        "Batching: %d peptides → %d batches of ≤%d (batch_size_max=%d, max_workers=%d)",
+        n_total,
+        len(peptide_batches),
+        actual_batch_size,
+        batch_size_max,
+        max_workers,
     )
     results_target, results_decoy = [], []
     pp_reference_list, pp_match_target_list = [], []
-    pp_quant_only_list = []
     pp_match_decoy_list = []
     no_quant_log = []
     no_match_log = []
 
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with ProcessPoolExecutor(
+        max_workers=max_workers,
+        initializer=_init_match_features_worker,
+        initargs=(dict_ref, raw_file_list, result_dir, processing_kwargs),
+    ) as executor:
         futures = [
-            executor.submit(
-                match_features_batch,
-                dict_ref,
-                raw_file_list,
-                result_dir,
-                batch,
-                processing_kwargs,
-            )
+            executor.submit(_match_features_batch_worker, batch)
             for batch in peptide_batches
         ]
 
-        for future in tqdm.tqdm(futures, desc="Processing batches", unit="batch"):
+        for future in tqdm.tqdm(
+            as_completed(futures),
+            total=len(futures),
+            desc="Processing batches",
+            unit="batch",
+        ):
             (
                 res_target,
                 res_decoy,
                 pp_reference_target,
-                pp_quant_only,
                 pp_match_target,
                 pp_match_decoy,
                 no_quant,
@@ -122,7 +148,6 @@ def match_features_batches_parallel(
             results_target.extend(res_target)
             results_decoy.extend(res_decoy)
             pp_reference_list.extend(pp_reference_target)
-            pp_quant_only_list.extend(pp_quant_only)
             pp_match_target_list.extend(pp_match_target)
             pp_match_decoy_list.extend(pp_match_decoy)
             no_quant_log.extend(no_quant)
@@ -133,11 +158,6 @@ def match_features_batches_parallel(
     pp_reference_target = (
         pd.concat(pp_reference_list, ignore_index=True)
         if pp_reference_list
-        else pd.DataFrame()
-    )
-    pp_quant_only = (
-        pd.concat(pp_quant_only_list, ignore_index=True)
-        if pp_quant_only_list
         else pd.DataFrame()
     )
     pp_match_target = (
@@ -156,11 +176,34 @@ def match_features_batches_parallel(
         matches_target,
         matches_decoy,
         pp_reference_target,
-        pp_quant_only,
         pp_match_target,
         pp_match_decoy,
         df_no_quant,
         df_no_match,
+    )
+
+
+def _init_match_features_worker(dict_ref, raw_file_list, result_dir, processing_kwargs):
+    """Store immutable batch context once per worker process."""
+
+    _WORKER_CONTEXT["dict_ref"] = dict_ref
+    _WORKER_CONTEXT["raw_file_list"] = raw_file_list
+    _WORKER_CONTEXT["result_dir"] = result_dir
+    _WORKER_CONTEXT["processing_kwargs"] = processing_kwargs
+    _WORKER_CONTEXT["dict_ref_by_mz"] = (
+        dict_ref.set_index("mz_rank")
+        if dict_ref["mz_rank"].is_unique
+        else dict_ref.drop_duplicates("mz_rank").set_index("mz_rank")
+    )
+
+
+def _match_features_batch_worker(batch):
+    return match_features_batch(
+        dict_ref=_WORKER_CONTEXT["dict_ref"],
+        raw_file_list=_WORKER_CONTEXT["raw_file_list"],
+        result_dir=_WORKER_CONTEXT["result_dir"],
+        batch=batch,
+        processing_kwargs=_WORKER_CONTEXT["processing_kwargs"],
     )
 
 
@@ -324,14 +367,20 @@ def _quantify_peptide_run(
     anchor_override: Optional[tuple[int, int]] = None,
     reference_image: np.ndarray | None = None,
     reference_props: pd.DataFrame | None = None,
+    precomputed_pept_act: tuple[np.ndarray, int, int] | None = None,
+    precomputed_smoothed_image: np.ndarray | None = None,
     processing_kwargs: dict | None = None,
     visualize_dir: str | None = None,
+    visualize_name: str | None = None,
 ):
     """Quantify one peptide in one run and return the full quantification state."""
 
-    pept_act, rt_msms_pos, im_msms_pos = get_pept_act_from_parquet(
-        act_df.loc[act_df["mz_rank"] == pept_idx], pept_idx, dict_ref, run_name
-    )
+    if precomputed_pept_act is None:
+        pept_act, rt_msms_pos, im_msms_pos = get_pept_act_from_parquet(
+            act_df, pept_idx, dict_ref, run_name
+        )
+    else:
+        pept_act, rt_msms_pos, im_msms_pos = precomputed_pept_act
     target_anchor = (
         anchor_override if anchor_override is not None else (rt_msms_pos, im_msms_pos)
     )
@@ -362,21 +411,100 @@ def _quantify_peptide_run(
             snapped_anchor=None,
             metadata={"pept_idx": pept_idx},
         )
+    if visualize_name is None:
+        visualize_name = f"mz{pept_idx}_{run_name}_{case.lower()}.png"
     result = quantify_from_coords(
         pept_act,
         anchor=(int(template_anchor[0]), int(template_anchor[1])),
         target_anchor=(int(target_anchor[0]), int(target_anchor[1])),
         reference_image=reference_image,
         propA=reference_props,
+        pre_smoothed_image=precomputed_smoothed_image,
         patch_size=min(pept_act.shape),
         **(processing_kwargs or {}),
         visualize_dir=visualize_dir,
-        visualize_filename=f"mz{pept_idx}_{run_name}_{case.lower()}.png",
+        visualize_filename=visualize_name,
     )
     result.run_name = run_name
     result.case = case
     result.metadata["pept_idx"] = pept_idx
     return result
+
+
+def _attach_quant_only_metadata(
+    prop_t: pd.DataFrame,
+    record: dict[str, Any],
+    match_state: "ReferenceMatchState",
+) -> None:
+    """Attach quant-only diagnostic metadata columns to a matched peak-properties row."""
+    quant_direct: QuantificationResult = record["direct"]
+    if quant_direct.snapped_anchor is not None:
+        prop_t["quant_direct_snap_rt"] = int(quant_direct.snapped_anchor[0])
+        prop_t["quant_direct_snap_im"] = int(quant_direct.snapped_anchor[1])
+    if quant_direct.peak_properties is not None:
+        for i, col in enumerate(["bbox-0", "bbox-1", "bbox-2", "bbox-3"]):
+            prop_t[f"quant_direct_bbox_{i}"] = int(
+                quant_direct.peak_properties[col].values[0]
+            )
+    prop_t["quant_anchor_inside_match_bbox"] = bool(record["inside_match_bbox"])
+    prop_t["quant_anchor_expanded_match_bbox"] = bool(record["expanded_match_bbox"])
+    prop_t["bbox_updated_from_original"] = bool(record["bbox_updated_from_original"])
+    for side in ("top", "bottom", "left", "right"):
+        prop_t[f"reference_bbox_{side}"] = int(match_state.bbox_offsets[side])
+
+
+def _visualize_quant_only_bbox_expansion(
+    pept_idx: int,
+    raw_file: str,
+    match_state: "ReferenceMatchState",
+    target_result: "QuantificationResult",
+    prop_t: pd.DataFrame,
+    record: dict[str, Any],
+    visualize_dir: str,
+) -> None:
+    """Render before/after bbox comparison panels for a quant-only expansion event."""
+    before_box = record["reference_bbox_before_update"]
+    after_box = record["reference_bbox_after_update"]
+    shifted_before = record["aligned_bbox_before_update"]
+    shifted_after = record["aligned_bbox_after_update"]
+    _visualize_quantify_from_coords(
+        match_state.reference_result.smoothed_image,
+        target_result.image,
+        target_result.smoothed_image,
+        target_result.image,
+        target_result.smoothed_image,
+        bbox_center=np.array(
+            [(prop_t["centroid-0"].values[0], prop_t["centroid-1"].values[0])]
+        ),
+        save_dir=visualize_dir,
+        msms_pos=match_state.reference_result.snapped_anchor,
+        snapped_msms_pos=target_result.snapped_anchor,
+        filename=f"mz{pept_idx}_{raw_file}_quant_only_bbox_update.png",
+        labels=target_result.labels_multi_markers,
+        template_box=shifted_after,
+        context_panels=[
+            {
+                "image": match_state.reference_result.smoothed_image,
+                "title": "reference_bbox_before_after",
+                "msms_pos": match_state.reference_result.snapped_anchor,
+                "snapped_msms_pos": match_state.reference_result.snapped_anchor,
+                "template_boxes": [
+                    {"box": before_box, "edgecolor": "orange", "linestyle": "--"},
+                    {"box": after_box, "edgecolor": "cyan", "linestyle": "-"},
+                ],
+            },
+            {
+                "image": target_result.smoothed_image,
+                "title": "quant_only_bbox_before_after",
+                "msms_pos": match_state.reference_result.snapped_anchor,
+                "snapped_msms_pos": target_result.snapped_anchor,
+                "template_boxes": [
+                    {"box": shifted_before, "edgecolor": "orange", "linestyle": "--"},
+                    {"box": shifted_after, "edgecolor": "cyan", "linestyle": "-"},
+                ],
+            },
+        ],
+    )
 
 
 def match_features_batch(
@@ -393,50 +521,88 @@ def match_features_batch(
     1. Quantify the main reference run once.
     2. Use the reference to template-match each quant-only run.
     3. If a quant-only run's own snapped anchor falls outside the matched bbox,
-       expand the reusable reference bbox and redo the quant-only matching.
+       expand the reusable reference bbox.
     4. Record which quant-only runs were already inside the bbox and which ones
        caused an expansion.
-    5. Match all regular `Match` runs using the final expanded bbox.
+    5. Match all regular `Match` and `Quant_only` runs using the final expanded bbox.
     """
-
     results_target, results_decoy = [], []
-    pp_reference_list, pp_match_target_list = [], []
-    pp_quant_only_list = []
-    pp_match_decoy_list = []
-    no_quant_log = []
-    no_match_log = []
-    act_dfs = {}
-    for raw_file in raw_file_list:
-        parquet_path = os.path.join(result_dir, raw_file, "activation", "*.parquet")
-        act_dfs[raw_file] = load_peptide_batch_df_from_partquet(parquet_path, batch)
-    for pept_idx in batch:
-        row_series = dict_ref.loc[dict_ref["mz_rank"] == pept_idx, :].iloc[0]
-        is_ref_mask = row_series.map(
-            lambda x: x == "Reference" if isinstance(x, str) else False
-        )
-        is_quant_only_mask = row_series.map(
-            lambda x: x == "Quant_Only" if isinstance(x, str) else False
-        )
-        is_match_mask = row_series.map(
-            lambda x: "Match" in x if isinstance(x, str) else False
-        )
+    pp_reference_list, pp_match_target_list, pp_match_decoy_list = [], [], []
+    no_quant_log, no_match_log = [], []
+    batch_np = np.asarray(batch)
 
-        reference_raw_file = str(is_ref_mask.idxmax())
-        quant_only_raw_file = is_quant_only_mask.index[is_quant_only_mask].tolist()
-        match_raw_file = is_match_mask.index[is_match_mask].tolist()
+    _cached = _WORKER_CONTEXT.get("dict_ref_by_mz")
+    dict_ref_by_mz = _cached if _cached is not None else (
+        dict_ref.set_index("mz_rank")
+        if dict_ref["mz_rank"].is_unique
+        else dict_ref.drop_duplicates("mz_rank").set_index("mz_rank")
+    )
+    smooth_kwargs = dict((processing_kwargs or {}).get("smooth_kwargs", {}))
+
+    # Load activation data for this mz_rank batch from the pre-built sorted parquet.
+    # DuckDB skips row groups outside [min(batch_np), max(batch_np)], so I/O scales
+    # with batch_size / N_total.  Requires build_mz_sorted_activation() to have been
+    # run for each raw_file activation directory beforehand.
+    con = duckdb.connect()
+    con.execute("SET enable_progress_bar = false")
+    act_dfs = {
+        raw_file: load_peptide_batch_df_from_partquet(
+            os.path.join(result_dir, raw_file, "activation"),
+            batch_np,
+            con=con,
+        ).set_index("mz_rank", drop=False)
+        for raw_file in raw_file_list
+    }
+    con.close()
+
+    def _select_mz(df_indexed: pd.DataFrame, mz_rank: int) -> pd.DataFrame:
+        try:
+            return df_indexed.loc[[mz_rank]]
+        except KeyError:
+            return df_indexed.iloc[0:0]
+
+    for pept_idx in batch_np:
+        pept_act_cache: dict[str, tuple[np.ndarray, int, int]] = {}
+        pept_act_smoothed_cache: dict[str, np.ndarray] = {}
+
+        def _get_pept_act_tuple(raw_file: str) -> tuple[np.ndarray, int, int]:
+            if raw_file not in pept_act_cache:
+                pept_act_cache[raw_file] = get_pept_act_from_parquet(
+                    _select_mz(act_dfs[raw_file], int(pept_idx)),
+                    int(pept_idx),
+                    dict_ref_by_mz,
+                    raw_file,
+                )
+            return pept_act_cache[raw_file]
+
+        def _get_smoothed_pept_act(raw_file: str) -> np.ndarray:
+            if raw_file not in pept_act_smoothed_cache:
+                pept_act_smoothed_cache[raw_file] = smooth_and_denoise_image(
+                    _get_pept_act_tuple(raw_file)[0], **smooth_kwargs
+                )
+            return pept_act_smoothed_cache[raw_file]
+
+        row_series = dict_ref_by_mz.loc[pept_idx, :]
+        str_values = row_series[row_series.map(lambda x: isinstance(x, str))]
+        reference_raw_file = str(str_values.index[(str_values == "Reference")][0])
+        quant_only_raw_files = str_values.index[str_values == "Quant_Only"].tolist()
+        match_raw_files = str_values.index[
+            str_values.str.contains("Match", regex=False)
+        ].tolist()
 
         own_anchor_id = 0
         feature_instance_id = _feature_instance_id(pept_idx, own_anchor_id)
         match_state: ReferenceMatchState | None = None
 
+        # --- Step 1: Quantify reference run ---
         reference_result = _quantify_peptide_run(
-            act_df=act_dfs[reference_raw_file].loc[
-                act_dfs[reference_raw_file]["mz_rank"] == pept_idx
-            ],
+            act_df=_select_mz(act_dfs[reference_raw_file], pept_idx),
             pept_idx=pept_idx,
             dict_ref=dict_ref,
             run_name=reference_raw_file,
             case="Reference",
+            precomputed_pept_act=_get_pept_act_tuple(reference_raw_file),
+            precomputed_smoothed_image=_get_smoothed_pept_act(reference_raw_file),
             processing_kwargs=processing_kwargs,
             visualize_dir=visualize_dir,
         )
@@ -472,41 +638,167 @@ def match_features_batch(
                 }
             )
 
+        # --- Step 2: Probe quant-only runs and expand bbox ---
         bbox_version = 0
         quant_only_probe_records: dict[str, dict[str, Any]] = {}
 
-        if len(quant_only_raw_file) > 0:
-            for raw_file in quant_only_raw_file:
-                quant_direct = _quantify_peptide_run(
-                    act_df=act_dfs[raw_file].loc[
-                        act_dfs[raw_file]["mz_rank"] == pept_idx
-                    ],
-                    pept_idx=pept_idx,
-                    dict_ref=dict_ref,
-                    run_name=raw_file,
-                    case="Quant_Only",
-                    processing_kwargs=processing_kwargs,
-                    visualize_dir=visualize_dir,
-                )
-                quant_only_probe_records[raw_file] = {
-                    "direct": quant_direct,
-                    "probe": None,
-                    "probe_bbox_version": None,
-                    "inside_match_bbox": False,
-                    "expanded_match_bbox": False,
-                    "bbox_updated_from_original": False,
-                    "reference_bbox_before_update": None,
-                    "reference_bbox_after_update": None,
-                    "aligned_bbox_before_update": None,
-                    "aligned_bbox_after_update": None,
-                }
-                if match_state is None or not quant_direct.succeeded:
-                    continue
+        for raw_file in quant_only_raw_files:
+            quant_direct = _quantify_peptide_run(
+                act_df=_select_mz(act_dfs[raw_file], pept_idx),
+                pept_idx=pept_idx,
+                dict_ref=dict_ref,
+                run_name=raw_file,
+                case="Quant_Only",
+                precomputed_pept_act=_get_pept_act_tuple(raw_file),
+                precomputed_smoothed_image=_get_smoothed_pept_act(raw_file),
+                processing_kwargs=processing_kwargs,
+                visualize_dir=visualize_dir,
+            )
+            record: dict[str, Any] = {
+                "direct": quant_direct,
+                "probe": None,
+                "probe_bbox_version": None,
+                "inside_match_bbox": False,
+                "expanded_match_bbox": False,
+                "bbox_updated_from_original": False,
+                "reference_bbox_before_update": None,
+                "reference_bbox_after_update": None,
+                "aligned_bbox_before_update": None,
+                "aligned_bbox_after_update": None,
+            }
+            quant_only_probe_records[raw_file] = record
 
-                probe_result = _quantify_peptide_run(
-                    act_df=act_dfs[raw_file].loc[
-                        act_dfs[raw_file]["mz_rank"] == pept_idx
-                    ],
+            if match_state is None or not quant_direct.succeeded:
+                continue  # cannot probe without a valid reference
+
+            probe_result = _quantify_peptide_run(
+                act_df=_select_mz(act_dfs[raw_file], pept_idx),
+                pept_idx=pept_idx,
+                dict_ref=dict_ref,
+                run_name=raw_file,
+                case="Match",
+                template_anchor_override=match_state.reference_result.snapped_anchor,
+                anchor_override=match_state.reference_result.snapped_anchor,
+                reference_image=match_state.reference_result.smoothed_image,
+                reference_props=match_state.match_props,
+                precomputed_pept_act=_get_pept_act_tuple(raw_file),
+                precomputed_smoothed_image=_get_smoothed_pept_act(raw_file),
+                processing_kwargs=processing_kwargs,
+                visualize_dir=visualize_dir,
+                visualize_name=f"mz{pept_idx}_{raw_file}_quant_only_probe.png",
+            )
+            record["probe"] = probe_result
+            record["probe_bbox_version"] = bbox_version
+
+            inside_match_bbox = _anchor_inside_bbox(
+                quant_direct.snapped_anchor, probe_result.peak_properties
+            )
+            record["inside_match_bbox"] = bool(inside_match_bbox)
+
+            if (
+                not inside_match_bbox
+                and quant_direct.peak_properties is not None
+                and quant_direct.snapped_anchor is not None
+                and probe_result.peak_properties is not None
+            ):
+                aligned_bbox = _bbox_tuple_from_prop(probe_result.peak_properties)
+                quant_bbox = _bbox_tuple_from_prop(quant_direct.peak_properties)
+                record["reference_bbox_before_update"] = _bbox_tuple_from_prop(
+                    match_state.match_props
+                )
+                record["aligned_bbox_before_update"] = aligned_bbox
+                expansion_deltas = _expansion_deltas_from_aligned_and_quant_bbox(
+                    aligned_bbox, quant_bbox
+                )
+                expanded_offsets = _add_offset_deltas(
+                    match_state.bbox_offsets, expansion_deltas
+                )
+                bbox_changed = expanded_offsets != match_state.bbox_offsets
+                match_state.bbox_offsets = expanded_offsets
+                match_state.match_props = _clone_props_with_offsets(
+                    match_state.match_props,
+                    match_state.reference_result.snapped_anchor,  # type: ignore[arg-type]
+                    match_state.bbox_offsets,
+                    match_state.reference_result.image.shape,  # type: ignore[arg-type]
+                )
+                record["expanded_match_bbox"] = True
+                record["bbox_updated_from_original"] = bool(bbox_changed)
+                record["reference_bbox_after_update"] = _bbox_tuple_from_prop(
+                    match_state.match_props
+                )
+                record["aligned_bbox_after_update"] = (
+                    max(aligned_bbox[0] - expansion_deltas["top"], 0),
+                    max(aligned_bbox[1] - expansion_deltas["left"], 0),
+                    min(
+                        aligned_bbox[2] + expansion_deltas["bottom"],
+                        probe_result.image.shape[0],
+                    ),
+                    min(
+                        aligned_bbox[3] + expansion_deltas["right"],
+                        probe_result.image.shape[1],
+                    ),
+                )
+                if bbox_changed:
+                    bbox_version += 1
+
+        # --- Step 3: Match all non-reference runs ---
+        non_reference_runs = quant_only_raw_files + match_raw_files
+        if not non_reference_runs:
+            continue
+
+        if match_state is None:
+            # Reference failed: log all non-reference runs as failures and move on
+            for raw_file in non_reference_runs:
+                is_quant_only = raw_file in quant_only_probe_records
+                no_quant_log.append(
+                    {
+                        "mz_rank": pept_idx,
+                        "run_name": raw_file,
+                        "type": "quant_only" if is_quant_only else "match_target",
+                    }
+                )
+                if not is_quant_only:
+                    no_quant_log.append(
+                        {
+                            "mz_rank": pept_idx,
+                            "run_name": raw_file,
+                            "type": "match_decoy",
+                        }
+                    )
+                    no_match_log.append(
+                        {
+                            "mz_rank": pept_idx,
+                            "run_name": raw_file,
+                            "type": "match_target",
+                        }
+                    )
+                    no_match_log.append(
+                        {
+                            "mz_rank": pept_idx,
+                            "run_name": raw_file,
+                            "type": "match_decoy",
+                        }
+                    )
+            continue
+
+        batch_exclude = batch_np[batch_np != pept_idx]
+        for raw_file in non_reference_runs:
+            decoy_pept_idx = np.random.choice(batch_exclude)
+            target_act_df = _select_mz(act_dfs[raw_file], pept_idx)
+            decoy_act_df = _select_mz(act_dfs[raw_file], int(decoy_pept_idx))
+            is_quant_only_run = raw_file in quant_only_probe_records
+
+            # Reuse the probe result if the bbox hasn't changed since probing
+            probe_record = quant_only_probe_records.get(raw_file)
+            if (
+                probe_record is not None
+                and probe_record["probe"] is not None
+                and probe_record["probe_bbox_version"] == bbox_version
+            ):
+                target_result = probe_record["probe"]
+            else:
+                target_result = _quantify_peptide_run(
+                    act_df=target_act_df,
                     pept_idx=pept_idx,
                     dict_ref=dict_ref,
                     run_name=raw_file,
@@ -515,398 +807,163 @@ def match_features_batch(
                     anchor_override=match_state.reference_result.snapped_anchor,
                     reference_image=match_state.reference_result.smoothed_image,
                     reference_props=match_state.match_props,
+                    precomputed_pept_act=_get_pept_act_tuple(raw_file),
+                    precomputed_smoothed_image=_get_smoothed_pept_act(raw_file),
                     processing_kwargs=processing_kwargs,
                     visualize_dir=visualize_dir,
                 )
-                quant_only_probe_records[raw_file]["probe"] = probe_result
-                quant_only_probe_records[raw_file]["probe_bbox_version"] = bbox_version
 
-                inside_match_bbox = _anchor_inside_bbox(
-                    quant_direct.snapped_anchor,
-                    probe_result.peak_properties,
-                )
-                quant_only_probe_records[raw_file]["inside_match_bbox"] = bool(
-                    inside_match_bbox
+            decoy_anchor = match_state.reference_result.snapped_anchor
+            decoy_act, _, _ = get_pept_act_from_parquet(
+                decoy_act_df,
+                decoy_pept_idx,
+                dict_ref,
+                raw_file,
+                shape=target_result.image.shape,
+            )
+            decoy_result = _quantify_peptide_run(
+                act_df=decoy_act_df,
+                pept_idx=decoy_pept_idx,
+                dict_ref=dict_ref,
+                run_name=raw_file,
+                case="Match",
+                template_anchor_override=decoy_anchor,
+                anchor_override=decoy_anchor,
+                reference_image=match_state.reference_result.smoothed_image,
+                reference_props=match_state.match_props,
+                precomputed_pept_act=(
+                    decoy_act,
+                    int(decoy_anchor[0]),
+                    int(decoy_anchor[1]),
+                ),
+                processing_kwargs=processing_kwargs,
+                visualize_dir=visualize_dir,
+                visualize_name=f"mz{pept_idx}_{raw_file}_match_decoy{decoy_pept_idx}.png",
+            )
+
+            prop_t = _annotate_peak_properties(
+                target_result.peak_properties,
+                mz_rank=pept_idx,
+                run_name=raw_file,
+                own_anchor_id=own_anchor_id,
+                assimilated_to_anchor_id=own_anchor_id,
+                feature_instance_id=feature_instance_id,
+                own_feature_instance_id=feature_instance_id,
+                source_run=reference_raw_file,
+                source_type="Quant_Only" if is_quant_only_run else "Reference",
+            )
+            prop_d = _annotate_peak_properties(
+                decoy_result.peak_properties,
+                mz_rank=pept_idx,
+                run_name=raw_file,
+                own_anchor_id=own_anchor_id,
+                assimilated_to_anchor_id=own_anchor_id,
+                feature_instance_id=feature_instance_id,
+                own_feature_instance_id=feature_instance_id,
+                source_run=reference_raw_file,
+                source_type="Quant_Only" if is_quant_only_run else "Reference",
+                decoy_mz_rank=int(decoy_pept_idx),
+            )
+
+            if is_quant_only_run and prop_t is not None:
+                _attach_quant_only_metadata(
+                    prop_t, quant_only_probe_records[raw_file], match_state
                 )
                 if (
-                    not inside_match_bbox
-                    and quant_direct.peak_properties is not None
-                    and quant_direct.snapped_anchor is not None
-                    and probe_result.peak_properties is not None
-                ):
-                    quant_only_probe_records[raw_file][
+                    visualize_dir is not None
+                    and quant_only_probe_records[raw_file]["bbox_updated_from_original"]
+                    and quant_only_probe_records[raw_file][
                         "reference_bbox_before_update"
-                    ] = _bbox_tuple_from_prop(match_state.match_props)
-                    quant_only_probe_records[raw_file]["aligned_bbox_before_update"] = (
-                        _bbox_tuple_from_prop(probe_result.peak_properties)
-                    )
-                    quant_bbox = _bbox_tuple_from_prop(quant_direct.peak_properties)
-                    aligned_bbox = _bbox_tuple_from_prop(probe_result.peak_properties)
-                    expansion_deltas = _expansion_deltas_from_aligned_and_quant_bbox(
-                        aligned_bbox,
-                        quant_bbox,
-                    )
-                    expanded_offsets = _add_offset_deltas(
-                        match_state.bbox_offsets, expansion_deltas
-                    )
-                    bbox_changed = expanded_offsets != match_state.bbox_offsets
-                    match_state.bbox_offsets = expanded_offsets
-                    match_state.match_props = _clone_props_with_offsets(
-                        match_state.match_props,
-                        match_state.reference_result.snapped_anchor,  # type: ignore[arg-type]
-                        match_state.bbox_offsets,
-                        match_state.reference_result.image.shape,
-                    )
-                    quant_only_probe_records[raw_file]["expanded_match_bbox"] = True
-                    quant_only_probe_records[raw_file]["bbox_updated_from_original"] = (
-                        bool(bbox_changed)
-                    )
-                    quant_only_probe_records[raw_file][
-                        "reference_bbox_after_update"
-                    ] = _bbox_tuple_from_prop(match_state.match_props)
-                    aligned_after_box = (
-                        max(aligned_bbox[0] - expansion_deltas["top"], 0),
-                        max(aligned_bbox[1] - expansion_deltas["left"], 0),
-                        min(
-                            aligned_bbox[2] + expansion_deltas["bottom"],
-                            probe_result.image.shape[0],
-                        ),
-                        min(
-                            aligned_bbox[3] + expansion_deltas["right"],
-                            probe_result.image.shape[1],
-                        ),
-                    )
-                    quant_only_probe_records[raw_file][
-                        "aligned_bbox_after_update"
-                    ] = aligned_after_box
-                    if bbox_changed:
-                        bbox_version += 1
-
-        non_reference_runs = quant_only_raw_file + match_raw_file
-        if len(non_reference_runs) > 0:
-            if match_state is not None:
-                for raw_file in non_reference_runs:
-                    batch_exclude = batch[batch != pept_idx]
-                    decoy_pept_idx = np.random.choice(batch_exclude)
-                    run_subset = act_dfs[raw_file].loc[
-                        act_dfs[raw_file]["mz_rank"].isin([pept_idx, decoy_pept_idx])
                     ]
-                    is_quant_only_run = raw_file in quant_only_probe_records
-                    target_result = None
-                    if is_quant_only_run:
-                        record = quant_only_probe_records[raw_file]
-                        if (
-                            record["probe"] is not None
-                            and record["probe_bbox_version"] == bbox_version
-                        ):
-                            target_result = record["probe"]
-                        else:
-                            target_result = _quantify_peptide_run(
-                                act_df=run_subset.loc[
-                                    run_subset["mz_rank"] == pept_idx
-                                ],
-                                pept_idx=pept_idx,
-                                dict_ref=dict_ref,
-                                run_name=raw_file,
-                                case="Match",
-                                template_anchor_override=match_state.reference_result.snapped_anchor,
-                                anchor_override=match_state.reference_result.snapped_anchor,
-                                reference_image=match_state.reference_result.smoothed_image,
-                                reference_props=match_state.match_props,
-                                processing_kwargs=processing_kwargs,
-                                visualize_dir=visualize_dir,
-                            )
-                    else:
-                        target_result = _quantify_peptide_run(
-                            act_df=run_subset.loc[run_subset["mz_rank"] == pept_idx],
-                            pept_idx=pept_idx,
-                            dict_ref=dict_ref,
-                            run_name=raw_file,
-                            case="Match",
-                            template_anchor_override=match_state.reference_result.snapped_anchor,
-                            anchor_override=match_state.reference_result.snapped_anchor,
-                            reference_image=match_state.reference_result.smoothed_image,
-                            reference_props=match_state.match_props,
-                            processing_kwargs=processing_kwargs,
-                            visualize_dir=visualize_dir,
-                        )
-                    decoy_act, _, _ = get_pept_act_from_parquet(
-                        run_subset.loc[run_subset["mz_rank"] == decoy_pept_idx],
-                        decoy_pept_idx,
-                        dict_ref,
-                        raw_file,
-                        shape=target_result.image.shape,
+                    is not None
+                    and quant_only_probe_records[raw_file][
+                        "reference_bbox_after_update"
+                    ]
+                    is not None
+                    and quant_only_probe_records[raw_file]["aligned_bbox_before_update"]
+                    is not None
+                    and quant_only_probe_records[raw_file]["aligned_bbox_after_update"]
+                    is not None
+                ):
+                    _visualize_quant_only_bbox_expansion(
+                        pept_idx=pept_idx,
+                        raw_file=raw_file,
+                        match_state=match_state,
+                        target_result=target_result,
+                        prop_t=prop_t,
+                        record=quant_only_probe_records[raw_file],
+                        visualize_dir=visualize_dir,
                     )
-                    decoy_result = quantify_from_coords(
-                        decoy_act,
-                        anchor=match_state.reference_result.snapped_anchor,
-                        target_anchor=match_state.reference_result.snapped_anchor,
-                        reference_image=match_state.reference_result.smoothed_image,
-                        propA=match_state.match_props,
-                        patch_size=min(decoy_act.shape),
-                        **(processing_kwargs or {}),
-                        visualize_dir=None,
-                        visualize_filename=(
-                            f"mz{pept_idx}_decoy{decoy_pept_idx}_{raw_file}.png"
-                        ),
-                    )
-                    decoy_result.run_name = raw_file
-                    decoy_result.case = "Match"
 
-                    prop_t = _annotate_peak_properties(
-                        target_result.peak_properties,
-                        mz_rank=pept_idx,
-                        run_name=raw_file,
-                        own_anchor_id=own_anchor_id,
-                        assimilated_to_anchor_id=own_anchor_id,
-                        feature_instance_id=feature_instance_id,
-                        own_feature_instance_id=feature_instance_id,
-                        source_run=reference_raw_file,
-                        source_type="Quant_Only" if is_quant_only_run else "Reference",
-                    )
-                    prop_d = _annotate_peak_properties(
-                        decoy_result.peak_properties,
-                        mz_rank=pept_idx,
-                        run_name=raw_file,
-                        own_anchor_id=own_anchor_id,
-                        assimilated_to_anchor_id=own_anchor_id,
-                        feature_instance_id=feature_instance_id,
-                        own_feature_instance_id=feature_instance_id,
-                        source_run=reference_raw_file,
-                        source_type="Quant_Only" if is_quant_only_run else "Reference",
-                        decoy_mz_rank=int(decoy_pept_idx),
-                    )
-                    if is_quant_only_run:
-                        record = quant_only_probe_records[raw_file]
-                        quant_direct = record["direct"]
-                        if prop_t is not None:
-                            if quant_direct.snapped_anchor is not None:
-                                prop_t["quant_direct_snap_rt"] = int(
-                                    quant_direct.snapped_anchor[0]
-                                )
-                                prop_t["quant_direct_snap_im"] = int(
-                                    quant_direct.snapped_anchor[1]
-                                )
-                            if quant_direct.peak_properties is not None:
-                                prop_t["quant_direct_bbox_0"] = int(
-                                    quant_direct.peak_properties["bbox-0"].values[0]
-                                )
-                                prop_t["quant_direct_bbox_1"] = int(
-                                    quant_direct.peak_properties["bbox-1"].values[0]
-                                )
-                                prop_t["quant_direct_bbox_2"] = int(
-                                    quant_direct.peak_properties["bbox-2"].values[0]
-                                )
-                                prop_t["quant_direct_bbox_3"] = int(
-                                    quant_direct.peak_properties["bbox-3"].values[0]
-                                )
-                            prop_t["quant_anchor_inside_match_bbox"] = bool(
-                                record["inside_match_bbox"]
-                            )
-                            prop_t["quant_anchor_expanded_match_bbox"] = bool(
-                                record["expanded_match_bbox"]
-                            )
-                            prop_t["bbox_updated_from_original"] = bool(
-                                record["bbox_updated_from_original"]
-                            )
-                            prop_t["reference_bbox_top"] = int(
-                                match_state.bbox_offsets["top"]
-                            )
-                            prop_t["reference_bbox_bottom"] = int(
-                                match_state.bbox_offsets["bottom"]
-                            )
-                            prop_t["reference_bbox_left"] = int(
-                                match_state.bbox_offsets["left"]
-                            )
-                            prop_t["reference_bbox_right"] = int(
-                                match_state.bbox_offsets["right"]
-                            )
-                            if (
-                                visualize_dir is not None
-                                and record["bbox_updated_from_original"]
-                                and record["reference_bbox_before_update"] is not None
-                                and record["reference_bbox_after_update"] is not None
-                                and record["aligned_bbox_before_update"] is not None
-                                and record["aligned_bbox_after_update"] is not None
-                            ):
-                                before_box = record["reference_bbox_before_update"]
-                                after_box = record["reference_bbox_after_update"]
-                                shifted_before_box = record[
-                                    "aligned_bbox_before_update"
-                                ]
-                                shifted_after_box = record["aligned_bbox_after_update"]
-                                _visualize_quantify_from_coords(
-                                    match_state.reference_result.smoothed_image,
-                                    target_result.image,
-                                    target_result.smoothed_image,
-                                    target_result.image,
-                                    target_result.smoothed_image,
-                                    bbox_center=np.array(
-                                        [
-                                            (
-                                                prop_t["centroid-0"].values[0],
-                                                prop_t["centroid-1"].values[0],
-                                            )
-                                        ]
-                                    ),
-                                    save_dir=visualize_dir,
-                                    msms_pos=match_state.reference_result.snapped_anchor,
-                                    snapped_msms_pos=target_result.snapped_anchor,
-                                    filename=(
-                                        f"mz{pept_idx}_{raw_file}_quant_only_bbox_update.png"
-                                    ),
-                                    labels=target_result.labels_multi_markers,
-                                    template_box=shifted_after_box,
-                                    context_panels=[
-                                        {
-                                            "image": match_state.reference_result.smoothed_image,
-                                            "title": "reference_bbox_before_after",
-                                            "msms_pos": match_state.reference_result.snapped_anchor,
-                                            "snapped_msms_pos": match_state.reference_result.snapped_anchor,
-                                            "template_boxes": [
-                                                {
-                                                    "box": before_box,
-                                                    "edgecolor": "orange",
-                                                    "linestyle": "--",
-                                                },
-                                                {
-                                                    "box": after_box,
-                                                    "edgecolor": "cyan",
-                                                    "linestyle": "-",
-                                                },
-                                            ],
-                                        },
-                                        {
-                                            "image": target_result.smoothed_image,
-                                            "title": "quant_only_bbox_before_after",
-                                            "msms_pos": match_state.reference_result.snapped_anchor,
-                                            "snapped_msms_pos": target_result.snapped_anchor,
-                                            "template_boxes": [
-                                                {
-                                                    "box": shifted_before_box,
-                                                    "edgecolor": "orange",
-                                                    "linestyle": "--",
-                                                },
-                                                {
-                                                    "box": shifted_after_box,
-                                                    "edgecolor": "cyan",
-                                                    "linestyle": "-",
-                                                },
-                                            ],
-                                        },
-                                    ],
-                                )
-
-                    if prop_t is not None:
-                        target_result.peak_properties = prop_t
-                        if is_quant_only_run:
-                            pp_quant_only_list.append(prop_t)
-                        else:
-                            pp_match_target_list.append(prop_t)
-                            match_t = compare_peak_properties(
-                                match_state.reference_result.peak_properties, prop_t
-                            )
-                            match_t["mz_rank"] = pept_idx
-                            match_t["feature_instance_id"] = feature_instance_id
-                            match_t["own_anchor_id"] = own_anchor_id
-                            match_t["assimilated_to_anchor_id"] = own_anchor_id
-                            match_t["source_run"] = reference_raw_file
-                            match_t["source_type"] = "Reference"
-                            results_target.append(match_t)
-                    else:
-                        no_quant_log.append(
-                            {
-                                "mz_rank": pept_idx,
-                                "run_name": raw_file,
-                                "type": (
-                                    "quant_only"
-                                    if is_quant_only_run
-                                    else "match_target"
-                                ),
-                                "feature_instance_id": feature_instance_id,
-                            }
-                        )
-                        if not is_quant_only_run:
-                            no_match_log.append(
-                                {
-                                    "mz_rank": pept_idx,
-                                    "run_name": raw_file,
-                                    "type": "match_target",
-                                    "feature_instance_id": feature_instance_id,
-                                }
-                            )
-                    if (prop_d is not None) and (not is_quant_only_run):
-                        decoy_result.peak_properties = prop_d
-                        pp_match_decoy_list.append(prop_d)
-                        match_d = compare_peak_properties(
-                            match_state.reference_result.peak_properties, prop_d
-                        )
-                        match_d["mz_rank"] = pept_idx
-                        match_d["decoy_mz_rank"] = decoy_pept_idx
-                        match_d["feature_instance_id"] = feature_instance_id
-                        match_d["own_anchor_id"] = own_anchor_id
-                        match_d["assimilated_to_anchor_id"] = own_anchor_id
-                        match_d["source_run"] = reference_raw_file
-                        match_d["source_type"] = "Reference"
-                        results_decoy.append(match_d)
-                    elif not is_quant_only_run:
-                        no_quant_log.append(
-                            {
-                                "mz_rank": pept_idx,
-                                "run_name": raw_file,
-                                "type": "match_decoy",
-                                "feature_instance_id": feature_instance_id,
-                            }
-                        )
-                        no_match_log.append(
-                            {
-                                "mz_rank": pept_idx,
-                                "run_name": raw_file,
-                                "type": "match_decoy",
-                                "feature_instance_id": feature_instance_id,
-                            }
-                        )
+            if prop_t is not None:
+                target_result.peak_properties = prop_t
+                pp_match_target_list.append(prop_t)
+                match_t = compare_peak_properties(
+                    match_state.reference_result.peak_properties, prop_t
+                )
+                match_t["mz_rank"] = pept_idx
+                match_t["feature_instance_id"] = feature_instance_id
+                match_t["own_anchor_id"] = own_anchor_id
+                match_t["assimilated_to_anchor_id"] = own_anchor_id
+                match_t["source_run"] = reference_raw_file
+                match_t["source_type"] = (
+                    "Quant_Only" if is_quant_only_run else "Reference"
+                )
+                results_target.append(match_t)
             else:
-                for raw_file in non_reference_runs:
-                    no_quant_log.append(
-                        {
-                            "mz_rank": pept_idx,
-                            "run_name": raw_file,
-                            "type": (
-                                "quant_only"
-                                if raw_file in quant_only_probe_records
-                                else "match_target"
-                            ),
-                        }
-                    )
-                    if raw_file not in quant_only_probe_records:
-                        no_quant_log.append(
-                            {
-                                "mz_rank": pept_idx,
-                                "run_name": raw_file,
-                                "type": "match_decoy",
-                            }
-                        )
-                        no_match_log.append(
-                            {
-                                "mz_rank": pept_idx,
-                                "run_name": raw_file,
-                                "type": "match_target",
-                            }
-                        )
-                        no_match_log.append(
-                            {
-                                "mz_rank": pept_idx,
-                                "run_name": raw_file,
-                                "type": "match_decoy",
-                            }
-                        )
+                no_quant_log.append(
+                    {
+                        "mz_rank": pept_idx,
+                        "run_name": raw_file,
+                        "type": "quant_only" if is_quant_only_run else "match_target",
+                        "feature_instance_id": feature_instance_id,
+                    }
+                )
+                no_match_log.append(
+                    {
+                        "mz_rank": pept_idx,
+                        "run_name": raw_file,
+                        "type": "match_target",
+                        "feature_instance_id": feature_instance_id,
+                    }
+                )
+
+            if prop_d is not None:
+                decoy_result.peak_properties = prop_d
+                pp_match_decoy_list.append(prop_d)
+                match_d = compare_peak_properties(
+                    match_state.reference_result.peak_properties, prop_d
+                )
+                match_d["mz_rank"] = pept_idx
+                match_d["decoy_mz_rank"] = decoy_pept_idx
+                match_d["feature_instance_id"] = feature_instance_id
+                match_d["own_anchor_id"] = own_anchor_id
+                match_d["assimilated_to_anchor_id"] = own_anchor_id
+                match_d["source_run"] = reference_raw_file
+                match_d["source_type"] = "Reference"
+                results_decoy.append(match_d)
+            else:
+                no_quant_log.append(
+                    {
+                        "mz_rank": pept_idx,
+                        "run_name": raw_file,
+                        "type": "match_decoy",
+                        "feature_instance_id": feature_instance_id,
+                    }
+                )
+                no_match_log.append(
+                    {
+                        "mz_rank": pept_idx,
+                        "run_name": raw_file,
+                        "type": "match_decoy",
+                        "feature_instance_id": feature_instance_id,
+                    }
+                )
 
     return (
         results_target,
         results_decoy,
         pp_reference_list,
-        pp_quant_only_list,
         pp_match_target_list,
         pp_match_decoy_list,
         no_quant_log,
@@ -935,6 +992,7 @@ def _visualize_quantify_from_coords(
     Optional ``context_panels`` can be prepended to show extra states such as a
     quant-only source image and how it maps into the reference image.
     """
+    import matplotlib.pyplot as plt
 
     def _draw_panel(
         ax,
@@ -1188,6 +1246,7 @@ def quantify_from_coords(
     target_anchor: tuple[int, int] | None = None,
     reference_image: np.ndarray | None = None,
     propA: pd.DataFrame | None = None,
+    pre_smoothed_image: np.ndarray | None = None,
     apply_seg: bool = True,
     smooth_kwargs: dict | None = None,
     peak_kwargs: dict | None = None,
@@ -1311,7 +1370,11 @@ def quantify_from_coords(
     if "min_distance" not in peak_kwargs:
         peak_kwargs["min_distance"] = 10
 
-    pept_act_image_smoothed = smooth_and_denoise_image(pept_act_image, **smooth_kwargs)
+    pept_act_image_smoothed = (
+        pre_smoothed_image.copy()
+        if pre_smoothed_image is not None
+        else smooth_and_denoise_image(pept_act_image, **smooth_kwargs)
+    )
     context_panels: list[dict[str, Any]] | None = None
     # Case "Match": perform template matching to find the best match for the reference peak
     # and then run watershed with the matched position as (updated) anchor
@@ -1547,12 +1610,10 @@ def quantify_from_coords(
             ),
             patch_size=patch_size,
         )
-        hu, zernike = get_roi_descriptor(
+        zernike = get_roi_descriptor(
             seg_bbox,
         )
-        peak_properties["hu"] = None
         peak_properties["zernike"] = None
-        peak_properties.at[0, "hu"] = hu
         peak_properties.at[0, "zernike"] = zernike
 
         if reference_image is not None:
@@ -1631,9 +1692,6 @@ def compare_peak_properties(peak_properties_a, peak_properties_b):
             peak_properties_a["sift_des"].values[0],
             peak_properties_b["sift_des"].values[0],
         ),
-        "hu_similarities": compare_image_descriptors_cosine(
-            peak_properties_a["hu"].values[0], peak_properties_b["hu"].values[0]
-        ),
         "zernike_similarities": compare_image_descriptors_cosine(
             peak_properties_a["zernike"].values[0],
             peak_properties_b["zernike"].values[0],
@@ -1641,9 +1699,6 @@ def compare_peak_properties(peak_properties_a, peak_properties_b):
         "sift_distance": compare_image_descriptors_euclidean(
             peak_properties_a["sift_des"].values[0],
             peak_properties_b["sift_des"].values[0],
-        ),
-        "hu_distance": compare_image_descriptors_euclidean(
-            peak_properties_a["hu"].values[0], peak_properties_b["hu"].values[0]
         ),
         "zernike_distance": compare_image_descriptors_euclidean(
             peak_properties_a["zernike"].values[0],
@@ -1810,22 +1865,13 @@ def get_roi_descriptor(roi, radius=None):
     else:
         roi_norm = (roi - roi.min()) / (roi.max() - roi.min())
 
-    # Hu Moments
-    moments = cv2.moments(roi_norm)
-    hu = cv2.HuMoments(moments).flatten()
-    # Log transform Hu moments (they span huge ranges)
-    hu_abs = np.abs(hu)
-    hu = np.zeros_like(hu)
-    mask = hu_abs > 0
-    hu[mask] = -np.sign(hu[mask]) * np.log10(hu_abs[mask])
-
     # Zernike Moments
     roi_uint8 = (roi_norm * 255).astype(np.uint8)
     radius = radius if radius is not None else max(roi.shape) // 2
     zernike = zernike_moments(
         roi_uint8, radius, cm=(roi.shape[1] // 2, roi.shape[0] // 2), degree=8
     )
-    return hu, zernike
+    return zernike
 
 
 def compare_image_descriptors_cosine(des1, des2):
@@ -1880,8 +1926,21 @@ def compare_sift_descriptors(des1, des2):
     return similarity
 
 
-def calc_quant_corr(pp_quant_only, pp_reference, pp_match_target, quant_dir):
+def calc_quant_corr(pp_reference, pp_match_target, quant_dir):
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
     os.makedirs(quant_dir, exist_ok=True)
+    if "source_type" in pp_match_target.columns:
+        pp_quant_only = pp_match_target.loc[
+            pp_match_target["source_type"] == "Quant_Only"
+        ].copy()
+        pp_match_target_only = pp_match_target.loc[
+            pp_match_target["source_type"] != "Quant_Only"
+        ].copy()
+    else:
+        pp_quant_only = pd.DataFrame(columns=pp_match_target.columns)
+        pp_match_target_only = pp_match_target
     pp_quant_only_pivoted = pp_quant_only.pivot_table(
         index="mz_rank",
         columns="Run_name",
@@ -1895,7 +1954,7 @@ def calc_quant_corr(pp_quant_only, pp_reference, pp_match_target, quant_dir):
         aggfunc="max",
     ).reset_index()
     # Log-transform numeric columns and compute pairwise Pearson correlations (pairwise complete cases)
-    pp_match_target_pivoted = pp_match_target.pivot_table(
+    pp_match_target_pivoted = pp_match_target_only.pivot_table(
         index="mz_rank",
         columns="Run_name",
         values="intensity_sum",
@@ -1981,6 +2040,8 @@ def calc_quant_corr(pp_quant_only, pp_reference, pp_match_target, quant_dir):
 def plot_match_type_from_combined(
     df, colors=None, labels=None, stack_order=None, fig_dir=None, fig_name_suffix=""
 ):
+    import matplotlib.pyplot as plt
+
     if colors is None:
         colors = {
             "MS/MS": "#55A868",

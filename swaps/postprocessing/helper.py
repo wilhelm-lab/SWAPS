@@ -3,26 +3,98 @@ import sparse
 import pyarrow as pa
 import pyarrow.parquet as pq
 import numpy as np
+import pandas as pd
 import duckdb
 from typing import Optional, List
 import logging
 
 Logger = logging.getLogger(__name__)
 
+_SORTED_ACTIVATION_FILENAME = "activation_sorted_by_mz.parquet"
+_SORTED_ROW_GROUP_SIZE = 100_000
 
-def load_peptide_batch_df_from_partquet(parquet_path, pept_indicies: List):
-    con = duckdb.connect()
-    # if not isinstance(pept_indicies, list):
-    #     pept_indicies = pept_indicies.tolist()
-    pept_ids_str = (
-        tuple(pept_indicies) if len(pept_indicies) > 1 else f"({pept_indicies[0]})"
-    )
-    query = f"""
-    SELECT *
-    FROM parquet_scan('{parquet_path}')
-    WHERE mz_rank IN {pept_ids_str}
+
+def build_mz_sorted_activation(
+    activation_dir: str,
+    row_group_size: int = _SORTED_ROW_GROUP_SIZE,
+) -> str:
+    """Merge all swa_frame_batch_*_activation.parquet files into one file sorted by mz_rank.
+
+    This one-time preprocessing step enables DuckDB row-group skipping when
+    workers query a contiguous mz_rank slice with BETWEEN.  I/O then scales
+    with batch_size / N_total instead of requiring a full scan of all files.
+
+    If the output file already exists the function returns immediately without
+    rebuilding it.
+
+    Parameters
+    ----------
+    activation_dir:
+        Directory containing the per-frame-batch parquet files.
+    row_group_size:
+        Number of rows per parquet row group.  Smaller groups give finer
+        skipping granularity at the cost of slightly larger file overhead.
+
+    Returns
+    -------
+    str
+        Absolute path of the written (or already-existing) sorted parquet file.
     """
-    df = con.execute(query).df()
+    out_path = os.path.join(activation_dir, _SORTED_ACTIVATION_FILENAME)
+    if os.path.exists(out_path):
+        Logger.info("mz-sorted activation already exists, skipping: %s", out_path)
+        return out_path
+    con = duckdb.connect()
+    con.execute("SET enable_progress_bar = false")
+    con.execute(f"""
+        COPY (
+            SELECT * FROM parquet_scan(
+                '{activation_dir}/swa_frame_batch_*_activation.parquet'
+            )
+            ORDER BY mz_rank
+        ) TO '{out_path}'
+        (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE {row_group_size})
+    """)
+    con.close()
+    Logger.info("Written mz-sorted activation to %s", out_path)
+    return out_path
+
+
+def load_peptide_batch_df_from_partquet(
+    activation_dir: str,
+    pept_indicies: List[int],
+    con: duckdb.DuckDBPyConnection | None = None,
+) -> pd.DataFrame:
+    """Load activation rows for a contiguous mz_rank slice from the sorted parquet.
+
+    Relies on the file produced by :func:`build_mz_sorted_activation`.
+    DuckDB skips row groups outside [min(pept_indicies), max(pept_indicies)],
+    so read I/O is proportional to the batch fraction rather than total data.
+
+    Parameters
+    ----------
+    activation_dir:
+        Directory containing ``activation_sorted_by_mz.parquet``.
+    pept_indicies:
+        Sequence of mz_rank values for this batch.  Should be a contiguous
+        range so the BETWEEN predicate matches exactly the needed row groups.
+    con:
+        Optional existing DuckDB connection.  A new one is created (and closed)
+        when *None*.
+    """
+    sorted_path = os.path.join(activation_dir, _SORTED_ACTIVATION_FILENAME)
+    own_connection = con is None
+    if con is None:
+        con = duckdb.connect()
+        con.execute("SET enable_progress_bar = false")
+    mz_min = int(min(pept_indicies))
+    mz_max = int(max(pept_indicies))
+    df = con.execute(
+        f"SELECT * FROM parquet_scan('{sorted_path}') "
+        f"WHERE mz_rank BETWEEN {mz_min} AND {mz_max}"
+    ).df()
+    if own_connection:
+        con.close()
     return df
 
 
@@ -34,8 +106,11 @@ def get_pept_act_from_parquet(
     shape: Optional[tuple] = None,
     return_offset: bool = False,
 ):
-    # con = duckdb.connect()
-    row = dict_ref.loc[dict_ref["mz_rank"] == pept_idx, :]
+    # Support both a pre-indexed DataFrame (index == "mz_rank") and a plain one.
+    if dict_ref.index.name == "mz_rank":
+        row = dict_ref.loc[[pept_idx]]
+    else:
+        row = dict_ref.loc[dict_ref["mz_rank"] == pept_idx, :]
     rt_start = row[f"MS1_frame_idx_left_ref_{run_name}"].values[0]
     rt_end = row[f"MS1_frame_idx_right_ref_{run_name}"].values[0]
     im_start = row[f"mobility_values_index_left_ref_{run_name}"].values[0]

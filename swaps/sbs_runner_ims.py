@@ -2,6 +2,7 @@
 
 import logging
 import os
+from concurrent.futures import ThreadPoolExecutor, as_completed as tpe_as_completed
 from datetime import datetime
 import time
 import argparse
@@ -34,7 +35,7 @@ from postprocessing.match_features import (
     calc_quant_corr,
     plot_match_type_from_combined,
 )
-from postprocessing.helper import build_pivot
+from postprocessing.helper import build_pivot, build_mz_sorted_activation
 from postprocessing.direct_lfq import (
     reformat_swaps_combined_for_directlfq,
     plot_quantification_by_run,
@@ -251,26 +252,46 @@ def opt_scan_by_scan(config_path: str):
     logging.info(
         "==================Quantification and Feature-Feature Match=================="
     )
+    raw_file_list = [
+        d
+        for d in os.listdir(cfg.RESULT_PATH)
+        if os.path.isdir(os.path.join(cfg.RESULT_PATH, d))
+        and not d.startswith("quantification")
+    ]
+
+    # One-time preprocessing: merge frame-partitioned parquets into a single
+    # mz_rank-sorted parquet per directory so workers can skip row groups.
+    # build_mz_sorted_activation is idempotent — skips if the file exists.
+    logging.info("Building mz-sorted activation parquets (skips if already done)...")
+    act_dirs = [
+        os.path.join(cfg.RESULT_PATH, raw_file, "activation")
+        for raw_file in raw_file_list
+    ]
+
+    with ThreadPoolExecutor(max_workers=min(len(act_dirs), cfg.N_CPU)) as tpe:
+        futures = {tpe.submit(build_mz_sorted_activation, d): d for d in act_dirs}
+        for fut in tpe_as_completed(futures):
+            d = futures[fut]
+            exc = fut.exception()
+            if exc:
+                logging.error("build_mz_sorted_activation failed for %s: %s", d, exc)
+            else:
+                logging.info("Done: %s", d)
+
     (
         matches_target,
         matches_decoy,
         pp_reference,
-        pp_quant_only,
         pp_match_target,
         pp_match_decoy,
         df_no_quant,
         df_no_match,
     ) = match_features_batches_parallel(
         dict_ref=dict_ref,
-        raw_file_list=[
-            d
-            for d in os.listdir(cfg.RESULT_PATH)
-            if os.path.isdir(os.path.join(cfg.RESULT_PATH, d))
-            and not d.startswith("quantification")
-        ],
+        raw_file_list=raw_file_list,
         result_dir=cfg.RESULT_PATH,
         peptide_indicies=dict_ref["mz_rank"].values,  # type: ignore
-        batch_size=100,
+        batch_size_max=1500,
         max_workers=cfg.N_CPU,
         processing_kwargs=processing_kwargs,
     )
@@ -280,7 +301,6 @@ def opt_scan_by_scan(config_path: str):
         "matches_target.csv": matches_target,
         "matches_decoy.csv": matches_decoy,
         "pp_reference.csv": pp_reference,
-        "pp_quant_only.csv": pp_quant_only,
         "pp_match_target.csv": pp_match_target,
         "pp_match_decoy.csv": pp_match_decoy,
         "no_quant_log.csv": df_no_quant,
@@ -307,10 +327,8 @@ def opt_scan_by_scan(config_path: str):
             "im_shift_scaled",
             "rt_shift_scaled",
             "sift_similarities",
-            "hu_similarities",
             "zernike_similarities",
             "sift_distance",
-            "hu_distance",
             "zernike_distance",
             "template_matching_score",
         ],
@@ -344,7 +362,7 @@ def opt_scan_by_scan(config_path: str):
     dfs_to_concat = {
         "MBR": pp_match_target_filtered.drop(columns=["filename"]),
         "MS/MS Ref": pp_reference,
-        "MS/MS Quant": pp_quant_only,
+        # "MS/MS Quant": pp_quant_only,
     }
     pp_all = pd.DataFrame()
     for df_type, df in dfs_to_concat.items():
@@ -369,7 +387,6 @@ def opt_scan_by_scan(config_path: str):
 
     logging.info("=================Result Analysis==================")
     calc_quant_corr(
-        pp_quant_only,
         pp_reference,
         pp_match_target_filtered,
         quant_dir,
