@@ -24,3 +24,7 @@ swaps/utils/exp_configs/config_jigsaw_*
 .coverage
 temp_config.yaml
 pyrightconfig.json
+.codex
+profile_script.py
+profile.stats
+swaps/match_features_batches_parallel.md
