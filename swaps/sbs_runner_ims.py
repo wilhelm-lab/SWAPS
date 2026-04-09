@@ -9,9 +9,7 @@ import yaml
 import pandas as pd
 import directlfq.lfq_manager as lfq_manager
 
-# Disable cuDNN globally BEFORE anything else
-torch.backends.cudnn.enabled = False
-
+from utils.tools import get_dot_d_paths
 from utils.ims_utils import (
     load_dotd_data,
     export_im_and_ms1scans,
@@ -130,7 +128,7 @@ def opt_scan_by_scan(config_path: str):
                 evidence = fragpipe_psm_parser(evidence)
         dict_ref = construct_dict_from_search_pivoted(
             cfg_prepare_dict=cfg.PREPARE_DICT,
-            evidence=evidence,
+            evidence=evidence,  # type: ignore
             n_blocks_by_pept=1,
         )
         dict_ref.to_pickle(os.path.join(cfg.RESULT_PATH, "dict_ref.pkl"))
@@ -143,103 +141,99 @@ def opt_scan_by_scan(config_path: str):
             cfg.DATA_PATH,
             cfg.EXCLUDE_DATASET_NAME,
         )
-        for dot_d_dir in os.listdir(cfg.DATA_PATH):
-            logging.info("process dataset: %s", dot_d_dir)
-            if dot_d_dir.endswith(".d") and dot_d_dir not in cfg.EXCLUDE_DATASET_NAME:
-                logging.info(
-                    "============Scan-Wise Activation for dataset: %s============",
-                    dot_d_dir,
-                )
-                logging.info(
-                    "--------------------------Load Data--------------------------"
-                )
-                # Get the lowest level directory name with .d extension
-                dir_wo_extension = dot_d_dir.split(".")[0]
-                act_dir = os.path.join(cfg.RESULT_PATH, dir_wo_extension, "activation")
-                os.makedirs(act_dir, exist_ok=True)
+        dot_d_paths = get_dot_d_paths(cfg.DATA_PATH, cfg.EXCLUDE_DATASET_NAME)
+        for dot_d_path in dot_d_paths:
+            dot_d_dir = os.path.basename(dot_d_path)
+            logging.info(
+                "============Scan-Wise Activation for dataset: %s============",
+                dot_d_dir,
+            )
+            logging.info(
+                "--------------------------Load Data--------------------------"
+            )
+            # Get the lowest level directory name with .d extension
+            dir_wo_extension = dot_d_dir.split(".")[0]
+            act_dir = os.path.join(cfg.RESULT_PATH, dir_wo_extension, "activation")
+            os.makedirs(act_dir, exist_ok=True)
 
-                # Load data
-                if cfg.USE_IMS:
-                    data, hdf_file_name = load_dotd_data(
-                        os.path.join(cfg.DATA_PATH, dot_d_dir),
-                        swaps_result_dir=cfg.EXPORT_DATA_HDF5_DIR,
-                    )
-                    ms1scans, mobility_values_df = export_im_and_ms1scans(
-                        data=data,  # type: ignore
-                        swaps_result_dir=os.path.join(
-                            cfg.RESULT_PATH, dir_wo_extension
-                        ),
-                    )
-                    dict_ref = dict_add_index_to_raw_file(
-                        dict_ref,
-                        mobility_values_df,
-                        ms1scans,
-                        dir_wo_extension,
-                    )
-                    # if not added_im_and_rt_index:
-                    dict_ref = dict_add_im_index(
-                        dict_ref,
-                        mobility_values_df,
-                        "IM_search_left",
-                        "IM_search_center",
-                        "IM_search_right",
-                        idx_suffix=f"_ref_{dir_wo_extension}",
-                    )
-                    dict_ref = dict_add_rt_index(
-                        dict_ref,
-                        ms1scans,
-                        idx_suffix=f"_ref_{dir_wo_extension}",
-                    )
-                    # added_im_and_rt_index = True
-
-                    # Save the updated dict_ref with added activation info to the result directory for downstream processing
-                    dict_ref.to_pickle(
-                        os.path.join(cfg.RESULT_PATH, "dict_ref_with_activation.pkl")
-                    )
-                else:
-                    raise NotImplementedError(
-                        "Currently only support IMS data. Please set USE_IMS to True."
-                    )
-                    # mzml_data = load_mzml(cfg.DATA_PATH, unify_format=True)
-                    # ms1scans = mzml_data
-                    # mobility_values_df = None
-
-                # Optimization
-                start_time = time.time()
-                logging.info(
-                    "-----------------Scan by Scan Optimization-----------------"
+            # Load data
+            if cfg.USE_IMS:
+                data, hdf_file_name = load_dotd_data(
+                    dot_d_path,
+                    swaps_result_dir=cfg.EXPORT_DATA_HDF5_DIR,
                 )
-
-                n_batch = cfg.OPTIMIZATION.N_BATCH
-                max_mz_rank = dict_ref.mz_rank.max()
-                logging.info("Number of batches: %s", n_batch)
-                batch_scan_indices = generate_id_partitions(
-                    n_batch=n_batch,
-                    id_array=ms1scans.index.values,
-                    how="round_robin",
-                )  # for small scale testing: ms1scans["Id"].iloc[0:500]
-                logging.debug("indices in first batch: %s", batch_scan_indices[0])
-                # process scans
-                process_frames_parallel(
-                    data=data,
-                    n_jobs=cfg.N_CPU,
-                    ms1scans=ms1scans,
-                    parquet_file_stem=os.path.join(act_dir, "swa"),
-                    batch_scan_indices=batch_scan_indices,
-                    maxquant_result_ref_with_im_index_sortmz=dict_ref,
-                    mobility_values=mobility_values_df,
-                    # cutoff=cutoff,
-                    delta_mobility_thres=cfg.OPTIMIZATION.DELTA_MOBILITY_INDEX_THRES,
-                    ppm_tol=cfg.PREPARE_DICT.PPM_TOL,
-                    bin_width=cfg.PREPARE_DICT.BIN_WIDTH,
-                    process_in_blocks=True,
-                    width=cfg.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH,
-                    # save_dir=os.path.join(act_dir, "target"),
-                    extract_im_peak=False,
-                    use_ims=cfg.USE_IMS,
-                    return_res_coo_dict=False,
-                    max_mz_rank=max_mz_rank,
+                ms1scans, mobility_values_df = export_im_and_ms1scans(
+                    data=data,  # type: ignore
+                    swaps_result_dir=os.path.join(cfg.RESULT_PATH, dir_wo_extension),
                 )
+                dict_ref = dict_add_index_to_raw_file(
+                    dict_ref,
+                    mobility_values_df,
+                    ms1scans,
+                    dir_wo_extension,
+                )
+                # if not added_im_and_rt_index:
+                dict_ref = dict_add_im_index(
+                    dict_ref,
+                    mobility_values_df,
+                    "IM_search_left",
+                    "IM_search_center",
+                    "IM_search_right",
+                    idx_suffix=f"_ref_{dir_wo_extension}",
+                )
+                dict_ref = dict_add_rt_index(
+                    dict_ref,
+                    ms1scans,
+                    idx_suffix=f"_ref_{dir_wo_extension}",
+                )
+                # added_im_and_rt_index = True
+
+                # Save the updated dict_ref with added activation info to the result directory for downstream processing
+                dict_ref.to_pickle(
+                    os.path.join(cfg.RESULT_PATH, "dict_ref_with_activation.pkl")
+                )
+            else:
+                raise NotImplementedError(
+                    "Currently only support IMS data. Please set USE_IMS to True."
+                )
+                # mzml_data = load_mzml(cfg.DATA_PATH, unify_format=True)
+                # ms1scans = mzml_data
+                # mobility_values_df = None
+
+            # Optimization
+            start_time = time.time()
+            logging.info("-----------------Scan by Scan Optimization-----------------")
+
+            n_batch = cfg.OPTIMIZATION.N_BATCH
+            max_mz_rank = dict_ref.mz_rank.max()
+            logging.info("Number of batches: %s", n_batch)
+            batch_scan_indices = generate_id_partitions(
+                n_batch=n_batch,
+                id_array=ms1scans.index.values,
+                how="round_robin",
+            )  # for small scale testing: ms1scans["Id"].iloc[0:500]
+            logging.debug("indices in first batch: %s", batch_scan_indices[0])
+            # process scans
+            process_frames_parallel(
+                data=data,
+                n_jobs=cfg.N_CPU,
+                ms1scans=ms1scans,
+                parquet_file_stem=os.path.join(act_dir, "swa"),
+                batch_scan_indices=batch_scan_indices,
+                maxquant_result_ref_with_im_index_sortmz=dict_ref,
+                mobility_values=mobility_values_df,
+                # cutoff=cutoff,
+                delta_mobility_thres=cfg.OPTIMIZATION.DELTA_MOBILITY_INDEX_THRES,
+                ppm_tol=cfg.PREPARE_DICT.PPM_TOL,
+                bin_width=cfg.PREPARE_DICT.BIN_WIDTH,
+                process_in_blocks=True,
+                width=cfg.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH,
+                # save_dir=os.path.join(act_dir, "target"),
+                extract_im_peak=False,
+                use_ims=cfg.USE_IMS,
+                return_res_coo_dict=False,
+                max_mz_rank=max_mz_rank,
+            )
     else:
         logging.info(
             "Scan-Wise Activation is skipped as SWA is set to False in config. Please make sure *.parquet files exists in RESULT_PATH/<raw_file>/activation/ for downstream processing."

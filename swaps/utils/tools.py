@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 from scipy.signal import find_peaks, peak_widths
 from scipy.spatial import cKDTree  # type: ignore
+from pathlib import Path
 
 Logger = logging.getLogger(__name__)
 
@@ -239,3 +240,26 @@ def load_mzml(msconvert_file: str, unify_format: bool = False) -> pd.DataFrame:
     return df_ms1
 
 
+def get_dot_d_paths(root_path, exclude_list):
+    found_paths = []
+    root = Path(root_path)
+
+    for item in root.iterdir():
+        # Skip excluded names
+        if item.name in exclude_list:
+            continue
+
+        # If it's a .d directory, add it and STOP going deeper in this branch
+        if item.is_dir() and item.suffix == ".d":
+            found_paths.append(str(item.absolute()))
+
+        # If it's a regular directory, recurse deeper
+        elif item.is_dir():
+            found_paths.extend(get_dot_d_paths(item, exclude_list))
+    Logger.info(
+        "Found %d .d directories in %s after excluding %s",
+        len(found_paths),
+        root_path,
+        exclude_list,
+    )
+    return found_paths
