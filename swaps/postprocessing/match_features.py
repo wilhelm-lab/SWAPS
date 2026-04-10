@@ -294,8 +294,8 @@ def _bbox_tuple_from_prop(peak_properties: pd.DataFrame) -> tuple[int, int, int,
 
 
 def _expansion_deltas_from_aligned_and_quant_bbox(
-    aligned_bbox: tuple[int, int, int, int],
-    quant_bbox: tuple[int, int, int, int],
+    ref_probe_new_bbox: tuple[int, int, int, int],
+    ref_bbox: tuple[int, int, int, int],
 ) -> dict[str, int]:
     """Compute directional expansion needed to cover both aligned and quant bboxes.
 
@@ -304,10 +304,10 @@ def _expansion_deltas_from_aligned_and_quant_bbox(
     """
 
     return {
-        "top": max(int(aligned_bbox[0]) - int(quant_bbox[0]), 0),
-        "left": max(int(aligned_bbox[1]) - int(quant_bbox[1]), 0),
-        "bottom": max(int(quant_bbox[2]) - int(aligned_bbox[2]), 0),
-        "right": max(int(quant_bbox[3]) - int(aligned_bbox[3]), 0),
+        "top": max(int(ref_probe_new_bbox[0]) - int(ref_bbox[0]), 0),
+        "left": max(int(ref_probe_new_bbox[1]) - int(ref_bbox[1]), 0),
+        "bottom": max(int(ref_probe_new_bbox[2]) - int(ref_bbox[2]), 0),
+        "right": max(int(ref_probe_new_bbox[3]) - int(ref_bbox[3]), 0),
     }
 
 
@@ -364,7 +364,6 @@ def _quantify_peptide_run(
     run_name,
     case: Literal["Reference", "Quant_Only", "Match"],
     template_anchor_override: Optional[tuple[int, int]] = None,
-    anchor_override: Optional[tuple[int, int]] = None,
     reference_image: np.ndarray | None = None,
     reference_props: pd.DataFrame | None = None,
     precomputed_pept_act: tuple[np.ndarray, int, int] | None = None,
@@ -373,7 +372,16 @@ def _quantify_peptide_run(
     visualize_dir: str | None = None,
     visualize_name: str | None = None,
 ):
-    """Quantify one peptide in one run and return the full quantification state."""
+    """Quantify one peptide in one run and return the full quantification state.
+
+    Parameters
+    ----------
+    template_anchor_override : tuple[int, int] | None
+        Position (rt, im) in the *reference* image used to crop the template patch
+        for cross-correlation matching (passed as ``anchor`` to
+        ``quantify_from_coords``).  Represents where the peak lives in the reference
+        run.  Defaults to ``(rt_msms_pos, im_msms_pos)`` when ``None``.
+    """
 
     if precomputed_pept_act is None:
         pept_act, rt_msms_pos, im_msms_pos = get_pept_act_from_parquet(
@@ -381,54 +389,46 @@ def _quantify_peptide_run(
         )
     else:
         pept_act, rt_msms_pos, im_msms_pos = precomputed_pept_act
-    target_anchor = (
-        anchor_override if anchor_override is not None else (rt_msms_pos, im_msms_pos)
-    )
     template_anchor = (
         template_anchor_override
-        if template_anchor_override is not None
-        else target_anchor
+        if template_anchor_override
+        else (rt_msms_pos, im_msms_pos)
     )
-    if (
-        target_anchor[0] >= pept_act.shape[0]
-        or target_anchor[1] >= pept_act.shape[1]
-        or target_anchor[0] < 0
-        or target_anchor[1] < 0
-    ):
-        logging.warning(
-            "Skipping %s for mz_rank %s in %s due to anchor out of bounds",
-            case,
-            pept_idx,
-            run_name,
-        )
-        return QuantificationResult(
-            run_name=run_name,
-            case=case,
-            image=pept_act,
-            smoothed_image=pept_act,
-            input_anchor=(int(target_anchor[0]), int(target_anchor[1])),
-            peak_properties=None,
-            snapped_anchor=None,
-            metadata={"pept_idx": pept_idx},
-        )
     if visualize_name is None:
         visualize_name = f"mz{pept_idx}_{run_name}_{case.lower()}.png"
-    result = quantify_from_coords(
-        pept_act,
-        anchor=(int(template_anchor[0]), int(template_anchor[1])),
-        target_anchor=(int(target_anchor[0]), int(target_anchor[1])),
-        reference_image=reference_image,
-        propA=reference_props,
-        pre_smoothed_image=precomputed_smoothed_image,
-        patch_size=min(pept_act.shape),
-        **(processing_kwargs or {}),
-        visualize_dir=visualize_dir,
-        visualize_filename=visualize_name,
-    )
-    result.run_name = run_name
-    result.case = case
-    result.metadata["pept_idx"] = pept_idx
-    return result
+    match case:
+        case "Match":
+            result = quantify_from_coords(
+                pept_act,
+                template_anchor=(int(template_anchor[0]), int(template_anchor[1])),
+                reference_image=reference_image,
+                propA=reference_props,
+                pre_smoothed_image=precomputed_smoothed_image,
+                patch_size=min(pept_act.shape),
+                **(processing_kwargs or {}),
+                visualize_dir=visualize_dir,
+                visualize_filename=visualize_name,
+            )
+        case "Reference":
+            result = quantify_from_coords(
+                pept_act,
+                template_anchor=(int(template_anchor[0]), int(template_anchor[1])),
+                pre_smoothed_image=precomputed_smoothed_image,
+                patch_size=min(pept_act.shape),
+                **(processing_kwargs or {}),
+                visualize_dir=visualize_dir,
+                visualize_filename=visualize_name,
+            )
+
+        case _:
+            raise ValueError(f"Unknown case: {case}")
+    if isinstance(result, QuantificationResult):
+        result.run_name = run_name
+        result.case = case
+        result.metadata["pept_idx"] = pept_idx
+        return result
+    else:
+        return None
 
 
 def _attach_quant_only_metadata(
@@ -453,58 +453,139 @@ def _attach_quant_only_metadata(
         prop_t[f"reference_bbox_{side}"] = int(match_state.bbox_offsets[side])
 
 
-def _visualize_quant_only_bbox_expansion(
-    pept_idx: int,
+def _visualize_probe_expansion(
+    smoothed_image_raw_file: np.ndarray,
+    smoothed_image_ref_file: np.ndarray,
+    quant_direct_snapped_anchor: tuple[int, int],
+    quant_direct_bbox: tuple[int, int, int, int],
+    ref_snapped_anchor: tuple[int, int],
+    ref_bbox: tuple[int, int, int, int],
+    ref_probe_new_bbox: tuple[int, int, int, int],
+    match_props_bbox_before: tuple[int, int, int, int],
+    match_props_bbox_after: tuple[int, int, int, int],
+    mz_rank: int,
     raw_file: str,
-    match_state: "ReferenceMatchState",
-    target_result: "QuantificationResult",
-    prop_t: pd.DataFrame,
-    record: dict[str, Any],
-    visualize_dir: str,
+    bbox_version: int,
+    visualization_dir: str,
 ) -> None:
-    """Render before/after bbox comparison panels for a quant-only expansion event."""
-    before_box = record["reference_bbox_before_update"]
-    after_box = record["reference_bbox_after_update"]
-    shifted_before = record["aligned_bbox_before_update"]
-    shifted_after = record["aligned_bbox_after_update"]
-    _visualize_quantify_from_coords(
-        match_state.reference_result.smoothed_image,
-        target_result.image,
-        target_result.smoothed_image,
-        target_result.image,
-        target_result.smoothed_image,
-        bbox_center=np.array(
-            [(prop_t["centroid-0"].values[0], prop_t["centroid-1"].values[0])]
-        ),
-        save_dir=visualize_dir,
-        msms_pos=match_state.reference_result.snapped_anchor,
-        snapped_msms_pos=target_result.snapped_anchor,
-        filename=f"mz{pept_idx}_{raw_file}_quant_only_bbox_update.png",
-        labels=target_result.labels_multi_markers,
-        template_box=shifted_after,
-        context_panels=[
-            {
-                "image": match_state.reference_result.smoothed_image,
-                "title": "reference_bbox_before_after",
-                "msms_pos": match_state.reference_result.snapped_anchor,
-                "snapped_msms_pos": match_state.reference_result.snapped_anchor,
-                "template_boxes": [
-                    {"box": before_box, "edgecolor": "orange", "linestyle": "--"},
-                    {"box": after_box, "edgecolor": "cyan", "linestyle": "-"},
-                ],
-            },
-            {
-                "image": target_result.smoothed_image,
-                "title": "quant_only_bbox_before_after",
-                "msms_pos": match_state.reference_result.snapped_anchor,
-                "snapped_msms_pos": target_result.snapped_anchor,
-                "template_boxes": [
-                    {"box": shifted_before, "edgecolor": "orange", "linestyle": "--"},
-                    {"box": shifted_after, "edgecolor": "cyan", "linestyle": "-"},
-                ],
-            },
-        ],
+    """Visualize a bbox expansion event triggered by a quant-only probe run.
+
+    Two panels:
+      1. Smoothed activation image of *raw_file*:
+         - Yellow star : quant_direct.snapped_anchor
+         - Blue solid  : quant_direct segmentation bbox
+      2. Smoothed activation image of the reference run:
+         - Yellow star : reference_result.snapped_anchor
+         - White solid : original reference segmentation bbox
+         - Blue dashed : ref_probe_new_bbox (aligned probe bbox on reference space)
+         - Red solid   : match_state.match_props bbox *before* _clone_props_with_offsets
+         - Red dashed  : match_state.match_props bbox *after* _clone_props_with_offsets
+
+    The legend is placed to the right of both panels without overlapping them.
+    """
+    import matplotlib.patches as mpatches
+    import matplotlib.lines as mlines
+    import matplotlib.pyplot as plt
+
+    def _draw_bbox(
+        ax, bbox: tuple[int, int, int, int], color: str, linestyle: str
+    ) -> None:
+        rect = plt.Rectangle(
+            (bbox[1], bbox[0]),
+            bbox[3] - bbox[1],
+            bbox[2] - bbox[0],
+            edgecolor=color,
+            facecolor="none",
+            linestyle=linestyle,
+            linewidth=1.5,
+        )
+        ax.add_patch(rect)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Panel 1: quant-only run smoothed image
+    ax0 = axes[0]
+    ax0.set_title(f"{raw_file}\n(smoothed)", fontsize=8)
+    ax0.imshow(smoothed_image_raw_file, aspect="auto", origin="lower")
+    ax0.plot(
+        quant_direct_snapped_anchor[1],
+        quant_direct_snapped_anchor[0],
+        "*",
+        markersize=10,
+        markeredgewidth=1.5,
+        color="yellow",
     )
+    _draw_bbox(ax0, quant_direct_bbox, color="blue", linestyle="solid")
+
+    # Panel 2: reference run smoothed image
+    ax1 = axes[1]
+    ax1.set_title(f"reference\n(smoothed)", fontsize=8)
+    ax1.imshow(smoothed_image_ref_file, aspect="auto", origin="lower")
+    ax1.plot(
+        ref_snapped_anchor[1],
+        ref_snapped_anchor[0],
+        "*",
+        markersize=10,
+        markeredgewidth=1.5,
+        color="yellow",
+    )
+    _draw_bbox(ax1, ref_bbox, color="white", linestyle="solid")
+    _draw_bbox(ax1, ref_probe_new_bbox, color="blue", linestyle="dashed")
+    _draw_bbox(ax1, match_props_bbox_before, color="red", linestyle="solid")
+    _draw_bbox(ax1, match_props_bbox_after, color="red", linestyle="dashed")
+
+    legend_handles = [
+        mlines.Line2D(
+            [],
+            [],
+            marker="*",
+            color="yellow",
+            linestyle="None",
+            markersize=8,
+            label="snapped anchor",
+        ),
+        mpatches.Patch(
+            edgecolor="blue",
+            facecolor="none",
+            linestyle="solid",
+            label="quant_direct bbox (panel 1)",
+        ),
+        mpatches.Patch(
+            edgecolor="white", facecolor="none", label="original ref bbox (panel 2)"
+        ),
+        mpatches.Patch(
+            edgecolor="blue",
+            facecolor="none",
+            linestyle="dashed",
+            label="ref_probe_new_bbox (panel 2)",
+        ),
+        mpatches.Patch(
+            edgecolor="red",
+            facecolor="none",
+            linestyle="solid",
+            label="match_props bbox before update (panel 2)",
+        ),
+        mpatches.Patch(
+            edgecolor="red",
+            facecolor="none",
+            linestyle="dashed",
+            label="match_props bbox after update (panel 2)",
+        ),
+    ]
+    fig.subplots_adjust(right=0.72)
+    fig.legend(
+        handles=legend_handles,
+        loc="center right",
+        bbox_to_anchor=(1.0, 0.5),
+        fontsize=8,
+        framealpha=0.85,
+        frameon=True,
+    )
+
+    os.makedirs(visualization_dir, exist_ok=True)
+    fname = f"probe_expansion_mz{mz_rank}_{raw_file}_bbox_v{bbox_version}.png"
+    fig.savefig(os.path.join(visualization_dir, fname), dpi=150, bbox_inches="tight")
+    plt.close(fig)
 
 
 def match_features_batch(
@@ -532,10 +613,14 @@ def match_features_batch(
     batch_np = np.asarray(batch)
 
     _cached = _WORKER_CONTEXT.get("dict_ref_by_mz")
-    dict_ref_by_mz = _cached if _cached is not None else (
-        dict_ref.set_index("mz_rank")
-        if dict_ref["mz_rank"].is_unique
-        else dict_ref.drop_duplicates("mz_rank").set_index("mz_rank")
+    dict_ref_by_mz = (
+        _cached
+        if _cached is not None
+        else (
+            dict_ref.set_index("mz_rank")
+            if dict_ref["mz_rank"].is_unique
+            else dict_ref.drop_duplicates("mz_rank").set_index("mz_rank")
+        )
     )
     smooth_kwargs = dict((processing_kwargs or {}).get("smooth_kwargs", {}))
 
@@ -587,7 +672,8 @@ def match_features_batch(
         reference_raw_file = str(str_values.index[(str_values == "Reference")][0])
         quant_only_raw_files = str_values.index[str_values == "Quant_Only"].tolist()
         match_raw_files = str_values.index[
-            str_values.str.contains("Match", regex=False)
+            (str_values.str.contains("Match", regex=False))
+            | (str_values == "Quant_Only")
         ].tolist()
 
         own_anchor_id = 0
@@ -648,11 +734,11 @@ def match_features_batch(
                 pept_idx=pept_idx,
                 dict_ref=dict_ref,
                 run_name=raw_file,
-                case="Quant_Only",
+                case="Reference",
                 precomputed_pept_act=_get_pept_act_tuple(raw_file),
                 precomputed_smoothed_image=_get_smoothed_pept_act(raw_file),
                 processing_kwargs=processing_kwargs,
-                visualize_dir=visualize_dir,
+                # visualize_dir=visualize_dir,
             )
             record: dict[str, Any] = {
                 "direct": quant_direct,
@@ -671,44 +757,41 @@ def match_features_batch(
             if match_state is None or not quant_direct.succeeded:
                 continue  # cannot probe without a valid reference
 
-            probe_result = _quantify_peptide_run(
-                act_df=_select_mz(act_dfs[raw_file], pept_idx),
+            quant_probe = _quantify_peptide_run(  # match quant_only to reference, this one is on reference space
+                act_df=_select_mz(act_dfs[reference_raw_file], pept_idx),
                 pept_idx=pept_idx,
                 dict_ref=dict_ref,
-                run_name=raw_file,
+                run_name=reference_raw_file,
                 case="Match",
-                template_anchor_override=match_state.reference_result.snapped_anchor,
-                anchor_override=match_state.reference_result.snapped_anchor,
-                reference_image=match_state.reference_result.smoothed_image,
-                reference_props=match_state.match_props,
-                precomputed_pept_act=_get_pept_act_tuple(raw_file),
-                precomputed_smoothed_image=_get_smoothed_pept_act(raw_file),
+                template_anchor_override=quant_direct.snapped_anchor,
+                # anchor_override=quant_direct.snapped_anchor,
+                reference_image=quant_direct.smoothed_image,
+                reference_props=quant_direct.peak_properties,
+                precomputed_pept_act=_get_pept_act_tuple(reference_raw_file),
+                precomputed_smoothed_image=_get_smoothed_pept_act(reference_raw_file),
                 processing_kwargs=processing_kwargs,
-                visualize_dir=visualize_dir,
-                visualize_name=f"mz{pept_idx}_{raw_file}_quant_only_probe.png",
+                # visualize_dir=visualize_dir,
+                # visualize_name=f"mz{pept_idx}_{raw_file}_quant_only_probe.png",
             )
-            record["probe"] = probe_result
+            record["probe"] = quant_probe
             record["probe_bbox_version"] = bbox_version
+            if not quant_probe.succeeded:
+                continue  # probe failed, cannot use for bbox expansion or future matching
 
             inside_match_bbox = _anchor_inside_bbox(
-                quant_direct.snapped_anchor, probe_result.peak_properties
+                quant_probe.snapped_anchor, reference_result.peak_properties
             )
             record["inside_match_bbox"] = bool(inside_match_bbox)
 
-            if (
-                not inside_match_bbox
-                and quant_direct.peak_properties is not None
-                and quant_direct.snapped_anchor is not None
-                and probe_result.peak_properties is not None
-            ):
-                aligned_bbox = _bbox_tuple_from_prop(probe_result.peak_properties)
-                quant_bbox = _bbox_tuple_from_prop(quant_direct.peak_properties)
+            if not inside_match_bbox:
+                ref_probe_new_bbox = _bbox_tuple_from_prop(quant_probe.peak_properties)
+                ref_bbox = _bbox_tuple_from_prop(reference_result.peak_properties)
                 record["reference_bbox_before_update"] = _bbox_tuple_from_prop(
                     match_state.match_props
                 )
-                record["aligned_bbox_before_update"] = aligned_bbox
+                # record["aligned_bbox_before_update"] = ref_probe_new_bbox
                 expansion_deltas = _expansion_deltas_from_aligned_and_quant_bbox(
-                    aligned_bbox, quant_bbox
+                    ref_probe_new_bbox, ref_bbox
                 )
                 expanded_offsets = _add_offset_deltas(
                     match_state.bbox_offsets, expansion_deltas
@@ -726,29 +809,39 @@ def match_features_batch(
                 record["reference_bbox_after_update"] = _bbox_tuple_from_prop(
                     match_state.match_props
                 )
-                record["aligned_bbox_after_update"] = (
-                    max(aligned_bbox[0] - expansion_deltas["top"], 0),
-                    max(aligned_bbox[1] - expansion_deltas["left"], 0),
-                    min(
-                        aligned_bbox[2] + expansion_deltas["bottom"],
-                        probe_result.image.shape[0],
-                    ),
-                    min(
-                        aligned_bbox[3] + expansion_deltas["right"],
-                        probe_result.image.shape[1],
-                    ),
-                )
+                if (
+                    visualize_dir is not None
+                    and quant_direct.peak_properties is not None
+                ):
+                    _visualize_probe_expansion(
+                        smoothed_image_raw_file=_get_smoothed_pept_act(raw_file),
+                        smoothed_image_ref_file=_get_smoothed_pept_act(
+                            reference_raw_file
+                        ),
+                        quant_direct_snapped_anchor=quant_direct.snapped_anchor,  # type: ignore[arg-type]
+                        quant_direct_bbox=_bbox_tuple_from_prop(
+                            quant_direct.peak_properties
+                        ),
+                        ref_snapped_anchor=reference_result.snapped_anchor,  # type: ignore[arg-type]
+                        ref_bbox=ref_bbox,
+                        ref_probe_new_bbox=ref_probe_new_bbox,
+                        match_props_bbox_before=record["reference_bbox_before_update"],
+                        match_props_bbox_after=record["reference_bbox_after_update"],
+                        mz_rank=pept_idx,
+                        raw_file=raw_file,
+                        bbox_version=bbox_version,
+                        visualization_dir=visualize_dir,
+                    )
                 if bbox_changed:
                     bbox_version += 1
 
         # --- Step 3: Match all non-reference runs ---
-        non_reference_runs = quant_only_raw_files + match_raw_files
-        if not non_reference_runs:
+        if not match_raw_files:
             continue
 
         if match_state is None:
             # Reference failed: log all non-reference runs as failures and move on
-            for raw_file in non_reference_runs:
+            for raw_file in match_raw_files:
                 is_quant_only = raw_file in quant_only_probe_records
                 no_quant_log.append(
                     {
@@ -782,7 +875,7 @@ def match_features_batch(
             continue
 
         batch_exclude = batch_np[batch_np != pept_idx]
-        for raw_file in non_reference_runs:
+        for raw_file in match_raw_files:
             decoy_pept_idx = np.random.choice(batch_exclude)
             target_act_df = _select_mz(act_dfs[raw_file], pept_idx)
             decoy_act_df = _select_mz(act_dfs[raw_file], int(decoy_pept_idx))
@@ -804,7 +897,7 @@ def match_features_batch(
                     run_name=raw_file,
                     case="Match",
                     template_anchor_override=match_state.reference_result.snapped_anchor,
-                    anchor_override=match_state.reference_result.snapped_anchor,
+                    # anchor_override=match_state.reference_result.snapped_anchor,
                     reference_image=match_state.reference_result.smoothed_image,
                     reference_props=match_state.match_props,
                     precomputed_pept_act=_get_pept_act_tuple(raw_file),
@@ -813,13 +906,12 @@ def match_features_batch(
                     visualize_dir=visualize_dir,
                 )
 
-            decoy_anchor = match_state.reference_result.snapped_anchor
             decoy_act, _, _ = get_pept_act_from_parquet(
                 decoy_act_df,
                 decoy_pept_idx,
                 dict_ref,
                 raw_file,
-                shape=target_result.image.shape,
+                shape=target_result.image.shape,  # here enforce the shape of target image
             )
             decoy_result = _quantify_peptide_run(
                 act_df=decoy_act_df,
@@ -827,14 +919,14 @@ def match_features_batch(
                 dict_ref=dict_ref,
                 run_name=raw_file,
                 case="Match",
-                template_anchor_override=decoy_anchor,
-                anchor_override=decoy_anchor,
+                template_anchor_override=match_state.reference_result.snapped_anchor,
+                # anchor_override=decoy_anchor,
                 reference_image=match_state.reference_result.smoothed_image,
                 reference_props=match_state.match_props,
                 precomputed_pept_act=(
                     decoy_act,
-                    int(decoy_anchor[0]),
-                    int(decoy_anchor[1]),
+                    int(match_state.reference_result.snapped_anchor[0]),
+                    int(match_state.reference_result.snapped_anchor[1]),
                 ),
                 processing_kwargs=processing_kwargs,
                 visualize_dir=visualize_dir,
@@ -975,36 +1067,54 @@ def _visualize_quantify_from_coords(
     reference_image,
     pept_act_image,
     pept_act_image_smoothed,
-    pept_act_image_aligned,
-    pept_act_image_smoothed_aligned,
     save_dir: str,
     bbox_center: Optional[Tuple[int, int]] = None,
-    msms_pos: Optional[Tuple[int, int]] = None,
-    snapped_msms_pos: Optional[Tuple[int, int]] = None,
+    target_msms_pos: Optional[Tuple[int, int]] = None,
+    target_snapped_msms_pos: Optional[Tuple[int, int]] = None,
+    template_msms_pos: Optional[Tuple[int, int]] = None,
+    template_snapped_msms_pos: Optional[Tuple[int, int]] = None,
     template_box: Optional[Tuple[int, int, int, int]] = None,
+    seg_box: Optional[Tuple[int, int, int, int]] = None,
+    matched_template_box: Optional[Tuple[int, int, int, int]] = None,
     filename: str = "quantify_from_coords.png",
     labels: np.ndarray | None = None,
-    context_panels: list[dict[str, Any]] | None = None,
 ):
-    """Visualize feature quantification and optional template-guided mapping context.
+    """Visualize feature quantification with a fixed 5-panel layout.
 
-    The base visualization keeps the existing segmentation-oriented panels.
-    Optional ``context_panels`` can be prepended to show extra states such as a
-    quant-only source image and how it maps into the reference image.
+    Panels (left to right):
+      1. Reference                     – N/A when reference_image is None
+      2. pept_act_image (Raw)
+      3. pept_act_image_smoothed
+      4. pept_act_image_smoothed_aligned
+      5. watershed_labels              – N/A when labels is None
+
+    Each panel carries a legend explaining the overlaid markers.
     """
     import matplotlib.pyplot as plt
+
+    LEGEND = (
+        "+ red = center of label bbox\n"
+        "\u2605 white = MS/MS pos\n"
+        "\u2605 yellow = snapped\n"
+        "\u2014 red = template bbox\n"
+        "-- red = matched template bbox\n"
+        "-- blue = segmentation bbox"
+    )
 
     def _draw_panel(
         ax,
         img,
-        title: str,
-        *,
-        bbox_center_local: Optional[Tuple[int, int]] = None,
-        msms_pos_local: Optional[Tuple[int, int]] = None,
-        snapped_msms_pos_local: Optional[Tuple[int, int]] = None,
-        template_box_local: Optional[Tuple[int, int, int, int]] = None,
-        template_boxes_local: list[dict[str, Any]] | None = None,
-        labels_local: np.ndarray | None = None,
+        title,
+        draw_markers=True,
+        labels_local=None,
+        template_box=None,
+        matched_template_box=None,
+        bbox_center=None,
+        target_msms_pos=None,
+        target_snapped_msms_pos=None,
+        template_msms_pos=None,
+        template_snapped_msms_pos=None,
+        seg_box=None,
     ):
         ax.set_title(title, fontsize=9)
         if img is None:
@@ -1022,170 +1132,158 @@ def _visualize_quantify_from_coords(
             ax.set_xticks([])
             ax.set_yticks([])
             return
-
         ax.imshow(img, aspect="auto", origin="lower")
         if labels_local is not None:
-            masked_labels = np.ma.masked_where(labels_local == 0, labels_local)
+            masked = np.ma.masked_where(labels_local == 0, labels_local)
             ax.imshow(
-                masked_labels,
+                masked,
                 aspect="auto",
                 origin="lower",
                 cmap="tab10",
                 interpolation="nearest",
                 alpha=0.35,
             )
-        if bbox_center_local is not None:
-            ax.plot(
-                bbox_center_local[1],
-                bbox_center_local[0],
-                "r+",
-                markersize=10,
-                markeredgewidth=2,
-            )
-        if msms_pos_local is not None:
-            ax.plot(
-                msms_pos_local[1],
-                msms_pos_local[0],
-                "*",
-                markersize=10,
-                markeredgewidth=2,
-                color="white",
-            )
-        if snapped_msms_pos_local is not None and len(snapped_msms_pos_local) == 2:
-            ax.plot(
-                snapped_msms_pos_local[1],
-                snapped_msms_pos_local[0],
-                "*",
-                markersize=10,
-                markeredgewidth=2,
-                color="yellow",
-            )
-        boxes_to_draw = []
-        if template_box_local is not None:
-            boxes_to_draw.append(
-                {"box": template_box_local, "edgecolor": "red", "linewidth": 2}
-            )
-        if template_boxes_local:
-            boxes_to_draw.extend(template_boxes_local)
-        for box_info in boxes_to_draw:
-            box = box_info["box"]
-            ax.add_patch(
-                plt.Rectangle(
-                    (box[1], box[0]),
-                    box[3] - box[1],
-                    box[2] - box[0],
-                    fill=False,
-                    edgecolor=box_info.get("edgecolor", "red"),
-                    linewidth=box_info.get("linewidth", 2),
-                    linestyle=box_info.get("linestyle", "-"),
+        if draw_markers:
+            if bbox_center is not None:
+                bc = (
+                    tuple(bbox_center[0])
+                    if isinstance(bbox_center, np.ndarray)
+                    else bbox_center
                 )
+                ax.plot(bc[1], bc[0], "r+", markersize=10, markeredgewidth=2)
+            if target_msms_pos is not None:
+                ax.plot(
+                    target_msms_pos[1],
+                    target_msms_pos[0],
+                    "*",
+                    markersize=10,
+                    markeredgewidth=2,
+                    color="white",
+                )
+            if (
+                target_snapped_msms_pos is not None
+                and len(target_snapped_msms_pos) == 2
+            ):
+                ax.plot(
+                    target_snapped_msms_pos[1],
+                    target_snapped_msms_pos[0],
+                    "*",
+                    markersize=10,
+                    markeredgewidth=2,
+                    color="yellow",
+                )
+            if template_msms_pos is not None:
+                ax.plot(
+                    template_msms_pos[1],
+                    template_msms_pos[0],
+                    "*",
+                    markersize=10,
+                    markeredgewidth=2,
+                    color="white",
+                )
+            if (
+                template_snapped_msms_pos is not None
+                and len(template_snapped_msms_pos) == 2
+            ):
+                ax.plot(
+                    template_snapped_msms_pos[1],
+                    template_snapped_msms_pos[0],
+                    "*",
+                    markersize=10,
+                    markeredgewidth=2,
+                    color="yellow",
+                )
+        if template_box is not None:
+            rect = plt.Rectangle(
+                (template_box[1], template_box[0]),
+                template_box[3] - template_box[1],
+                template_box[2] - template_box[0],
+                edgecolor="red",
+                facecolor="none",
+                linestyle="solid",
+                linewidth=1.5,
             )
+            ax.add_patch(rect)
+        if matched_template_box is not None:
+            rect = plt.Rectangle(
+                (matched_template_box[1], matched_template_box[0]),
+                matched_template_box[3] - matched_template_box[1],
+                matched_template_box[2] - matched_template_box[0],
+                edgecolor="red",
+                facecolor="none",
+                linestyle="dashed",
+                linewidth=1.5,
+            )
+            ax.add_patch(rect)
+        if seg_box is not None:
+            rect = plt.Rectangle(
+                (seg_box[1], seg_box[0]),
+                seg_box[3] - seg_box[1],
+                seg_box[2] - seg_box[0],
+                edgecolor="blue",
+                facecolor="none",
+                linestyle="dashed",
+                linewidth=1.5,
+            )
+            ax.add_patch(rect)
 
-    images = []
-    if context_panels:
-        for panel in context_panels:
-            images.append(
-                (
-                    panel.get("image"),
-                    panel.get("title", "context"),
-                    panel.get("labels"),
-                    panel.get("bbox_center"),
-                    panel.get("msms_pos"),
-                    panel.get("snapped_msms_pos"),
-                    panel.get("template_box"),
-                    panel.get("template_boxes"),
-                )
-            )
-    images.extend(
-        [
-            (
-                reference_image,
-                "reference_image",
-                None,
-                None,
-                None,
-                None,
-                template_box,
-                None,
-            ),
-            (
-                pept_act_image,
-                "pept_act_image",
-                None,
-                bbox_center,
-                msms_pos,
-                snapped_msms_pos,
-                None,
-                None,
-            ),
-            (
-                pept_act_image_smoothed,
-                "pept_act_image_smoothed",
-                None,
-                bbox_center,
-                msms_pos,
-                snapped_msms_pos,
-                None,
-                None,
-            ),
-            (
-                pept_act_image_aligned,
-                "pept_act_image_aligned",
-                labels,
-                bbox_center,
-                msms_pos,
-                snapped_msms_pos,
-                template_box,
-                None,
-            ),
-            (
-                pept_act_image_smoothed_aligned,
-                "pept_act_image_smoothed_aligned",
-                labels,
-                bbox_center,
-                msms_pos,
-                snapped_msms_pos,
-                template_box,
-                None,
-            ),
-        ]
+    fig, axes = plt.subplots(1, 4, figsize=(25, 5))
+
+    # Panel 1: Reference (N/A for reference-only runs)
+    _draw_panel(
+        axes[0],
+        reference_image,
+        "Reference",
+        draw_markers=True,
+        template_box=template_box,
+        template_msms_pos=template_msms_pos,
+        template_snapped_msms_pos=template_snapped_msms_pos,
     )
-    n_cols = len(images) + (1 if labels is not None else 0)
-    fig, axes = plt.subplots(1, n_cols, figsize=(5 * n_cols, 5))
-    if n_cols == 1:
-        axes = [axes]
-    for ax, (
-        img,
-        title,
-        lbl,
-        bbox_center_local,
-        msms_pos_local,
-        snapped_msms_pos_local,
-        template_box_local,
-        template_boxes_local,
-    ) in zip(axes, images):
-        _draw_panel(
-            ax,
-            img,
-            title,
-            bbox_center_local=(
-                tuple(bbox_center_local[0])
-                if isinstance(bbox_center_local, np.ndarray)
-                else bbox_center_local
-            ),
-            msms_pos_local=msms_pos_local,
-            snapped_msms_pos_local=snapped_msms_pos_local,
-            template_box_local=template_box_local,
-            template_boxes_local=template_boxes_local,
-            labels_local=lbl,
+
+    # Panel 2: Raw image
+    _draw_panel(
+        axes[1],
+        pept_act_image,
+        "pept_act_image (Raw)",
+        matched_template_box=matched_template_box,
+        target_msms_pos=target_msms_pos,
+        target_snapped_msms_pos=target_snapped_msms_pos,
+    )
+
+    # Panel 3: Smoothed
+    _draw_panel(
+        axes[2],
+        pept_act_image_smoothed,
+        "pept_act_image_smoothed",
+        matched_template_box=matched_template_box,
+        seg_box=seg_box,
+        target_msms_pos=target_msms_pos,
+        target_snapped_msms_pos=target_snapped_msms_pos,
+        bbox_center=bbox_center,
+    )
+
+    # Panel 4: Watershed labels standalone
+    ax_lbl = axes[3]
+    ax_lbl.set_title("labels", fontsize=9)
+    if labels is None:
+        ax_lbl.set_facecolor("#f0f0f0")
+        ax_lbl.text(
+            0.5,
+            0.5,
+            "N/A",
+            ha="center",
+            va="center",
+            transform=ax_lbl.transAxes,
+            fontsize=12,
+            color="gray",
         )
-    if labels is not None:
-        ax_lbl = axes[-1]
-        ax_lbl.set_title("watershed_labels", fontsize=9)
-        masked_labels = np.ma.masked_where(labels == 0, labels)
+        ax_lbl.set_xticks([])
+        ax_lbl.set_yticks([])
+    else:
+        masked = np.ma.masked_where(labels == 0, labels)
         ax_lbl.imshow(np.zeros_like(labels), aspect="auto", origin="lower", cmap="gray")
         ax_lbl.imshow(
-            masked_labels,
+            masked,
             aspect="auto",
             origin="lower",
             cmap="tab10",
@@ -1206,35 +1304,43 @@ def _visualize_quantify_from_coords(
                 fontweight="bold",
             )
         if bbox_center is not None:
-            ax_lbl.plot(
-                bbox_center[0][1],
-                bbox_center[0][0],
-                "r+",
-                markersize=10,
-                markeredgewidth=2,
+            bc = (
+                tuple(bbox_center[0])
+                if isinstance(bbox_center, np.ndarray)
+                else bbox_center
             )
-        if msms_pos is not None:
+            ax_lbl.plot(bc[1], bc[0], "r+", markersize=10, markeredgewidth=2)
+        if target_msms_pos is not None:
             ax_lbl.plot(
-                msms_pos[1],
-                msms_pos[0],
+                target_msms_pos[1],
+                target_msms_pos[0],
                 "*",
                 markersize=10,
                 markeredgewidth=2,
                 color="white",
-            )  # white * for MS/MS position
-        if template_box is not None:
-            axes[len(context_panels or [])].add_patch(
-                plt.Rectangle(
-                    (template_box[1], template_box[0]),
-                    template_box[3] - template_box[1],
-                    template_box[2] - template_box[0],
-                    fill=False,
-                    edgecolor="red",
-                    linewidth=2,
-                )
             )
-
-    fig.tight_layout()
+        if target_snapped_msms_pos is not None and len(target_snapped_msms_pos) == 2:
+            ax_lbl.plot(
+                target_snapped_msms_pos[1],
+                target_snapped_msms_pos[0],
+                "*",
+                markersize=10,
+                markeredgewidth=2,
+                color="yellow",
+            )
+    fig.subplots_adjust(right=0.80)
+    fig.text(
+        0.815,
+        0.5,
+        LEGEND,
+        fontsize=8,
+        va="center",
+        ha="left",
+        transform=fig.transFigure,
+        bbox=dict(boxstyle="round,pad=0.6", facecolor="black", alpha=0.75),
+        color="white",
+        linespacing=1.6,
+    )
     os.makedirs(save_dir, exist_ok=True)
     fig.savefig(os.path.join(save_dir, filename), dpi=150, bbox_inches="tight")
     plt.close(fig)
@@ -1242,8 +1348,7 @@ def _visualize_quantify_from_coords(
 
 def quantify_from_coords(
     pept_act_image,
-    anchor,
-    target_anchor: tuple[int, int] | None = None,
+    template_anchor,
     reference_image: np.ndarray | None = None,
     propA: pd.DataFrame | None = None,
     pre_smoothed_image: np.ndarray | None = None,
@@ -1262,11 +1367,10 @@ def quantify_from_coords(
     ----------
     pept_act_image : np.ndarray
         The peptide activity image.
-    anchor : tuple
+    template_anchor : tuple
         The template/source anchor coordinates (row, column).
-    target_anchor : tuple | None, optional
-        The target-image anchor coordinates. If omitted, the same anchor is used
-        for both the template crop and the target placement.
+        If no reference_image is given, then it's the Reference case
+        and it will be used on the target image as well.
     reference_image : np.ndarray | None, optional
         The reference image for template matching.
     propA : pd.DataFrame | None, optional
@@ -1291,36 +1395,15 @@ def quantify_from_coords(
         properties, snapped anchor, watershed labels, and template-matching
         metadata used by downstream anchor-family logic.
     """
-    target_anchor = anchor if target_anchor is None else target_anchor
-    if (
-        target_anchor[0] >= pept_act_image.shape[0]
-        or target_anchor[1] >= pept_act_image.shape[1]
-        or target_anchor[0] < 0
-        or target_anchor[1] < 0
-    ):
-        logging.warning(
-            "Target anchor coordinates %s are out of bounds of the image dimensions %s.",
-            target_anchor,
-            pept_act_image.shape,
-        )
-        return QuantificationResult(
-            run_name="",
-            case="Reference",
-            image=pept_act_image,
-            smoothed_image=pept_act_image,
-            input_anchor=(int(target_anchor[0]), int(target_anchor[1])),
-            peak_properties=None,
-            snapped_anchor=None,
-        )
     if reference_image is not None and (
-        anchor[0] >= reference_image.shape[0]
-        or anchor[1] >= reference_image.shape[1]
-        or anchor[0] < 0
-        or anchor[1] < 0
+        template_anchor[0] >= reference_image.shape[0]
+        or template_anchor[1] >= reference_image.shape[1]
+        or template_anchor[0] < 0
+        or template_anchor[1] < 0
     ):
         logging.warning(
             "Anchor coordinates %s are out of bounds of the reference image dimensions %s.",
-            anchor,
+            template_anchor,
             reference_image.shape,
         )
         return QuantificationResult(
@@ -1328,33 +1411,13 @@ def quantify_from_coords(
             case="Reference",
             image=pept_act_image,
             smoothed_image=pept_act_image,
-            input_anchor=(int(target_anchor[0]), int(target_anchor[1])),
-            peak_properties=None,
-            snapped_anchor=None,
-        )
-    if reference_image is None and (
-        anchor[0] >= pept_act_image.shape[0]
-        or anchor[1] >= pept_act_image.shape[1]
-        or anchor[0] < 0
-        or anchor[1] < 0
-    ):
-        logging.warning(
-            "Anchor coordinates %s are out of bounds of the image dimensions %s.",
-            anchor,
-            pept_act_image.shape,
-        )
-        return QuantificationResult(
-            run_name="",
-            case="Reference",
-            image=pept_act_image,
-            smoothed_image=pept_act_image,
-            input_anchor=(int(target_anchor[0]), int(target_anchor[1])),
+            input_anchor=(int(template_anchor[0]), int(template_anchor[1])),
             peak_properties=None,
             snapped_anchor=None,
         )
 
-    anchor = np.array([(int(anchor[0]), int(anchor[1]))])
-    target_anchor_arr = np.array([(int(target_anchor[0]), int(target_anchor[1]))])
+    template_anchor = np.array([(int(template_anchor[0]), int(template_anchor[1]))])
+
     smooth_kwargs = {} if smooth_kwargs is None else dict(smooth_kwargs)
     peak_kwargs = {} if peak_kwargs is None else dict(peak_kwargs)
     align_kwargs = {} if align_kwargs is None else dict(align_kwargs)
@@ -1375,24 +1438,23 @@ def quantify_from_coords(
         if pre_smoothed_image is not None
         else smooth_and_denoise_image(pept_act_image, **smooth_kwargs)
     )
-    context_panels: list[dict[str, Any]] | None = None
     # Case "Match": perform template matching to find the best match for the reference peak
     # and then run watershed with the matched position as (updated) anchor
     if reference_image is not None and propA is not None:
         # Getting template for "Match" case
         template_im_start = max(
-            (anchor[0][1] - 0.3 * reference_image.shape[1]).astype(int), 0
+            (template_anchor[0][1] - 0.3 * reference_image.shape[1]).astype(int), 0
         )
         template_im_end = min(
-            (anchor[0][1] + 0.3 * reference_image.shape[1]).astype(int),
-            pept_act_image.shape[1],
+            (template_anchor[0][1] + 0.3 * reference_image.shape[1]).astype(int),
+            reference_image.shape[1],
         )
         template_rt_start = max(
-            (anchor[0][0] - 0.3 * reference_image.shape[0]).astype(int), 0
+            (template_anchor[0][0] - 0.3 * reference_image.shape[0]).astype(int), 0
         )
         template_rt_end = min(
-            (anchor[0][0] + 0.3 * reference_image.shape[0]).astype(int),
-            pept_act_image.shape[0],
+            (template_anchor[0][0] + 0.3 * reference_image.shape[0]).astype(int),
+            reference_image.shape[0],
         )  # Use up to 36% of the image size as the template size to
         # make sure the template can cover the peak region even when the
         # anchor is not very accurate, which can be common for low abundance peptides with weak MS/MS signal
@@ -1413,31 +1475,49 @@ def quantify_from_coords(
             match_box_im_topleft - template_im_start,
         )
         match_bbox_mask = np.zeros(pept_act_image_smoothed.shape, dtype=int)
+        match_bbox = (
+            np.clip(
+                propA["bbox-0"].values[0].astype(int) + shift[0],
+                0,
+                match_bbox_mask.shape[0],
+            ),
+            np.clip(
+                propA["bbox-1"].values[0].astype(int) + shift[1],
+                0,
+                match_bbox_mask.shape[1],
+            ),
+            np.clip(
+                propA["bbox-2"].values[0].astype(int) + shift[0],
+                0,
+                match_bbox_mask.shape[0],
+            ),
+            np.clip(
+                propA["bbox-3"].values[0].astype(int) + shift[1],
+                0,
+                match_bbox_mask.shape[1],
+            ),
+        )
         match_bbox_mask[
-            propA["bbox-0"].values[0].astype(int)
-            + shift[0] : propA["bbox-2"].values[0].astype(int)
-            + shift[0],
-            propA["bbox-1"].values[0].astype(int)
-            + shift[1] : propA["bbox-3"].values[0].astype(int)
-            + shift[1],
+            match_bbox[0] : match_bbox[2],
+            match_bbox[1] : match_bbox[3],
         ] = 1  # matched bounding box calculated as original bbox plus shift
 
-        anchor = np.array(
+        target_anchor_shifted = np.array(
             [
                 (
                     np.clip(
-                        target_anchor_arr[0][0] + shift[0],
+                        template_anchor[0][0] + shift[0],
                         0,
                         pept_act_image_smoothed.shape[0] - 1,
                     ),
                     np.clip(
-                        target_anchor_arr[0][1] + shift[1],
+                        template_anchor[0][1] + shift[1],
                         0,
                         pept_act_image_smoothed.shape[1] - 1,
                     ),
                 )
             ]
-        )  # anchor is updated: shifted anchor for the matched image
+        )  # target anchor is updated: shifted anchor for the matched image
         labels = ((pept_act_image_smoothed != 0) & match_bbox_mask.astype(bool)).astype(
             int
         )
@@ -1453,44 +1533,6 @@ def quantify_from_coords(
         #     )
         # )
         template_matching_score_max = np.max(template_match_result)
-        context_panels = [
-            {
-                "image": reference_image,
-                "title": "source_template_smoothed",
-                "msms_pos": tuple(anchor[0]),
-                "snapped_msms_pos": tuple(anchor[0]),
-                "template_box": (
-                    template_rt_start,
-                    template_im_start,
-                    template_rt_end,
-                    template_im_end,
-                ),
-            },
-            {
-                "image": pept_act_image_smoothed,
-                "title": "target_smoothed_before_mapping",
-                "msms_pos": tuple(target_anchor_arr[0]),
-                "snapped_msms_pos": tuple(anchor[0]),
-                "template_box": (
-                    max(
-                        propA["bbox-0"].values[0].astype(int) + shift[0],
-                        0,
-                    ),
-                    max(
-                        propA["bbox-1"].values[0].astype(int) + shift[1],
-                        0,
-                    ),
-                    min(
-                        propA["bbox-2"].values[0].astype(int) + shift[0],
-                        pept_act_image_smoothed.shape[0],
-                    ),
-                    min(
-                        propA["bbox-3"].values[0].astype(int) + shift[1],
-                        pept_act_image_smoothed.shape[1],
-                    ),
-                ),
-            },
-        ]
 
     # Case quantification without template matching, directly run watershed with the original anchor
     # Which will be snapped into the nearest connected local maximum if the anchor is not already a local maximum
@@ -1500,23 +1542,32 @@ def quantify_from_coords(
                 detect_2d_peak_with_watershed(
                     pept_act_image_smoothed,
                     **peak_kwargs,
-                    coordinates=anchor,
+                    coordinates=template_anchor,
                 )
             )
         else:
-            # Getting template for "Match" case
             template_im_start = max(
-                (anchor[0][1] - 0.3 * pept_act_image_smoothed.shape[1]).astype(int), 0
+                (template_anchor[0][1] - 0.3 * pept_act_image_smoothed.shape[1]).astype(
+                    int
+                ),
+                0,
             )
             template_im_end = min(
-                (anchor[0][1] + 0.3 * pept_act_image_smoothed.shape[1]).astype(int),
+                (template_anchor[0][1] + 0.3 * pept_act_image_smoothed.shape[1]).astype(
+                    int
+                ),
                 pept_act_image_smoothed.shape[1],
             )
             template_rt_start = max(
-                (anchor[0][0] - 0.3 * pept_act_image_smoothed.shape[0]).astype(int), 0
+                (template_anchor[0][0] - 0.3 * pept_act_image_smoothed.shape[0]).astype(
+                    int
+                ),
+                0,
             )
             template_rt_end = min(
-                (anchor[0][0] + 0.3 * pept_act_image_smoothed.shape[0]).astype(int),
+                (template_anchor[0][0] + 0.3 * pept_act_image_smoothed.shape[0]).astype(
+                    int
+                ),
                 pept_act_image_smoothed.shape[0],
             )  # Use up to 36% of the image size as the template size to
             # make sure the template can cover the peak region even when the
@@ -1542,17 +1593,20 @@ def quantify_from_coords(
                 reference_image,
                 pept_act_image,
                 pept_act_image_smoothed,
-                pept_act_image,
-                pept_act_image_smoothed,
                 bbox_center=None,
                 save_dir=visualize_dir,
-                msms_pos=target_anchor_arr[0] if reference_image is None else None,
-                snapped_msms_pos=(
-                    snapped_anchor if "snapped_anchor" in locals() else anchor[0]
+                target_msms_pos=template_anchor[0],
+                target_snapped_msms_pos=(
+                    snapped_anchor
+                    if reference_image is None and "snapped_anchor" in locals()
+                    else target_anchor_shifted[0]
+                ),
+                template_msms_pos=None,
+                template_snapped_msms_pos=(
+                    template_anchor[0] if reference_image is not None else None
                 ),
                 filename=visualize_filename,
                 labels=labels_with_multi_marker,
-                context_panels=context_panels,
                 template_box=(
                     (
                         template_rt_start,
@@ -1563,18 +1617,43 @@ def quantify_from_coords(
                     if propA is not None
                     else None
                 ),
+                matched_template_box=(
+                    (
+                        template_rt_start + shift[0],
+                        template_im_start + shift[1],
+                        template_rt_end + shift[0],
+                        template_im_end + shift[1],
+                    )
+                    if propA is not None
+                    else None
+                ),
+                seg_box=(
+                    (
+                        (
+                            propA["bbox-0"].values[0].astype(int) + shift[0],
+                            propA["bbox-1"].values[0].astype(int) + shift[1],
+                            propA["bbox-2"].values[0].astype(int) + shift[0],
+                            propA["bbox-3"].values[0].astype(int) + shift[1],
+                        )
+                    )
+                    if propA is not None
+                    else None
+                ),
             )
         return QuantificationResult(
             run_name="",
             case="Reference",
             image=pept_act_image,
             smoothed_image=pept_act_image_smoothed,
-            input_anchor=(int(target_anchor_arr[0][0]), int(target_anchor_arr[0][1])),
+            input_anchor=(int(template_anchor[0][0]), int(template_anchor[0][1])),
             peak_properties=None,
             snapped_anchor=(
                 tuple(int(x) for x in snapped_anchor)
-                if "snapped_anchor" in locals() and len(snapped_anchor) == 2
-                else (int(target_anchor_arr[0][0]), int(target_anchor_arr[0][1]))
+                if reference_image is None and "snapped_anchor" in locals()
+                else (
+                    int(target_anchor_shifted[0][0]),
+                    int(target_anchor_shifted[0][1]),
+                )
             ),
             labels=labels,
             labels_multi_markers=labels_with_multi_marker,
@@ -1582,6 +1661,7 @@ def quantify_from_coords(
             shift=tuple(int(x) for x in shift) if "shift" in locals() else (0, 0),
         )
     else:
+        # successful match
         seg_bbox = pept_act_image_smoothed[
             peak_properties["bbox-0"]
             .values[0]
@@ -1595,10 +1675,10 @@ def quantify_from_coords(
             .astype(int),
         ]  # Centers around the updated anchor
         peak_properties["snap_rt"] = (
-            snapped_anchor[0] if "snapped_anchor" in locals() else anchor[0][0]
+            snapped_anchor[0] if "snapped_anchor" in locals() else template_anchor[0][0]
         )
         peak_properties["snap_im"] = (
-            snapped_anchor[1] if "snapped_anchor" in locals() else anchor[0][1]
+            snapped_anchor[1] if "snapped_anchor" in locals() else template_anchor[0][1]
         )
         peak_properties["template_matching_score"] = template_matching_score_max
         peak_properties["sift_des"] = None
@@ -1627,8 +1707,6 @@ def quantify_from_coords(
                 reference_image,
                 pept_act_image,
                 pept_act_image_smoothed,
-                pept_act_image,
-                pept_act_image_smoothed,
                 bbox_center=np.array(
                     [
                         (
@@ -1637,20 +1715,43 @@ def quantify_from_coords(
                         )
                     ]
                 ),
-                msms_pos=target_anchor_arr[0] if reference_image is None else None,
-                snapped_msms_pos=(
-                    snapped_anchor if "snapped_anchor" in locals() else anchor[0]
+                target_msms_pos=template_anchor[0],
+                target_snapped_msms_pos=(
+                    snapped_anchor
+                    if reference_image is None and "snapped_anchor" in locals()
+                    else target_anchor_shifted[0]
+                ),
+                template_msms_pos=None,
+                template_snapped_msms_pos=(
+                    template_anchor[0] if reference_image is not None else None
                 ),
                 save_dir=visualize_dir,
                 filename=visualize_filename,
                 labels=labels_with_multi_marker,
-                context_panels=context_panels,
                 template_box=(
                     (
                         template_rt_start,
                         template_im_start,
                         template_rt_end,
                         template_im_end,
+                    )
+                    if reference_image is not None
+                    else None
+                ),
+                seg_box=(
+                    (
+                        peak_properties["bbox-0"].values[0].astype(int),
+                        peak_properties["bbox-1"].values[0].astype(int),
+                        peak_properties["bbox-2"].values[0].astype(int),
+                        peak_properties["bbox-3"].values[0].astype(int),
+                    )
+                ),
+                matched_template_box=(
+                    (
+                        template_rt_start + shift[0],
+                        template_im_start + shift[1],
+                        template_rt_end + shift[0],
+                        template_im_end + shift[1],
                     )
                     if propA is not None
                     else None
@@ -1661,7 +1762,7 @@ def quantify_from_coords(
             (
                 tuple(int(x) for x in snapped_anchor)
                 if "snapped_anchor" in locals() and len(snapped_anchor) == 2
-                else (int(target_anchor_arr[0][0]), int(target_anchor_arr[0][1]))
+                else (int(template_anchor[0][0]), int(template_anchor[0][1]))
             ),
         )
         return QuantificationResult(
@@ -1669,12 +1770,15 @@ def quantify_from_coords(
             case="Reference",
             image=pept_act_image,
             smoothed_image=pept_act_image_smoothed,
-            input_anchor=(int(target_anchor_arr[0][0]), int(target_anchor_arr[0][1])),
+            input_anchor=(int(template_anchor[0][0]), int(template_anchor[0][1])),
             peak_properties=peak_properties,
             snapped_anchor=(
                 tuple(int(x) for x in snapped_anchor)
-                if "snapped_anchor" in locals() and len(snapped_anchor) == 2
-                else (int(target_anchor_arr[0][0]), int(target_anchor_arr[0][1]))
+                if reference_image is None and "snapped_anchor" in locals()
+                else (
+                    int(target_anchor_shifted[0][0]),
+                    int(target_anchor_shifted[0][1]),
+                )
             ),
             labels=labels,
             labels_multi_markers=labels_with_multi_marker,
