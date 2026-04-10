@@ -1,6 +1,6 @@
 RESULT_PATH: /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/SWAPS_exp/random_15min_XR_15min_exp_library_no_decoy_MBR_6R_with_ok
 ADD_TIMESTAMP_TO_RESULT_PATH: true
-DATA_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/Random_6ramps_200ng_K562_15min_Slot2-2_1_6932.d/
+DATA_PATH: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/random/
 DEBUG: false
 DICT_PICKLE_PATH: ''
 EXPORT_DATA_HDF5_DIR: ''
@@ -21,8 +21,8 @@ PREPARE_DICT:
   IM_REF: ref
   RT_REF: ref
   RT_TOL: 0.15 # Use 0.2 as half of MaxQuant MBR default
-  EXP_OK_DIR: /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/rescoring/out_no_rl_fix_ce_mokapot_random/
-  REF_OK_DIR: /cmnfs/proj/ORIGINS/SWAPS_precursor_sampling/bruker_nanoflow/rescoring/out_no_rl_fix_ce_mokapot_random/
+  EXP_OK_DIR: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/rescoring/out_no_rl_fix_ce_mokapot_random/
+  REF_OK_DIR: /cmnfs/proj/ORIGINS/data/random_precursor_sampling/nanoflow_bruker/rescoring/out_no_rl_fix_ce_mokapot_random/
 RANDOM_SEED: 42
 PEAK_SELECTION:
   ENABLE: false

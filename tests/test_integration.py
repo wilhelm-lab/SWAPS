@@ -166,7 +166,6 @@ class TestDictConstructionIntegration:
 
         cfg = get_cfg_defaults(swaps_optimization_cfg)
         cfg.PREPARE_DICT.SEARCH_ENGINE = "fragpipe"
-        cfg.PREPARE_DICT.GENERATE_DECOY = True
 
         dict_ref = construct_dict_from_search_pivoted(
             cfg_prepare_dict=cfg.PREPARE_DICT,
@@ -332,7 +331,6 @@ class TestSageParsingIntegration:
 
         cfg = get_cfg_defaults(swaps_optimization_cfg)
         cfg.PREPARE_DICT.SEARCH_ENGINE = "sage"
-        cfg.PREPARE_DICT.GENERATE_DECOY = True
 
         dict_ref = construct_dict_from_search_pivoted(
             cfg_prepare_dict=cfg.PREPARE_DICT,
@@ -395,7 +393,6 @@ class TestMaxQuantParsingIntegration:
 
         cfg = get_cfg_defaults(swaps_optimization_cfg)
         cfg.PREPARE_DICT.SEARCH_ENGINE = "maxquant"
-        cfg.PREPARE_DICT.GENERATE_DECOY = True
 
         dict_ref = construct_dict_from_search_pivoted(
             cfg_prepare_dict=cfg.PREPARE_DICT,
@@ -405,3 +402,112 @@ class TestMaxQuantParsingIntegration:
         assert isinstance(dict_ref, pd.DataFrame)
         assert len(dict_ref) > 0
         assert "mz_rank" in dict_ref.columns
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 – Oktoberfest rescoring filter (PREPARE_DICT.OK pipeline)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+class TestOktoberfestFilterIntegration:
+    """Verify filter_maxquant_by_ok works end-to-end on real nanoflow MQ data."""
+
+    @pytest.fixture(scope="class")
+    def evidence_100fdr(self, mq_ok_evidence_path):
+        df = pd.read_csv(mq_ok_evidence_path, sep="\t", low_memory=False)
+        assert len(df) > 0, "Evidence file is empty"
+        return df
+
+    @pytest.fixture(scope="class")
+    def filtered_evidence(self, evidence_100fdr, ok_dir):
+        from prepare_dict.prepare_dict import filter_maxquant_by_ok
+
+        return filter_maxquant_by_ok(
+            evidence_100fdr=evidence_100fdr,
+            ok_dir=ok_dir,
+            ok_output_type="psms",
+            rescore_fdr=0.01,
+        )
+
+    # --- prerequisite checks ---
+
+    def test_ok_mokapot_psms_file_exists(self, ok_dir):
+        mokapot_path = os.path.join(ok_dir, "results", "mokapot", "rescore.mokapot.psms.txt")
+        assert os.path.isfile(mokapot_path), f"Mokapot PSMs file not found: {mokapot_path}"
+
+    def test_ok_mokapot_psms_loadable(self, ok_dir):
+        mokapot_path = os.path.join(ok_dir, "results", "mokapot", "rescore.mokapot.psms.txt")
+        df = pd.read_csv(mokapot_path, sep="\t")
+        assert len(df) > 0
+        for col in ["ScanNr", "filename", "mokapot q-value", "Peptide", "Proteins"]:
+            assert col in df.columns, f"Missing column in mokapot PSMs: {col}"
+
+    def test_evidence_has_required_columns(self, evidence_100fdr):
+        for col in ["Sequence", "Raw file", "MS/MS scan number", "Retention time"]:
+            assert col in evidence_100fdr.columns, f"Missing column in evidence: {col}"
+
+    # --- filter behaviour ---
+
+    def test_filter_returns_dataframe(self, filtered_evidence):
+        assert isinstance(filtered_evidence, pd.DataFrame)
+
+    def test_filter_reduces_row_count(self, evidence_100fdr, filtered_evidence):
+        """Rescoring at 1% FDR must discard some of the 100%-FDR PSMs."""
+        assert len(filtered_evidence) < len(evidence_100fdr), (
+            f"Expected fewer rows after OK filtering; got {len(filtered_evidence)} "
+            f"from {len(evidence_100fdr)}"
+        )
+
+    def test_filtered_evidence_not_empty(self, filtered_evidence):
+        assert len(filtered_evidence) > 0, "OK filter discarded all rows — check FDR threshold"
+
+    def test_filtered_evidence_has_mokapot_score(self, filtered_evidence):
+        assert "mokapot q-value" in filtered_evidence.columns
+
+    def test_filtered_evidence_all_pass_fdr(self, filtered_evidence):
+        """All retained PSMs must satisfy q-value ≤ 0.01."""
+        assert (filtered_evidence["mokapot q-value"] <= 0.01).all(), (
+            "Some rows in filtered evidence exceed the 1% FDR threshold"
+        )
+
+    def test_filtered_evidence_has_evidence_columns(self, filtered_evidence):
+        """Merge must preserve key MaxQuant evidence columns."""
+        for col in ["Sequence", "Raw file", "Retention time"]:
+            assert col in filtered_evidence.columns, f"Missing evidence column after filter: {col}"
+
+    # --- runner-level config wiring ---
+
+    def test_cfg_ok_dir_triggers_filter(self, evidence_100fdr, ok_dir):
+        """Simulate the runner: when PREPARE_DICT.OK.DIR is set, evidence shrinks."""
+        from prepare_dict.prepare_dict import filter_maxquant_by_ok
+        from utils.config import get_cfg_defaults
+        from utils.singleton_swaps_optimization import swaps_optimization_cfg
+
+        cfg = get_cfg_defaults(swaps_optimization_cfg)
+        cfg.PREPARE_DICT.OK.DIR = ok_dir
+        cfg.PREPARE_DICT.OK.OUTPUT = "psms"
+        cfg.PREPARE_DICT.OK.FDR = 0.01
+
+        evidence = evidence_100fdr.copy()
+        if len(cfg.PREPARE_DICT.OK.DIR) > 0:
+            evidence = filter_maxquant_by_ok(
+                evidence_100fdr=evidence,
+                ok_dir=cfg.PREPARE_DICT.OK.DIR,
+                ok_output_type=cfg.PREPARE_DICT.OK.OUTPUT,
+                rescore_fdr=cfg.PREPARE_DICT.OK.FDR,
+            )
+        assert len(evidence) < len(evidence_100fdr)
+
+    def test_cfg_empty_ok_dir_skips_filter(self, evidence_100fdr):
+        """When PREPARE_DICT.OK.DIR is empty, evidence must pass through unchanged."""
+        from utils.config import get_cfg_defaults
+        from utils.singleton_swaps_optimization import swaps_optimization_cfg
+
+        cfg = get_cfg_defaults(swaps_optimization_cfg)
+        assert cfg.PREPARE_DICT.OK.DIR == ""
+
+        evidence = evidence_100fdr.copy()
+        if len(cfg.PREPARE_DICT.OK.DIR) > 0:
+            raise AssertionError("Should not enter OK filtering block")
+        assert len(evidence) == len(evidence_100fdr)

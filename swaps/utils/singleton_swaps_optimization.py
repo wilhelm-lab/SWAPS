@@ -8,64 +8,82 @@ swaps_optimization_cfg = __C
 # general setup
 __C.DESCRIPTION = "Default config from the Singleton"
 __C.DEBUG = False
-__C.SWA = True  # whether to perform scan-wise activation, if False, the code will skip the SWA part and directly save the dict_ref with empty activation for downstream processing, which is useful for debugging and testing downstream steps without running SWA
-__C.DATA_PATH = ""  # different results depending on data ending with .mzml or .d
-__C.EXCLUDE_DATASET_NAME = []
+__C.SWA = True  # whether to perform scan-wise activation; if False, skips SWA and saves dict_ref with empty activation, useful for debugging downstream steps without running SWA
+__C.DATA_PATH = ""  # path to raw data directory (.d or .mzml)
+__C.EXCLUDE_DATASET_NAME = (
+    []
+)  # list of dataset names to exclude, e.g. ["20230515_HeLa_100ng_1"]
 __C.RESULT_PATH = ""  # path to save all intermediate and final results
-__C.ADD_TIMESTAMP_TO_RESULT_PATH = False  # disenble when reusing the same result path
-__C.EXPORT_DATA_HDF5_DIR = ""  # empty string for export to data directory
-__C.SEARCH_OUTPUT_PATH = ""  # path to MaxQuant reference file, pickle
+__C.ADD_TIMESTAMP_TO_RESULT_PATH = False  # disable when reusing the same result path
+__C.EXPORT_DATA_HDF5_DIR = (
+    ""  # path to export HDF5 data; empty string exports to the data directory
+)
+__C.SEARCH_OUTPUT_PATH = ""  # path to search engine output; for FragPipe: output directory; for MaxQuant: path to evidence.txt; for Sage: path to results.sage.tsv
 __C.USE_IMS = True
 __C.N_CPU = (
     -1
-)  # number of CPUs for multiprocessing, <0 means using all CPUs requested by the slurm job (if any), else 0
+)  # number of CPUs for multiprocessing; <0 means use all CPUs from SLURM_CPUS_PER_TASK (or 1 if not in a SLURM job)
 
 # prepare dictionary
 __C.PREPARE_DICT = ConfigurationNode()
 __C.PREPARE_DICT.SEARCH_ENGINE = "maxquant"  # one of ["maxquant", "fragpipe", "sage"]
-__C.PREPARE_DICT.UPDATED_RT_MODEL_PATH = ""
-__C.PREPARE_DICT.UPDATED_IM_MODEL_PATH = ""
-__C.PREPARE_DICT.TRAIN_FRAC = 0.9
-__C.PREPARE_DICT.RT_TRAIN_EPOCHS = 15  # For nanoflow higher epochs are needed, e.g. 30
-__C.PREPARE_DICT.IM_TRAIN_EPOCHS = 8
-__C.PREPARE_DICT.RT_REF = "pred"  # How to calc ref RT, one of ["pred", "exp", "mix"]
+__C.PREPARE_DICT.RT_REF = "pred"  # How to calc ref RT; supported: "pred" (AlphaPeptDeep model)
 __C.PREPARE_DICT.IM_REF = (
-    "ref"  # How to calc ref IM, one of ["exp", "pred", "mix", "ref", "pred_lr"]
+    "ref"  # How to calc ref IM; supported: "ref" (from search engine output)
 )
-__C.PREPARE_DICT.RT_TOL = (
+__C.PREPARE_DICT.PRED = ConfigurationNode()
+__C.PREPARE_DICT.PRED.UPDATED_RT_MODEL_PATH = (
+    ""  # path to a pre-trained RT model; empty string triggers retraining
+)
+__C.PREPARE_DICT.PRED.UPDATED_IM_MODEL_PATH = (
+    ""  # path to a pre-trained IM model; empty string triggers retraining
+)
+__C.PREPARE_DICT.PRED.TRAIN_FRAC = 0.9
+__C.PREPARE_DICT.PRED.RT_TRAIN_EPOCHS = 15  # For nanoflow higher epochs are needed, e.g. 30
+__C.PREPARE_DICT.PRED.IM_TRAIN_EPOCHS = 8
+
+__C.PREPARE_DICT.REF = ConfigurationNode()
+__C.PREPARE_DICT.REF.RT_TOL = (
     -0.1
-)  # RT tolerance in minutes, negative means calc from data, float
-__C.PREPARE_DICT.SUMMARIZE_WITHOUT_MATCH = False
-__C.PREPARE_DICT.IM_LENGTH = (
+)  # RT tolerance in minutes; negative means infer from data
+__C.PREPARE_DICT.REF.IM_LENGTH = (
     -1
-)  # IM elution length in mobility index, negative means calc from data, int
-__C.PREPARE_DICT.DELTA_IM_95 = (
+)  # IM elution length in mobility index; negative means infer from data
+__C.PREPARE_DICT.REF.DELTA_IM_95 = (
     -0.1
-)  # delta IM for 95% of the data, only used if IM_REF == "pred"
-__C.PREPARE_DICT.MZ_BIN_DIGITS = 2  # legacy, not used
+)  # delta IM covering 95% of data; negative means infer from data; only used when IM_REF == "pred"
+__C.PREPARE_DICT.REF.SUMMARIZE_WITHOUT_MATCH = False
+
+__C.PREPARE_DICT.SAGE = ConfigurationNode()
+__C.PREPARE_DICT.SAGE.RT_WINDOW = (
+    0.0  # RT elution window (min) for SAGE; 0 = auto (1% of max RT)
+)
+__C.PREPARE_DICT.SAGE.IM_WINDOW = (
+    0.0  # IM elution window for SAGE; 0 = auto (0.1 1/K0 units)
+)
+
+__C.PREPARE_DICT.MZ_BIN_DIGITS = 2
 __C.PREPARE_DICT.ISO_MIN_AB_THRES = 0.01
-__C.PREPARE_DICT.GENERATE_DECOY = False
-__C.PREPARE_DICT.SAGE_RT_WINDOW = 0.0   # RT elution window (min) for SAGE; 0 = auto (1% of max RT)
-__C.PREPARE_DICT.SAGE_IM_WINDOW = 0.0   # IM elution window for SAGE; 0 = auto (0.1 1/K0 units)
-__C.PREPARE_DICT.RT_MAX = 0.0
-__C.PREPARE_DICT.EXP_OK_DIR = ""  # path to the oktoberfest output directory for using rescoring output, then MQ evidence should be 100FDR
-__C.PREPARE_DICT.EXP_OK_OUTPUT = "psms"  # one of ["psms", "peptides"], whether use ok psms or peptides table for filtering
-__C.PREPARE_DICT.EXP_OK_FDR = 0.01  # FDR threshold for oktoberfest output
-__C.PREPARE_DICT.REF_OK_DIR = ""  # path to the oktoberfest output directory for using rescoring output, then MQ evidence should be 100FDR
-__C.PREPARE_DICT.REF_OK_OUTPUT = "psms"  # one of ["psms", "peptides"], whether use ok psms or peptides table for filtering
-__C.PREPARE_DICT.REF_OK_FDR = 0.01  # FDR threshold for oktoberfest output
 __C.PREPARE_DICT.PPM_TOL = 20  # ppm tolerance for matching precursors to MS1 peaks
-__C.PREPARE_DICT.BIN_WIDTH = 0.01  # m/z bin
+__C.PREPARE_DICT.BIN_WIDTH = 0.01  # m/z bin width
+
+__C.PREPARE_DICT.OK = ConfigurationNode()
+__C.PREPARE_DICT.OK.DIR = (
+    ""  # path to Oktoberfest rescoring output directory; empty string disables rescoring
+)
+__C.PREPARE_DICT.OK.OUTPUT = "psms"  # one of ["psms", "peptides"]
+__C.PREPARE_DICT.OK.FDR = 0.01  # FDR threshold for Oktoberfest rescoring
+
 # optimization
 __C.OPTIMIZATION = ConfigurationNode()
 __C.OPTIMIZATION.N_BATCH = (
     -1
-)  # number of batches of MS1 scans, -1 means set batches as the same as N_CPU
+)  # number of batches of MS1 scans; -1 means use the same value as N_CPU
 __C.OPTIMIZATION.DELTA_MOBILITY_INDEX_THRES = (
-    80  # TODO: threshold for delta mobility, not used if extract_im_peak == False
+    80  # threshold for delta mobility index; only effective when extract_im_peak=True (currently hardcoded to False)
 )
 __C.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH = (
-    4  # TODO: width for IM peak extraction, not used if extract_im_peak == False
+    4  # width for IM peak extraction; only effective when extract_im_peak=True (currently hardcoded to False)
 )
 
 # match features kwargs (postprocessing peak detection/matching parameters)

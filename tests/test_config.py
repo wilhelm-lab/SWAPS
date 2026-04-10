@@ -41,6 +41,33 @@ def minimal_yaml(tmp_path):
     return str(p)
 
 
+@pytest.fixture
+def nested_yaml(tmp_path):
+    """Write an override YAML exercising all three new sub-nodes."""
+    data = {
+        "PREPARE_DICT": {
+            "PRED": {
+                "TRAIN_FRAC": 0.8,
+                "RT_TRAIN_EPOCHS": 20,
+                "UPDATED_RT_MODEL_PATH": "/tmp/rt_model.pt",
+            },
+            "REF": {
+                "RT_TOL": 0.5,
+                "IM_LENGTH": 10,
+                "DELTA_IM_95": 0.05,
+                "SUMMARIZE_WITHOUT_MATCH": True,
+            },
+            "SAGE": {
+                "RT_WINDOW": 1.5,
+                "IM_WINDOW": 0.2,
+            },
+        },
+    }
+    p = tmp_path / "test_nested_override.yaml"
+    p.write_text(yaml.dump(data))
+    return str(p)
+
+
 # ---------------------------------------------------------------------------
 # Default config shape
 # ---------------------------------------------------------------------------
@@ -57,8 +84,26 @@ class TestGetCfgDefaults:
             assert hasattr(cfg, key), f"Missing top-level key: {key}"
 
     def test_prepare_dict_keys_present(self, cfg):
-        for key in ["SEARCH_ENGINE", "PPM_TOL", "BIN_WIDTH", "GENERATE_DECOY"]:
+        for key in ["SEARCH_ENGINE", "PPM_TOL", "BIN_WIDTH",
+                    "PRED", "REF", "SAGE", "OK"]:
             assert hasattr(cfg.PREPARE_DICT, key), f"Missing PREPARE_DICT.{key}"
+
+    def test_prepare_dict_pred_keys_present(self, cfg):
+        for key in ["UPDATED_RT_MODEL_PATH", "UPDATED_IM_MODEL_PATH",
+                    "TRAIN_FRAC", "RT_TRAIN_EPOCHS", "IM_TRAIN_EPOCHS"]:
+            assert hasattr(cfg.PREPARE_DICT.PRED, key), f"Missing PREPARE_DICT.PRED.{key}"
+
+    def test_prepare_dict_ref_keys_present(self, cfg):
+        for key in ["RT_TOL", "IM_LENGTH", "DELTA_IM_95", "SUMMARIZE_WITHOUT_MATCH"]:
+            assert hasattr(cfg.PREPARE_DICT.REF, key), f"Missing PREPARE_DICT.REF.{key}"
+
+    def test_prepare_dict_sage_keys_present(self, cfg):
+        for key in ["RT_WINDOW", "IM_WINDOW"]:
+            assert hasattr(cfg.PREPARE_DICT.SAGE, key), f"Missing PREPARE_DICT.SAGE.{key}"
+
+    def test_prepare_dict_ok_keys_present(self, cfg):
+        for key in ["DIR", "OUTPUT", "FDR"]:
+            assert hasattr(cfg.PREPARE_DICT.OK, key), f"Missing PREPARE_DICT.OK.{key}"
 
     def test_optimization_keys_present(self, cfg):
         assert hasattr(cfg.OPTIMIZATION, "N_BATCH")
@@ -78,8 +123,26 @@ class TestGetCfgDefaults:
     def test_default_n_batch_is_negative(self, cfg):
         assert cfg.OPTIMIZATION.N_BATCH < 0
 
-    def test_default_generate_decoy_is_false(self, cfg):
-        assert cfg.PREPARE_DICT.GENERATE_DECOY is False
+    def test_default_ok_dir_is_empty(self, cfg):
+        assert cfg.PREPARE_DICT.OK.DIR == ""
+
+    def test_default_ok_output_is_psms(self, cfg):
+        assert cfg.PREPARE_DICT.OK.OUTPUT == "psms"
+
+    def test_default_pred_model_paths_empty(self, cfg):
+        assert cfg.PREPARE_DICT.PRED.UPDATED_RT_MODEL_PATH == ""
+        assert cfg.PREPARE_DICT.PRED.UPDATED_IM_MODEL_PATH == ""
+
+    def test_default_ref_tols_negative(self, cfg):
+        """Negative values trigger auto-detection from data."""
+        assert cfg.PREPARE_DICT.REF.RT_TOL < 0
+        assert cfg.PREPARE_DICT.REF.IM_LENGTH < 0
+        assert cfg.PREPARE_DICT.REF.DELTA_IM_95 < 0
+
+    def test_default_sage_windows_zero(self, cfg):
+        """Zero values trigger auto-detection."""
+        assert cfg.PREPARE_DICT.SAGE.RT_WINDOW == 0.0
+        assert cfg.PREPARE_DICT.SAGE.IM_WINDOW == 0.0
 
     def test_cfg_is_mutable_after_get_defaults(self, cfg):
         """get_cfg_defaults should return an unfrozen copy, ready to merge."""
@@ -110,6 +173,32 @@ class TestCfgMergeFromFile:
         original_swa = cfg.SWA
         cfg.merge_from_file(minimal_yaml)
         assert cfg.SWA == original_swa
+
+
+class TestNestedSubNodeMerge:
+    def test_merge_pred_keys(self, cfg, nested_yaml):
+        cfg.merge_from_file(nested_yaml)
+        assert cfg.PREPARE_DICT.PRED.TRAIN_FRAC == 0.8
+        assert cfg.PREPARE_DICT.PRED.RT_TRAIN_EPOCHS == 20
+        assert cfg.PREPARE_DICT.PRED.UPDATED_RT_MODEL_PATH == "/tmp/rt_model.pt"
+
+    def test_merge_ref_keys(self, cfg, nested_yaml):
+        cfg.merge_from_file(nested_yaml)
+        assert cfg.PREPARE_DICT.REF.RT_TOL == 0.5
+        assert cfg.PREPARE_DICT.REF.IM_LENGTH == 10
+        assert cfg.PREPARE_DICT.REF.DELTA_IM_95 == 0.05
+        assert cfg.PREPARE_DICT.REF.SUMMARIZE_WITHOUT_MATCH is True
+
+    def test_merge_sage_keys(self, cfg, nested_yaml):
+        cfg.merge_from_file(nested_yaml)
+        assert cfg.PREPARE_DICT.SAGE.RT_WINDOW == 1.5
+        assert cfg.PREPARE_DICT.SAGE.IM_WINDOW == 0.2
+
+    def test_unrelated_defaults_unchanged(self, cfg, nested_yaml):
+        cfg.merge_from_file(nested_yaml)
+        assert cfg.PREPARE_DICT.PRED.IM_TRAIN_EPOCHS == 8  # default untouched
+        assert cfg.PREPARE_DICT.REF.IM_LENGTH == 10  # overridden
+        assert cfg.N_CPU < 0  # top-level default untouched
 
 
 # ---------------------------------------------------------------------------

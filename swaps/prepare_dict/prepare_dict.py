@@ -1385,10 +1385,10 @@ def construct_dict_from_search_pivoted(
     # Modified sequence from the MSMS row to all rows in the same
     # (Sequence, Modifications, Charge) group so the aggregation in
     # get_rt_im_range always finds a non-null value.
-    evidence_cleaned["Modified sequence"] = (
-        evidence_cleaned
-        .groupby(["Sequence", "Modifications", "Charge"], dropna=False)["Modified sequence"]
-        .transform(lambda x: x.fillna(x.dropna().iloc[0]) if x.notna().any() else x)
+    evidence_cleaned["Modified sequence"] = evidence_cleaned.groupby(
+        ["Sequence", "Modifications", "Charge"], dropna=False
+    )["Modified sequence"].transform(
+        lambda x: x.fillna(x.dropna().iloc[0]) if x.notna().any() else x
     )
     # After propagation, rows that are still null are MATCH-only groups with no
     # MSMS donor present.  Recover unmodified peptides from the bare Sequence;
@@ -1412,7 +1412,7 @@ def construct_dict_from_search_pivoted(
     evidence_group_summary = get_rt_im_range(
         evidence_cleaned,
         id_cols=["Sequence", "Modifications", "Charge", "Proteins"],
-        summarize_without_match=cfg_prepare_dict.SUMMARIZE_WITHOUT_MATCH,
+        summarize_without_match=cfg_prepare_dict.REF.SUMMARIZE_WITHOUT_MATCH,
     )
 
     # add extra columns
@@ -1499,28 +1499,6 @@ def construct_dict(
         filter_exp_by_raw_file,
         maxquant_exp_df.shape,
     )
-    if len(cfg_prepare_dict.EXP_OK_DIR) > 0:
-        maxquant_exp_df = filter_maxquant_by_ok(
-            evidence_100fdr=maxquant_exp_df,
-            ok_dir=cfg_prepare_dict.EXP_OK_DIR,
-            ok_output_type=cfg_prepare_dict.EXP_OK_OUTPUT,
-            rescore_fdr=cfg_prepare_dict.EXP_OK_FDR,
-        )
-        Logger.info(
-            "maxquant_exp_df size after filtering by Oktoberfest: %s",
-            maxquant_exp_df.shape,
-        )
-    if len(cfg_prepare_dict.REF_OK_DIR) > 0:
-        maxquant_ref_df = filter_maxquant_by_ok(
-            evidence_100fdr=maxquant_ref_df,
-            ok_dir=cfg_prepare_dict.REF_OK_DIR,
-            ok_output_type=cfg_prepare_dict.REF_OK_OUTPUT,
-            rescore_fdr=cfg_prepare_dict.REF_OK_FDR,
-        )
-        Logger.info(
-            "maxquant_ref_df size after filtering by Oktoberfest: %s",
-            maxquant_ref_df.shape,
-        )
     if not keep_matched_precursors:
         if use_ims:
             maxquant_exp_df = maxquant_exp_df.loc[
@@ -1574,17 +1552,18 @@ def construct_dict(
     maxquant_exp_df.to_csv(maxquant_exp_filtered_path, sep="\t")
 
     _LOADED_ALPHA_DATASET = False
+    rt_max_grad = 0.0  # LC gradient length; set from data when model retraining is triggered
     # RT
     if cfg_prepare_dict.RT_REF == "pred":
-        if cfg_prepare_dict.UPDATED_RT_MODEL_PATH == "":
+        if cfg_prepare_dict.PRED.UPDATED_RT_MODEL_PATH == "":
             if not _LOADED_ALPHA_DATASET:
                 train_df, test_df, rt_max = prepare_alpha_train_test_df(
                     maxquant_exp_filtered_path,
-                    train_frac=cfg_prepare_dict.TRAIN_FRAC,
+                    train_frac=cfg_prepare_dict.PRED.TRAIN_FRAC,
                     filter_dict={"raw_name": filter_exp_by_raw_file},
                     random_state=random_seed,
                 )
-                cfg_prepare_dict.RT_MAX = rt_max.item()
+                rt_max_grad = rt_max.item()
                 _LOADED_ALPHA_DATASET = True
             Logger.info("Retraining RT model with AlphaPeptDeep")
             delta_rt_95, model_path = update_alpha_pept_deep_model(
@@ -1592,44 +1571,44 @@ def construct_dict(
                 train_df=train_df,
                 test_df=test_df,
                 save_dir=rt_transfer_dir,
-                epoch=cfg_prepare_dict.RT_TRAIN_EPOCHS,
+                epoch=cfg_prepare_dict.PRED.RT_TRAIN_EPOCHS,
                 lc_grad=rt_max,
                 device=device,
             )
-            cfg_prepare_dict.UPDATED_RT_MODEL_PATH = model_path
-            if cfg_prepare_dict.RT_TOL < 0:
-                cfg_prepare_dict.RT_TOL = delta_rt_95.item()
+            cfg_prepare_dict.PRED.UPDATED_RT_MODEL_PATH = model_path
+            if cfg_prepare_dict.REF.RT_TOL < 0:
+                cfg_prepare_dict.REF.RT_TOL = delta_rt_95.item()
         else:
             Logger.info("Using existing RT model")
-            delta_rt_95 = cfg_prepare_dict.RT_TOL
+            delta_rt_95 = cfg_prepare_dict.REF.RT_TOL
     # IM
     if use_ims and cfg_prepare_dict.IM_REF == "pred":
-        if cfg_prepare_dict.UPDATED_IM_MODEL_PATH == "":
+        if cfg_prepare_dict.PRED.UPDATED_IM_MODEL_PATH == "":
             Logger.info("Retraining IM model with AlphaPeptDeep")
             if not _LOADED_ALPHA_DATASET:
                 train_df, test_df, rt_max = prepare_alpha_train_test_df(
                     maxquant_exp_filtered_path,
-                    train_frac=cfg_prepare_dict.TRAIN_FRAC,
+                    train_frac=cfg_prepare_dict.PRED.TRAIN_FRAC,
                     filter_dict={"raw_name": filter_exp_by_raw_file},
                     random_state=random_seed,
                 )
                 _LOADED_ALPHA_DATASET = True
-                cfg_prepare_dict.RT_MAX = rt_max.item()
+                rt_max_grad = rt_max.item()
             delta_im_95, model_path = update_alpha_pept_deep_model(
                 pept_property="mobility",
                 train_df=train_df,
                 test_df=test_df,
                 save_dir=im_transfer_dir,
-                epoch=cfg_prepare_dict.IM_TRAIN_EPOCHS,
+                epoch=cfg_prepare_dict.PRED.IM_TRAIN_EPOCHS,
                 lc_grad=rt_max,
                 device=device,
             )
-            cfg_prepare_dict.UPDATED_IM_MODEL_PATH = model_path
-            if cfg_prepare_dict.DELTA_IM_95 < 0:
-                cfg_prepare_dict.DELTA_IM_95 = delta_im_95.item()
+            cfg_prepare_dict.PRED.UPDATED_IM_MODEL_PATH = model_path
+            if cfg_prepare_dict.REF.DELTA_IM_95 < 0:
+                cfg_prepare_dict.REF.DELTA_IM_95 = delta_im_95.item()
         else:
             Logger.info("Using existing IM model")
-            delta_im_95 = cfg_prepare_dict.DELTA_IM_95
+            delta_im_95 = cfg_prepare_dict.REF.DELTA_IM_95
 
     maxquant_exp_df["Retention time start"] = (
         maxquant_exp_df["Calibrated retention time start"]
@@ -1699,12 +1678,8 @@ def construct_dict(
         use_ims=use_ims,
     )
 
-    # generate decoy first and then predict RT and IM
-    if cfg_prepare_dict.GENERATE_DECOY:
-        Logger.info("Generating decoy")
-        maxquant_dict = concat_decoy_and_target(maxquant_dict)
-    else:
-        maxquant_dict["Decoy"] = False
+    # decoy generation not supported in this path
+    maxquant_dict["Decoy"] = False
     # Do prediction first and then concat target and decoys
     # IM/RT prediction for full dictionary, define RT and IM search range
     dict_path = os.path.join(construct_dict_dir, "maxquant_dict_for_pred.txt")
@@ -1723,11 +1698,11 @@ def construct_dict(
     match cfg_prepare_dict.RT_REF:
         case "pred":
             maxquant_dict = dict_add_alpha_pept_pred(
-                model_path=cfg_prepare_dict.UPDATED_RT_MODEL_PATH,
+                model_path=cfg_prepare_dict.PRED.UPDATED_RT_MODEL_PATH,
                 pept_property="rt",
                 dict_for_pred_path=dict_path,
                 maxquant_dict=maxquant_dict,
-                lc_grad=cfg_prepare_dict.RT_MAX,
+                lc_grad=rt_max_grad,
                 device=device,
             )
         case "align_lr":
@@ -1735,11 +1710,11 @@ def construct_dict(
         case "align_lowess":
             maxquant_dict, delta_rt_95 = dict_add_rt_align_lowess(
                 maxquant_dict,
-                train_frac=cfg_prepare_dict.TRAIN_FRAC,
+                train_frac=cfg_prepare_dict.PRED.TRAIN_FRAC,
                 random_state=random_seed,
             )
-            if cfg_prepare_dict.RT_TOL < 0:
-                cfg_prepare_dict.RT_TOL = delta_rt_95.item()
+            if cfg_prepare_dict.REF.RT_TOL < 0:
+                cfg_prepare_dict.REF.RT_TOL = delta_rt_95.item()
         case "exp":
             Logger.info("Using exp RT for RT reference")
             pass
@@ -1757,20 +1732,20 @@ def construct_dict(
         match cfg_prepare_dict.IM_REF:
             case "pred":
                 maxquant_dict = dict_add_alpha_pept_pred(
-                    model_path=cfg_prepare_dict.UPDATED_IM_MODEL_PATH,
+                    model_path=cfg_prepare_dict.PRED.UPDATED_IM_MODEL_PATH,
                     pept_property="mobility",
                     dict_for_pred_path=dict_path,
                     maxquant_dict=maxquant_dict,
-                    lc_grad=cfg_prepare_dict.RT_MAX,
+                    lc_grad=rt_max_grad,
                     device=device,
                 )
             case "align_lr":
                 maxquant_dict, delta_im_95 = dict_add_im_align_lr(
                     maxquant_dict,
-                    train_frac=cfg_prepare_dict.TRAIN_FRAC,
+                    train_frac=cfg_prepare_dict.PRED.TRAIN_FRAC,
                     random_state=random_seed,
                 )
-                cfg_prepare_dict.DELTA_IM_95 = delta_im_95.item()
+                cfg_prepare_dict.REF.DELTA_IM_95 = delta_im_95.item()
             case "ref":
                 Logger.info("Using ref IM for IM prediction")
                 pass
@@ -1788,26 +1763,26 @@ def construct_dict(
             mapper={"mobility_values_index": "mobility_pred_idx"}, axis=1
         )
         # specify im tolerence for search range (expected ion mobility length)
-        if cfg_prepare_dict.IM_LENGTH < 0:
+        if cfg_prepare_dict.REF.IM_LENGTH < 0:
             Logger.info(
                 "IM tolerance not specified, using 99.9 percentile of experiment IM length"
             )
             im_length = (
                 int(maxquant_exp_df["Ion mobility length"].quantile(0.999) + 2) // 2
             )  # TODO: currently using only exp IM length
-            cfg_prepare_dict.IM_LENGTH = im_length
+            cfg_prepare_dict.REF.IM_LENGTH = im_length
 
         maxquant_dict = _define_im_idx_search_range(
             maxquant_df=maxquant_dict,
-            im_length=cfg_prepare_dict.IM_LENGTH,
+            im_length=cfg_prepare_dict.REF.IM_LENGTH,
             im_ref=cfg_prepare_dict.IM_REF,
             im_idx_range=im_idx_range,
-            delta_im_95=cfg_prepare_dict.DELTA_IM_95,
+            delta_im_95=cfg_prepare_dict.REF.DELTA_IM_95,
             mobility_values_df=mobility_values_df,
         )
     maxquant_dict = _define_rt_search_range(
         maxquant_result_dict=maxquant_dict,
-        rt_tol=float(cfg_prepare_dict.RT_TOL),
+        rt_tol=float(cfg_prepare_dict.REF.RT_TOL),
         rt_ref=cfg_prepare_dict.RT_REF,
         rt_range=rt_range,
     )
@@ -1826,8 +1801,7 @@ def construct_dict(
         maxquant_dict, ab_thres=cfg_prepare_dict.ISO_MIN_AB_THRES
     )
     maxquant_dict = dict_add_mz_rank(maxquant_dict_df=maxquant_dict)
-    if not cfg_prepare_dict.GENERATE_DECOY:
-        maxquant_dict["TD pair id"] = maxquant_dict["mz_rank"]
+    maxquant_dict["TD pair id"] = maxquant_dict["mz_rank"]
     maxquant_dict = dict_add_mz_bin(
         maxquant_dict_df=maxquant_dict,
         mz_bin_digits=cfg_prepare_dict.MZ_BIN_DIGITS,
@@ -1957,7 +1931,7 @@ def get_rt_im_range(
     if summarize_without_match:
         evidence = evidence[
             ~evidence[match_col].str.contains("MATCH", na=False)
-        ]  # only keep matched for summary
+        ]  # only keep not-matched for summary
     evidence_group_summary = (
         evidence.groupby(id_cols)
         .agg(
@@ -2105,22 +2079,30 @@ def pivot_psm_by_mz_rank(
     # Prefer direct MS/MS identifications as global reference candidates.
     # MATCH/MBR rows are still kept for RT/IM metrics (Steps 3-4).
     # Use dropna=False so peptides with NaN in any id column are not silently dropped.
-    msms_mask = ~evidence["Type"].str.upper().str.contains(match_keyword.upper(), na=False)
+    msms_mask = (
+        ~evidence["Type"].str.upper().str.contains(match_keyword.upper(), na=False)
+    )
     msms_only = evidence[msms_mask]
     sorted_msms = msms_only.sort_values(
         by=id_cols + [metric_col, intensity_col],
         ascending=[True] * len(id_cols) + [not higher_is_better, False],
     )
     evidence["is_global_best"] = False
-    evidence.loc[sorted_msms.groupby(id_cols, dropna=False).head(1).index, "is_global_best"] = True
+    evidence.loc[
+        sorted_msms.groupby(id_cols, dropna=False).head(1).index, "is_global_best"
+    ] = True
 
     # Fallback: for peptides with no MSMS rows at all, use their best row of any type.
-    no_best_mask = ~evidence.groupby(id_cols, dropna=False)["is_global_best"].transform("any")
+    no_best_mask = ~evidence.groupby(id_cols, dropna=False)["is_global_best"].transform(
+        "any"
+    )
     fallback = evidence[no_best_mask].sort_values(
         by=id_cols + [metric_col, intensity_col],
         ascending=[True] * len(id_cols) + [not higher_is_better, False],
     )
-    evidence.loc[fallback.groupby(id_cols, dropna=False).head(1).index, "is_global_best"] = True
+    evidence.loc[
+        fallback.groupby(id_cols, dropna=False).head(1).index, "is_global_best"
+    ] = True
 
     # --- Step 2: Status Labeling ---
     def label_logic(row):
@@ -2138,7 +2120,11 @@ def pivot_psm_by_mz_rank(
     # --- Step 3: Pivot Status ---
     # We use min() here as per your logic to prioritize the '1' (Reference) label
     # if a file has multiple entries for the same peptide.
-    summary = evidence.groupby(id_cols + ["Raw file"], dropna=False)["Status_Val"].min().reset_index()
+    summary = (
+        evidence.groupby(id_cols + ["Raw file"], dropna=False)["Status_Val"]
+        .min()
+        .reset_index()
+    )
 
     pivot_status = summary.pivot(index=id_cols, columns="Raw file", values="Status_Val")
     mapping = {3: "Match", 2: "Quant_Only", 1: "Reference", 0: "Other"}

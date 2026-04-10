@@ -112,6 +112,32 @@ def maxquant_dir():
     return path
 
 
+@pytest.fixture(scope="session")
+def mq_ok_evidence_path():
+    """Path to a MaxQuant evidence.txt searched at 100% FDR, for OK rescoring tests."""
+    path = os.environ.get(
+        "SWAPS_TEST_MQ_OK_EVIDENCE_PATH",
+        "/cmnfs/proj/ORIGINS/data/random_precursor_sampling/"
+        "nanoflow_bruker/txt_100FDR_15min/evidence.txt",
+    )
+    if not path or not os.path.isfile(path):
+        pytest.skip(f"MQ 100%FDR evidence not found: {path}")
+    return path
+
+
+@pytest.fixture(scope="session")
+def ok_dir():
+    """Path to an Oktoberfest rescoring output directory for integration tests."""
+    path = os.environ.get(
+        "SWAPS_TEST_OK_DIR",
+        "/cmnfs/proj/ORIGINS/data/random_precursor_sampling/"
+        "nanoflow_bruker/rescoring/out_no_rl_fix_ce_mokapot_random/",
+    )
+    if not path or not os.path.isdir(path):
+        pytest.skip(f"Oktoberfest output dir not found: {path}")
+    return path
+
+
 # ---------------------------------------------------------------------------
 # Minimal synthetic DataFrames reused across unit-test modules
 # ---------------------------------------------------------------------------

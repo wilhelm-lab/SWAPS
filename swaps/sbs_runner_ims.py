@@ -23,6 +23,7 @@ from prepare_dict.prepare_dict import (
     dict_add_index_to_raw_file,
     dict_add_im_index,
     dict_add_rt_index,
+    filter_maxquant_by_ok,
 )
 from prepare_dict.search_engine_output_parser import sage_parser, fragpipe_psm_parser
 from postprocessing.rescore import (
@@ -107,8 +108,8 @@ def opt_scan_by_scan(config_path: str):
                 )
                 evidence = sage_parser(
                     evidence,
-                    rt_window=cfg.PREPARE_DICT.SAGE_RT_WINDOW,
-                    im_window=cfg.PREPARE_DICT.SAGE_IM_WINDOW,
+                    rt_window=cfg.PREPARE_DICT.SAGE.RT_WINDOW,
+                    im_window=cfg.PREPARE_DICT.SAGE.IM_WINDOW,
                 )
             case "fragpipe":
                 evidence = pd.DataFrame()
@@ -127,6 +128,17 @@ def opt_scan_by_scan(config_path: str):
                         )
 
                 evidence = fragpipe_psm_parser(evidence)
+        if len(cfg.PREPARE_DICT.OK.DIR) > 0:
+            evidence = filter_maxquant_by_ok(
+                evidence_100fdr=evidence,
+                ok_dir=cfg.PREPARE_DICT.OK.DIR,
+                ok_output_type=cfg.PREPARE_DICT.OK.OUTPUT,
+                rescore_fdr=cfg.PREPARE_DICT.OK.FDR,
+            )
+            logging.info(
+                "Evidence filtered by Oktoberfest rescoring: %d rows retained",
+                len(evidence),
+            )
         dict_ref = construct_dict_from_search_pivoted(
             cfg_prepare_dict=cfg.PREPARE_DICT,
             evidence=evidence,  # type: ignore
