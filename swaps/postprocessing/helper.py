@@ -17,6 +17,7 @@ _SORTED_ROW_GROUP_SIZE = 100_000
 def build_mz_sorted_activation(
     activation_dir: str,
     row_group_size: int = _SORTED_ROW_GROUP_SIZE,
+    delete_input_files: bool = True,
 ) -> str:
     """Merge all swa_frame_batch_*_activation.parquet files into one file sorted by mz_rank.
 
@@ -46,7 +47,8 @@ def build_mz_sorted_activation(
         return out_path
     con = duckdb.connect()
     con.execute("SET enable_progress_bar = false")
-    con.execute(f"""
+    con.execute(
+        f"""
         COPY (
             SELECT * FROM parquet_scan(
                 '{activation_dir}/swa_frame_batch_*_activation.parquet'
@@ -54,8 +56,14 @@ def build_mz_sorted_activation(
             ORDER BY mz_rank
         ) TO '{out_path}'
         (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE {row_group_size})
-    """)
+    """
+    )
     con.close()
+    if delete_input_files:
+        for filename in os.listdir(activation_dir):
+            if filename.startswith("swa_frame_batch_"):
+                os.remove(os.path.join(activation_dir, filename))
+                Logger.info("Deleted input file: %s", filename)
     Logger.info("Written mz-sorted activation to %s", out_path)
     return out_path
 
@@ -127,6 +135,7 @@ def get_pept_act_from_parquet(
         else ((im_start + im_end) // 2 - im_start)
     )
     pept_act = parquet_df_to_dense_frame(act_df, (rt_start, rt_end), (im_start, im_end))
+
     if shape is not None:
         target_h, target_w = shape
 
