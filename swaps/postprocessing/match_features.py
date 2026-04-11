@@ -738,7 +738,7 @@ def match_features_batch(
                 precomputed_pept_act=_get_pept_act_tuple(raw_file),
                 precomputed_smoothed_image=_get_smoothed_pept_act(raw_file),
                 processing_kwargs=processing_kwargs,
-                # visualize_dir=visualize_dir,
+                visualize_dir=visualize_dir,
             )
             record: dict[str, Any] = {
                 "direct": quant_direct,
@@ -754,7 +754,49 @@ def match_features_batch(
             }
             quant_only_probe_records[raw_file] = record
 
-            if match_state is None or not quant_direct.succeeded:
+            if match_state is None:
+                if quant_direct.succeeded:
+                    # Reference run failed — promote this quant-only run as the reference
+                    prop_promoted = _annotate_peak_properties(
+                        quant_direct.peak_properties,
+                        mz_rank=pept_idx,
+                        run_name=raw_file,
+                        own_anchor_id=own_anchor_id,
+                        assimilated_to_anchor_id=own_anchor_id,
+                        feature_instance_id=feature_instance_id,
+                        own_feature_instance_id=feature_instance_id,
+                        source_run=raw_file,
+                        source_type="Reference",
+                    )
+                    if prop_promoted is not None:
+                        quant_direct.peak_properties = prop_promoted
+                        pp_reference_list.append(prop_promoted)
+                        match_state = ReferenceMatchState(
+                            reference_result=quant_direct,
+                            match_props=prop_promoted.copy(),
+                            bbox_offsets=_bbox_offsets_from_prop(
+                                prop_promoted,
+                                quant_direct.snapped_anchor,  # type: ignore[arg-type]
+                            ),
+                        )
+                        match_raw_files = [
+                            f for f in match_raw_files if f != raw_file
+                        ] + [reference_raw_file]
+                        reference_raw_file = raw_file
+                        Logger.info(
+                            f"mz{pept_idx}: Promoted quant-only run as reference: {raw_file}"
+                        )
+                else:
+                    no_quant_log.append(
+                        {
+                            "mz_rank": pept_idx,
+                            "run_name": raw_file,
+                            "type": "reference_promoted",
+                        }
+                    )
+                continue  # promoted run skips probe; failed promotion also skips
+
+            if not quant_direct.succeeded:
                 continue  # cannot probe without a valid reference
 
             quant_probe = _quantify_peptide_run(  # match quant_only to reference, this one is on reference space
@@ -779,13 +821,15 @@ def match_features_batch(
                 continue  # probe failed, cannot use for bbox expansion or future matching
 
             inside_match_bbox = _anchor_inside_bbox(
-                quant_probe.snapped_anchor, reference_result.peak_properties
+                quant_probe.snapped_anchor, match_state.reference_result.peak_properties
             )
             record["inside_match_bbox"] = bool(inside_match_bbox)
 
             if not inside_match_bbox:
                 ref_probe_new_bbox = _bbox_tuple_from_prop(quant_probe.peak_properties)
-                ref_bbox = _bbox_tuple_from_prop(reference_result.peak_properties)
+                ref_bbox = _bbox_tuple_from_prop(
+                    match_state.reference_result.peak_properties
+                )
                 record["reference_bbox_before_update"] = _bbox_tuple_from_prop(
                     match_state.match_props
                 )
@@ -822,7 +866,7 @@ def match_features_batch(
                         quant_direct_bbox=_bbox_tuple_from_prop(
                             quant_direct.peak_properties
                         ),
-                        ref_snapped_anchor=reference_result.snapped_anchor,  # type: ignore[arg-type]
+                        ref_snapped_anchor=match_state.reference_result.snapped_anchor,  # type: ignore[arg-type]
                         ref_bbox=ref_bbox,
                         ref_probe_new_bbox=ref_probe_new_bbox,
                         match_props_bbox_before=record["reference_bbox_before_update"],
@@ -840,6 +884,10 @@ def match_features_batch(
             continue
 
         if match_state is None:
+            Logger.info(
+                f"mz{pept_idx}: No valid reference for matching; {len(quant_only_raw_files)} quant-only runs;"
+                f"logging all {len(match_raw_files)} non-reference runs as no-quant."
+            )
             # Reference failed: log all non-reference runs as failures and move on
             for raw_file in match_raw_files:
                 is_quant_only = raw_file in quant_only_probe_records
