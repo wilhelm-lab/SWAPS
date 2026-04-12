@@ -55,7 +55,7 @@ def sparse_encode_divide_and_conquer_with_residual_stats(
 
     # Preallocate outputs
     frame_act = np.zeros((im, pept), dtype=np.float32)
-    Logger.debug("Frame activation shape: %s", frame_act.shape)
+    # Logger.debug("Frame activation shape: %s", frame_act.shape)
     reconstruction = np.zeros_like(frame_array, dtype=np.float32)
 
     # Precompute offsets for placing peptide activations
@@ -81,7 +81,7 @@ def sparse_encode_divide_and_conquer_with_residual_stats(
 
         try:
             frame_act[
-                :, col_offset : col_offset + candidate_block.shape[1]
+                :, col_offset : col_offset + candidate_block.shape[0]
             ] += im_pept_act
         except:
             Logger.info(
@@ -102,7 +102,7 @@ def sparse_encode_divide_and_conquer_with_residual_stats(
         if return_act_res:
             # Add reconstruction contribution for residual computation
             reconstruction += im_pept_act @ candidate_block
-    Logger.debug("frame_act non-zero count: %s", np.count_nonzero(frame_act))
+    # Logger.debug("frame_act non-zero count: %s", np.count_nonzero(frame_act))
     if return_act_res:
         # --- Measurement-space residual ---
         residual_im_mz = frame_array - reconstruction  # (im, m_z)
@@ -128,7 +128,6 @@ def _decide_row_cuts(n_rows, target_block_size=6000):
     Tries to split evenly if leftover is small.
     """
     if n_rows <= target_block_size:
-        Logger.debug("No slicing needed, n_rows <= target_block_size")
         return [n_rows]  # no slicing needed
 
     num_blocks = round(n_rows / target_block_size)
@@ -192,10 +191,10 @@ def process_one_frame(
     debug: bool = False,
 ):
     """Process one frame data without IMS dimension with sparse encoding and peak selection."""
-    Logger.debug("Start data preparation.")
+    # Logger.debug("Start data preparation.")
     # prepare data
     frame_data = ms1scans.loc[ms1scans["MS1_frame_idx"] == ms1_frame_idx]
-    Logger.debug("Frame data shape: %s", frame_data.shape[0])
+    # Logger.debug("Frame data shape: %s", frame_data.shape[0])
     peaks_df = pd.DataFrame()
     pept_act_coo = {
         "coord_frame_indices": [],
@@ -204,16 +203,16 @@ def process_one_frame(
     }
     if frame_data.shape[0] > 0:
         scan_time = np.round(ms1scans.loc[ms1_frame_idx, "Time_minute"], decimals=4)  # type: ignore[arg-type]
-        Logger.info("Scan time: %s", scan_time)
+        # Logger.debug("Scan time: %s", scan_time)
         candidate_precursor_by_rt = maxquant_result_ref_with_im_index_sortmz.loc[
             (maxquant_result_ref_with_im_index_sortmz["RT_search_left"] <= scan_time)
             & (maxquant_result_ref_with_im_index_sortmz["RT_search_right"] >= scan_time)
         ]
-        Logger.info(
-            "Number of candidates by RT in frame %s: %s",
-            ms1_frame_idx,
-            candidate_precursor_by_rt.shape[0],
-        )
+        # Logger.debug(
+        #     "Number of candidates by RT in frame %s: %s",
+        #     ms1_frame_idx,
+        #     candidate_precursor_by_rt.shape[0],
+        # )
         if candidate_precursor_by_rt.shape[0] > 0:
             candidate_precursor_by_rt.sort_values(
                 "mz_rank", ascending=True, inplace=True
@@ -230,13 +229,9 @@ def process_one_frame(
                 use_ims=False,
             )
 
-            Logger.debug("Start optimization with sparse encoding.")
-
             im_pept_act = sparse_encode_divide_and_conquer_with_residual_stats(
                 frame_array, candidate_array
             )  # TODO: not yet hanlding returning residues
-
-            Logger.debug("Start peak selection.")
 
             nonzero_indices = np.nonzero(im_pept_act)
             pept_act_coo["data"] = im_pept_act[nonzero_indices].tolist()  # type: ignore[assignment]
@@ -290,7 +285,6 @@ def process_one_frame_ims(
     **im_peak_selection_kwargs,
 ):
     """Process one frame data with IMS dimension with sparse encoding and peak selection."""
-    Logger.debug("Start data preparation.")
     # prepare data
     frame_data = data[
         {
@@ -298,7 +292,7 @@ def process_one_frame_ims(
             "precursor_indices": [0],
         }
     ]
-    Logger.debug("Finished data indexing, frame data shape: %s", frame_data.shape[0])
+    # Logger.debug("Finished data indexing, frame data shape: %s", frame_data.shape[0])
     peaks_df = pd.DataFrame()
     if writer is None:
         im_pept_act_coo_dict = {
@@ -328,11 +322,11 @@ def process_one_frame_ims(
             (maxquant_result_ref_with_im_index_sortmz["RT_search_left"] <= scan_time)
             & (maxquant_result_ref_with_im_index_sortmz["RT_search_right"] >= scan_time)
         ].copy()
-        Logger.debug(
-            "Finished filtering candidate precursors. Number of candidates by RT in frame %s: %s",
-            ms1_frame_idx,
-            candidate_precursor_by_rt.shape[0],
-        )
+        # Logger.debug(
+        #     "Finished filtering candidate precursors. Number of candidates by RT in frame %s: %s",
+        #     ms1_frame_idx,
+        #     candidate_precursor_by_rt.shape[0],
+        # )
         if candidate_precursor_by_rt.shape[0] > 0:
             candidate_precursor_by_rt = candidate_precursor_by_rt.sort_values(
                 "mz_rank", ascending=True
@@ -355,14 +349,9 @@ def process_one_frame_ims(
                 im_pept_act = None
                 Logger.warning("No sparse matrices return for frame %s", ms1_frame_idx)
             else:
-                Logger.debug(
-                    "Finished preparing sparse matrix. Start optimization with sparse encoding."
-                )
-
                 deconv_results = sparse_encode_divide_and_conquer_with_residual_stats(
                     frame_array, candidate_array, return_act_res=return_res_coo_dict
                 )
-                Logger.debug("Finished sparse encoding.")
                 if return_res_coo_dict:
                     im_pept_act, im_pept_res = deconv_results  # type: ignore[assignment]
                     nonzero_indices_res = np.nonzero(im_pept_res)
@@ -374,7 +363,6 @@ def process_one_frame_ims(
                     im_pept_res_coo_dict["coord_pept_indices"] = all_frame_pept_idx[
                         nonzero_indices_res[1]
                     ].tolist()
-                    Logger.debug("Finished preparing residual COO dict.")
                 else:
                     im_pept_act = deconv_results  # type: ignore[assignment]
                 assert isinstance(im_pept_act, np.ndarray)
@@ -402,7 +390,6 @@ def process_one_frame_ims(
                     im_pept_act_coo_dict["coord_pept_indices"] = all_frame_pept_idx[
                         nonzero_indices[1]
                     ].tolist()
-                    Logger.debug("Finished preparing activation COO dict.")
         else:
             Logger.info("No candidate precursor by RT from frame %s", ms1_frame_idx)
     else:
@@ -436,14 +423,14 @@ def make_coo_from_dict(data_dict, shape: tuple, cutoff: List[int]):
         # n_pept_in_blocks = shape[2] // n_blocks_by_pept
         # cutoff = [(n_pept_in_blocks * (i + 1)) for i in range(n_blocks_by_pept - 1)]
         # cutoff.append(shape[2] + 1)
-        Logger.debug("cutoff list %s", cutoff)
+        # Logger.debug("cutoff list %s", cutoff)
         prev_cutoff = 0
         for cutoff_i in cutoff:
             block_idx = np.where(
                 (prev_cutoff <= np.array(data_dict["coord_pept_indices"]))
                 & (np.array(data_dict["coord_pept_indices"]) < cutoff_i)
             )[0].astype(int)
-            Logger.debug("block index %s", block_idx)
+            # Logger.debug("block index %s", block_idx)
             coo_list.append(
                 sparse.COO(
                     coords=[
@@ -476,7 +463,7 @@ def make_coo_from_dict_no_ims(data_dict, shape: tuple, cutoff: List[int]):
         # n_pept_in_blocks = shape[2] // n_blocks_by_pept
         # cutoff = [(n_pept_in_blocks * (i + 1)) for i in range(n_blocks_by_pept - 1)]
         # cutoff.append(shape[2] + 1)
-        Logger.debug("cutoff list %s", cutoff)
+        # Logger.debug("cutoff list %s", cutoff)
         prev_cutoff = 0
         for cutoff_i in cutoff:
             block_idx = np.where(
@@ -553,7 +540,7 @@ def process_batch_frame(
             "data": [],
         }
     for scan_idx in batch_scan_idx:
-        Logger.debug("Start processing frame index %s", scan_idx)
+        # Logger.debug("Start processing frame index %s", scan_idx)
         if use_ims:
             assert mobility_values is not None
             one_frame_results = process_one_frame_ims(  # type: ignore[assignment]
@@ -744,7 +731,6 @@ def process_batch_frame_save_parquet(
             desc=f"Processing batch starting {batch_scan_idx[0]}",
             total=len(batch_scan_idx),
         ):
-            Logger.debug("Start processing frame index %s", scan_idx)
             if use_ims:
                 assert mobility_values is not None
                 one_frame_results = process_one_frame_ims(  # type: ignore[assignment]
@@ -946,18 +932,18 @@ def _match_merged_candidate_mz_and_frame_mz_by_ppm(
     ) = anchor_bin_hybrid_with_assignments(
         candidate_mz, candidate_abundance, ppm_tol=ppm_tol
     )
-    Logger.debug(
-        "Number of anchors selected: %s from %s", len(anchor_mz), len(candidate_mz)
-    )
+    # Logger.debug(
+    #     "Number of anchors selected: %s from %s", len(anchor_mz), len(candidate_mz)
+    # )
     frame_mz_idx = np.arange(frame_mz.size)
     frame_mask, mapped_frame_mz_idx = match_frame_to_anchors(
         frame_mz, anchor_mz, ppm_tol=ppm_tol
     )
-    Logger.debug(
-        "Number of frame m/z matched to anchors: %s from %s",
-        frame_mask.sum(),
-        len(frame_mz),
-    )
+    # Logger.debug(
+    #     "Number of frame m/z matched to anchors: %s from %s",
+    #     frame_mask.sum(),
+    #     len(frame_mz),
+    # )
 
     return (
         unique_candidate_mz_idx,
@@ -1189,11 +1175,11 @@ def _prepare_sparse_matrices(
     candidate_mz_idx_filtered = candidate_mz_idx[candidate_mask]
     candidate_abundance_filtered = candidate_abundance[candidate_mask]
     candidate_id_idx_filtered = candidate_id_idx[candidate_mask]
-    Logger.debug(
-        "After ppm+binning: %s candidates mz idx kept (out of %s)",
-        len(candidate_mz_idx_filtered),
-        len(candidate_mz),
-    )
+    # Logger.debug(
+    #     "After ppm+binning: %s candidates mz idx kept (out of %s)",
+    #     len(candidate_mz_idx_filtered),
+    #     len(candidate_mz),
+    # )
     candidate_array = np.zeros(
         (all_id.size, uniform_mz_idx.size), dtype=candidate_abundance.dtype
     )

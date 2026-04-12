@@ -1344,6 +1344,7 @@ def plot_frame_act_and_mono_mz(
     ppm_tol=20,
     log_int=False,
     log_act=False,
+    raw_file="",
 ):
     """
     Plot side-by-side heatmaps:
@@ -1389,8 +1390,11 @@ def plot_frame_act_and_mono_mz(
         records.append(df_sub)
 
     result_df = pd.concat(records, ignore_index=True)
-    heat_exp = result_df.pivot(
-        index="center_mz", columns="mobility_values", values="intensity_values"
+    heat_exp = result_df.pivot_table(
+        index="center_mz",
+        columns="mobility_values",
+        values="intensity_values",
+        aggfunc="sum",
     )
     left_title = f"Experimental MonoM/Z (ppm={ppm_tol}) - 1/K0 - Intensity"
     if log_int:
@@ -1405,8 +1409,11 @@ def plot_frame_act_and_mono_mz(
     if log_act:
         act_3d_df["data"] = np.log1p(act_3d_df["data"])
         right_title += " (log-scaled)"
-    heat_act = act_3d_df.pivot(
-        index="coord_pept_indices", columns="coord_im_indices", values="data"
+    heat_act = act_3d_df.pivot_table(
+        index="coord_pept_indices",
+        columns="coord_im_indices",
+        values="data",
+        aggfunc="sum",
     ).fillna(0)
 
     # --- Plot ---
@@ -1422,7 +1429,7 @@ def plot_frame_act_and_mono_mz(
         filtered_precursor,
         heat_exp.index.values,
         "mono_mz",
-        "1/K0",
+        f"{raw_file}_1K0",
     )
     # Right: activation
     plot_heat(
@@ -1432,7 +1439,7 @@ def plot_frame_act_and_mono_mz(
         filtered_precursor,
         heat_act.index.values,
         "mz_rank",
-        "mobility_values_index_center_exp",
+        f"{raw_file}_mobility_values_index_exp",
     )
 
     plt.tight_layout()
