@@ -130,7 +130,7 @@ def opt_scan_by_scan(config_path: str):
                 evidence = fragpipe_psm_parser(evidence)
         if len(cfg.PREPARE_DICT.OK.DIR) > 0:
             evidence = filter_maxquant_by_ok(
-                evidence_100fdr=evidence,
+                evidence_100fdr=evidence,  # type: ignore
                 ok_dir=cfg.PREPARE_DICT.OK.DIR,
                 ok_output_type=cfg.PREPARE_DICT.OK.OUTPUT,
                 rescore_fdr=cfg.PREPARE_DICT.OK.FDR,
@@ -280,7 +280,11 @@ def opt_scan_by_scan(config_path: str):
         for raw_file in raw_file_list
     ]
 
-    with ThreadPoolExecutor(max_workers=min(len(act_dirs), cfg.N_CPU)) as tpe:
+    with ThreadPoolExecutor(
+        max_workers=min(
+            5, min(len(act_dirs), cfg.N_CPU)
+        )  # TODO: dirty fix to avoid OOM
+    ) as tpe:
         futures = {tpe.submit(build_mz_sorted_activation, d): d for d in act_dirs}
         for fut in tpe_as_completed(futures):
             d = futures[fut]
@@ -310,17 +314,22 @@ def opt_scan_by_scan(config_path: str):
     quant_dir = os.path.join(cfg.RESULT_PATH, "quantification")
     os.makedirs(quant_dir, exist_ok=True)
     dfs_to_save = {
-        "matches_target.csv": matches_target,
-        "matches_decoy.csv": matches_decoy,
-        "pp_reference.csv": pp_reference,
-        "pp_match_target.csv": pp_match_target,
-        "pp_match_decoy.csv": pp_match_decoy,
-        "no_quant_log.csv": df_no_quant,
-        "no_match_log.csv": df_no_match,
+        "no_quant_log.parquet": df_no_quant,
+        "no_match_log.parquet": df_no_match,
+        "matches_target.parquet": matches_target,
+        "matches_decoy.parquet": matches_decoy,
+        "pp_reference.parquet": pp_reference,
+        "pp_match_target.parquet": pp_match_target,
+        "pp_match_decoy.parquet": pp_match_decoy,
     }
 
-    for filename, df in dfs_to_save.items():
-        df.to_csv(os.path.join(quant_dir, filename), index=False)
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = [
+            ex.submit(df.to_parquet, os.path.join(quant_dir, fn), index=False)
+            for fn, df in dfs_to_save.items()
+        ]
+        for f in futs:
+            f.result()
 
     logging.info("=================FDR control==================")
     matches_target_normalized, matches_decoy_normalized = normalize_shift_by_runs(
@@ -368,8 +377,8 @@ def opt_scan_by_scan(config_path: str):
         right_on=["mz_rank", "filename", "feature_instance_id"],
         how="inner",
     )
-    pp_match_target_filtered.to_csv(
-        os.path.join(quant_dir, "pp_match_target_filtered.csv"), index=False
+    pp_match_target_filtered.to_parquet(
+        os.path.join(quant_dir, "pp_match_target_filtered.parquet"), index=False
     )
     dfs_to_concat = {
         "MBR": pp_match_target_filtered.drop(columns=["filename"]),
@@ -380,12 +389,22 @@ def opt_scan_by_scan(config_path: str):
     for df_type, df in dfs_to_concat.items():
         df["Match Type"] = df_type
         pp_all = pd.concat([pp_all, df], ignore_index=True)
-    pp_all.to_csv(
-        os.path.join(quant_dir, "pp_reference_quant_only_match_target_filtered.csv"),
-        index=False,
-    )
     pivot = build_pivot(pp_all, dict_ref)
-    pivot.to_csv(os.path.join(quant_dir, "swaps_combined_ions.csv"))
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futs = [
+            ex.submit(
+                pp_all.to_parquet,
+                os.path.join(
+                    quant_dir, "pp_reference_quant_only_match_target_filtered.parquet"
+                ),
+                index=False,
+            ),
+            ex.submit(
+                pivot.to_parquet, os.path.join(quant_dir, "swaps_combined_ions.parquet")
+            ),
+        ]
+        for f in futs:
+            f.result()
 
     logging.info("=================DirectLFQ Analysis==================")
     _ = reformat_swaps_combined_for_directlfq(

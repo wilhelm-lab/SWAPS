@@ -18,7 +18,12 @@ ORGANISM_NAME_MAP = {
 
 
 def reformat_swaps_combined_for_directlfq(
-    combined_ion, dict_ref, output_dir, ion_id_col="mz_rank", protein_id_col="Proteins"
+    combined_ion,
+    dict_ref,
+    output_dir,
+    ion_id_col="mz_rank",
+    protein_id_col="Proteins",
+    output_name="swaps.aq_reformat.tsv",
 ):
     intensity_cols = [col for col in combined_ion.columns if col.endswith("Intensity")]
     reformatted_df = pd.merge(
@@ -34,9 +39,7 @@ def reformat_swaps_combined_for_directlfq(
     reformatted_df = reformatted_df[
         ["protein", "ion"] + list(intensity_cols_rename_map.values())[:-2]
     ]
-    reformatted_df.to_csv(
-        os.path.join(output_dir, "swaps.aq_reformat.tsv"), index=False, sep="\t"
-    )
+    reformatted_df.to_csv(os.path.join(output_dir, output_name), index=False, sep="\t")
     return reformatted_df
 
 
