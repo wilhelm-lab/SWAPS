@@ -17,6 +17,7 @@ def prepare_mokapot_input(
     feature_cols: list,
     scannr_col: Optional[str] = None,
     psmid_col: Optional[str] = None,
+    specid_col: Optional[str] = None,
     normalize_features: bool = True,
     decoy_col: str = "decoy",
     peptide_col: str = "modified_sequence",
@@ -72,8 +73,8 @@ def prepare_mokapot_input(
         df_pin["scannr"] = (
             df_pin["mz_rank"].astype(str) + "_" + df_pin["label"].astype(str)
         )
-    if psmid_col is not None:
-        df_pin["specid"] = df_pin[psmid_col]
+    if specid_col is not None:
+        df_pin["specid"] = df_pin[specid_col]
     else:
         df_pin["specid"] = (
             df_pin["mz_rank"].astype(str) + "_" + df_pin["label"].astype(str)
@@ -229,21 +230,27 @@ def combine_matches_target_decoy(matches_target, matches_decoy, dict_ref):
     tdc_df = pd.concat([matches_target, matches_decoy], ignore_index=True)
     tdc_df = pd.merge(tdc_df, dict_ref[["mz_rank", "Sequence", "Proteins"]])
     tdc_df.loc[~tdc_df["IsTarget"], "Sequence"] = (
-        "DECOY_" + tdc_df.loc[tdc_df["IsTarget"], "Sequence"]
+        "DECOY_" + tdc_df.loc[~tdc_df["IsTarget"], "Sequence"]
     )
     tdc_df.loc[~tdc_df["IsTarget"], "Proteins"] = (
-        "DECOY_" + tdc_df.loc[tdc_df["IsTarget"], "Proteins"]
+        "DECOY_" + tdc_df.loc[~tdc_df["IsTarget"], "Proteins"]
     )
     tdc_df["Decoy"] = ~tdc_df["IsTarget"]
     tdc_df["label"] = tdc_df["IsTarget"]
     if "feature_instance_id" not in tdc_df.columns:
         tdc_df["feature_instance_id"] = tdc_df["mz_rank"].astype(str)
+    tdc_df["feature_instance_id_with_label"] = (
+        tdc_df["feature_instance_id"].astype(str) + "_" + tdc_df["label"].astype(str)
+    )
     tdc_df["Sequence_with_runs"] = (
         tdc_df["Sequence"]
         + "_"
         + tdc_df["matched_run"]
         + "_"
         + tdc_df["feature_instance_id"].astype(str)
+    )
+    tdc_df["feature_run"] = (
+        tdc_df["feature_instance_id"].astype(str) + "_" + tdc_df["matched_run"]
     )
     return tdc_df
 
