@@ -27,7 +27,9 @@ __C.N_CPU = (
 # prepare dictionary
 __C.PREPARE_DICT = ConfigurationNode()
 __C.PREPARE_DICT.SEARCH_ENGINE = "maxquant"  # one of ["maxquant", "fragpipe", "sage"]
-__C.PREPARE_DICT.RT_REF = "pred"  # How to calc ref RT; supported: "pred" (AlphaPeptDeep model)
+__C.PREPARE_DICT.RT_REF = (
+    "pred"  # How to calc ref RT; supported: "pred" (AlphaPeptDeep model)
+)
 __C.PREPARE_DICT.IM_REF = (
     "ref"  # How to calc ref IM; supported: "ref" (from search engine output)
 )
@@ -39,7 +41,9 @@ __C.PREPARE_DICT.PRED.UPDATED_IM_MODEL_PATH = (
     ""  # path to a pre-trained IM model; empty string triggers retraining
 )
 __C.PREPARE_DICT.PRED.TRAIN_FRAC = 0.9
-__C.PREPARE_DICT.PRED.RT_TRAIN_EPOCHS = 15  # For nanoflow higher epochs are needed, e.g. 30
+__C.PREPARE_DICT.PRED.RT_TRAIN_EPOCHS = (
+    15  # For nanoflow higher epochs are needed, e.g. 30
+)
 __C.PREPARE_DICT.PRED.IM_TRAIN_EPOCHS = 8
 
 __C.PREPARE_DICT.REF = ConfigurationNode()
@@ -68,9 +72,7 @@ __C.PREPARE_DICT.PPM_TOL = 20  # ppm tolerance for matching precursors to MS1 pe
 __C.PREPARE_DICT.BIN_WIDTH = 0.01  # m/z bin width
 
 __C.PREPARE_DICT.OK = ConfigurationNode()
-__C.PREPARE_DICT.OK.DIR = (
-    ""  # path to Oktoberfest rescoring output directory; empty string disables rescoring
-)
+__C.PREPARE_DICT.OK.DIR = ""  # path to Oktoberfest rescoring output directory; empty string disables rescoring
 __C.PREPARE_DICT.OK.OUTPUT = "psms"  # one of ["psms", "peptides"]
 __C.PREPARE_DICT.OK.FDR = 0.01  # FDR threshold for Oktoberfest rescoring
 
