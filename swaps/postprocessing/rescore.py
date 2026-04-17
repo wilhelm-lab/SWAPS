@@ -242,12 +242,27 @@ def combine_matches_target_decoy(matches_target, matches_decoy, dict_ref):
     tdc_df["feature_instance_id_with_label"] = (
         tdc_df["feature_instance_id"].astype(str) + "_" + tdc_df["label"].astype(str)
     )
+    if "decoy_strategy" in tdc_df.columns:
+        decoy_rep = (
+            tdc_df["decoy_rep"].fillna(0).astype(int).astype(str)
+            if "decoy_rep" in tdc_df.columns
+            else "0"
+        )
+        tdc_df["sequence_variant"] = np.where(
+            tdc_df["Decoy"],
+            tdc_df["decoy_strategy"].fillna("decoy").astype(str) + "_" + decoy_rep,
+            "target_0",
+        )
+    else:
+        tdc_df["sequence_variant"] = "target_0"
     tdc_df["Sequence_with_runs"] = (
         tdc_df["Sequence"]
         + "_"
         + tdc_df["matched_run"]
         + "_"
         + tdc_df["feature_instance_id"].astype(str)
+        + "_"
+        + tdc_df["sequence_variant"].astype(str)
     )
     tdc_df["feature_run"] = (
         tdc_df["feature_instance_id"].astype(str) + "_" + tdc_df["matched_run"]

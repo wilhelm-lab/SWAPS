@@ -71,6 +71,55 @@ class ReferenceMatchState:
     bbox_offsets: dict[str, int]
 
 
+@dataclass
+class ConsensusAlignmentState:
+    """Aligned image state for consensus generation and consensus decoys."""
+
+    reference_idx: int
+    target_shape: tuple[int, int]
+    anchor_row: int
+    anchor_col: int
+    template_bounds: tuple[int, int, int, int]
+    template: np.ndarray
+    resized_images: list[np.ndarray]
+    aligned_images: list[np.ndarray]
+    matched_boxes: list[tuple[int, int, int, int]]
+    aligned_anchors: list[tuple[float, float] | None]
+    shifts: list[tuple[int, int]]
+    max_scores: list[float]
+    match_score_maps: list[np.ndarray] = field(default_factory=list)
+    match_score_peaks: list[tuple[int, int]] = field(default_factory=list)
+    match_score_label_indices: list[int] = field(default_factory=list)
+
+
+@dataclass
+class ConsensusSegmentationState:
+    """Consensus segmentation, snap decisions, and tracked target labels."""
+
+    consensus: np.ndarray
+    consensus_smoothed: np.ndarray
+    snapped_per_anchor: list[tuple[int, int] | None]
+    watershed_labels: np.ndarray
+    snap_log: dict[str, Any]
+    target_label_ids: list[int]
+    label_to_snap: dict[int, tuple[int, int]]
+    non_none_indices: list[int]
+
+
+@dataclass
+class ConsensusFeatureBundle:
+    """Full consensus state used for scoring targets and generating decoys."""
+
+    alignment: ConsensusAlignmentState
+    segmentation: ConsensusSegmentationState
+    consensus_pp: pd.DataFrame | None
+    individual_pps: list[pd.DataFrame | None]
+    raw_aligned_images: list[np.ndarray] = field(default_factory=list)
+    raw_aligned_smoothed_images: list[np.ndarray] = field(default_factory=list)
+    raw_consensus: np.ndarray | None = None
+    raw_consensus_smoothed: np.ndarray | None = None
+
+
 def match_features_batches_parallel(
     dict_ref,
     raw_file_list,
@@ -78,6 +127,7 @@ def match_features_batches_parallel(
     peptide_indicies: np.ndarray | None = None,
     batch_size_max: int = 1500,
     max_workers: int = 4,
+    generate_consensus: bool = False,
     processing_kwargs: dict | None = None,
 ):
     if peptide_indicies is None:
@@ -121,11 +171,18 @@ def match_features_batches_parallel(
     pp_match_decoy_list = []
     no_quant_log = []
     no_match_log = []
+    snap_log_collection: dict[int, dict] = {}
 
     with ProcessPoolExecutor(
         max_workers=max_workers,
         initializer=_init_match_features_worker,
-        initargs=(dict_ref, raw_file_list, result_dir, processing_kwargs),
+        initargs=(
+            dict_ref,
+            raw_file_list,
+            result_dir,
+            generate_consensus,
+            processing_kwargs,
+        ),
     ) as executor:
         futures = [
             executor.submit(_match_features_batch_worker, batch)
@@ -146,6 +203,7 @@ def match_features_batches_parallel(
                 pp_match_decoy,
                 no_quant,
                 no_match,
+                batch_snap_log,
             ) = future.result()
             results_target.extend(res_target)
             results_decoy.extend(res_decoy)
@@ -154,6 +212,7 @@ def match_features_batches_parallel(
             pp_match_decoy_list.extend(pp_match_decoy)
             no_quant_log.extend(no_quant)
             no_match_log.extend(no_match)
+            snap_log_collection.update(batch_snap_log)
     # Final Data Assembly
     matches_target = pd.DataFrame(results_target)
     matches_decoy = pd.DataFrame(results_decoy)
@@ -188,16 +247,20 @@ def match_features_batches_parallel(
         pp_match_decoy,
         df_no_quant,
         df_no_match,
+        snap_log_collection,
     )
 
 
-def _init_match_features_worker(dict_ref, raw_file_list, result_dir, processing_kwargs):
+def _init_match_features_worker(
+    dict_ref, raw_file_list, result_dir, generate_consensus, processing_kwargs
+):
     """Store immutable batch context once per worker process."""
 
     _WORKER_CONTEXT["dict_ref"] = dict_ref
     _WORKER_CONTEXT["raw_file_list"] = raw_file_list
     _WORKER_CONTEXT["result_dir"] = result_dir
     _WORKER_CONTEXT["processing_kwargs"] = processing_kwargs
+    _WORKER_CONTEXT["generate_consensus"] = generate_consensus
     _WORKER_CONTEXT["dict_ref_by_mz"] = (
         dict_ref.set_index("mz_rank")
         if dict_ref["mz_rank"].is_unique
@@ -211,6 +274,7 @@ def _match_features_batch_worker(batch):
         raw_file_list=_WORKER_CONTEXT["raw_file_list"],
         result_dir=_WORKER_CONTEXT["result_dir"],
         batch=batch,
+        generate_consensus=_WORKER_CONTEXT["generate_consensus"],
         processing_kwargs=_WORKER_CONTEXT["processing_kwargs"],
     )
 
@@ -604,6 +668,7 @@ def match_features_batch(
     processing_kwargs: dict | None = None,
     visualize_dir: str | None = None,
     match_decoy: bool = True,
+    generate_consensus: bool = False,
 ):
     """Process one peptide batch with sequential quant-only bbox expansion.
 
@@ -619,6 +684,7 @@ def match_features_batch(
     results_target, results_decoy = [], []
     pp_reference_list, pp_match_target_list, pp_match_decoy_list = [], [], []
     no_quant_log, no_match_log = [], []
+    snap_log_collection: dict[int, dict] = {}
     batch_np = np.asarray(batch)
 
     _cached = _WORKER_CONTEXT.get("dict_ref_by_mz")
@@ -689,317 +755,700 @@ def match_features_batch(
         feature_instance_id = _feature_instance_id(pept_idx, own_anchor_id)
         match_state: ReferenceMatchState | None = None
 
-        # --- Step 1: Quantify reference run ---
-        reference_result = _quantify_peptide_run(
-            act_df=_select_mz(act_dfs[reference_raw_file], pept_idx),
-            pept_idx=pept_idx,
-            dict_ref=dict_ref,
-            run_name=reference_raw_file,
-            case="Reference",
-            precomputed_pept_act=_get_pept_act_tuple(reference_raw_file),
-            precomputed_smoothed_image=_get_smoothed_pept_act(reference_raw_file),
-            processing_kwargs=processing_kwargs,
-            visualize_dir=visualize_dir,
-        )
-        if reference_result.succeeded:
-            prop_ref = _annotate_peak_properties(
-                reference_result.peak_properties,
-                mz_rank=pept_idx,
-                run_name=reference_raw_file,
-                own_anchor_id=own_anchor_id,
-                assimilated_to_anchor_id=own_anchor_id,
-                feature_instance_id=feature_instance_id,
-                own_feature_instance_id=feature_instance_id,
-                source_run=reference_raw_file,
-                source_type="Reference",
-            )
-            if prop_ref is not None:
-                reference_result.peak_properties = prop_ref
-                pp_reference_list.append(prop_ref)
-                match_state = ReferenceMatchState(
-                    reference_result=reference_result,
-                    match_props=prop_ref.copy(),
-                    bbox_offsets=_bbox_offsets_from_prop(
-                        prop_ref,
-                        reference_result.snapped_anchor,  # type: ignore[arg-type]
-                    ),
+        if generate_consensus:
+            _consensus_raw_files = [reference_raw_file] + match_raw_files
+            _quant_only_set = set(quant_only_raw_files)
+            _consensus_anchors: list[tuple[int, int] | None] = [
+                (
+                    (int(_get_pept_act_tuple(rf)[1]), int(_get_pept_act_tuple(rf)[2]))
+                    if rf in _quant_only_set or rf == reference_raw_file
+                    else None
                 )
-        else:
-            no_quant_log.append(
-                {
-                    "mz_rank": pept_idx,
-                    "run_name": reference_raw_file,
-                    "type": "reference",
-                }
+                for rf in _consensus_raw_files
+            ]
+            _consensus_bundle = build_consensus_feature_bundle(
+                images=[_get_smoothed_pept_act(rf) for rf in _consensus_raw_files],
+                reference_idx=0,
+                template_anchor=_get_pept_act_tuple(reference_raw_file)[1:3],
+                template_frac=0.3,
+                anchors=_consensus_anchors,
+                smooth_kwargs=dict(
+                    (processing_kwargs or {}).get("smooth_consensus_kwargs", {})
+                ),
+                watershed_kwargs=dict(
+                    (processing_kwargs or {}).get("peak_consensus_kwargs", {})
+                ),
+                raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
+                labels=_consensus_raw_files,
             )
-
-        # --- Step 2: Probe quant-only runs and expand bbox ---
-        bbox_version = 0
-        quant_only_probe_records: dict[str, dict[str, Any]] = {}
-
-        for raw_file in quant_only_raw_files:
-            quant_direct = _quantify_peptide_run(
-                act_df=_select_mz(act_dfs[raw_file], pept_idx),
-                pept_idx=pept_idx,
-                dict_ref=dict_ref,
-                run_name=raw_file,
-                case="Reference",
-                precomputed_pept_act=_get_pept_act_tuple(raw_file),
-                precomputed_smoothed_image=_get_smoothed_pept_act(raw_file),
-                processing_kwargs=processing_kwargs,
-                visualize_dir=visualize_dir,
+            if visualize_dir is not None:
+                _visualize_consensus_bundle(
+                    _consensus_bundle.alignment,
+                    _consensus_bundle.segmentation,
+                    fig_dir=visualize_dir,
+                    filename=f"mz{pept_idx}_consensus.png",
+                    labels=_consensus_raw_files,
+                )
+            consensus_pp = _consensus_bundle.consensus_pp
+            individual_pps = _consensus_bundle.individual_pps
+            snap_log_collection[int(pept_idx)] = _consensus_bundle.segmentation.snap_log
+            _consensus_decoy_kwargs = dict(
+                (processing_kwargs or {}).get("consensus_decoy_kwargs", {})
             )
-            record: dict[str, Any] = {
-                "direct": quant_direct,
-                "probe": None,
-                "probe_bbox_version": None,
-                "inside_match_bbox": False,
-                "expanded_match_bbox": False,
-                "bbox_updated_from_original": False,
-                "reference_bbox_before_update": None,
-                "reference_bbox_after_update": None,
-                "aligned_bbox_before_update": None,
-                "aligned_bbox_after_update": None,
+            _consensus_decoy_strategies = {
+                str(s)
+                for s in _consensus_decoy_kwargs.get(
+                    "strategies", ["peptide_swap", "off_target_shift"]
+                )
             }
-            quant_only_probe_records[raw_file] = record
+            _n_peptide_swap_decoys = max(
+                int(_consensus_decoy_kwargs.get("n_peptide_swap_decoys", 1)), 0
+            )
+            _n_off_target_decoys = max(
+                int(_consensus_decoy_kwargs.get("n_off_target_shift_decoys", 1)), 0
+            )
+            _off_target_min_offset_frac = float(
+                _consensus_decoy_kwargs.get("off_target_min_offset_frac", 0.35)
+            )
+            _off_target_max_overlap_fraction = float(
+                _consensus_decoy_kwargs.get("off_target_max_overlap_fraction", 0.05)
+            )
+            _batch_exclude = (
+                batch_np[batch_np != pept_idx]
+                if match_decoy and batch_np.size > 1
+                else np.array([], dtype=batch_np.dtype)
+            )
+            _peptide_swap_decoys_by_rep: list[dict[str, dict[str, Any]]] = []
+            if (
+                match_decoy
+                and "peptide_swap" in _consensus_decoy_strategies
+                and _n_peptide_swap_decoys > 0
+                and _batch_exclude.size > 0
+            ):
+                for _rep in range(_n_peptide_swap_decoys):
+                    _rep_specs: dict[str, dict[str, Any]] = {}
+                    _plot_raw_images: list[np.ndarray] = []
+                    _plot_smoothed_images: list[np.ndarray] = []
+                    _plot_labels: list[str] = []
+                    for _plot_i, _plot_rf in enumerate(_consensus_raw_files):
+                        if _plot_rf == reference_raw_file:
+                            _ref_raw = _get_pept_act_tuple(_plot_rf)[0]
+                            _plot_raw_images.append(_ref_raw)
+                            _plot_smoothed_images.append(_get_smoothed_pept_act(_plot_rf))
+                            _plot_labels.append(_plot_rf)
+                            continue
+                        _decoy_mz = int(np.random.choice(_batch_exclude))
+                        _decoy_act_df = _select_mz(act_dfs[_plot_rf], _decoy_mz)
+                        _decoy_raw, _, _ = get_pept_act_from_parquet(
+                            _decoy_act_df,
+                            _decoy_mz,
+                            dict_ref_by_mz,
+                            _plot_rf,
+                            shape=_get_pept_act_tuple(_plot_rf)[0].shape,
+                        )
+                        _decoy_smoothed = smooth_and_denoise_image(
+                            _decoy_raw, **smooth_kwargs
+                        )
+                        _rep_specs[_plot_rf] = {
+                            "decoy_mz_rank": _decoy_mz,
+                            "decoy_raw_image": _decoy_raw,
+                            "decoy_smoothed_image": _decoy_smoothed,
+                        }
+                        _plot_raw_images.append(_decoy_raw)
+                        _plot_smoothed_images.append(_decoy_smoothed)
+                        _plot_labels.append(f"{_plot_rf}\n(decoy mz{_decoy_mz})")
+                    _peptide_swap_decoys_by_rep.append(_rep_specs)
+                    if visualize_dir is not None:
+                        _plot_anchors = [
+                            _consensus_anchors[0]
+                        ] + [None] * (len(_consensus_raw_files) - 1)
+                        _decoy_bundle = build_consensus_feature_bundle(
+                            images=_plot_smoothed_images,
+                            reference_idx=0,
+                            template_anchor=_get_pept_act_tuple(reference_raw_file)[1:3],
+                            template_frac=0.3,
+                            anchors=_plot_anchors,
+                            smooth_kwargs=dict(
+                                (processing_kwargs or {}).get(
+                                    "smooth_consensus_kwargs", {}
+                                )
+                            ),
+                            watershed_kwargs=dict(
+                                (processing_kwargs or {}).get(
+                                    "peak_consensus_kwargs", {}
+                                )
+                            ),
+                            raw_images=_plot_raw_images,
+                            labels=_plot_labels,
+                        )
+                        _visualize_consensus_bundle(
+                            _decoy_bundle.alignment,
+                            _decoy_bundle.segmentation,
+                            fig_dir=visualize_dir,
+                            filename=(
+                                f"mz{pept_idx}_consensus_decoy_peptide_swap_rep{_rep}.png"
+                            ),
+                            labels=_plot_labels,
+                        )
 
-            if match_state is None:
-                if quant_direct.succeeded:
-                    # Reference run failed — promote this quant-only run as the reference
-                    prop_promoted = _annotate_peak_properties(
-                        quant_direct.peak_properties,
+            _off_target_label_shifts: list[tuple[int, int] | None] = []
+            if (
+                match_decoy
+                and "off_target_shift" in _consensus_decoy_strategies
+                and _n_off_target_decoys > 0
+            ):
+                for _rep in range(_n_off_target_decoys):
+                    _shift = _choose_off_target_shift(
+                        _consensus_bundle.segmentation.watershed_labels,
+                        _consensus_bundle.segmentation.target_label_ids,
+                        rep=_rep,
+                        min_offset_frac=_off_target_min_offset_frac,
+                        max_overlap_fraction=_off_target_max_overlap_fraction,
+                    )
+                    _off_target_label_shifts.append(_shift)
+                    if visualize_dir is not None and _shift is not None:
+                        _shifted_seg = _make_shifted_consensus_segmentation_state(
+                            _consensus_bundle.segmentation,
+                            _shift,
+                        )
+                        _visualize_consensus_bundle(
+                            _consensus_bundle.alignment,
+                            _shifted_seg,
+                            fig_dir=visualize_dir,
+                            filename=(
+                                f"mz{pept_idx}_consensus_decoy_off_target_shift_rep{_rep}.png"
+                            ),
+                            labels=_consensus_raw_files,
+                        )
+            if consensus_pp is not None:
+                for _ci, (_rf, _ind_pp) in enumerate(
+                    zip(_consensus_raw_files, individual_pps)
+                ):
+                    _run_type = (
+                        "reference"
+                        if _rf == reference_raw_file
+                        else ("quant_only" if _rf in _quant_only_set else "match_target")
+                    )
+                    if _ind_pp is None:
+                        no_quant_log.append(
+                            {
+                                "mz_rank": pept_idx,
+                                "run_name": _rf,
+                                "type": _run_type,
+                                "feature_instance_id": feature_instance_id,
+                            }
+                        )
+                        if _rf != reference_raw_file:
+                            no_match_log.append(
+                                {
+                                    "mz_rank": pept_idx,
+                                    "run_name": _rf,
+                                    "type": _run_type,
+                                    "feature_instance_id": feature_instance_id,
+                                }
+                            )
+                        continue
+                    _annotated_pp = _annotate_peak_properties(
+                        _ind_pp,
                         mz_rank=pept_idx,
-                        run_name=raw_file,
+                        run_name=_rf,
                         own_anchor_id=own_anchor_id,
                         assimilated_to_anchor_id=own_anchor_id,
                         feature_instance_id=feature_instance_id,
                         own_feature_instance_id=feature_instance_id,
-                        source_run=raw_file,
-                        source_type="Reference",
+                        source_run="consensus",
+                        source_type="Consensus",
                     )
-                    if prop_promoted is not None:
-                        quant_direct.peak_properties = prop_promoted
-                        pp_reference_list.append(prop_promoted)
-                        match_state = ReferenceMatchState(
-                            reference_result=quant_direct,
-                            match_props=prop_promoted.copy(),
-                            bbox_offsets=_bbox_offsets_from_prop(
-                                prop_promoted,
-                                quant_direct.snapped_anchor,  # type: ignore[arg-type]
-                            ),
-                        )
-                        match_raw_files = [
-                            f for f in match_raw_files if f != raw_file
-                        ] + [reference_raw_file]
-                        reference_raw_file = raw_file
-                        Logger.info(
-                            f"mz{pept_idx}: Promoted quant-only run as reference: {raw_file}"
-                        )
-                else:
+                    if _annotated_pp is None:
+                        continue
+                    if _rf == reference_raw_file:
+                        pp_reference_list.append(_annotated_pp)
+                        continue
+                    _match_t = compare_peak_properties(consensus_pp, _annotated_pp)
+                    _match_t["mz_rank"] = pept_idx
+                    _match_t["feature_instance_id"] = feature_instance_id
+                    _match_t["own_anchor_id"] = own_anchor_id
+                    _match_t["assimilated_to_anchor_id"] = own_anchor_id
+                    _match_t["source_run"] = "consensus"
+                    _match_t["source_type"] = "Consensus"
+                    results_target.append(_match_t)
+                    pp_match_target_list.append(_annotated_pp)
+
+                    if not match_decoy:
+                        continue
+
+                    if (
+                        "peptide_swap" in _consensus_decoy_strategies
+                        and _n_peptide_swap_decoys > 0
+                        and _peptide_swap_decoys_by_rep
+                    ):
+                        for _rep in range(_n_peptide_swap_decoys):
+                            _rep_spec = _peptide_swap_decoys_by_rep[_rep].get(_rf)
+                            if _rep_spec is None:
+                                continue
+                            decoy_pept_idx = int(_rep_spec["decoy_mz_rank"])
+                            decoy_act = _rep_spec["decoy_raw_image"]
+                            decoy_pp_raw, _, _ = _build_consensus_peptide_swap_decoy(
+                                _consensus_bundle,
+                                decoy_act,
+                                _rf,
+                                smooth_kwargs=smooth_kwargs,
+                            )
+                            if decoy_pp_raw is None:
+                                no_quant_log.append(
+                                    {
+                                        "mz_rank": pept_idx,
+                                        "run_name": _rf,
+                                        "type": "match_decoy",
+                                        "feature_instance_id": feature_instance_id,
+                                        "decoy_strategy": "peptide_swap_consensus",
+                                        "decoy_rep": _rep,
+                                        "decoy_mz_rank": decoy_pept_idx,
+                                    }
+                                )
+                                no_match_log.append(
+                                    {
+                                        "mz_rank": pept_idx,
+                                        "run_name": _rf,
+                                        "type": "match_decoy",
+                                        "feature_instance_id": feature_instance_id,
+                                        "decoy_strategy": "peptide_swap_consensus",
+                                        "decoy_rep": _rep,
+                                        "decoy_mz_rank": decoy_pept_idx,
+                                    }
+                                )
+                                continue
+                            _prop_d = _annotate_peak_properties(
+                                decoy_pp_raw,
+                                mz_rank=pept_idx,
+                                run_name=_rf,
+                                own_anchor_id=own_anchor_id,
+                                assimilated_to_anchor_id=own_anchor_id,
+                                feature_instance_id=feature_instance_id,
+                                own_feature_instance_id=feature_instance_id,
+                                source_run="consensus",
+                                source_type="Consensus",
+                                decoy_mz_rank=decoy_pept_idx,
+                            )
+                            if _prop_d is None:
+                                continue
+                            _prop_d["decoy_strategy"] = "peptide_swap_consensus"
+                            _prop_d["decoy_rep"] = _rep
+                            pp_match_decoy_list.append(_prop_d)
+                            _match_d = compare_peak_properties(consensus_pp, _prop_d)
+                            _match_d["mz_rank"] = pept_idx
+                            _match_d["decoy_mz_rank"] = decoy_pept_idx
+                            _match_d["feature_instance_id"] = feature_instance_id
+                            _match_d["own_anchor_id"] = own_anchor_id
+                            _match_d["assimilated_to_anchor_id"] = own_anchor_id
+                            _match_d["source_run"] = "consensus"
+                            _match_d["source_type"] = "Consensus"
+                            _match_d["decoy_strategy"] = "peptide_swap_consensus"
+                            _match_d["decoy_rep"] = _rep
+                            results_decoy.append(_match_d)
+
+                    if (
+                        "off_target_shift" in _consensus_decoy_strategies
+                        and _n_off_target_decoys > 0
+                    ):
+                        for _rep in range(_n_off_target_decoys):
+                            _precomputed_shift = (
+                                _off_target_label_shifts[_rep]
+                                if _rep < len(_off_target_label_shifts)
+                                else None
+                            )
+                            decoy_pp_raw, label_shift = _build_consensus_off_target_decoy(
+                                _consensus_bundle,
+                                run_index=_ci,
+                                run_name=_rf,
+                                rep=_rep,
+                                min_offset_frac=_off_target_min_offset_frac,
+                                max_overlap_fraction=_off_target_max_overlap_fraction,
+                                label_shift=_precomputed_shift,
+                            )
+                            if decoy_pp_raw is None or label_shift is None:
+                                no_quant_log.append(
+                                    {
+                                        "mz_rank": pept_idx,
+                                        "run_name": _rf,
+                                        "type": "match_decoy",
+                                        "feature_instance_id": feature_instance_id,
+                                        "decoy_strategy": "off_target_shift_consensus",
+                                        "decoy_rep": _rep,
+                                    }
+                                )
+                                no_match_log.append(
+                                    {
+                                        "mz_rank": pept_idx,
+                                        "run_name": _rf,
+                                        "type": "match_decoy",
+                                        "feature_instance_id": feature_instance_id,
+                                        "decoy_strategy": "off_target_shift_consensus",
+                                        "decoy_rep": _rep,
+                                    }
+                                )
+                                continue
+                            _prop_d = _annotate_peak_properties(
+                                decoy_pp_raw,
+                                mz_rank=pept_idx,
+                                run_name=_rf,
+                                own_anchor_id=own_anchor_id,
+                                assimilated_to_anchor_id=own_anchor_id,
+                                feature_instance_id=feature_instance_id,
+                                own_feature_instance_id=feature_instance_id,
+                                source_run="consensus",
+                                source_type="Consensus",
+                                decoy_mz_rank=-1,
+                            )
+                            if _prop_d is None:
+                                continue
+                            _prop_d["decoy_strategy"] = "off_target_shift_consensus"
+                            _prop_d["decoy_rep"] = _rep
+                            _prop_d["label_shift_rt"] = int(label_shift[0])
+                            _prop_d["label_shift_im"] = int(label_shift[1])
+                            pp_match_decoy_list.append(_prop_d)
+                            _match_d = compare_peak_properties(consensus_pp, _prop_d)
+                            _match_d["mz_rank"] = pept_idx
+                            _match_d["decoy_mz_rank"] = -1
+                            _match_d["feature_instance_id"] = feature_instance_id
+                            _match_d["own_anchor_id"] = own_anchor_id
+                            _match_d["assimilated_to_anchor_id"] = own_anchor_id
+                            _match_d["source_run"] = "consensus"
+                            _match_d["source_type"] = "Consensus"
+                            _match_d["decoy_strategy"] = "off_target_shift_consensus"
+                            _match_d["decoy_rep"] = _rep
+                            _match_d["label_shift_rt"] = int(label_shift[0])
+                            _match_d["label_shift_im"] = int(label_shift[1])
+                            results_decoy.append(_match_d)
+            else:
+                # consensus_pp is None: consensus generation failed — log all runs
+                for _rf in _consensus_raw_files:
                     no_quant_log.append(
                         {
                             "mz_rank": pept_idx,
-                            "run_name": raw_file,
-                            "type": "reference_promoted",
+                            "run_name": _rf,
+                            "type": (
+                                "reference"
+                                if _rf == reference_raw_file
+                                else (
+                                    "quant_only"
+                                    if _rf in _quant_only_set
+                                    else "match_target"
+                                )
+                            ),
+                            "feature_instance_id": feature_instance_id,
                         }
                     )
-                continue  # promoted run skips probe; failed promotion also skips
 
-            if not quant_direct.succeeded:
-                continue  # cannot probe without a valid reference
-
-            quant_probe = _quantify_peptide_run(  # match quant_only to reference, this one is on reference space
+        elif not generate_consensus:
+            # --- Step 1: Quantify reference run ---
+            reference_result = _quantify_peptide_run(
                 act_df=_select_mz(act_dfs[reference_raw_file], pept_idx),
                 pept_idx=pept_idx,
                 dict_ref=dict_ref,
                 run_name=reference_raw_file,
-                case="Match",
-                template_anchor_override=quant_direct.snapped_anchor,
-                # anchor_override=quant_direct.snapped_anchor,
-                reference_image=quant_direct.smoothed_image,
-                reference_props=quant_direct.peak_properties,
+                case="Reference",
                 precomputed_pept_act=_get_pept_act_tuple(reference_raw_file),
                 precomputed_smoothed_image=_get_smoothed_pept_act(reference_raw_file),
                 processing_kwargs=processing_kwargs,
                 visualize_dir=visualize_dir,
-                visualize_name=f"mz{pept_idx}_{raw_file}_quant_only_probe.png",
             )
-            record["probe"] = quant_probe
-            record["probe_bbox_version"] = bbox_version
-            if not quant_probe.succeeded:
-                continue  # probe failed, cannot use for bbox expansion or future matching
-
-            inside_match_bbox = _anchor_inside_bbox(
-                quant_probe.snapped_anchor, match_state.reference_result.peak_properties
-            )
-            record["inside_match_bbox"] = bool(inside_match_bbox)
-
-            if not inside_match_bbox:
-                ref_probe_new_bbox = _bbox_tuple_from_prop(quant_probe.peak_properties)
-                ref_bbox = _bbox_tuple_from_prop(
-                    match_state.reference_result.peak_properties
+            if reference_result.succeeded:
+                prop_ref = _annotate_peak_properties(
+                    reference_result.peak_properties,
+                    mz_rank=pept_idx,
+                    run_name=reference_raw_file,
+                    own_anchor_id=own_anchor_id,
+                    assimilated_to_anchor_id=own_anchor_id,
+                    feature_instance_id=feature_instance_id,
+                    own_feature_instance_id=feature_instance_id,
+                    source_run=reference_raw_file,
+                    source_type="Reference",
                 )
-                record["reference_bbox_before_update"] = _bbox_tuple_from_prop(
-                    match_state.match_props
-                )
-                # record["aligned_bbox_before_update"] = ref_probe_new_bbox
-                expansion_deltas = _expansion_deltas_from_aligned_and_quant_bbox(
-                    ref_probe_new_bbox, ref_bbox
-                )
-                expanded_offsets = _add_offset_deltas(
-                    match_state.bbox_offsets, expansion_deltas
-                )
-                bbox_changed = expanded_offsets != match_state.bbox_offsets
-                match_state.bbox_offsets = expanded_offsets
-                match_state.match_props = _clone_props_with_offsets(
-                    match_state.match_props,
-                    match_state.reference_result.snapped_anchor,  # type: ignore[arg-type]
-                    match_state.bbox_offsets,
-                    match_state.reference_result.image.shape,  # type: ignore[arg-type]
-                )
-                record["expanded_match_bbox"] = True
-                record["bbox_updated_from_original"] = bool(bbox_changed)
-                record["reference_bbox_after_update"] = _bbox_tuple_from_prop(
-                    match_state.match_props
-                )
-                if (
-                    visualize_dir is not None
-                    and quant_direct.peak_properties is not None
-                ):
-                    _visualize_probe_expansion(
-                        smoothed_image_raw_file=_get_smoothed_pept_act(raw_file),
-                        smoothed_image_ref_file=_get_smoothed_pept_act(
-                            reference_raw_file
+                if prop_ref is not None:
+                    reference_result.peak_properties = prop_ref
+                    pp_reference_list.append(prop_ref)
+                    match_state = ReferenceMatchState(
+                        reference_result=reference_result,
+                        match_props=prop_ref.copy(),
+                        bbox_offsets=_bbox_offsets_from_prop(
+                            prop_ref,
+                            reference_result.snapped_anchor,  # type: ignore[arg-type]
                         ),
-                        quant_direct_snapped_anchor=quant_direct.snapped_anchor,  # type: ignore[arg-type]
-                        quant_direct_bbox=_bbox_tuple_from_prop(
-                            quant_direct.peak_properties
-                        ),
-                        ref_snapped_anchor=match_state.reference_result.snapped_anchor,  # type: ignore[arg-type]
-                        ref_bbox=ref_bbox,
-                        ref_probe_new_bbox=ref_probe_new_bbox,
-                        match_props_bbox_before=record["reference_bbox_before_update"],
-                        match_props_bbox_after=record["reference_bbox_after_update"],
-                        mz_rank=pept_idx,
-                        raw_file=raw_file,
-                        bbox_version=bbox_version,
-                        visualization_dir=visualize_dir,
                     )
-                if bbox_changed:
-                    bbox_version += 1
-
-        # --- Step 3: Match all non-reference runs ---
-        if not match_raw_files:
-            continue
-
-        if match_state is None:
-            Logger.info(
-                f"mz{pept_idx}: No valid reference for matching; {len(quant_only_raw_files)} quant-only runs;"
-                f"logging all {len(match_raw_files)} non-reference runs as no-quant."
-            )
-            # Reference failed: log all non-reference runs as failures and move on
-            for raw_file in match_raw_files:
-                is_quant_only = raw_file in quant_only_probe_records
+            else:
                 no_quant_log.append(
                     {
                         "mz_rank": pept_idx,
-                        "run_name": raw_file,
-                        "type": "quant_only" if is_quant_only else "match_target",
+                        "run_name": reference_raw_file,
+                        "type": "reference",
                     }
                 )
-                if not is_quant_only:
-                    if match_decoy:
+
+            # --- Step 2: Probe quant-only runs and expand bbox ---
+            bbox_version = 0
+            quant_only_probe_records: dict[str, dict[str, Any]] = {}
+
+            for raw_file in quant_only_raw_files:
+                quant_direct = _quantify_peptide_run(
+                    act_df=_select_mz(act_dfs[raw_file], pept_idx),
+                    pept_idx=pept_idx,
+                    dict_ref=dict_ref,
+                    run_name=raw_file,
+                    case="Reference",
+                    precomputed_pept_act=_get_pept_act_tuple(raw_file),
+                    precomputed_smoothed_image=_get_smoothed_pept_act(raw_file),
+                    processing_kwargs=processing_kwargs,
+                    visualize_dir=visualize_dir,
+                )
+                record: dict[str, Any] = {
+                    "direct": quant_direct,
+                    "probe": None,
+                    "probe_bbox_version": None,
+                    "inside_match_bbox": False,
+                    "expanded_match_bbox": False,
+                    "bbox_updated_from_original": False,
+                    "reference_bbox_before_update": None,
+                    "reference_bbox_after_update": None,
+                    "aligned_bbox_before_update": None,
+                    "aligned_bbox_after_update": None,
+                }
+                quant_only_probe_records[raw_file] = record
+
+                if match_state is None:
+                    if quant_direct.succeeded:
+                        # Reference run failed — promote this quant-only run as the reference
+                        prop_promoted = _annotate_peak_properties(
+                            quant_direct.peak_properties,
+                            mz_rank=pept_idx,
+                            run_name=raw_file,
+                            own_anchor_id=own_anchor_id,
+                            assimilated_to_anchor_id=own_anchor_id,
+                            feature_instance_id=feature_instance_id,
+                            own_feature_instance_id=feature_instance_id,
+                            source_run=raw_file,
+                            source_type="Reference",
+                        )
+                        if prop_promoted is not None:
+                            quant_direct.peak_properties = prop_promoted
+                            pp_reference_list.append(prop_promoted)
+                            match_state = ReferenceMatchState(
+                                reference_result=quant_direct,
+                                match_props=prop_promoted.copy(),
+                                bbox_offsets=_bbox_offsets_from_prop(
+                                    prop_promoted,
+                                    quant_direct.snapped_anchor,  # type: ignore[arg-type]
+                                ),
+                            )
+                            match_raw_files = [
+                                f for f in match_raw_files if f != raw_file
+                            ] + [reference_raw_file]
+                            reference_raw_file = raw_file
+                            Logger.info(
+                                f"mz{pept_idx}: Promoted quant-only run as reference: {raw_file}"
+                            )
+                    else:
                         no_quant_log.append(
                             {
                                 "mz_rank": pept_idx,
                                 "run_name": raw_file,
-                                "type": "match_decoy",
+                                "type": "reference_promoted",
                             }
                         )
-                    no_match_log.append(
+                    continue  # promoted run skips probe; failed promotion also skips
+
+                if not quant_direct.succeeded:
+                    continue  # cannot probe without a valid reference
+
+                quant_probe = _quantify_peptide_run(  # match quant_only to reference, this one is on reference space
+                    act_df=_select_mz(act_dfs[reference_raw_file], pept_idx),
+                    pept_idx=pept_idx,
+                    dict_ref=dict_ref,
+                    run_name=reference_raw_file,
+                    case="Match",
+                    template_anchor_override=quant_direct.snapped_anchor,
+                    # anchor_override=quant_direct.snapped_anchor,
+                    reference_image=quant_direct.smoothed_image,
+                    reference_props=quant_direct.peak_properties,
+                    precomputed_pept_act=_get_pept_act_tuple(reference_raw_file),
+                    precomputed_smoothed_image=_get_smoothed_pept_act(
+                        reference_raw_file
+                    ),
+                    processing_kwargs=processing_kwargs,
+                    visualize_dir=visualize_dir,
+                    visualize_name=f"mz{pept_idx}_{raw_file}_quant_only_probe.png",
+                )
+                record["probe"] = quant_probe
+                record["probe_bbox_version"] = bbox_version
+                if not quant_probe.succeeded:
+                    continue  # probe failed, cannot use for bbox expansion or future matching
+
+                inside_match_bbox = _anchor_inside_bbox(
+                    quant_probe.snapped_anchor,
+                    match_state.reference_result.peak_properties,
+                )
+                record["inside_match_bbox"] = bool(inside_match_bbox)
+
+                if not inside_match_bbox:
+                    ref_probe_new_bbox = _bbox_tuple_from_prop(
+                        quant_probe.peak_properties
+                    )
+                    ref_bbox = _bbox_tuple_from_prop(
+                        match_state.reference_result.peak_properties
+                    )
+                    record["reference_bbox_before_update"] = _bbox_tuple_from_prop(
+                        match_state.match_props
+                    )
+                    # record["aligned_bbox_before_update"] = ref_probe_new_bbox
+                    expansion_deltas = _expansion_deltas_from_aligned_and_quant_bbox(
+                        ref_probe_new_bbox, ref_bbox
+                    )
+                    expanded_offsets = _add_offset_deltas(
+                        match_state.bbox_offsets, expansion_deltas
+                    )
+                    bbox_changed = expanded_offsets != match_state.bbox_offsets
+                    match_state.bbox_offsets = expanded_offsets
+                    match_state.match_props = _clone_props_with_offsets(
+                        match_state.match_props,
+                        match_state.reference_result.snapped_anchor,  # type: ignore[arg-type]
+                        match_state.bbox_offsets,
+                        match_state.reference_result.image.shape,  # type: ignore[arg-type]
+                    )
+                    record["expanded_match_bbox"] = True
+                    record["bbox_updated_from_original"] = bool(bbox_changed)
+                    record["reference_bbox_after_update"] = _bbox_tuple_from_prop(
+                        match_state.match_props
+                    )
+                    if (
+                        visualize_dir is not None
+                        and quant_direct.peak_properties is not None
+                    ):
+                        _visualize_probe_expansion(
+                            smoothed_image_raw_file=_get_smoothed_pept_act(raw_file),
+                            smoothed_image_ref_file=_get_smoothed_pept_act(
+                                reference_raw_file
+                            ),
+                            quant_direct_snapped_anchor=quant_direct.snapped_anchor,  # type: ignore[arg-type]
+                            quant_direct_bbox=_bbox_tuple_from_prop(
+                                quant_direct.peak_properties
+                            ),
+                            ref_snapped_anchor=match_state.reference_result.snapped_anchor,  # type: ignore[arg-type]
+                            ref_bbox=ref_bbox,
+                            ref_probe_new_bbox=ref_probe_new_bbox,
+                            match_props_bbox_before=record[
+                                "reference_bbox_before_update"
+                            ],
+                            match_props_bbox_after=record[
+                                "reference_bbox_after_update"
+                            ],
+                            mz_rank=pept_idx,
+                            raw_file=raw_file,
+                            bbox_version=bbox_version,
+                            visualization_dir=visualize_dir,
+                        )
+                    if bbox_changed:
+                        bbox_version += 1
+
+            # --- Step 3: Match all non-reference runs ---
+            if not match_raw_files:
+                continue
+
+            if match_state is None:
+                Logger.info(
+                    f"mz{pept_idx}: No valid reference for matching; {len(quant_only_raw_files)} quant-only runs;"
+                    f"logging all {len(match_raw_files)} non-reference runs as no-quant."
+                )
+                # Reference failed: log all non-reference runs as failures and move on
+                for raw_file in match_raw_files:
+                    is_quant_only = raw_file in quant_only_probe_records
+                    no_quant_log.append(
                         {
                             "mz_rank": pept_idx,
                             "run_name": raw_file,
-                            "type": "match_target",
+                            "type": "quant_only" if is_quant_only else "match_target",
                         }
                     )
-                    if match_decoy:
+                    if not is_quant_only:
+                        if match_decoy:
+                            no_quant_log.append(
+                                {
+                                    "mz_rank": pept_idx,
+                                    "run_name": raw_file,
+                                    "type": "match_decoy",
+                                }
+                            )
                         no_match_log.append(
                             {
                                 "mz_rank": pept_idx,
                                 "run_name": raw_file,
-                                "type": "match_decoy",
+                                "type": "match_target",
                             }
                         )
-            continue
-
-        if match_decoy:
-            batch_exclude = batch_np[batch_np != pept_idx]
-
-        for raw_file in match_raw_files:
-            target_act_df = _select_mz(act_dfs[raw_file], pept_idx)
-            is_quant_only_run = raw_file in quant_only_probe_records
-
-            target_result = _quantify_peptide_run(
-                act_df=target_act_df,
-                pept_idx=pept_idx,
-                dict_ref=dict_ref,
-                run_name=raw_file,
-                case="Match",
-                template_anchor_override=match_state.reference_result.snapped_anchor,
-                # anchor_override=match_state.reference_result.snapped_anchor,
-                reference_image=match_state.reference_result.smoothed_image,
-                reference_props=match_state.match_props,
-                precomputed_pept_act=_get_pept_act_tuple(raw_file),
-                precomputed_smoothed_image=_get_smoothed_pept_act(raw_file),
-                processing_kwargs=processing_kwargs,
-                visualize_dir=visualize_dir,
-            )
+                        if match_decoy:
+                            no_match_log.append(
+                                {
+                                    "mz_rank": pept_idx,
+                                    "run_name": raw_file,
+                                    "type": "match_decoy",
+                                }
+                            )
+                continue
 
             if match_decoy:
-                decoy_pept_idx = np.random.choice(batch_exclude)
-                decoy_act_df = _select_mz(act_dfs[raw_file], int(decoy_pept_idx))
-                decoy_act, _, _ = get_pept_act_from_parquet(
-                    decoy_act_df,
-                    decoy_pept_idx,
-                    dict_ref,
-                    raw_file,
-                    shape=target_result.image.shape,  # here enforce the shape of target image
-                )
-                decoy_result = _quantify_peptide_run(
-                    act_df=decoy_act_df,
-                    pept_idx=decoy_pept_idx,
+                batch_exclude = batch_np[batch_np != pept_idx]
+
+            for raw_file in match_raw_files:
+                target_act_df = _select_mz(act_dfs[raw_file], pept_idx)
+                is_quant_only_run = raw_file in quant_only_probe_records
+
+                target_result = _quantify_peptide_run(
+                    act_df=target_act_df,
+                    pept_idx=pept_idx,
                     dict_ref=dict_ref,
                     run_name=raw_file,
                     case="Match",
                     template_anchor_override=match_state.reference_result.snapped_anchor,
-                    # anchor_override=decoy_anchor,
+                    # anchor_override=match_state.reference_result.snapped_anchor,
                     reference_image=match_state.reference_result.smoothed_image,
                     reference_props=match_state.match_props,
-                    precomputed_pept_act=(
-                        decoy_act,
-                        int(match_state.reference_result.snapped_anchor[0]),
-                        int(match_state.reference_result.snapped_anchor[1]),
-                    ),
+                    precomputed_pept_act=_get_pept_act_tuple(raw_file),
+                    precomputed_smoothed_image=_get_smoothed_pept_act(raw_file),
                     processing_kwargs=processing_kwargs,
                     visualize_dir=visualize_dir,
-                    visualize_name=f"mz{pept_idx}_{raw_file}_match_decoy{decoy_pept_idx}.png",
                 )
 
-            prop_t = _annotate_peak_properties(
-                target_result.peak_properties,
-                mz_rank=pept_idx,
-                run_name=raw_file,
-                own_anchor_id=own_anchor_id,
-                assimilated_to_anchor_id=own_anchor_id,
-                feature_instance_id=feature_instance_id,
-                own_feature_instance_id=feature_instance_id,
-                source_run=reference_raw_file,
-                source_type="Quant_Only" if is_quant_only_run else "Reference",
-            )
-            prop_d = (
-                _annotate_peak_properties(
-                    decoy_result.peak_properties,
+                if match_decoy:
+                    decoy_pept_idx = np.random.choice(batch_exclude)
+                    decoy_act_df = _select_mz(act_dfs[raw_file], int(decoy_pept_idx))
+                    decoy_act, _, _ = get_pept_act_from_parquet(
+                        decoy_act_df,
+                        decoy_pept_idx,
+                        dict_ref,
+                        raw_file,
+                        shape=target_result.image.shape,  # here enforce the shape of target image
+                    )
+                    decoy_result = _quantify_peptide_run(
+                        act_df=decoy_act_df,
+                        pept_idx=decoy_pept_idx,
+                        dict_ref=dict_ref,
+                        run_name=raw_file,
+                        case="Match",
+                        template_anchor_override=match_state.reference_result.snapped_anchor,
+                        # anchor_override=decoy_anchor,
+                        reference_image=match_state.reference_result.smoothed_image,
+                        reference_props=match_state.match_props,
+                        precomputed_pept_act=(
+                            decoy_act,
+                            int(match_state.reference_result.snapped_anchor[0]),
+                            int(match_state.reference_result.snapped_anchor[1]),
+                        ),
+                        processing_kwargs=processing_kwargs,
+                        visualize_dir=visualize_dir,
+                        visualize_name=f"mz{pept_idx}_{raw_file}_match_decoy{decoy_pept_idx}.png",
+                    )
+
+                prop_t = _annotate_peak_properties(
+                    target_result.peak_properties,
                     mz_rank=pept_idx,
                     run_name=raw_file,
                     own_anchor_id=own_anchor_id,
@@ -1008,96 +1457,83 @@ def match_features_batch(
                     own_feature_instance_id=feature_instance_id,
                     source_run=reference_raw_file,
                     source_type="Quant_Only" if is_quant_only_run else "Reference",
-                    decoy_mz_rank=int(decoy_pept_idx),
                 )
-                if match_decoy
-                else None
-            )
-
-            if is_quant_only_run and prop_t is not None:
-                _attach_quant_only_metadata(
-                    prop_t, quant_only_probe_records[raw_file], match_state
-                )
-                if (
-                    visualize_dir is not None
-                    and quant_only_probe_records[raw_file]["bbox_updated_from_original"]
-                    and quant_only_probe_records[raw_file][
-                        "reference_bbox_before_update"
-                    ]
-                    is not None
-                    and quant_only_probe_records[raw_file][
-                        "reference_bbox_after_update"
-                    ]
-                    is not None
-                    and quant_only_probe_records[raw_file]["aligned_bbox_before_update"]
-                    is not None
-                    and quant_only_probe_records[raw_file]["aligned_bbox_after_update"]
-                    is not None
-                ):
-                    _visualize_quant_only_bbox_expansion(
-                        pept_idx=pept_idx,
-                        raw_file=raw_file,
-                        match_state=match_state,
-                        target_result=target_result,
-                        prop_t=prop_t,
-                        record=quant_only_probe_records[raw_file],
-                        visualize_dir=visualize_dir,
+                prop_d = (
+                    _annotate_peak_properties(
+                        decoy_result.peak_properties,
+                        mz_rank=pept_idx,
+                        run_name=raw_file,
+                        own_anchor_id=own_anchor_id,
+                        assimilated_to_anchor_id=own_anchor_id,
+                        feature_instance_id=feature_instance_id,
+                        own_feature_instance_id=feature_instance_id,
+                        source_run=reference_raw_file,
+                        source_type="Quant_Only" if is_quant_only_run else "Reference",
+                        decoy_mz_rank=int(decoy_pept_idx),
                     )
-
-            if prop_t is not None:
-                target_result.peak_properties = prop_t
-                pp_match_target_list.append(prop_t)
-                match_t = compare_peak_properties(
-                    match_state.reference_result.peak_properties, prop_t
-                )
-                match_t["mz_rank"] = pept_idx
-                match_t["feature_instance_id"] = feature_instance_id
-                match_t["own_anchor_id"] = own_anchor_id
-                match_t["assimilated_to_anchor_id"] = own_anchor_id
-                match_t["source_run"] = reference_raw_file
-                match_t["source_type"] = (
-                    "Quant_Only" if is_quant_only_run else "Reference"
-                )
-                results_target.append(match_t)
-            else:
-                no_quant_log.append(
-                    {
-                        "mz_rank": pept_idx,
-                        "run_name": raw_file,
-                        "type": "quant_only" if is_quant_only_run else "match_target",
-                        "feature_instance_id": feature_instance_id,
-                    }
-                )
-                no_match_log.append(
-                    {
-                        "mz_rank": pept_idx,
-                        "run_name": raw_file,
-                        "type": "match_target",
-                        "feature_instance_id": feature_instance_id,
-                    }
+                    if match_decoy
+                    else None
                 )
 
-            if match_decoy:
-                if prop_d is not None:
-                    decoy_result.peak_properties = prop_d
-                    pp_match_decoy_list.append(prop_d)
-                    match_d = compare_peak_properties(
-                        match_state.reference_result.peak_properties, prop_d
+                if is_quant_only_run and prop_t is not None:
+                    _attach_quant_only_metadata(
+                        prop_t, quant_only_probe_records[raw_file], match_state
                     )
-                    match_d["mz_rank"] = pept_idx
-                    match_d["decoy_mz_rank"] = decoy_pept_idx
-                    match_d["feature_instance_id"] = feature_instance_id
-                    match_d["own_anchor_id"] = own_anchor_id
-                    match_d["assimilated_to_anchor_id"] = own_anchor_id
-                    match_d["source_run"] = reference_raw_file
-                    match_d["source_type"] = "Reference"
-                    results_decoy.append(match_d)
+                    if (
+                        visualize_dir is not None
+                        and quant_only_probe_records[raw_file][
+                            "bbox_updated_from_original"
+                        ]
+                        and quant_only_probe_records[raw_file][
+                            "reference_bbox_before_update"
+                        ]
+                        is not None
+                        and quant_only_probe_records[raw_file][
+                            "reference_bbox_after_update"
+                        ]
+                        is not None
+                        and quant_only_probe_records[raw_file][
+                            "aligned_bbox_before_update"
+                        ]
+                        is not None
+                        and quant_only_probe_records[raw_file][
+                            "aligned_bbox_after_update"
+                        ]
+                        is not None
+                    ):
+                        _visualize_quant_only_bbox_expansion(
+                            pept_idx=pept_idx,
+                            raw_file=raw_file,
+                            match_state=match_state,
+                            target_result=target_result,
+                            prop_t=prop_t,
+                            record=quant_only_probe_records[raw_file],
+                            visualize_dir=visualize_dir,
+                        )
+
+                if prop_t is not None:
+                    target_result.peak_properties = prop_t
+                    pp_match_target_list.append(prop_t)
+                    match_t = compare_peak_properties(
+                        match_state.reference_result.peak_properties, prop_t
+                    )
+                    match_t["mz_rank"] = pept_idx
+                    match_t["feature_instance_id"] = feature_instance_id
+                    match_t["own_anchor_id"] = own_anchor_id
+                    match_t["assimilated_to_anchor_id"] = own_anchor_id
+                    match_t["source_run"] = reference_raw_file
+                    match_t["source_type"] = (
+                        "Quant_Only" if is_quant_only_run else "Reference"
+                    )
+                    results_target.append(match_t)
                 else:
                     no_quant_log.append(
                         {
                             "mz_rank": pept_idx,
                             "run_name": raw_file,
-                            "type": "match_decoy",
+                            "type": (
+                                "quant_only" if is_quant_only_run else "match_target"
+                            ),
                             "feature_instance_id": feature_instance_id,
                         }
                     )
@@ -1105,10 +1541,43 @@ def match_features_batch(
                         {
                             "mz_rank": pept_idx,
                             "run_name": raw_file,
-                            "type": "match_decoy",
+                            "type": "match_target",
                             "feature_instance_id": feature_instance_id,
                         }
                     )
+
+                if match_decoy:
+                    if prop_d is not None:
+                        decoy_result.peak_properties = prop_d
+                        pp_match_decoy_list.append(prop_d)
+                        match_d = compare_peak_properties(
+                            match_state.reference_result.peak_properties, prop_d
+                        )
+                        match_d["mz_rank"] = pept_idx
+                        match_d["decoy_mz_rank"] = decoy_pept_idx
+                        match_d["feature_instance_id"] = feature_instance_id
+                        match_d["own_anchor_id"] = own_anchor_id
+                        match_d["assimilated_to_anchor_id"] = own_anchor_id
+                        match_d["source_run"] = reference_raw_file
+                        match_d["source_type"] = "Reference"
+                        results_decoy.append(match_d)
+                    else:
+                        no_quant_log.append(
+                            {
+                                "mz_rank": pept_idx,
+                                "run_name": raw_file,
+                                "type": "match_decoy",
+                                "feature_instance_id": feature_instance_id,
+                            }
+                        )
+                        no_match_log.append(
+                            {
+                                "mz_rank": pept_idx,
+                                "run_name": raw_file,
+                                "type": "match_decoy",
+                                "feature_instance_id": feature_instance_id,
+                            }
+                        )
 
     return (
         results_target,
@@ -1118,6 +1587,7 @@ def match_features_batch(
         pp_match_decoy_list,
         no_quant_log,
         no_match_log,
+        snap_log_collection,
     )
 
 
@@ -1928,131 +2398,6 @@ def compare_peak_properties(peak_properties_a, peak_properties_b):
     }
 
 
-def smooth_and_denoise_image(
-    image,
-    smooth_filter: Literal["gaussian", "uniform"] = "gaussian",
-    log_transform: bool = True,
-    threshold: float = 10,
-    gaussian_kwargs: dict | None = None,
-    uniform_kwargs: dict | None = None,
-    remove_kwargs: dict | None = None,
-):
-    """Smooth image with filters and denoise by remove small objects
-
-    Parameters
-    ----------
-    image : 2D array
-        Input image to be smoothed.
-    smooth_filter : str, optional
-        Type of filter to use. Options are "gaussian" or "uniform". Default is "gaussian".
-    threshold : float, optional
-        Threshold used to create a mask before removing small objects.
-    gaussian_kwargs : dict, optional
-        Keyword arguments for scipy.ndimage.gaussian_filter.
-    uniform_kwargs : dict, optional
-        Keyword arguments for scipy.ndimage.uniform_filter.
-    remove_kwargs : dict, optional
-        Keyword arguments for skimage.morphology.remove_small_objects.
-    """
-    gaussian_kwargs = {} if gaussian_kwargs is None else dict(gaussian_kwargs)
-    uniform_kwargs = {} if uniform_kwargs is None else dict(uniform_kwargs)
-    remove_kwargs = {} if remove_kwargs is None else dict(remove_kwargs)
-
-    if "sigma" not in gaussian_kwargs:
-        gaussian_kwargs["sigma"] = 2  # (rt, im)
-        gaussian_kwargs["mode"] = "nearest"
-    if "size" not in uniform_kwargs:
-        uniform_kwargs["size"] = (1, 5)
-    if "min_size" not in remove_kwargs:
-        remove_kwargs["min_size"] = 5
-
-    match smooth_filter:
-        case "gaussian":
-            image_smoothed = gaussian_filter(image, **gaussian_kwargs)
-        case "uniform":
-            blurred = uniform_filter(image, **uniform_kwargs)
-            image_smoothed = np.maximum(image, blurred)
-    # remove small objects after smoothing
-    cleaned_mask = remove_small_objects(image_smoothed >= threshold, **remove_kwargs)
-    image_smoothed = image_smoothed * cleaned_mask
-
-    # log transform smoothed and cleaned up
-    if log_transform:
-        image_smoothed = np.log10(1 + image_smoothed)
-    return image_smoothed
-
-
-def get_orb_peak_descriptor(
-    img, peak_coords, patch_size=100
-):  # This doesn't work well when image is noisy or only one smooth peak exists
-    """
-    Computes the ORB descriptor for a specific peak.
-    Returns the descriptor (feature vector).
-
-    Parameters
-    ----------
-    img : 2D array
-        Input image (should be in uint8 format).
-    peak_coords : tuple
-        (y, x) coordinates of the peak for which to compute the descriptor.
-    patch_size : int, optional
-        Size of the patch around the peak to consider for descriptor computation. Default is 31.
-    """
-    # 1. Normalize and convert to 8-bit once
-    img_8bit = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype("uint8")
-
-    # 2. Initialize ORB
-    orb = cv2.ORB_create()
-    y, x = peak_coords
-
-    # 3. Create the KeyPoint at the peak
-    kp = [cv2.KeyPoint(x=float(x), y=float(y), size=patch_size)]
-
-    # 4. Compute the descriptor
-    _, des = orb.compute(img_8bit, kp)
-
-    return des
-
-
-def get_sift_descriptor(img, peak_coords, patch_size=31):
-    """
-    Computes a SIFT descriptor for a specific peak coordinate.
-    """
-    # 1. SIFT works best on 8-bit images.
-    # Normalization ensures intensity differences don't break the gradient math.
-    img_8bit = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype("uint8")
-
-    # 2. Initialize SIFT
-    sift = cv2.SIFT_create()
-
-    y, x = peak_coords
-
-    # 3. Create a KeyPoint.
-    # 'size' determines the area the descriptor looks at.
-    # 'angle=0' is used because your images are already aligned.
-    kp = [cv2.KeyPoint(x=float(x), y=float(y), size=patch_size, angle=0)]
-
-    # 4. Compute the descriptor
-    _, des = sift.compute(img_8bit, kp)
-
-    return des
-
-
-def get_roi_descriptor(roi, radius=None):
-    if roi.max() == roi.min():
-        roi_norm = np.zeros_like(roi, dtype=np.float32)
-    else:
-        roi_norm = (roi - roi.min()) / (roi.max() - roi.min())
-
-    # Zernike Moments
-    roi_uint8 = (roi_norm * 255).astype(np.uint8)
-    radius = radius if radius is not None else max(roi.shape) // 2
-    zernike = zernike_moments(
-        roi_uint8, radius, cm=(roi.shape[1] // 2, roi.shape[0] // 2), degree=8
-    )
-    return zernike
-
-
 def compare_image_descriptors_cosine(des1, des2):
     if des1 is None or des2 is None:
         return 0.0
@@ -2105,177 +2450,1304 @@ def compare_sift_descriptors(des1, des2):
     return similarity
 
 
-def calc_quant_corr(pp_reference, pp_match_target, quant_dir):
+def _draw_rect(ax, rt_start, im_start, rt_end, im_end, color, linestyle):
+    """Draw a bbox rectangle on *ax*; axes use (x=IM col, y=RT row, origin=lower)."""
+    import matplotlib.patches as mpatches
+
+    rect = mpatches.Rectangle(
+        (im_start, rt_start),
+        im_end - im_start,
+        rt_end - rt_start,
+        edgecolor=color,
+        facecolor="none",
+        linestyle=linestyle,
+        linewidth=1.5,
+    )
+    ax.add_patch(rect)
+
+
+def _make_grid_fig(n: int, max_cols: int, extra_rows: int = 0):
+    """Create a (n_rows + extra_rows) × max_cols subplot grid.
+
+    Returns ``(fig, axes)`` where *axes* is always a 2-D ndarray of shape
+    ``(n_rows + extra_rows, max_cols)``.
+    """
+    import math
     import matplotlib.pyplot as plt
-    import seaborn as sns
 
-    os.makedirs(quant_dir, exist_ok=True)
-    if "source_type" in pp_match_target.columns:
-        pp_quant_only = pp_match_target.loc[
-            pp_match_target["source_type"] == "Quant_Only"
-        ].copy()
-        pp_match_target_only = pp_match_target.loc[
-            pp_match_target["source_type"] != "Quant_Only"
-        ].copy()
+    n_rows = math.ceil(n / max_cols) + extra_rows
+    fig, axes = plt.subplots(n_rows, max_cols, figsize=(4 * max_cols, 4 * n_rows))
+    if n_rows == 1:
+        axes = axes[np.newaxis, :]
+    if max_cols == 1:
+        axes = axes[:, np.newaxis]
+    return fig, axes
+
+
+def _save_or_show(fig, fig_dir, filename: str) -> None:
+    """Save *fig* to *fig_dir*/*filename*, or show it interactively."""
+    import matplotlib.pyplot as plt
+
+    if fig_dir is not None:
+        fig.savefig(os.path.join(fig_dir, filename), dpi=150, bbox_inches="tight")
+        plt.close(fig)
     else:
-        pp_quant_only = pd.DataFrame(columns=pp_match_target.columns)
-        pp_match_target_only = pp_match_target
-    pp_quant_only_pivoted = pp_quant_only.pivot_table(
-        index="mz_rank",
-        columns="Run_name",
-        values="intensity_sum",
-        aggfunc="max",
-    ).reset_index()
-    pp_reference_pivoted = pp_reference.pivot_table(
-        index="mz_rank",
-        columns="Run_name",
-        values="intensity_sum",
-        aggfunc="max",
-    ).reset_index()
-    # Log-transform numeric columns and compute pairwise Pearson correlations (pairwise complete cases)
-    pp_match_target_pivoted = pp_match_target_only.pivot_table(
-        index="mz_rank",
-        columns="Run_name",
-        values="intensity_sum",
-        aggfunc="max",
-    ).reset_index()
-    # Log-transform numeric columns and compute pairwise Pearson correlations (pairwise complete cases)
-    num_cols = pp_match_target_pivoted.select_dtypes(
-        include=[np.number]
-    ).columns.difference(["mz_rank"])
-    pp_log = pp_match_target_pivoted.copy()
-    pp_log[num_cols] = np.log2(pp_log[num_cols] + 1)
+        plt.show()
 
-    corr_matrix = pp_log[num_cols].corr(method="pearson", min_periods=1)
-    corr_matrix.to_csv(
-        os.path.join(
-            quant_dir, "pp_match_target_filtered_log_intensity_correlation_matrix.csv"
+
+def _resize_image_to_shape(
+    image: np.ndarray, target_shape: tuple[int, int]
+) -> np.ndarray:
+    rows, cols = int(target_shape[0]), int(target_shape[1])
+    image_f32 = image.astype(np.float32)
+    resized = cv2.resize(image_f32, (cols, rows), interpolation=cv2.INTER_LINEAR)
+    return resized.astype(np.float64)
+
+
+def _scale_anchor_to_target_shape(
+    anchor: tuple[int, int] | None,
+    source_shape: tuple[int, int],
+    target_shape: tuple[int, int],
+) -> tuple[float, float] | None:
+    if anchor is None:
+        return None
+    scale_r = int(target_shape[0]) / int(source_shape[0])
+    scale_c = int(target_shape[1]) / int(source_shape[1])
+    return (float(anchor[0]) * scale_r, float(anchor[1]) * scale_c)
+
+
+def _build_reference_template(
+    reference_image: np.ndarray,
+    template_anchor: tuple[int, int] | None,
+    template_frac: float,
+) -> tuple[int, int, tuple[int, int, int, int], np.ndarray]:
+    rows, cols = reference_image.shape
+    if template_anchor is None:
+        anchor_row, anchor_col = np.unravel_index(
+            np.argmax(reference_image), reference_image.shape
         )
+    else:
+        anchor_row, anchor_col = int(template_anchor[0]), int(template_anchor[1])
+    template_rt_start = max(int(anchor_row - template_frac * rows), 0)
+    template_rt_end = min(int(anchor_row + template_frac * rows), rows)
+    template_im_start = max(int(anchor_col - template_frac * cols), 0)
+    template_im_end = min(int(anchor_col + template_frac * cols), cols)
+    template_bounds = (
+        template_rt_start,
+        template_im_start,
+        template_rt_end,
+        template_im_end,
+    )
+    template = reference_image[
+        template_rt_start:template_rt_end, template_im_start:template_im_end
+    ]
+    return anchor_row, anchor_col, template_bounds, template
+
+
+def _align_resized_image_to_template(
+    resized_image: np.ndarray,
+    template: np.ndarray,
+    template_bounds: tuple[int, int, int, int],
+    scaled_anchor: tuple[float, float] | None = None,
+) -> tuple[
+    np.ndarray,
+    tuple[int, int, int, int],
+    tuple[float, float] | None,
+    tuple[int, int],
+    float,
+    np.ndarray,
+    tuple[int, int],
+]:
+    from scipy.ndimage import shift as nd_shift
+
+    template_rt_start, template_im_start, template_rt_end, template_im_end = (
+        template_bounds
+    )
+    match_score = match_template(resized_image, template)
+    max_score_index = np.unravel_index(np.argmax(match_score), match_score.shape)
+    match_rt_topleft, match_im_topleft = max_score_index
+    shift = (
+        int(template_rt_start - match_rt_topleft),
+        int(template_im_start - match_im_topleft),
+    )
+    aligned_image = nd_shift(resized_image, shift=shift, mode="constant", cval=0.0)
+    aligned_anchor = (
+        (float(scaled_anchor[0] + shift[0]), float(scaled_anchor[1] + shift[1]))
+        if scaled_anchor is not None
+        else None
+    )
+    return (
+        aligned_image,
+        (template_rt_start, template_im_start, template_rt_end, template_im_end),
+        aligned_anchor,
+        shift,
+        float(match_score.max()),
+        match_score,
+        (int(match_rt_topleft), int(match_im_topleft)),
     )
 
-    # 1. Concatenate with MultiIndex
-    pp_all_pivoted = pd.concat(
-        [
-            pp_reference_pivoted.set_index("mz_rank"),
-            pp_quant_only_pivoted.set_index("mz_rank"),
-            pp_match_target_pivoted.set_index("mz_rank"),
-        ],
-        axis=1,
-        keys=["reference", "quant_only", "match_target"],
+
+def align_images_to_reference(
+    images: list[np.ndarray],
+    reference_idx: int = 0,
+    target_shape: tuple[int, int] | None = None,
+    template_anchor: tuple[int, int] | None = None,
+    template_frac: float = 0.3,
+    anchors: list[tuple[int, int] | None] | None = None,
+) -> ConsensusAlignmentState:
+    """Resize and align images to a reference template for consensus scoring."""
+
+    if not images:
+        raise ValueError("images must contain at least one image.")
+    if reference_idx < 0 or reference_idx >= len(images):
+        raise ValueError(
+            f"reference_idx {reference_idx} is out of range for {len(images)} images."
+        )
+    if anchors is not None and len(anchors) != len(images):
+        raise ValueError(
+            "anchors must have the same length as images "
+            f"(got {len(anchors)}, expected {len(images)})."
+        )
+    if not (0 < template_frac <= 0.5):
+        raise ValueError(f"template_frac must be in (0, 0.5], got {template_frac}.")
+
+    ref_image = images[reference_idx]
+    resolved_target_shape = (
+        ref_image.shape if target_shape is None else tuple(map(int, target_shape))
+    )
+    resized_images = [
+        _resize_image_to_shape(image, resolved_target_shape) for image in images
+    ]
+    scaled_anchors = [
+        (
+            _scale_anchor_to_target_shape(
+                anchors[i], images[i].shape, resolved_target_shape
+            )
+            if anchors is not None
+            else None
+        )
+        for i in range(len(images))
+    ]
+    reference_resized = resized_images[reference_idx]
+    anchor_row, anchor_col, template_bounds, template = _build_reference_template(
+        reference_resized,
+        template_anchor,
+        template_frac,
     )
 
-    # 2. Identify numeric columns (excluding the index 'mz_rank')
-    # Since mz_rank is the index now, we just take all columns
-    num_cols = pp_all_pivoted.select_dtypes(include=[np.number]).columns
+    aligned_images: list[np.ndarray] = []
+    matched_boxes: list[tuple[int, int, int, int]] = []
+    aligned_anchors: list[tuple[float, float] | None] = []
+    shifts: list[tuple[int, int]] = []
+    max_scores: list[float] = []
+    match_score_maps: list[np.ndarray] = []
+    match_score_peaks: list[tuple[int, int]] = []
+    match_score_label_indices: list[int] = []
 
-    # 3. Log transformation (using log2(x+1) to handle zeros)
-    pp_log = np.log2(pp_all_pivoted[num_cols] + 1)
+    for i, resized_image in enumerate(resized_images):
+        if i == reference_idx:
+            aligned_images.append(resized_image.copy())
+            matched_boxes.append(template_bounds)
+            aligned_anchors.append(scaled_anchors[i])
+            shifts.append((0, 0))
+            max_scores.append(1.0)
+            continue
+        (
+            aligned_image,
+            matched_box,
+            aligned_anchor,
+            shift,
+            max_score,
+            match_score_map,
+            match_score_peak,
+        ) = _align_resized_image_to_template(
+            resized_image,
+            template,
+            template_bounds,
+            scaled_anchors[i],
+        )
+        aligned_images.append(aligned_image)
+        matched_boxes.append(matched_box)
+        aligned_anchors.append(aligned_anchor)
+        shifts.append(shift)
+        max_scores.append(max_score)
+        match_score_maps.append(match_score_map)
+        match_score_peaks.append(match_score_peak)
+        match_score_label_indices.append(i)
 
-    # 4. Correlation Matrix
-    # min_periods=1 ensures you get a value even if there's only one overlapping point
-    corr_matrix = pp_log.corr(method="pearson", min_periods=1)
-    corr_matrix.to_csv(
-        os.path.join(quant_dir, "pp_all_log_intensity_correlation_matrix.csv")
+    return ConsensusAlignmentState(
+        reference_idx=reference_idx,
+        target_shape=resolved_target_shape,
+        anchor_row=anchor_row,
+        anchor_col=anchor_col,
+        template_bounds=template_bounds,
+        template=template,
+        resized_images=resized_images,
+        aligned_images=aligned_images,
+        matched_boxes=matched_boxes,
+        aligned_anchors=aligned_anchors,
+        shifts=shifts,
+        max_scores=max_scores,
+        match_score_maps=match_score_maps,
+        match_score_peaks=match_score_peaks,
+        match_score_label_indices=match_score_label_indices,
     )
-    # Optional: Flatten the MultiIndex for easier viewing if it's too cluttered
 
-    count_matrix = pp_log.notna().astype(int).T.dot(pp_log.notna().astype(int))
-    sns.heatmap(corr_matrix)
-    ax = plt.gca()
-    for i in range(count_matrix.shape[0]):
-        for j in range(count_matrix.shape[1]):
-            _ = ax.text(
-                j + 0.5,
-                i + 0.5,
-                str(int(count_matrix.iloc[i, j])),
-                ha="center",
-                va="center",
-                fontsize=3,
-                color="white",
+
+def segment_consensus_from_aligned(
+    alignment_state: ConsensusAlignmentState,
+    smooth_kwargs: dict | None = None,
+    watershed_kwargs: dict | None = None,
+) -> ConsensusSegmentationState:
+    """Segment a consensus image and track which labels belong to target anchors."""
+
+    consensus = np.stack(alignment_state.aligned_images, axis=0).mean(axis=0)
+    consensus_smoothed = smooth_and_denoise_image(consensus, **(smooth_kwargs or {}))
+    rows, cols = alignment_state.target_shape
+    non_none_indices = [
+        i for i, aa in enumerate(alignment_state.aligned_anchors) if aa is not None
+    ]
+    snapped_per_anchor: list[tuple[int, int] | None] = [
+        None
+    ] * len(alignment_state.aligned_anchors)
+    watershed_labels: np.ndarray = np.zeros(consensus_smoothed.shape, dtype=int)
+    snap_log: dict[str, Any] = {
+        "snap_record": {},
+        "discard_record": {},
+        "no_seg_log": None,
+        "jump_anchor_log": None,
+    }
+    target_label_ids: list[int] = []
+    seen_label_ids: set[int] = set()
+    label_to_snap: dict[int, tuple[int, int]] = {}
+
+    if non_none_indices:
+        _wkwargs = dict(watershed_kwargs or {})
+        _int_threshold = _wkwargs.get("int_threshold", 0.5)
+        _min_distance = _wkwargs.get("min_distance", 15)
+        _threshold_rel = _wkwargs.get("threshold_rel", 0.2)
+        all_peaks, _unused_labels, _, watershed_labels, _ = (
+            detect_2d_peak_with_watershed(
+                consensus_smoothed,
+                int_threshold=_int_threshold,
+                min_distance=_min_distance,
+                threshold_rel=_threshold_rel,
+            )
+        )
+        if all_peaks.shape[0] == 0 or watershed_labels.max() == 0:
+            _anchor_rs = [
+                int(np.clip(round(_aa[0]), 0, rows - 1))
+                for i in non_none_indices
+                for _aa in (alignment_state.aligned_anchors[i],)
+                if _aa is not None
+            ]
+            _anchor_cs = [
+                int(np.clip(round(_aa[1]), 0, cols - 1))
+                for i in non_none_indices
+                for _aa in (alignment_state.aligned_anchors[i],)
+                if _aa is not None
+            ]
+            _ctr_r = int(round(float(np.mean(_anchor_rs))))
+            _ctr_c = int(round(float(np.mean(_anchor_cs))))
+            _rt_start = max(int(_ctr_r - 0.3 * rows), 0)
+            _rt_end = min(int(_ctr_r + 0.3 * rows), rows)
+            _im_start = max(int(_ctr_c - 0.3 * cols), 0)
+            _im_end = min(int(_ctr_c + 0.3 * cols), cols)
+            watershed_labels[_rt_start:_rt_end, _im_start:_im_end] = (
+                consensus[_rt_start:_rt_end, _im_start:_im_end] > 0
+            ).astype(int)
+            snap_log["no_seg_log"] = {
+                "anchor_positions": list(zip(_anchor_rs, _anchor_cs)),
+                "rect": (_rt_start, _im_start, _rt_end, _im_end),
+            }
+            for i, (r_i, c_i) in zip(non_none_indices, zip(_anchor_rs, _anchor_cs)):
+                snapped_per_anchor[i] = (r_i, c_i)
+                snap_log["snap_record"][i] = ((r_i, c_i), (r_i, c_i))
+            if watershed_labels.max() > 0:
+                target_label_ids.append(1)
+                seen_label_ids.add(1)
+                label_to_snap[1] = (_anchor_rs[0], _anchor_cs[0])
+        else:
+            for i in non_none_indices:
+                aa = alignment_state.aligned_anchors[i]
+                assert aa is not None
+                r = int(np.clip(round(aa[0]), 0, rows - 1))
+                c = int(np.clip(round(aa[1]), 0, cols - 1))
+                anchor_ws = int(watershed_labels[r, c])
+                if anchor_ws == 0:
+                    snap_log["discard_record"][i] = (r, c)
+                    continue
+                same_ws_peak_as_anchor = all_peaks[
+                    watershed_labels[all_peaks[:, 0], all_peaks[:, 1]] == anchor_ws
+                ]
+                if same_ws_peak_as_anchor.shape[0] == 0:
+                    snap_log["discard_record"][i] = (r, c)
+                    continue
+                dists = np.hypot(
+                    same_ws_peak_as_anchor[:, 0] - r,
+                    same_ws_peak_as_anchor[:, 1] - c,
+                )
+                nearest = same_ws_peak_as_anchor[int(np.argmin(dists))]
+                snapped_rc = (int(nearest[0]), int(nearest[1]))
+                snapped_per_anchor[i] = snapped_rc
+                snap_log["snap_record"][i] = ((r, c), snapped_rc)
+                if anchor_ws not in seen_label_ids:
+                    target_label_ids.append(anchor_ws)
+                    seen_label_ids.add(anchor_ws)
+                    label_to_snap[anchor_ws] = snapped_rc
+
+            if all(snapped_per_anchor[i] is None for i in non_none_indices):
+                _anchor_rcs = np.array(
+                    [
+                        [
+                            int(np.clip(round(_aa[0]), 0, rows - 1)),
+                            int(np.clip(round(_aa[1]), 0, cols - 1)),
+                        ]
+                        for i in non_none_indices
+                        for _aa in (alignment_state.aligned_anchors[i],)
+                        if _aa is not None
+                    ],
+                    dtype=float,
+                )
+                _dist_matrix = np.hypot(
+                    all_peaks[:, 0:1] - _anchor_rcs[:, 0],
+                    all_peaks[:, 1:2] - _anchor_rcs[:, 1],
+                )
+                _peak_total_dists = _dist_matrix.sum(axis=1)
+                _best_j = int(np.argmin(_peak_total_dists))
+                _jump_peak = (int(all_peaks[_best_j, 0]), int(all_peaks[_best_j, 1]))
+                snap_log["jump_anchor_log"] = {
+                    "jump_peak": _jump_peak,
+                    "per_anchor_distances": {
+                        i: float(_dist_matrix[_best_j, k])
+                        for k, i in enumerate(non_none_indices)
+                    },
+                    "total_distance": float(_peak_total_dists[_best_j]),
+                }
+                for _arc, i in zip(_anchor_rcs.astype(int), non_none_indices):
+                    snapped_per_anchor[i] = _jump_peak
+                    snap_log["snap_record"][i] = (
+                        (int(_arc[0]), int(_arc[1])),
+                        _jump_peak,
+                    )
+                _jump_label = int(watershed_labels[_jump_peak[0], _jump_peak[1]])
+                if _jump_label > 0 and _jump_label not in seen_label_ids:
+                    target_label_ids.append(_jump_label)
+                    seen_label_ids.add(_jump_label)
+                    label_to_snap[_jump_label] = _jump_peak
+
+    return ConsensusSegmentationState(
+        consensus=consensus,
+        consensus_smoothed=consensus_smoothed,
+        snapped_per_anchor=snapped_per_anchor,
+        watershed_labels=watershed_labels,
+        snap_log=snap_log,
+        target_label_ids=target_label_ids,
+        label_to_snap=label_to_snap,
+        non_none_indices=non_none_indices,
+    )
+
+
+def _align_raw_images_with_shifts(
+    raw_images: list[np.ndarray],
+    target_shape: tuple[int, int],
+    shifts: list[tuple[int, int]],
+) -> list[np.ndarray]:
+    from scipy.ndimage import shift as nd_shift
+
+    raw_aligned: list[np.ndarray] = []
+    for i, raw_image in enumerate(raw_images):
+        raw_resized = _resize_image_to_shape(raw_image, target_shape)
+        if shifts[i] == (0, 0):
+            raw_aligned.append(raw_resized)
+        else:
+            raw_aligned.append(
+                nd_shift(raw_resized, shift=shifts[i], mode="constant", cval=0.0)
+            )
+    return raw_aligned
+
+
+def _extract_feature_rows_for_label_ids(
+    label_ids: list[int],
+    label_image: np.ndarray,
+    raw_image: np.ndarray,
+    smoothed_image: np.ndarray,
+    *,
+    run_name: str,
+    shift: tuple[int, int],
+    template_matching_score: float,
+    snap_resolver: Callable[[int], tuple[int, int] | None],
+) -> pd.DataFrame | None:
+    rows: list[pd.DataFrame] = []
+    for label_id in label_ids:
+        single_label = (label_image == label_id).astype(int)
+        peak_properties = calculate_peak_property_from_labels_and_image(
+            single_label,
+            raw_image,
+            min_peak_area=0,
+            min_peak_sum_intensity=0,
+        )
+        if peak_properties is None:
+            continue
+        snap_rc = snap_resolver(label_id)
+        if snap_rc is None:
+            continue
+        peak_properties = peak_properties.reset_index(drop=True)
+        peak_properties["snap_rt"] = int(snap_rc[0])
+        peak_properties["snap_im"] = int(snap_rc[1])
+        peak_properties["shift_rt"] = int(shift[0])
+        peak_properties["shift_im"] = int(shift[1])
+        peak_properties["template_matching_score"] = float(template_matching_score)
+        peak_properties["sift_des"] = None
+        peak_properties.at[0, "sift_des"] = get_sift_descriptor(
+            np.log1p(smoothed_image),
+            (int(snap_rc[0]), int(snap_rc[1])),
+            patch_size=min(smoothed_image.shape),
+        )
+        _r0 = int(peak_properties["bbox-0"].values[0])
+        _r1 = int(peak_properties["bbox-2"].values[0])
+        _c0 = int(peak_properties["bbox-1"].values[0])
+        _c1 = int(peak_properties["bbox-3"].values[0])
+        seg_bbox = smoothed_image[_r0:_r1, _c0:_c1]
+        peak_properties["zernike"] = None
+        peak_properties.at[0, "zernike"] = get_roi_descriptor(seg_bbox)
+        peak_properties["Run_name"] = run_name
+        rows.append(peak_properties)
+    if rows:
+        return pd.concat(rows, ignore_index=True)
+    return None
+
+
+def extract_peak_properties_from_consensus_labels(
+    alignment_state: ConsensusAlignmentState,
+    segmentation_state: ConsensusSegmentationState,
+    *,
+    raw_images: list[np.ndarray] | None = None,
+    smooth_kwargs: dict | None = None,
+    labels: list[str] | None = None,
+) -> tuple[
+    pd.DataFrame | None,
+    list[pd.DataFrame | None],
+    list[np.ndarray],
+    list[np.ndarray],
+    np.ndarray | None,
+    np.ndarray | None,
+]:
+    """Extract per-run and consensus peak properties from consensus labels."""
+
+    individual_pps: list[pd.DataFrame | None] = [None] * len(alignment_state.aligned_images)
+    if (
+        raw_images is None
+        or not segmentation_state.non_none_indices
+        or segmentation_state.watershed_labels.max() == 0
+    ):
+        return None, individual_pps, [], [], None, None
+
+    raw_aligned = _align_raw_images_with_shifts(
+        raw_images,
+        alignment_state.target_shape,
+        alignment_state.shifts,
+    )
+    raw_aligned_smoothed = [
+        smooth_and_denoise_image(raw_image, **(smooth_kwargs or {}))
+        for raw_image in raw_aligned
+    ]
+    raw_consensus = np.stack(raw_aligned, axis=0).mean(axis=0)
+    raw_consensus_smoothed = smooth_and_denoise_image(
+        raw_consensus, **(smooth_kwargs or {})
+    )
+
+    consensus_pp: pd.DataFrame | None = None
+    if segmentation_state.target_label_ids:
+        for i in range(len(raw_aligned)):
+            run_name = labels[i] if (labels is not None and i < len(labels)) else str(i)
+            individual_pps[i] = _extract_feature_rows_for_label_ids(
+                segmentation_state.target_label_ids,
+                segmentation_state.watershed_labels,
+                raw_aligned[i],
+                raw_aligned_smoothed[i],
+                run_name=run_name,
+                shift=alignment_state.shifts[i],
+                template_matching_score=alignment_state.max_scores[i],
+                snap_resolver=lambda label_id, i=i: (
+                    segmentation_state.snapped_per_anchor[i]
+                    if segmentation_state.snapped_per_anchor[i] is not None
+                    else segmentation_state.label_to_snap.get(label_id)
+                ),
+            )
+        consensus_pp = _extract_feature_rows_for_label_ids(
+            segmentation_state.target_label_ids,
+            segmentation_state.watershed_labels,
+            raw_consensus,
+            raw_consensus_smoothed,
+            run_name="consensus",
+            shift=(0, 0),
+            template_matching_score=1.0,
+            snap_resolver=lambda label_id: segmentation_state.label_to_snap.get(
+                label_id
+            ),
+        )
+
+    return (
+        consensus_pp,
+        individual_pps,
+        raw_aligned,
+        raw_aligned_smoothed,
+        raw_consensus,
+        raw_consensus_smoothed,
+    )
+
+
+def build_consensus_feature_bundle(
+    images: list[np.ndarray],
+    reference_idx: int = 0,
+    target_shape: tuple[int, int] | None = None,
+    template_anchor: tuple[int, int] | None = None,
+    template_frac: float = 0.3,
+    anchors: list[tuple[int, int] | None] | None = None,
+    smooth_kwargs: dict | None = None,
+    watershed_kwargs: dict | None = None,
+    labels: list[str] | None = None,
+    raw_images: list[np.ndarray] | None = None,
+) -> ConsensusFeatureBundle:
+    """Build alignment, segmentation, and feature tables for consensus scoring."""
+
+    if labels is not None and len(labels) != len(images):
+        raise ValueError(
+            "labels must have the same length as images "
+            f"(got {len(labels)}, expected {len(images)})."
+        )
+    alignment_state = align_images_to_reference(
+        images=images,
+        reference_idx=reference_idx,
+        target_shape=target_shape,
+        template_anchor=template_anchor,
+        template_frac=template_frac,
+        anchors=anchors,
+    )
+    segmentation_state = segment_consensus_from_aligned(
+        alignment_state,
+        smooth_kwargs=smooth_kwargs,
+        watershed_kwargs=watershed_kwargs,
+    )
+    (
+        consensus_pp,
+        individual_pps,
+        raw_aligned,
+        raw_aligned_smoothed,
+        raw_consensus,
+        raw_consensus_smoothed,
+    ) = extract_peak_properties_from_consensus_labels(
+        alignment_state,
+        segmentation_state,
+        raw_images=raw_images,
+        smooth_kwargs=smooth_kwargs,
+        labels=labels,
+    )
+    return ConsensusFeatureBundle(
+        alignment=alignment_state,
+        segmentation=segmentation_state,
+        consensus_pp=consensus_pp,
+        individual_pps=individual_pps,
+        raw_aligned_images=raw_aligned,
+        raw_aligned_smoothed_images=raw_aligned_smoothed,
+        raw_consensus=raw_consensus,
+        raw_consensus_smoothed=raw_consensus_smoothed,
+    )
+
+
+def _make_shifted_consensus_segmentation_state(
+    segmentation_state: ConsensusSegmentationState,
+    label_shift: tuple[int, int],
+) -> ConsensusSegmentationState:
+    """Build a display-ready consensus segmentation state with shifted labels."""
+
+    shifted_labels = _shift_integer_label_image(
+        segmentation_state.watershed_labels, label_shift
+    )
+    shifted_label_to_snap: dict[int, tuple[int, int]] = {}
+    for label_id, snap_rc in segmentation_state.label_to_snap.items():
+        shifted_snap = _resolve_shifted_label_snap(
+            shifted_labels,
+            label_id,
+            (int(snap_rc[0] + label_shift[0]), int(snap_rc[1] + label_shift[1])),
+        )
+        if shifted_snap is not None:
+            shifted_label_to_snap[int(label_id)] = shifted_snap
+
+    shifted_snapped_per_anchor: list[tuple[int, int] | None] = []
+    shifted_snap_record: dict[int, tuple[tuple[int, int], tuple[int, int]]] = {}
+    shifted_discard_record = dict(segmentation_state.snap_log.get("discard_record", {}))
+    for idx, old_snap in enumerate(segmentation_state.snapped_per_anchor):
+        if old_snap is None:
+            shifted_snapped_per_anchor.append(None)
+            continue
+        label_id = int(segmentation_state.watershed_labels[old_snap[0], old_snap[1]])
+        shifted_snap = (
+            _resolve_shifted_label_snap(
+                shifted_labels,
+                label_id,
+                (
+                    int(old_snap[0] + label_shift[0]),
+                    int(old_snap[1] + label_shift[1]),
+                ),
+            )
+            if label_id > 0
+            else None
+        )
+        shifted_snapped_per_anchor.append(shifted_snap)
+        if shifted_snap is not None and idx in segmentation_state.snap_log.get(
+            "snap_record", {}
+        ):
+            orig_rc, _old_snap = segmentation_state.snap_log["snap_record"][idx]
+            shifted_snap_record[idx] = (orig_rc, shifted_snap)
+
+    shifted_snap_log = {
+        "snap_record": shifted_snap_record,
+        "discard_record": shifted_discard_record,
+        "no_seg_log": segmentation_state.snap_log.get("no_seg_log"),
+        "jump_anchor_log": segmentation_state.snap_log.get("jump_anchor_log"),
+        "label_shift": (int(label_shift[0]), int(label_shift[1])),
+    }
+    return ConsensusSegmentationState(
+        consensus=segmentation_state.consensus,
+        consensus_smoothed=segmentation_state.consensus_smoothed,
+        snapped_per_anchor=shifted_snapped_per_anchor,
+        watershed_labels=shifted_labels,
+        snap_log=shifted_snap_log,
+        target_label_ids=list(segmentation_state.target_label_ids),
+        label_to_snap=shifted_label_to_snap,
+        non_none_indices=list(segmentation_state.non_none_indices),
+    )
+
+
+def _visualize_consensus_bundle(
+    alignment_state: ConsensusAlignmentState,
+    segmentation_state: ConsensusSegmentationState,
+    *,
+    fig_dir: str | None,
+    filename: str,
+    labels: list[str] | None = None,
+    aligned_images: list[np.ndarray] | None = None,
+    consensus: np.ndarray | None = None,
+    consensus_smoothed: np.ndarray | None = None,
+) -> None:
+    """Visualize aligned images plus consensus panels for targets or decoys."""
+
+    import math
+    import matplotlib.lines as mlines
+    import matplotlib.patches as mpatches
+    import matplotlib.pyplot as plt
+
+    display_aligned = (
+        alignment_state.aligned_images if aligned_images is None else aligned_images
+    )
+    display_consensus = (
+        segmentation_state.consensus if consensus is None else consensus
+    )
+    display_consensus_smoothed = (
+        segmentation_state.consensus_smoothed
+        if consensus_smoothed is None
+        else consensus_smoothed
+    )
+
+    max_cols = 5
+    n = len(display_aligned)
+    vmin = min(img.min() for img in display_aligned)
+    vmax = max(img.max() for img in display_aligned)
+    snap_record = segmentation_state.snap_log["snap_record"]
+    discard_record = segmentation_state.snap_log["discard_record"]
+    non_none_indices = segmentation_state.non_none_indices
+    _anchor_color_map: dict[int, Any] = {
+        i_idx: plt.cm.tab10(k % 10) for k, i_idx in enumerate(non_none_indices)
+    }
+
+    fig, axes = _make_grid_fig(n, max_cols, extra_rows=1)
+    _watershed_overlay: np.ma.MaskedArray | None = None
+    if segmentation_state.watershed_labels.max() > 0:
+        _target_label_mask = np.zeros_like(segmentation_state.watershed_labels, dtype=float)
+        for _snap in segmentation_state.snapped_per_anchor:
+            if _snap is None:
+                continue
+            _lid = int(
+                segmentation_state.watershed_labels[_snap[0], _snap[1]]
+            )
+            if _lid > 0:
+                _target_label_mask[
+                    segmentation_state.watershed_labels == _lid
+                ] = float(_lid)
+        if _target_label_mask.max() > 0:
+            _watershed_overlay = np.ma.masked_where(
+                _target_label_mask == 0, _target_label_mask
             )
 
-    plt.xticks(
-        ticks=np.arange(len(corr_matrix.columns)),
-        labels=[c[0] + c[1][-5:] for c in corr_matrix.columns.values],
-        fontsize=5,
-        # rotation=45,
+    for i, img in enumerate(display_aligned):
+        row, col = divmod(i, max_cols)
+        ax = axes[row, col]
+        title = labels[i] if labels is not None else f"Image {i}"
+        if i == alignment_state.reference_idx:
+            title += "\n(reference)"
+        ax.imshow(img, aspect="auto", origin="lower", vmin=vmin, vmax=vmax)
+        if _watershed_overlay is not None:
+            white_cmap = ListedColormap(["white"])
+            ax.imshow(
+                _watershed_overlay,
+                aspect="auto",
+                origin="lower",
+                cmap=white_cmap,
+                alpha=0.3,
+                interpolation="nearest",
+            )
+        ax.set_title(title, fontsize=6)
+        ax.set_xlabel("IM axis")
+        ax.set_ylabel("RT axis")
+        rt0, im0, rt1, im1 = alignment_state.matched_boxes[i]
+        if i == alignment_state.reference_idx:
+            ax.plot(
+                alignment_state.anchor_col,
+                alignment_state.anchor_row,
+                "*",
+                color="white",
+                markersize=10,
+                markeredgewidth=1,
+                zorder=5,
+            )
+            _draw_rect(ax, rt0, im0, rt1, im1, color="red", linestyle="solid")
+        else:
+            _draw_rect(ax, rt0, im0, rt1, im1, color="red", linestyle="dashed")
+        aa = alignment_state.aligned_anchors[i]
+        if aa is not None and i in _anchor_color_map:
+            ax.plot(
+                aa[1],
+                aa[0],
+                "o",
+                color=_anchor_color_map[i],
+                markersize=7,
+                markeredgecolor="black",
+                markeredgewidth=0.8,
+                zorder=5,
+            )
+
+    n_img_rows = math.ceil(n / max_cols)
+    for empty in range(n, n_img_rows * max_cols):
+        row, col = divmod(empty, max_cols)
+        axes[row, col].set_visible(False)
+
+    for col in range(max_cols):
+        axes[-1, col].set_visible(False)
+    _last_cols = [0, max_cols // 2, max_cols - 1]
+    ax_craw, ax_csm, ax_cws = [axes[-1, c] for c in _last_cols]
+    for _ax in (ax_craw, ax_csm, ax_cws):
+        _ax.set_visible(True)
+
+    im_craw = ax_craw.imshow(
+        display_consensus, aspect="auto", origin="lower", vmin=vmin, vmax=vmax
     )
-    plt.yticks(
-        ticks=np.arange(len(corr_matrix.index)),
-        labels=[c[0] + c[1][-5:] for c in corr_matrix.index.values],
-        fontsize=5,
-    )
-    plt.savefig(
-        os.path.join(
-            quant_dir,
-            "correlation_matrix_of_log_intensity_with_counts.png",
-        ),
-        dpi=300,
-        bbox_inches="tight",
-    )
-    plt.close()
+    ax_craw.set_title("Consensus (mean)", fontsize=9)
+    ax_craw.set_xlabel("IM axis")
+    ax_craw.set_ylabel("RT axis")
+    fig.colorbar(im_craw, ax=ax_craw, shrink=0.8, label="Intensity")
 
+    ax_csm.imshow(display_consensus_smoothed, aspect="auto", origin="lower")
+    ax_csm.set_title("Consensus (smoothed)", fontsize=9)
+    ax_csm.set_xlabel("IM axis")
+    ax_csm.set_ylabel("RT axis")
 
-def plot_match_type_from_combined(
-    df, colors=None, labels=None, stack_order=None, fig_dir=None, fig_name_suffix=""
-):
-    import matplotlib.pyplot as plt
-
-    if colors is None:
-        colors = {
-            "MS/MS": "#55A868",
-            "MS/MS Quant": "#55A868",
-            "MS/MS Ref": "#4C72B0",
-            "MBR": "#C44E52",
-            "unmatched": "#BBBBBB",
-        }
-
-    if stack_order is None:
-        stack_order = ["MS/MS", "MS/MS Quant", "MS/MS Ref", "MBR", "unmatched"]
-
-    match_type_cols = [col for col in df.columns if "Match Type" in col]
-
-    counts_dict = {}
-    for col in match_type_cols:
-        counts_dict[col] = df[col].value_counts(dropna=True)
-
-    counts = pd.DataFrame(counts_dict).T.fillna(0)
-
-    # Reorder columns to control stack and legend order
-    ordered_cols = [c for c in stack_order if c in counts.columns]
-    counts = counts[ordered_cols]
-
-    if labels is None:
-        labels = [f"Run{i+1}" for i in range(len(counts.index))]
-
-    plt.figure(figsize=(10, 8))
-    ax = counts.plot(kind="bar", stacked=True, color=colors)
-
-    plt.xlabel("Match Type Column")
-    plt.ylabel("Count")
-    plt.title("Entry Counts per Match Type Column")
-    plt.xticks(rotation=45, ticks=range(len(counts.index)), labels=labels)
-
-    for container in ax.containers:
-        for bar in container:
-            height = bar.get_height()
-            if height > 0:
-                ax.text(
-                    bar.get_x() + bar.get_width() / 2,
-                    bar.get_y() + height / 2,
-                    f"{int(height)}",
+    if segmentation_state.watershed_labels.max() > 0:
+        ax_cws.imshow(
+            segmentation_state.watershed_labels,
+            aspect="auto",
+            origin="lower",
+            cmap="tab20",
+        )
+        for label_val in range(1, segmentation_state.watershed_labels.max() + 1):
+            mask = segmentation_state.watershed_labels == label_val
+            if mask.any():
+                rows, cols = np.where(mask)
+                cy, cx = rows.mean(), cols.mean()
+                ax_cws.text(
+                    cx,
+                    cy,
+                    str(label_val),
                     ha="center",
                     va="center",
-                    fontsize=8,
+                    fontsize=7,
+                    fontweight="bold",
+                    color="white",
+                )
+    else:
+        ax_cws.text(
+            0.5,
+            0.5,
+            "No watershed\n(no anchors or no signal)",
+            ha="center",
+            va="center",
+            transform=ax_cws.transAxes,
+            fontsize=9,
+        )
+    ax_cws.set_title("Watershed segmentation", fontsize=9)
+    ax_cws.set_xlabel("IM axis")
+    ax_cws.set_ylabel("RT axis")
+
+    for i_idx in non_none_indices:
+        _c = _anchor_color_map[i_idx]
+        for _ax in (ax_craw, ax_csm, ax_cws):
+            if i_idx in snap_record:
+                _orig_rc, _snap_rc = snap_record[i_idx]
+                _ax.plot(
+                    _orig_rc[1],
+                    _orig_rc[0],
+                    "*",
+                    color=_c,
+                    markersize=10,
+                    markeredgecolor="black",
+                    markeredgewidth=0.5,
+                    zorder=6,
+                )
+                _ax.plot(
+                    _snap_rc[1],
+                    _snap_rc[0],
+                    "o",
+                    color=_c,
+                    markersize=7,
+                    markeredgecolor="black",
+                    markeredgewidth=0.8,
+                    zorder=7,
+                )
+            elif i_idx in discard_record:
+                _orig_rc = discard_record[i_idx]
+                _ax.plot(
+                    _orig_rc[1],
+                    _orig_rc[0],
+                    "x",
+                    color=_c,
+                    markersize=9,
+                    markeredgewidth=1.5,
+                    zorder=6,
                 )
 
-    plt.legend(title="Entry", bbox_to_anchor=(1.02, 1), loc="upper left")
-    plt.tight_layout()
-    if fig_dir is not None:
-        plt.savefig(
-            os.path.join(fig_dir, f"match_type_counts{fig_name_suffix}.png"),
-            dpi=300,
-            bbox_inches="tight",
+    legend_handles = [
+        mlines.Line2D(
+            [],
+            [],
+            marker="*",
+            color="white",
+            markerfacecolor="white",
+            markersize=10,
+            linestyle="None",
+            label="Anchor (template centre)",
+        ),
+        mpatches.Patch(
+            edgecolor="red",
+            facecolor="none",
+            linestyle="solid",
+            linewidth=1.5,
+            label="Template region (reference)",
+        ),
+        mpatches.Patch(
+            edgecolor="red",
+            facecolor="none",
+            linestyle="dashed",
+            linewidth=1.5,
+            label="Matched template region",
+        ),
+    ]
+    if non_none_indices:
+        legend_handles += [
+            mlines.Line2D(
+                [],
+                [],
+                marker="o",
+                color=plt.cm.tab10(0),
+                markerfacecolor=plt.cm.tab10(0),
+                markeredgecolor="black",
+                markeredgewidth=0.8,
+                markersize=7,
+                linestyle="None",
+                label="Per-image anchor (aligned, ●)",
+            ),
+            mlines.Line2D(
+                [],
+                [],
+                marker="*",
+                color=plt.cm.tab10(0),
+                markerfacecolor=plt.cm.tab10(0),
+                markeredgecolor="black",
+                markeredgewidth=0.5,
+                markersize=10,
+                linestyle="None",
+                label="Anchor on consensus — original (★, same colour = same anchor)",
+            ),
+            mlines.Line2D(
+                [],
+                [],
+                marker="o",
+                color=plt.cm.tab10(0),
+                markerfacecolor=plt.cm.tab10(0),
+                markeredgecolor="black",
+                markeredgewidth=0.8,
+                markersize=7,
+                linestyle="None",
+                label="Anchor on consensus — snapped (●)",
+            ),
+        ]
+    if discard_record:
+        legend_handles.append(
+            mlines.Line2D(
+                [],
+                [],
+                marker="x",
+                color=plt.cm.tab10(0),
+                markersize=9,
+                markeredgewidth=1.5,
+                linestyle="None",
+                label="Anchor on consensus — discarded (✕, no connected peak)",
+            )
         )
-        plt.close()
-    plt.show()
+    fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        ncol=min(4, len(legend_handles)),
+        fontsize=8,
+        framealpha=0.8,
+        bbox_to_anchor=(0.5, 0.0),
+    )
+    fig.suptitle("Resized, aligned images and mean consensus", fontsize=11)
+    plt.tight_layout(rect=[0, 0.05, 1, 1])
+    _save_or_show(fig, fig_dir, filename)
+
+
+def _shift_integer_label_image(
+    label_image: np.ndarray, shift: tuple[int, int]
+) -> np.ndarray:
+    """Shift an integer label image with zero padding and no wrap-around."""
+
+    dr, dc = int(shift[0]), int(shift[1])
+    shifted = np.zeros_like(label_image)
+    src_r0 = max(-dr, 0)
+    src_r1 = min(label_image.shape[0] - dr, label_image.shape[0])
+    src_c0 = max(-dc, 0)
+    src_c1 = min(label_image.shape[1] - dc, label_image.shape[1])
+    dst_r0 = max(dr, 0)
+    dst_r1 = dst_r0 + max(src_r1 - src_r0, 0)
+    dst_c0 = max(dc, 0)
+    dst_c1 = dst_c0 + max(src_c1 - src_c0, 0)
+    if src_r1 <= src_r0 or src_c1 <= src_c0:
+        return shifted
+    shifted[dst_r0:dst_r1, dst_c0:dst_c1] = label_image[src_r0:src_r1, src_c0:src_c1]
+    return shifted
+
+
+def _resolve_shifted_label_snap(
+    shifted_labels: np.ndarray,
+    label_id: int,
+    desired_rc: tuple[int, int],
+) -> tuple[int, int] | None:
+    mask = shifted_labels == int(label_id)
+    if not mask.any():
+        return None
+    rows, cols = shifted_labels.shape
+    desired_r = int(np.clip(desired_rc[0], 0, rows - 1))
+    desired_c = int(np.clip(desired_rc[1], 0, cols - 1))
+    if mask[desired_r, desired_c]:
+        return (desired_r, desired_c)
+    coords = np.argwhere(mask)
+    if coords.size == 0:
+        return None
+    dists = np.hypot(coords[:, 0] - desired_r, coords[:, 1] - desired_c)
+    nearest = coords[int(np.argmin(dists))]
+    return (int(nearest[0]), int(nearest[1]))
+
+
+def _choose_off_target_shift(
+    watershed_labels: np.ndarray,
+    target_label_ids: list[int],
+    rep: int = 0,
+    min_offset_frac: float = 0.35,
+    max_overlap_fraction: float = 0.05,
+) -> tuple[int, int] | None:
+    """Choose a large integer shift that moves target labels away from themselves."""
+
+    if not target_label_ids:
+        return None
+    base_mask = np.isin(watershed_labels, target_label_ids)
+    base_area = int(base_mask.sum())
+    if base_area == 0:
+        return None
+    rows, cols = watershed_labels.shape
+    frac_values = [min_offset_frac, min(0.5, min_offset_frac + 0.15)]
+    candidates: list[tuple[int, int]] = []
+    for frac in frac_values:
+        dr = max(1, int(round(rows * frac)))
+        dc = max(1, int(round(cols * frac)))
+        candidates.extend(
+            [
+                (dr, 0),
+                (-dr, 0),
+                (0, dc),
+                (0, -dc),
+                (dr, dc),
+                (dr, -dc),
+                (-dr, dc),
+                (-dr, -dc),
+            ]
+        )
+    seen: set[tuple[int, int]] = set()
+    unique_candidates = []
+    for candidate in candidates:
+        if candidate not in seen:
+            seen.add(candidate)
+            unique_candidates.append(candidate)
+    evaluated: list[tuple[float, float, tuple[int, int]]] = []
+    valid: list[tuple[float, float, tuple[int, int]]] = []
+    for candidate in unique_candidates:
+        shifted_labels = _shift_integer_label_image(watershed_labels, candidate)
+        shifted_mask = np.isin(shifted_labels, target_label_ids)
+        shifted_area = int(shifted_mask.sum())
+        if shifted_area == 0:
+            continue
+        overlap = (
+            np.logical_and(base_mask, shifted_mask).sum() / float(max(base_area, 1))
+        )
+        dist = float(np.hypot(candidate[0], candidate[1]))
+        record = (float(overlap), -dist, candidate)
+        evaluated.append(record)
+        if overlap <= max_overlap_fraction:
+            valid.append(record)
+    if valid:
+        valid_sorted = sorted(valid, key=lambda item: (item[0], item[1]))
+        return valid_sorted[int(rep) % len(valid_sorted)][2]
+    if evaluated:
+        evaluated_sorted = sorted(evaluated, key=lambda item: (item[0], item[1]))
+        return evaluated_sorted[int(rep) % len(evaluated_sorted)][2]
+    return None
+
+
+def _build_consensus_peptide_swap_decoy(
+    bundle: ConsensusFeatureBundle,
+    decoy_raw_image: np.ndarray,
+    run_name: str,
+    smooth_kwargs: dict | None = None,
+) -> tuple[pd.DataFrame | None, tuple[int, int], float]:
+    """Align a wrong same-run peptide image and score it under target consensus labels."""
+
+    decoy_smoothed = smooth_and_denoise_image(decoy_raw_image, **(smooth_kwargs or {}))
+    decoy_smoothed_resized = _resize_image_to_shape(
+        decoy_smoothed, bundle.alignment.target_shape
+    )
+    (
+        _aligned_smoothed,
+        _matched_box,
+        _aligned_anchor,
+        shift,
+        max_score,
+        _match_score_map,
+        _match_score_peak,
+    ) = _align_resized_image_to_template(
+        decoy_smoothed_resized,
+        bundle.alignment.template,
+        bundle.alignment.template_bounds,
+        None,
+    )
+    decoy_raw_resized = _resize_image_to_shape(decoy_raw_image, bundle.alignment.target_shape)
+    from scipy.ndimage import shift as nd_shift
+
+    decoy_raw_aligned = nd_shift(
+        decoy_raw_resized, shift=shift, mode="constant", cval=0.0
+    )
+    decoy_raw_aligned_smoothed = smooth_and_denoise_image(
+        decoy_raw_aligned, **(smooth_kwargs or {})
+    )
+    decoy_pp = _extract_feature_rows_for_label_ids(
+        bundle.segmentation.target_label_ids,
+        bundle.segmentation.watershed_labels,
+        decoy_raw_aligned,
+        decoy_raw_aligned_smoothed,
+        run_name=run_name,
+        shift=shift,
+        template_matching_score=max_score,
+        snap_resolver=lambda label_id: bundle.segmentation.label_to_snap.get(label_id),
+    )
+    return decoy_pp, shift, max_score
+
+
+def _build_consensus_off_target_decoy(
+    bundle: ConsensusFeatureBundle,
+    run_index: int,
+    run_name: str,
+    rep: int = 0,
+    min_offset_frac: float = 0.35,
+    max_overlap_fraction: float = 0.05,
+    label_shift: tuple[int, int] | None = None,
+) -> tuple[pd.DataFrame | None, tuple[int, int] | None]:
+    """Quantify the target run against a deliberately shifted consensus label mask."""
+
+    if not bundle.raw_aligned_images or not bundle.raw_aligned_smoothed_images:
+        return None, None
+    resolved_label_shift = (
+        _choose_off_target_shift(
+            bundle.segmentation.watershed_labels,
+            bundle.segmentation.target_label_ids,
+            rep=rep,
+            min_offset_frac=min_offset_frac,
+            max_overlap_fraction=max_overlap_fraction,
+        )
+        if label_shift is None
+        else (int(label_shift[0]), int(label_shift[1]))
+    )
+    if resolved_label_shift is None:
+        return None, None
+    shifted_labels = _shift_integer_label_image(
+        bundle.segmentation.watershed_labels, resolved_label_shift
+    )
+    decoy_pp = _extract_feature_rows_for_label_ids(
+        bundle.segmentation.target_label_ids,
+        shifted_labels,
+        bundle.raw_aligned_images[run_index],
+        bundle.raw_aligned_smoothed_images[run_index],
+        run_name=run_name,
+        shift=bundle.alignment.shifts[run_index],
+        template_matching_score=bundle.alignment.max_scores[run_index],
+        snap_resolver=lambda label_id: _resolve_shifted_label_snap(
+            shifted_labels,
+            label_id,
+            (
+                int(
+                    bundle.segmentation.label_to_snap[label_id][0]
+                    + resolved_label_shift[0]
+                ),
+                int(
+                    bundle.segmentation.label_to_snap[label_id][1]
+                    + resolved_label_shift[1]
+                ),
+            ),
+        ),
+    )
+    return decoy_pp, resolved_label_shift
+
+
+def generate_consensus_image(
+    images: list[np.ndarray],
+    reference_idx: int = 0,
+    target_shape: tuple[int, int] | None = None,
+    template_anchor: tuple[int, int] | None = None,
+    template_frac: float = 0.3,
+    anchors: list[tuple[int, int] | None] | None = None,
+    smooth_kwargs: dict | None = None,
+    watershed_kwargs: dict | None = None,
+    visualize: bool = False,
+    labels: list[str] | None = None,
+    raw_images: list[np.ndarray] | None = None,
+    fig_dir: str | None = None,
+    filename: str = "consensus_image.png",
+) -> tuple[
+    np.ndarray,
+    list[np.ndarray],
+    list[tuple[int, int] | None],
+    np.ndarray,
+    dict[str, Any],
+    pd.DataFrame | None,
+    list[pd.DataFrame | None],
+]:
+    """Resize, align, and average a collection of smoothed images into a consensus.
+
+    Alignment reuses the same template-matching logic as
+    :func:`quantify_from_coords`: a patch of size
+    ``±template_frac * dim`` is extracted from the (resized) reference image
+    centred on *template_anchor*, then :func:`skimage.feature.match_template`
+    locates that patch in every other image and the resulting integer shift is
+    applied with :func:`scipy.ndimage.shift`.
+
+    Then a consensus image is generated and smoothed and watershed segmented.
+
+    Then peak properties of the consensus image and individual images are calculated.
+
+    Parameters
+    ----------
+    images : list of 2-D arrays
+        The n images to aggregate.  They may differ in shape.
+    reference_idx : int, optional
+        Index into *images* that is used as the alignment target.
+        Default is 0 (first image).
+    target_shape : (rows, cols) or None, optional
+        Shape to which every image is resized before alignment.  When *None*
+        the shape of the reference image (at *reference_idx*) is used.
+    template_anchor : (row, col) or None, optional
+        Pixel coordinate **in the resized reference image** that centres the
+        template patch.  When *None* the peak (argmax) of the resized reference
+        image is used, which mirrors the typical use-case in
+        :func:`quantify_from_coords`.
+    template_frac : float, optional
+        Fraction of each image dimension used as the half-extent of the
+        template patch (``±template_frac * dim``).  Must be in ``(0, 0.5)``.
+        Default is ``0.3``, matching :func:`quantify_from_coords`.
+    visualize : bool, optional
+        When *True* a figure is produced showing all n resized+aligned images
+        in a grid of at most 5 columns, with the consensus on its own final row.
+    labels : list of str or None, optional
+        Panel titles for the visualisation.  Must have the same length as
+        *images* when provided.
+    fig_dir : str or None, optional
+        Directory in which the figure is saved.  When *None* the figure is
+        only shown interactively.
+    filename : str, optional
+        File-name used when saving the figure.  Default is
+        ``"consensus_image.png"``.
+
+    Returns
+    -------
+    consensus : 2-D ndarray
+        Mean image computed over all aligned images.
+    aligned_images : list of 2-D ndarray
+        The n resized and aligned images (same order as *images*).
+    """
+    bundle = build_consensus_feature_bundle(
+        images=images,
+        reference_idx=reference_idx,
+        target_shape=target_shape,
+        template_anchor=template_anchor,
+        template_frac=template_frac,
+        anchors=anchors,
+        smooth_kwargs=smooth_kwargs,
+        watershed_kwargs=watershed_kwargs,
+        labels=labels,
+        raw_images=raw_images,
+    )
+    alignment = bundle.alignment
+    segmentation = bundle.segmentation
+    rows, cols = alignment.target_shape
+    anchor_row, anchor_col = alignment.anchor_row, alignment.anchor_col
+    aligned = alignment.aligned_images
+    matched_boxes = alignment.matched_boxes
+    aligned_anchors = alignment.aligned_anchors
+    match_score = alignment.match_score_maps
+    match_score_peaks = alignment.match_score_peaks
+    match_score_label_indices = alignment.match_score_label_indices
+    consensus = segmentation.consensus
+    consensus_smoothed = segmentation.consensus_smoothed
+    non_none_indices = segmentation.non_none_indices
+    snapped_per_anchor = segmentation.snapped_per_anchor
+    watershed_labels = segmentation.watershed_labels
+    snap_log = segmentation.snap_log
+    consensus_pp = bundle.consensus_pp
+    individual_pps = bundle.individual_pps
+
+    # --- 7. Optional visualisation -------------------------------------------
+    if visualize:
+        _visualize_consensus_bundle(
+            bundle.alignment,
+            bundle.segmentation,
+            fig_dir=fig_dir,
+            filename=filename,
+            labels=labels,
+        )
+
+    return (
+        consensus,
+        aligned,
+        snapped_per_anchor,
+        watershed_labels,
+        snap_log,
+        consensus_pp,
+        individual_pps,
+    )

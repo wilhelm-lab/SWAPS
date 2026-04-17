@@ -77,6 +77,11 @@ def opt_scan_by_scan(config_path: str):
         merge_cfg_from_file(cfg, config_path)
         logging.info("merge with cfg file %s", config_path)
     processing_kwargs = yaml.safe_load(cfg.MATCH_FEATURES_KWARGS.dump())
+    generate_consensus = bool(
+        processing_kwargs.pop(
+            "generate_consensus", getattr(cfg, "GENERATE_CONSENSUS", False)
+        )
+    )
 
     if cfg.ADD_TIMESTAMP_TO_RESULT_PATH:
         cfg.RESULT_PATH = cfg.RESULT_PATH + "_" + name_timestamp
@@ -304,6 +309,7 @@ def opt_scan_by_scan(config_path: str):
         pp_match_decoy,
         df_no_quant,
         df_no_match,
+        snap_log_collection,
     ) = match_features_batches_parallel(
         dict_ref=dict_ref,
         raw_file_list=raw_file_list,
@@ -311,6 +317,7 @@ def opt_scan_by_scan(config_path: str):
         peptide_indicies=dict_ref["mz_rank"].values,  # type: ignore
         batch_size_max=1500,
         max_workers=cfg.N_CPU,
+        generate_consensus=generate_consensus,
         processing_kwargs=processing_kwargs,
     )
     quant_dir = os.path.join(cfg.RESULT_PATH, "quantification")

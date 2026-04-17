@@ -79,15 +79,12 @@ __C.OPTIMIZATION = ConfigurationNode()
 __C.OPTIMIZATION.N_BATCH = (
     -1
 )  # number of batches of MS1 scans; -1 means use the same value as N_CPU
-__C.OPTIMIZATION.DELTA_MOBILITY_INDEX_THRES = (
-    80  # threshold for delta mobility index; only effective when extract_im_peak=True (currently hardcoded to False)
-)
-__C.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH = (
-    4  # width for IM peak extraction; only effective when extract_im_peak=True (currently hardcoded to False)
-)
+__C.OPTIMIZATION.DELTA_MOBILITY_INDEX_THRES = 80  # threshold for delta mobility index; only effective when extract_im_peak=True (currently hardcoded to False)
+__C.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH = 4  # width for IM peak extraction; only effective when extract_im_peak=True (currently hardcoded to False)
 
 # match features kwargs (postprocessing peak detection/matching parameters)
 __C.MATCH_FEATURES_KWARGS = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.generate_consensus = False  # whether to use consensus-based feature matching instead of the reference-driven path
 __C.MATCH_FEATURES_KWARGS.smooth_kwargs = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.smooth_kwargs.smooth_filter = "gaussian"
 __C.MATCH_FEATURES_KWARGS.smooth_kwargs.gaussian_kwargs = ConfigurationNode()
@@ -106,3 +103,26 @@ __C.MATCH_FEATURES_KWARGS.filter_kwargs = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.filter_kwargs.min_peak_area = 10
 __C.MATCH_FEATURES_KWARGS.filter_kwargs.min_peak_sum_intensity = 500
 __C.MATCH_FEATURES_KWARGS.apply_seg = True
+__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.smooth_filter = "uniform"
+__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.log_transform = False
+__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.threshold = 0
+__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.gaussian_kwargs = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.gaussian_kwargs.sigma = [2, 2]
+__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.gaussian_kwargs.mode = "nearest"
+__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.uniform_kwargs = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.uniform_kwargs.size = [3, 5]
+__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.remove_kwargs = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.remove_kwargs.min_size = 3
+__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.int_threshold = 1
+__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.min_distance = 10
+__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.threshold_rel = 0.1
+__C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.strategies = [
+    "peptide_swap",
+]  # ["peptide_swap", "off_target_shift"]
+__C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.n_peptide_swap_decoys = 1
+__C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.n_off_target_shift_decoys = 1
+__C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.off_target_min_offset_frac = 0.35
+__C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.off_target_max_overlap_fraction = 0.05

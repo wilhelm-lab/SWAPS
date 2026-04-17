@@ -70,7 +70,7 @@ def build_mz_sorted_activation(
 
 def load_peptide_batch_df_from_partquet(
     activation_dir: str,
-    pept_indicies: List[int],
+    pept_indicies,  # list of int or np.ndarray
     con: duckdb.DuckDBPyConnection | None = None,
 ) -> pd.DataFrame:
     """Load activation rows for a contiguous mz_rank slice from the sorted parquet.
@@ -260,7 +260,7 @@ def build_pivot(pp_all, dict_ref):
         index="mz_rank",
         columns="Run_name",
         values=["Match Type", "intensity_sum"],
-        aggfunc={"Match Type": "first", "intensity_sum": "max"},
+        aggfunc={"Match Type": "first", "intensity_sum": "sum"},
     )
 
     # Rename intensity column level
