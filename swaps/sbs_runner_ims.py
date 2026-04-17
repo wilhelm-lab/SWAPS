@@ -363,8 +363,9 @@ def opt_scan_by_scan(config_path: str):
             "template_matching_score",
         ],
         normalize_features=False,
-        scannr_col="feature_instance_id",
+        scannr_col="feature_instance_id_with_label",  # No deduplication btw target and decoy for now
         psmid_col="Sequence_with_runs",
+        specid_col="Sequence_with_runs",
         peptide_col="Sequence",
         protein_col="Proteins",
         decoy_col="Decoy",
@@ -376,7 +377,9 @@ def opt_scan_by_scan(config_path: str):
     )
     # Filter for the columns passed the makopot filter
     psms_filtered = psms.loc[(psms["mokapot q-value"] < 0.01) & (psms["label"] == True)]
-    psms_filtered["feature_instance_id"] = psms_filtered["scannr"]
+    psms_filtered["feature_instance_id"] = psms_filtered["scannr"].str.replace(
+        "_True", "", regex=True
+    )
     psms_filtered["mz_rank"] = (
         psms_filtered["feature_instance_id"].str.split("_").str[0].astype(int)
     )
@@ -386,6 +389,7 @@ def opt_scan_by_scan(config_path: str):
         right_on=["mz_rank", "filename", "feature_instance_id"],
         how="inner",
     )
+    # TODO: filter for intensity threshold
     pp_match_target_filtered.to_parquet(
         os.path.join(quant_dir, "pp_match_target_filtered.parquet"), index=False
     )

@@ -75,6 +75,8 @@ def prepare_mokapot_input(
         )
     if specid_col is not None:
         df_pin["specid"] = df_pin[specid_col]
+    elif psmid_col is not None:
+        df_pin["specid"] = df_pin[psmid_col]
     else:
         df_pin["specid"] = (
             df_pin["mz_rank"].astype(str) + "_" + df_pin["label"].astype(str)
