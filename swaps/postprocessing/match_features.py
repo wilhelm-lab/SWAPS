@@ -1,26 +1,28 @@
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional, Tuple
+from typing import Any, Callable, Literal, Optional, Tuple
 import numpy as np
 import pandas as pd
 import tqdm
-from scipy.ndimage import gaussian_filter, uniform_filter
-from skimage.morphology import remove_small_objects
 from skimage.feature import match_template
 import cv2
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from mahotas.features import zernike_moments
 from scipy.spatial.distance import cosine
-from swaps.utils.ims_utils import (
-    detect_2d_peak_with_watershed,
-    calculate_peak_property_from_labels_and_image,
-)
 from .helper import (
     load_peptide_batch_df_from_partquet,
     get_pept_act_from_parquet,
 )
+from .image_processing import (
+    get_roi_descriptor,
+    get_sift_descriptor,
+    smooth_and_denoise_image,
+    detect_2d_peak_with_watershed,
+    calculate_peak_property_from_labels_and_image,
+    fast_intensity_weighted_ncc,
+)
 import duckdb
+from matplotlib.colors import ListedColormap
 
 Logger = logging.getLogger(__name__)
 _WORKER_CONTEXT: dict[str, Any] = {}

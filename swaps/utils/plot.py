@@ -1512,3 +1512,411 @@ def plot_image_comparison(
         os.makedirs(fig_dir, exist_ok=True)
         plt.savefig(os.path.join(fig_dir, fig_name), dpi=300)
         plt.close()
+
+
+def calc_quant_corr(pp_reference, pp_match_target, quant_dir):
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+
+    os.makedirs(quant_dir, exist_ok=True)
+    if "source_type" in pp_match_target.columns:
+        pp_quant_only = pp_match_target.loc[
+            pp_match_target["source_type"] == "Quant_Only"
+        ].copy()
+        pp_match_target_only = pp_match_target.loc[
+            pp_match_target["source_type"] != "Quant_Only"
+        ].copy()
+    else:
+        pp_quant_only = pd.DataFrame(columns=pp_match_target.columns)
+        pp_match_target_only = pp_match_target
+    pp_quant_only_pivoted = pp_quant_only.pivot_table(
+        index="mz_rank",
+        columns="Run_name",
+        values="intensity_sum",
+        aggfunc="max",
+    ).reset_index()
+    pp_reference_pivoted = pp_reference.pivot_table(
+        index="mz_rank",
+        columns="Run_name",
+        values="intensity_sum",
+        aggfunc="max",
+    ).reset_index()
+    # Log-transform numeric columns and compute pairwise Pearson correlations (pairwise complete cases)
+    pp_match_target_pivoted = pp_match_target_only.pivot_table(
+        index="mz_rank",
+        columns="Run_name",
+        values="intensity_sum",
+        aggfunc="max",
+    ).reset_index()
+    # Log-transform numeric columns and compute pairwise Pearson correlations (pairwise complete cases)
+    num_cols = pp_match_target_pivoted.select_dtypes(
+        include=[np.number]
+    ).columns.difference(["mz_rank"])
+    pp_log = pp_match_target_pivoted.copy()
+    pp_log[num_cols] = np.log2(pp_log[num_cols] + 1)
+
+    corr_matrix = pp_log[num_cols].corr(method="pearson", min_periods=1)
+    corr_matrix.to_csv(
+        os.path.join(
+            quant_dir, "pp_match_target_filtered_log_intensity_correlation_matrix.csv"
+        )
+    )
+
+    # 1. Concatenate with MultiIndex
+    pp_all_pivoted = pd.concat(
+        [
+            pp_reference_pivoted.set_index("mz_rank"),
+            pp_quant_only_pivoted.set_index("mz_rank"),
+            pp_match_target_pivoted.set_index("mz_rank"),
+        ],
+        axis=1,
+        keys=["reference", "quant_only", "match_target"],
+    )
+
+    # 2. Identify numeric columns (excluding the index 'mz_rank')
+    # Since mz_rank is the index now, we just take all columns
+    num_cols = pp_all_pivoted.select_dtypes(include=[np.number]).columns
+
+    # 3. Log transformation (using log2(x+1) to handle zeros)
+    pp_log = np.log2(pp_all_pivoted[num_cols] + 1)
+
+    # 4. Correlation Matrix
+    # min_periods=1 ensures you get a value even if there's only one overlapping point
+    corr_matrix = pp_log.corr(method="pearson", min_periods=1)
+    corr_matrix.to_csv(
+        os.path.join(quant_dir, "pp_all_log_intensity_correlation_matrix.csv")
+    )
+    # Optional: Flatten the MultiIndex for easier viewing if it's too cluttered
+
+    count_matrix = pp_log.notna().astype(int).T.dot(pp_log.notna().astype(int))
+    sns.heatmap(corr_matrix)
+    ax = plt.gca()
+    for i in range(count_matrix.shape[0]):
+        for j in range(count_matrix.shape[1]):
+            _ = ax.text(
+                j + 0.5,
+                i + 0.5,
+                str(int(count_matrix.iloc[i, j])),
+                ha="center",
+                va="center",
+                fontsize=3,
+                color="white",
+            )
+
+    plt.xticks(
+        ticks=np.arange(len(corr_matrix.columns)),
+        labels=[c[0] + c[1][-5:] for c in corr_matrix.columns.values],
+        fontsize=5,
+        # rotation=45,
+    )
+    plt.yticks(
+        ticks=np.arange(len(corr_matrix.index)),
+        labels=[c[0] + c[1][-5:] for c in corr_matrix.index.values],
+        fontsize=5,
+    )
+    plt.savefig(
+        os.path.join(
+            quant_dir,
+            "correlation_matrix_of_log_intensity_with_counts.png",
+        ),
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+
+def plot_run_summary(
+    df,
+    mode: str = "match_type",
+    # --- match_type-specific ---
+    colors=None,
+    # --- nonzero_quant-specific ---
+    id_cols=None,
+    int_col_keyword=None,
+    zero_color: str = "#d73027",
+    nonzero_color: str = "#1a9850",
+    # --- shared ---
+    labels=None,
+    stack_order=None,
+    sort_columns: bool = False,
+    label_char_range=None,
+    dataset_name: str = "",
+    fig_name_suffix: str = "",
+    ax=None,
+    fig_dir=None,
+):
+    """
+    Plot per-run stacked bar counts in one of two modes.
+
+    Parameters
+    ----------
+    df
+        Input DataFrame.
+    mode
+        ``"match_type"`` – stacked bars broken down by MS/MS / MBR / unmatched
+        category, one bar per run.
+        ``"nonzero_quant"`` – stacked bars of quantified vs non-quantified
+        entries, one bar per intensity column / run.
+    colors
+        [match_type] Dict mapping category label → hex color.
+    id_cols
+        [nonzero_quant] Columns to exclude from plotting.
+    int_col_keyword
+        [nonzero_quant] Only columns whose name contains this substring are plotted.
+    zero_color
+        [nonzero_quant] Color for zero / missing counts.
+    nonzero_color
+        [nonzero_quant] Color for quantified counts.
+    labels
+        X-tick labels for each bar; if None, derived from the data.
+    stack_order
+        Ordered list controlling which categories are shown and in what stack
+        order. For ``"match_type"`` these are category names; for
+        ``"nonzero_quant"`` this sets the column display order.
+    sort_columns
+        Sort bars by total count descending (applied before ``stack_order``).
+    label_char_range
+        ``(m, n)`` – slice each derived x-axis label as ``label[m:n]``.
+        Ignored when ``labels`` is provided explicitly.
+    dataset_name
+        Used in the plot title and saved filename.
+    fig_name_suffix
+        Appended to the saved filename.
+    ax
+        Optional existing Axes to draw on.
+    fig_dir
+        Directory to save PNG + SVG; if None the figure is shown interactively.
+    """
+    if mode == "match_type":
+        if colors is None:
+            colors = {
+                "MS/MS": "#55A868",
+                "MS/MS Quant": "#55A868",
+                "MS/MS Ref": "#4C72B0",
+                "MBR": "#C44E52",
+                "unmatched": "#BBBBBB",
+            }
+        if stack_order is None:
+            stack_order = ["MS/MS", "MS/MS Quant", "MS/MS Ref", "MBR", "unmatched"]
+
+        match_type_cols = [col for col in df.columns if "Match Type" in col]
+        counts_dict = {
+            col: df[col].value_counts(dropna=True) for col in match_type_cols
+        }
+        counts = pd.DataFrame(counts_dict).T.fillna(0)
+        ordered_cols = [c for c in stack_order if c in counts.columns]
+        counts = counts[ordered_cols]
+
+        if sort_columns:
+            counts = counts.loc[counts.sum(axis=1).sort_values(ascending=False).index]
+
+        derived_labels = list(counts.index.astype(str))
+        if label_char_range is not None and labels is None:
+            m, n = label_char_range
+            derived_labels = [lbl[m:n] for lbl in derived_labels]
+        x_labels = labels if labels is not None else derived_labels
+
+        if ax is None:
+            fig, ax = plt.subplots(
+                figsize=(max(8, 0.5 * len(counts) + 2), 6),
+                constrained_layout=True,
+            )
+        else:
+            fig = ax.figure
+
+        counts.plot(kind="bar", stacked=True, color=colors, ax=ax)
+        ax.set_xlabel("Run")
+        ax.set_ylabel("Count")
+        ax.set_title(
+            f"Entry Counts per Match Type{' (' + dataset_name + ')' if dataset_name else ''}"
+        )
+        ax.set_xticks(range(len(x_labels)))
+        ax.set_xticklabels(x_labels, rotation=45, ha="right")
+
+        for container in ax.containers:
+            for bar in container:
+                height = bar.get_height()
+                if height > 0:
+                    ax.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        bar.get_y() + height / 2,
+                        f"{int(height)}",
+                        ha="center",
+                        va="center",
+                        fontsize=8,
+                    )
+
+        ax.legend(title="Entry", bbox_to_anchor=(1.02, 1), loc="upper left")
+        fig_name = f"match_type_counts{fig_name_suffix}"
+
+    elif mode == "nonzero_quant":
+        assert (
+            id_cols or int_col_keyword
+        ), "Must provide either id_cols or int_col_keyword to identify columns to plot."
+        if id_cols is not None:
+            cols_to_plot = [
+                col
+                for col in df.columns
+                if col not in id_cols
+                and (not int_col_keyword or int_col_keyword in col)
+            ]
+        else:
+            cols_to_plot = [
+                col for col in df.columns if int_col_keyword and int_col_keyword in col
+            ]
+        if not cols_to_plot:
+            raise ValueError(
+                f"No columns available for plotting after excluding '{id_cols}'."
+            )
+
+        if stack_order is not None:
+            cols_to_plot = [c for c in stack_order if c in cols_to_plot] + [
+                c for c in cols_to_plot if c not in stack_order
+            ]
+
+        values = df[cols_to_plot]
+        zero_counts = values.eq(0).sum(axis=0)
+        na_counts = values.isna().sum(axis=0)
+        nonquant_counts = zero_counts + na_counts
+        nonzero_counts = values.gt(0).sum(axis=0)
+
+        counts_df = pd.DataFrame(
+            {
+                "column": cols_to_plot,
+                "non_quantified_counts": nonquant_counts.values,
+                "quantified_counts": nonzero_counts.values,
+            }
+        )
+        counts_df["total_count"] = (
+            counts_df["non_quantified_counts"] + counts_df["quantified_counts"]
+        )
+        if sort_columns:
+            counts_df = counts_df.sort_values("total_count", ascending=False)
+
+        if ax is None:
+            fig, ax = plt.subplots(
+                figsize=(max(8, 0.5 * len(counts_df) + 2), 5),
+                constrained_layout=True,
+            )
+        else:
+            fig = ax.figure
+
+        x = np.arange(len(counts_df))
+        ax.bar(
+            x,
+            counts_df["quantified_counts"],
+            color=nonzero_color,
+            label="Quantified count",
+        )
+        ax.bar(
+            x,
+            counts_df["non_quantified_counts"],
+            bottom=counts_df["quantified_counts"],
+            color=zero_color,
+            label="Non-quantified count",
+        )
+
+        for i, (qc, non_qc) in enumerate(
+            zip(counts_df["quantified_counts"], counts_df["non_quantified_counts"])
+        ):
+            ax.text(
+                i,
+                qc / 2,
+                str(int(qc)),
+                ha="center",
+                va="center",
+                color="black",
+                fontsize=10,
+                fontweight="bold",
+                rotation=45,
+            )
+            ax.text(
+                i,
+                qc + non_qc / 2,
+                str(int(non_qc)),
+                ha="center",
+                va="center",
+                color="black",
+                fontsize=10,
+                fontweight="bold",
+                rotation=45,
+            )
+
+        derived_labels = counts_df["column"].astype(str).tolist()
+        if label_char_range is not None and labels is None:
+            m, n = label_char_range
+            derived_labels = [lbl[m:n] for lbl in derived_labels]
+        x_labels = labels if labels is not None else derived_labels
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(x_labels, rotation=45, ha="right")
+        ax.set_ylabel("Count")
+        ax.set_xlabel("Columns")
+        ax.set_title(
+            f"Quantification per Run{' (' + dataset_name + ')' if dataset_name else ''}"
+        )
+        ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
+        fig_name = f"quantification_count_{dataset_name}{fig_name_suffix}"
+
+    else:
+        raise ValueError(f"Unknown mode '{mode}'. Use 'match_type' or 'nonzero_quant'.")
+
+    if fig_dir is not None:
+        os.makedirs(fig_dir, exist_ok=True)
+        fig.savefig(
+            os.path.join(fig_dir, f"{fig_name}.png"), dpi=300, bbox_inches="tight"
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f"{fig_name}.svg"), dpi=300, bbox_inches="tight"
+        )
+        plt.close(fig)
+    else:
+        plt.show()
+
+    if mode == "nonzero_quant":
+        return fig, ax, counts_df.reset_index(drop=True)
+    return fig, ax
+
+
+def plot_match_type_from_combined(
+    df, colors=None, labels=None, stack_order=None, fig_dir=None, fig_name_suffix=""
+):
+    """Backward-compatible wrapper around plot_run_summary(mode='match_type')."""
+    return plot_run_summary(
+        df,
+        mode="match_type",
+        colors=colors,
+        labels=labels,
+        stack_order=stack_order,
+        fig_name_suffix=fig_name_suffix,
+        fig_dir=fig_dir,
+    )
+
+
+def plot_quantification_by_run(
+    df: pd.DataFrame,
+    *,
+    id_cols: list[str] | None = None,
+    int_col_keyword: Optional[str] = None,
+    zero_color: str = "#d73027",
+    nonzero_color: str = "#1a9850",
+    sort_columns: bool = False,
+    label_char_range: Optional[tuple[int, int]] = None,
+    dataset_name: Optional[str] = "",
+    fig_dir: Optional[str] = None,
+    ax: Optional[plt.Axes] = None,
+):
+    """Wrapper around plot_run_summary(mode='nonzero_quant')."""
+    return plot_run_summary(
+        df,
+        mode="nonzero_quant",
+        id_cols=id_cols,
+        int_col_keyword=int_col_keyword,
+        zero_color=zero_color,
+        nonzero_color=nonzero_color,
+        sort_columns=sort_columns,
+        label_char_range=label_char_range,
+        dataset_name=dataset_name,
+        fig_dir=fig_dir,
+        ax=ax,
+    )
