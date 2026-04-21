@@ -1,7 +1,7 @@
 import logging
 import os
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal, Optional, Tuple
+from typing import Any, Callable
 import numpy as np
 import pandas as pd
 import tqdm
@@ -787,6 +787,81 @@ def match_features_batch(
                         "feature_instance_id": feature_instance_id,
                     }
                 )
+                            )
+                        )
+                        if decoy_pp_raw is None or label_shift is None:
+                            no_quant_log.append(
+                                {
+                                    "mz_rank": pept_idx,
+                                    "run_name": _rf,
+                                    "type": "match_decoy",
+                                    "feature_instance_id": feature_instance_id,
+                                    "decoy_strategy": "off_target_shift_consensus",
+                                    "decoy_rep": _rep,
+                                }
+                            )
+                            no_match_log.append(
+                                {
+                                    "mz_rank": pept_idx,
+                                    "run_name": _rf,
+                                    "type": "match_decoy",
+                                    "feature_instance_id": feature_instance_id,
+                                    "decoy_strategy": "off_target_shift_consensus",
+                                    "decoy_rep": _rep,
+                                }
+                            )
+                            continue
+                        _prop_d = _annotate_peak_properties(
+                            decoy_pp_raw,
+                            mz_rank=pept_idx,
+                            run_name=_rf,
+                            own_anchor_id=own_anchor_id,
+                            assimilated_to_anchor_id=own_anchor_id,
+                            feature_instance_id=feature_instance_id,
+                            own_feature_instance_id=feature_instance_id,
+                            source_run="consensus",
+                            source_type="Consensus",
+                            decoy_mz_rank=-1,
+                        )
+                        if _prop_d is None:
+                            continue
+                        _prop_d["decoy_strategy"] = "off_target_shift_consensus"
+                        _prop_d["decoy_rep"] = _rep
+                        _prop_d["label_shift_rt"] = int(label_shift[0])
+                        _prop_d["label_shift_im"] = int(label_shift[1])
+                        pp_match_decoy_list.append(_prop_d)
+                        _match_d = compare_peak_properties(consensus_pp, _prop_d)
+                        _match_d["mz_rank"] = pept_idx
+                        _match_d["decoy_mz_rank"] = -1
+                        _match_d["feature_instance_id"] = feature_instance_id
+                        _match_d["own_anchor_id"] = own_anchor_id
+                        _match_d["assimilated_to_anchor_id"] = own_anchor_id
+                        _match_d["source_run"] = "consensus"
+                        _match_d["source_type"] = "Consensus"
+                        _match_d["decoy_strategy"] = "off_target_shift_consensus"
+                        _match_d["decoy_rep"] = _rep
+                        _match_d["label_shift_rt"] = int(label_shift[0])
+                        _match_d["label_shift_im"] = int(label_shift[1])
+                        results_decoy.append(_match_d)
+        else:
+            # consensus_pp is None: consensus generation failed — log all runs
+            for _rf in _consensus_raw_files:
+                no_quant_log.append(
+                    {
+                        "mz_rank": pept_idx,
+                        "run_name": _rf,
+                        "type": (
+                            "reference"
+                            if _rf == reference_raw_file
+                            else (
+                                "quant_only"
+                                if _rf in _quant_only_set
+                                else "match_target"
+                            )
+                        ),
+                        "feature_instance_id": feature_instance_id,
+                    }
+                )
 
     return (
         results_target,
@@ -798,748 +873,6 @@ def match_features_batch(
         no_match_log,
         snap_log_collection,
     )
-
-
-def _visualize_quantify_from_coords(
-    reference_image,
-    pept_act_image,
-    pept_act_image_smoothed,
-    save_dir: str,
-    bbox_center: Optional[Tuple[int, int]] = None,
-    target_msms_pos: Optional[Tuple[int, int]] = None,
-    target_snapped_msms_pos: Optional[Tuple[int, int]] = None,
-    template_msms_pos: Optional[Tuple[int, int]] = None,
-    template_snapped_msms_pos: Optional[Tuple[int, int]] = None,
-    template_box: Optional[Tuple[int, int, int, int]] = None,
-    seg_box: Optional[Tuple[int, int, int, int]] = None,
-    matched_template_box: Optional[Tuple[int, int, int, int]] = None,
-    filename: str = "quantify_from_coords.png",
-    labels: np.ndarray | None = None,
-):
-    """Visualize feature quantification with a fixed 5-panel layout.
-
-    Panels (left to right):
-      1. Reference                     – N/A when reference_image is None
-      2. pept_act_image (Raw)
-      3. pept_act_image_smoothed
-      4. pept_act_image_smoothed_aligned
-      5. watershed_labels              – N/A when labels is None
-
-    Each panel carries a legend explaining the overlaid markers.
-    """
-    import matplotlib.pyplot as plt
-
-    LEGEND = (
-        "+ red = center of label bbox\n"
-        "\u2605 white = MS/MS pos\n"
-        "\u2605 yellow = snapped\n"
-        "\u2014 red = template bbox\n"
-        "-- red = matched template bbox\n"
-        "-- blue = segmentation bbox"
-    )
-
-    def _draw_panel(
-        ax,
-        img,
-        title,
-        draw_markers=True,
-        labels_local=None,
-        template_box=None,
-        matched_template_box=None,
-        bbox_center=None,
-        target_msms_pos=None,
-        target_snapped_msms_pos=None,
-        template_msms_pos=None,
-        template_snapped_msms_pos=None,
-        seg_box=None,
-    ):
-        ax.set_title(title, fontsize=9)
-        if img is None:
-            ax.set_facecolor("#f0f0f0")
-            ax.text(
-                0.5,
-                0.5,
-                "N/A",
-                ha="center",
-                va="center",
-                transform=ax.transAxes,
-                fontsize=12,
-                color="gray",
-            )
-            ax.set_xticks([])
-            ax.set_yticks([])
-            return
-        ax.imshow(img, aspect="auto", origin="lower")
-        if labels_local is not None:
-            masked = np.ma.masked_where(labels_local == 0, labels_local)
-            ax.imshow(
-                masked,
-                aspect="auto",
-                origin="lower",
-                cmap="tab10",
-                interpolation="nearest",
-                alpha=0.35,
-            )
-        if draw_markers:
-            if bbox_center is not None:
-                bc = (
-                    tuple(bbox_center[0])
-                    if isinstance(bbox_center, np.ndarray)
-                    else bbox_center
-                )
-                ax.plot(bc[1], bc[0], "r+", markersize=10, markeredgewidth=2)
-            if target_msms_pos is not None:
-                ax.plot(
-                    target_msms_pos[1],
-                    target_msms_pos[0],
-                    "*",
-                    markersize=10,
-                    markeredgewidth=2,
-                    color="white",
-                )
-            if (
-                target_snapped_msms_pos is not None
-                and len(target_snapped_msms_pos) == 2
-            ):
-                ax.plot(
-                    target_snapped_msms_pos[1],
-                    target_snapped_msms_pos[0],
-                    "*",
-                    markersize=10,
-                    markeredgewidth=2,
-                    color="yellow",
-                )
-            if template_msms_pos is not None:
-                ax.plot(
-                    template_msms_pos[1],
-                    template_msms_pos[0],
-                    "*",
-                    markersize=10,
-                    markeredgewidth=2,
-                    color="white",
-                )
-            if (
-                template_snapped_msms_pos is not None
-                and len(template_snapped_msms_pos) == 2
-            ):
-                ax.plot(
-                    template_snapped_msms_pos[1],
-                    template_snapped_msms_pos[0],
-                    "*",
-                    markersize=10,
-                    markeredgewidth=2,
-                    color="yellow",
-                )
-        if template_box is not None:
-            rect = plt.Rectangle(
-                (template_box[1], template_box[0]),
-                template_box[3] - template_box[1],
-                template_box[2] - template_box[0],
-                edgecolor="red",
-                facecolor="none",
-                linestyle="solid",
-                linewidth=1.5,
-            )
-            ax.add_patch(rect)
-        if matched_template_box is not None:
-            rect = plt.Rectangle(
-                (matched_template_box[1], matched_template_box[0]),
-                matched_template_box[3] - matched_template_box[1],
-                matched_template_box[2] - matched_template_box[0],
-                edgecolor="red",
-                facecolor="none",
-                linestyle="dashed",
-                linewidth=1.5,
-            )
-            ax.add_patch(rect)
-        if seg_box is not None:
-            rect = plt.Rectangle(
-                (seg_box[1], seg_box[0]),
-                seg_box[3] - seg_box[1],
-                seg_box[2] - seg_box[0],
-                edgecolor="blue",
-                facecolor="none",
-                linestyle="dashed",
-                linewidth=1.5,
-            )
-            ax.add_patch(rect)
-
-    fig, axes = plt.subplots(1, 4, figsize=(25, 5))
-
-    # Panel 1: Reference (N/A for reference-only runs)
-    _draw_panel(
-        axes[0],
-        reference_image,
-        "Reference",
-        draw_markers=True,
-        template_box=template_box,
-        template_msms_pos=template_msms_pos,
-        template_snapped_msms_pos=template_snapped_msms_pos,
-    )
-
-    # Panel 2: Raw image
-    _draw_panel(
-        axes[1],
-        pept_act_image,
-        "pept_act_image (Raw)",
-        matched_template_box=matched_template_box,
-        target_msms_pos=target_msms_pos,
-        target_snapped_msms_pos=target_snapped_msms_pos,
-    )
-
-    # Panel 3: Smoothed
-    _draw_panel(
-        axes[2],
-        pept_act_image_smoothed,
-        "pept_act_image_smoothed",
-        matched_template_box=matched_template_box,
-        seg_box=seg_box,
-        target_msms_pos=target_msms_pos,
-        target_snapped_msms_pos=target_snapped_msms_pos,
-        bbox_center=bbox_center,
-    )
-
-    # Panel 4: Watershed labels standalone
-    ax_lbl = axes[3]
-    ax_lbl.set_title("labels", fontsize=9)
-    if labels is None:
-        ax_lbl.set_facecolor("#f0f0f0")
-        ax_lbl.text(
-            0.5,
-            0.5,
-            "N/A",
-            ha="center",
-            va="center",
-            transform=ax_lbl.transAxes,
-            fontsize=12,
-            color="gray",
-        )
-        ax_lbl.set_xticks([])
-        ax_lbl.set_yticks([])
-    else:
-        masked = np.ma.masked_where(labels == 0, labels)
-        ax_lbl.imshow(np.zeros_like(labels), aspect="auto", origin="lower", cmap="gray")
-        ax_lbl.imshow(
-            masked,
-            aspect="auto",
-            origin="lower",
-            cmap="tab10",
-            interpolation="nearest",
-        )
-        for lbl_val in np.unique(labels):
-            if lbl_val == 0:
-                continue
-            ys, xs = np.where(labels == lbl_val)
-            ax_lbl.text(
-                xs.mean(),
-                ys.mean(),
-                str(lbl_val),
-                ha="center",
-                va="center",
-                fontsize=7,
-                color="white",
-                fontweight="bold",
-            )
-        if bbox_center is not None:
-            bc = (
-                tuple(bbox_center[0])
-                if isinstance(bbox_center, np.ndarray)
-                else bbox_center
-            )
-            ax_lbl.plot(bc[1], bc[0], "r+", markersize=10, markeredgewidth=2)
-        if target_msms_pos is not None:
-            ax_lbl.plot(
-                target_msms_pos[1],
-                target_msms_pos[0],
-                "*",
-                markersize=10,
-                markeredgewidth=2,
-                color="white",
-            )
-        if target_snapped_msms_pos is not None and len(target_snapped_msms_pos) == 2:
-            ax_lbl.plot(
-                target_snapped_msms_pos[1],
-                target_snapped_msms_pos[0],
-                "*",
-                markersize=10,
-                markeredgewidth=2,
-                color="yellow",
-            )
-    fig.subplots_adjust(right=0.80)
-    fig.text(
-        0.815,
-        0.5,
-        LEGEND,
-        fontsize=8,
-        va="center",
-        ha="left",
-        transform=fig.transFigure,
-        bbox=dict(boxstyle="round,pad=0.6", facecolor="black", alpha=0.75),
-        color="white",
-        linespacing=1.6,
-    )
-    os.makedirs(save_dir, exist_ok=True)
-    fig.savefig(os.path.join(save_dir, filename), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
-def quantify_from_coords(
-    pept_act_image,
-    template_anchor,
-    reference_image: np.ndarray | None = None,
-    propA: pd.DataFrame | None = None,
-    pre_smoothed_image: np.ndarray | None = None,
-    apply_seg: bool = True,
-    smooth_kwargs: dict | None = None,
-    peak_kwargs: dict | None = None,
-    align_kwargs: dict | None = None,
-    filter_kwargs: dict | None = None,
-    patch_size: int | None = None,
-    visualize_dir: str | None = None,
-    visualize_filename: str = "quantify_from_coords.png",
-):
-    """
-    Quantify features from a peptide activity image given anchor coordinates and optional reference information.
-    Parameters
-    ----------
-    pept_act_image : np.ndarray
-        The peptide activity image.
-    template_anchor : tuple
-        The template/source anchor coordinates (row, column).
-        If no reference_image is given, then it's the Reference case
-        and it will be used on the target image as well.
-    reference_image : np.ndarray | None, optional
-        The reference image for template matching.
-    propA : pd.DataFrame | None, optional
-        The properties dataframe for template matching.
-    smooth_kwargs : dict | None, optional
-        Keyword arguments for smoothing the image.
-    peak_kwargs : dict | None, optional
-        Keyword arguments for peak detection.
-    align_kwargs : dict | None, optional
-        Keyword arguments for alignment.
-    patch_size : int | None, optional
-        The size of the patch to extract.
-    visualize_dir : str | None, optional
-        The directory to save visualizations.
-    visualize_filename : str, optional
-        The filename for the visualization.
-
-    Returns
-    -------
-    QuantificationResult
-        Structured quantification output containing the smoothed image, peak
-        properties, snapped anchor, watershed labels, and template-matching
-        metadata used by downstream anchor-family logic.
-    """
-    if reference_image is not None and (
-        template_anchor[0] >= reference_image.shape[0]
-        or template_anchor[1] >= reference_image.shape[1]
-        or template_anchor[0] < 0
-        or template_anchor[1] < 0
-    ):
-        logging.warning(
-            "Anchor coordinates %s are out of bounds of the reference image dimensions %s.",
-            template_anchor,
-            reference_image.shape,
-        )
-        return QuantificationResult(
-            run_name="",
-            case="Reference",
-            image=pept_act_image,
-            smoothed_image=pept_act_image,
-            input_anchor=(int(template_anchor[0]), int(template_anchor[1])),
-            peak_properties=None,
-            snapped_anchor=None,
-        )
-
-    template_anchor = np.array([(int(template_anchor[0]), int(template_anchor[1]))])
-
-    smooth_kwargs = {} if smooth_kwargs is None else dict(smooth_kwargs)
-    peak_kwargs = {} if peak_kwargs is None else dict(peak_kwargs)
-    align_kwargs = {} if align_kwargs is None else dict(align_kwargs)
-    filter_kwargs = {} if filter_kwargs is None else dict(filter_kwargs)
-    if "min_peak_area" not in filter_kwargs:
-        filter_kwargs["min_peak_area"] = 10
-    if "min_peak_sum_intensity" not in filter_kwargs:
-        filter_kwargs["min_peak_sum_intensity"] = 500
-    if "int_threshold" not in peak_kwargs:
-        peak_kwargs["int_threshold"] = 1
-    if "threshold_rel" not in peak_kwargs:
-        peak_kwargs["threshold_rel"] = 0.2
-    if "min_distance" not in peak_kwargs:
-        peak_kwargs["min_distance"] = 10
-
-    pept_act_image_smoothed = (
-        pre_smoothed_image.copy()
-        if pre_smoothed_image is not None
-        else smooth_and_denoise_image(pept_act_image, **smooth_kwargs)
-    )
-    # Case "Match": perform template matching to find the best match for the reference peak
-    # and then run watershed with the matched position as (updated) anchor
-    target_anchor_shifted = None
-    if reference_image is not None and propA is not None:
-        # Getting template for "Match" case
-        template_im_start = max(
-            (template_anchor[0][1] - 0.3 * reference_image.shape[1]).astype(int), 0
-        )
-        template_im_end = min(
-            (template_anchor[0][1] + 0.3 * reference_image.shape[1]).astype(int),
-            reference_image.shape[1],
-        )
-        template_rt_start = max(
-            (template_anchor[0][0] - 0.3 * reference_image.shape[0]).astype(int), 0
-        )
-        template_rt_end = min(
-            (template_anchor[0][0] + 0.3 * reference_image.shape[0]).astype(int),
-            reference_image.shape[0],
-        )  # Use up to 36% of the image size as the template size to
-        # make sure the template can cover the peak region even when the
-        # anchor is not very accurate, which can be common for low abundance peptides with weak MS/MS signal
-        template = reference_image[
-            template_rt_start:template_rt_end,
-            template_im_start:template_im_end,
-        ]  # template is larger than the segementation to make template matching more robust
-
-        template_match_result = match_template(pept_act_image_smoothed, template)
-        max_score_index = np.unravel_index(
-            np.argmax(template_match_result), template_match_result.shape
-        )
-        match_box_im_topleft, match_box_rt_topleft = max_score_index[
-            ::-1
-        ]  # template box top left, not the bounding box of segmentation
-        shift = (
-            match_box_rt_topleft - template_rt_start,
-            match_box_im_topleft - template_im_start,
-        )
-        match_bbox_mask = np.zeros(pept_act_image_smoothed.shape, dtype=int)
-        match_bbox = (
-            np.clip(
-                propA["bbox-0"].values[0].astype(int) + shift[0],
-                0,
-                match_bbox_mask.shape[0],
-            ),
-            np.clip(
-                propA["bbox-1"].values[0].astype(int) + shift[1],
-                0,
-                match_bbox_mask.shape[1],
-            ),
-            np.clip(
-                propA["bbox-2"].values[0].astype(int) + shift[0],
-                0,
-                match_bbox_mask.shape[0],
-            ),
-            np.clip(
-                propA["bbox-3"].values[0].astype(int) + shift[1],
-                0,
-                match_bbox_mask.shape[1],
-            ),
-        )
-        match_bbox_mask[
-            match_bbox[0] : match_bbox[2],
-            match_bbox[1] : match_bbox[3],
-        ] = 1  # matched bounding box calculated as original bbox plus shift
-
-        target_anchor_shifted = np.array(
-            [
-                (
-                    np.clip(
-                        template_anchor[0][0] + shift[0],
-                        0,
-                        pept_act_image_smoothed.shape[0] - 1,
-                    ),
-                    np.clip(
-                        template_anchor[0][1] + shift[1],
-                        0,
-                        pept_act_image_smoothed.shape[1] - 1,
-                    ),
-                )
-            ]
-        )  # target anchor is updated: shifted anchor for the matched image
-        labels = ((pept_act_image_smoothed != 0) & match_bbox_mask.astype(bool)).astype(
-            int
-        )
-        labels_with_multi_marker = (
-            labels  # Only one label is available in matched images
-        )
-        # alternatively, get match labels from watershed with the shifted anchor, which will be more robust to noise but may fail when the shift is large and there are multiple local maximum in the shifted region
-        # _, labels, _, labels_with_multi_marker, snapped_anchor = (
-        #     detect_2d_peak_with_watershed(
-        #         pept_act_image_smoothed,
-        #         **peak_kwargs,
-        #         coordinates=anchor,
-        #     )
-        # )
-        template_matching_score_max = np.max(template_match_result)
-
-    # Case quantification without template matching, directly run watershed with the original anchor
-    # Which will be snapped into the nearest connected local maximum if the anchor is not already a local maximum
-    else:
-        if apply_seg:
-            _, labels, _, labels_with_multi_marker, snapped_anchor = (
-                detect_2d_peak_with_watershed(
-                    pept_act_image_smoothed,
-                    **peak_kwargs,
-                    coordinates=template_anchor,
-                )
-            )
-        else:
-            template_im_start = max(
-                (template_anchor[0][1] - 0.3 * pept_act_image_smoothed.shape[1]).astype(
-                    int
-                ),
-                0,
-            )
-            template_im_end = min(
-                (template_anchor[0][1] + 0.3 * pept_act_image_smoothed.shape[1]).astype(
-                    int
-                ),
-                pept_act_image_smoothed.shape[1],
-            )
-            template_rt_start = max(
-                (template_anchor[0][0] - 0.3 * pept_act_image_smoothed.shape[0]).astype(
-                    int
-                ),
-                0,
-            )
-            template_rt_end = min(
-                (template_anchor[0][0] + 0.3 * pept_act_image_smoothed.shape[0]).astype(
-                    int
-                ),
-                pept_act_image_smoothed.shape[0],
-            )  # Use up to 36% of the image size as the template size to
-            # make sure the template can cover the peak region even when the
-            # anchor is not very accurate, which can be common for low abundance peptides with weak MS/MS signal
-
-            labels = np.zeros(pept_act_image_smoothed.shape, dtype=int)
-            labels[
-                template_rt_start:template_rt_end, template_im_start:template_im_end
-            ] = (
-                pept_act_image_smoothed[
-                    template_rt_start:template_rt_end, template_im_start:template_im_end
-                ]
-                > 0
-            )
-            labels_with_multi_marker = labels  # Only one label is available in this case as well, as watershed is not applied
-        template_matching_score_max = np.nan
-    peak_properties = calculate_peak_property_from_labels_and_image(
-        labels, pept_act_image, **filter_kwargs
-    )
-    if peak_properties is None:
-        if visualize_dir is not None:
-            _visualize_quantify_from_coords(
-                reference_image,
-                pept_act_image,
-                pept_act_image_smoothed,
-                bbox_center=None,
-                save_dir=visualize_dir,
-                target_msms_pos=template_anchor[0],
-                target_snapped_msms_pos=(
-                    snapped_anchor
-                    if reference_image is None and "snapped_anchor" in locals()
-                    else (
-                        target_anchor_shifted[0]
-                        if target_anchor_shifted is not None
-                        else template_anchor[0]
-                    )
-                ),
-                template_msms_pos=None,
-                template_snapped_msms_pos=(
-                    template_anchor[0] if reference_image is not None else None
-                ),
-                filename=visualize_filename,
-                labels=labels_with_multi_marker,
-                template_box=(
-                    (
-                        template_rt_start,
-                        template_im_start,
-                        template_rt_end,
-                        template_im_end,
-                    )
-                    if propA is not None
-                    else None
-                ),
-                matched_template_box=(
-                    (
-                        template_rt_start + shift[0],
-                        template_im_start + shift[1],
-                        template_rt_end + shift[0],
-                        template_im_end + shift[1],
-                    )
-                    if propA is not None
-                    else None
-                ),
-                seg_box=(
-                    (
-                        (
-                            propA["bbox-0"].values[0].astype(int) + shift[0],
-                            propA["bbox-1"].values[0].astype(int) + shift[1],
-                            propA["bbox-2"].values[0].astype(int) + shift[0],
-                            propA["bbox-3"].values[0].astype(int) + shift[1],
-                        )
-                    )
-                    if propA is not None
-                    else None
-                ),
-            )
-        return QuantificationResult(
-            run_name="",
-            case="Reference",
-            image=pept_act_image,
-            smoothed_image=pept_act_image_smoothed,
-            input_anchor=(int(template_anchor[0][0]), int(template_anchor[0][1])),
-            peak_properties=None,
-            snapped_anchor=(
-                tuple(int(x) for x in snapped_anchor)
-                if reference_image is None and "snapped_anchor" in locals()
-                else (
-                    (
-                        int(target_anchor_shifted[0][0]),
-                        int(target_anchor_shifted[0][1]),
-                    )
-                    if target_anchor_shifted is not None
-                    else (int(template_anchor[0][0]), int(template_anchor[0][1]))
-                )
-            ),
-            labels=labels,
-            labels_multi_markers=labels_with_multi_marker,
-            template_matching_score=template_matching_score_max,
-            shift=tuple(int(x) for x in shift) if "shift" in locals() else (0, 0),
-        )
-    else:
-        # successful match
-        seg_bbox = pept_act_image_smoothed[
-            peak_properties["bbox-0"]
-            .values[0]
-            .astype(int) : peak_properties["bbox-2"]
-            .values[0]
-            .astype(int),
-            peak_properties["bbox-1"]
-            .values[0]
-            .astype(int) : peak_properties["bbox-3"]
-            .values[0]
-            .astype(int),
-        ]  # Centers around the updated anchor
-        peak_properties["snap_rt"] = (
-            snapped_anchor[0] if "snapped_anchor" in locals() else template_anchor[0][0]
-        )
-        peak_properties["snap_im"] = (
-            snapped_anchor[1] if "snapped_anchor" in locals() else template_anchor[0][1]
-        )
-        peak_properties["template_matching_score"] = template_matching_score_max
-        peak_properties["sift_des"] = None
-        peak_properties.at[0, "sift_des"] = get_sift_descriptor(
-            np.log1p(pept_act_image),
-            (
-                peak_properties["snap_rt"].values[0],
-                peak_properties["snap_im"].values[0],
-            ),
-            patch_size=patch_size,
-        )
-        zernike = get_roi_descriptor(
-            seg_bbox,
-        )
-        peak_properties["zernike"] = None
-        peak_properties.at[0, "zernike"] = zernike
-
-        if reference_image is not None:
-            peak_properties["shift_rt"] = shift[0]
-            peak_properties["shift_im"] = shift[1]
-        else:
-            peak_properties["shift_rt"] = 0
-            peak_properties["shift_im"] = 0
-        if visualize_dir is not None:
-            _visualize_quantify_from_coords(
-                reference_image,
-                pept_act_image,
-                pept_act_image_smoothed,
-                bbox_center=np.array(
-                    [
-                        (
-                            peak_properties["centroid-0"].values[0],
-                            peak_properties["centroid-1"].values[0],
-                        )
-                    ]
-                ),
-                target_msms_pos=template_anchor[0],
-                target_snapped_msms_pos=(
-                    snapped_anchor
-                    if reference_image is None and "snapped_anchor" in locals()
-                    else (
-                        target_anchor_shifted[0]
-                        if target_anchor_shifted is not None
-                        else template_anchor[0]
-                    )
-                ),
-                template_msms_pos=None,
-                template_snapped_msms_pos=(
-                    template_anchor[0] if reference_image is not None else None
-                ),
-                save_dir=visualize_dir,
-                filename=visualize_filename,
-                labels=labels_with_multi_marker,
-                template_box=(
-                    (
-                        template_rt_start,
-                        template_im_start,
-                        template_rt_end,
-                        template_im_end,
-                    )
-                    if reference_image is not None
-                    else None
-                ),
-                seg_box=(
-                    (
-                        peak_properties["bbox-0"].values[0].astype(int),
-                        peak_properties["bbox-1"].values[0].astype(int),
-                        peak_properties["bbox-2"].values[0].astype(int),
-                        peak_properties["bbox-3"].values[0].astype(int),
-                    )
-                ),
-                matched_template_box=(
-                    (
-                        template_rt_start + shift[0],
-                        template_im_start + shift[1],
-                        template_rt_end + shift[0],
-                        template_im_end + shift[1],
-                    )
-                    if propA is not None
-                    else None
-                ),
-            )
-        peak_properties = _extract_single_peak_properties(
-            peak_properties,
-            (
-                tuple(int(x) for x in snapped_anchor)
-                if "snapped_anchor" in locals() and len(snapped_anchor) == 2
-                else (int(template_anchor[0][0]), int(template_anchor[0][1]))
-            ),
-        )
-        return QuantificationResult(
-            run_name="",
-            case="Reference",
-            image=pept_act_image,
-            smoothed_image=pept_act_image_smoothed,
-            input_anchor=(int(template_anchor[0][0]), int(template_anchor[0][1])),
-            peak_properties=peak_properties,
-            snapped_anchor=(
-                tuple(int(x) for x in snapped_anchor)
-                if reference_image is None and "snapped_anchor" in locals()
-                else (
-                    (
-                        int(target_anchor_shifted[0][0]),
-                        int(target_anchor_shifted[0][1]),
-                    )
-                    if target_anchor_shifted is not None
-                    else (int(template_anchor[0][0]), int(template_anchor[0][1]))
-                )
-            ),
-            labels=labels,
-            labels_multi_markers=labels_with_multi_marker,
-            template_matching_score=template_matching_score_max,
-            shift=tuple(int(x) for x in shift) if "shift" in locals() else (0, 0),
-        )
-
 
 def compare_peak_properties(peak_properties_a, peak_properties_b):
     return {
@@ -2145,7 +1478,9 @@ def extract_peak_properties_from_consensus_labels(
     """Extract per-run and consensus peak properties from consensus labels."""
 
     individual_pps: list[pd.DataFrame | None] = [None] * len(
+        
         alignment_state.aligned_images
+    
     )
     if (
         raw_images is None
@@ -2862,12 +2197,11 @@ def generate_consensus_image(
 ]:
     """Resize, align, and average a collection of smoothed images into a consensus.
 
-    Alignment reuses the same template-matching logic as
-    :func:`quantify_from_coords`: a patch of size
-    ``±template_frac * dim`` is extracted from the (resized) reference image
-    centred on *template_anchor*, then :func:`skimage.feature.match_template`
-    locates that patch in every other image and the resulting integer shift is
-    applied with :func:`scipy.ndimage.shift`.
+    A patch of size ``±template_frac * dim`` is extracted from the (resized)
+    reference image centred on *template_anchor*, then
+    :func:`skimage.feature.match_template` locates that patch in every other
+    image and the resulting integer shift is applied with
+    :func:`scipy.ndimage.shift`.
 
     Then a consensus image is generated and smoothed and watershed segmented.
 
@@ -2886,12 +2220,11 @@ def generate_consensus_image(
     template_anchor : (row, col) or None, optional
         Pixel coordinate **in the resized reference image** that centres the
         template patch.  When *None* the peak (argmax) of the resized reference
-        image is used, which mirrors the typical use-case in
-        :func:`quantify_from_coords`.
+        image is used.
     template_frac : float, optional
         Fraction of each image dimension used as the half-extent of the
         template patch (``±template_frac * dim``).  Must be in ``(0, 0.5)``.
-        Default is ``0.3``, matching :func:`quantify_from_coords`.
+        Default is ``0.3``.
     visualize : bool, optional
         When *True* a figure is produced showing all n resized+aligned images
         in a grid of at most 5 columns, with the consensus on its own final row.
