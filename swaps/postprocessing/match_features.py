@@ -19,7 +19,6 @@ from .image_processing import (
     smooth_and_denoise_image,
     detect_2d_peak_with_watershed,
     calculate_peak_property_from_labels_and_image,
-    fast_intensity_weighted_ncc,
 )
 import duckdb
 from matplotlib.colors import ListedColormap
@@ -55,20 +54,6 @@ class QuantificationResult:
         """Return True when a valid quantified feature was produced."""
 
         return self.peak_properties is not None and self.snapped_anchor is not None
-
-
-@dataclass
-class ReferenceMatchState:
-    """Mutable reference state used to update the reusable match bounding box.
-
-    The source quantification remains the peptide's original reference feature.
-    Quant-only runs can expand the bbox offsets used for future template-guided
-    matching, but they do not create separate match identities.
-    """
-
-    reference_result: QuantificationResult
-    match_props: pd.DataFrame
-    bbox_offsets: dict[str, int]
 
 
 @dataclass
@@ -127,7 +112,6 @@ def match_features_batches_parallel(
     peptide_indicies: np.ndarray | None = None,
     batch_size_max: int = 1500,
     max_workers: int = 4,
-    generate_consensus: bool = False,
     processing_kwargs: dict | None = None,
 ):
     if peptide_indicies is None:
@@ -180,7 +164,6 @@ def match_features_batches_parallel(
             dict_ref,
             raw_file_list,
             result_dir,
-            generate_consensus,
             processing_kwargs,
         ),
     ) as executor:
@@ -252,7 +235,7 @@ def match_features_batches_parallel(
 
 
 def _init_match_features_worker(
-    dict_ref, raw_file_list, result_dir, generate_consensus, processing_kwargs
+    dict_ref, raw_file_list, result_dir, processing_kwargs
 ):
     """Store immutable batch context once per worker process."""
 
@@ -260,7 +243,6 @@ def _init_match_features_worker(
     _WORKER_CONTEXT["raw_file_list"] = raw_file_list
     _WORKER_CONTEXT["result_dir"] = result_dir
     _WORKER_CONTEXT["processing_kwargs"] = processing_kwargs
-    _WORKER_CONTEXT["generate_consensus"] = generate_consensus
     _WORKER_CONTEXT["dict_ref_by_mz"] = (
         dict_ref.set_index("mz_rank")
         if dict_ref["mz_rank"].is_unique
@@ -274,7 +256,6 @@ def _match_features_batch_worker(batch):
         raw_file_list=_WORKER_CONTEXT["raw_file_list"],
         result_dir=_WORKER_CONTEXT["result_dir"],
         batch=batch,
-        generate_consensus=_WORKER_CONTEXT["generate_consensus"],
         processing_kwargs=_WORKER_CONTEXT["processing_kwargs"],
     )
 
@@ -332,334 +313,6 @@ def _extract_single_peak_properties(
         return peak_properties.loc[mask].iloc[[0]].reset_index(drop=True)
     return peak_properties.iloc[[0]].reset_index(drop=True)
 
-
-def _bbox_offsets_from_prop(
-    peak_properties: pd.DataFrame, anchor: tuple[int, int]
-) -> dict[str, int]:
-    """Express a peak bbox as offsets around a snapped anchor."""
-
-    row = peak_properties.iloc[0]
-    return {
-        "top": max(int(anchor[0]) - int(row["bbox-0"]), 0),
-        "bottom": max(int(row["bbox-2"]) - int(anchor[0]), 0),
-        "left": max(int(anchor[1]) - int(row["bbox-1"]), 0),
-        "right": max(int(row["bbox-3"]) - int(anchor[1]), 0),
-    }
-
-
-def _expand_offsets(
-    base_offsets: dict[str, int], new_offsets: dict[str, int]
-) -> dict[str, int]:
-    """Expand bbox offsets to cover both the existing and the new segmentation."""
-
-    return {
-        key: max(int(base_offsets.get(key, 0)), int(new_offsets.get(key, 0)))
-        for key in ["top", "bottom", "left", "right"]
-    }
-
-
-def _bbox_tuple_from_prop(peak_properties: pd.DataFrame) -> tuple[int, int, int, int]:
-    """Return the first-row bbox as a plain integer tuple."""
-
-    row = peak_properties.iloc[0]
-    return tuple(int(row[col]) for col in ["bbox-0", "bbox-1", "bbox-2", "bbox-3"])
-
-
-def _expansion_deltas_from_aligned_and_quant_bbox(
-    ref_probe_new_bbox: tuple[int, int, int, int],
-    ref_bbox: tuple[int, int, int, int],
-) -> dict[str, int]:
-    """Compute directional expansion needed to cover both aligned and quant bboxes.
-
-    The returned values are *additional* expansion amounts beyond the current
-    aligned bbox, expressed as top/bottom/left/right deltas.
-    """
-
-    return {
-        "top": max(int(ref_probe_new_bbox[0]) - int(ref_bbox[0]), 0),
-        "left": max(int(ref_probe_new_bbox[1]) - int(ref_bbox[1]), 0),
-        "bottom": max(int(ref_probe_new_bbox[2]) - int(ref_bbox[2]), 0),
-        "right": max(int(ref_probe_new_bbox[3]) - int(ref_bbox[3]), 0),
-    }
-
-
-def _add_offset_deltas(
-    base_offsets: dict[str, int], deltas: dict[str, int]
-) -> dict[str, int]:
-    """Add expansion deltas onto an existing offset dictionary."""
-
-    return {
-        key: int(base_offsets.get(key, 0)) + int(deltas.get(key, 0))
-        for key in ["top", "bottom", "left", "right"]
-    }
-
-
-def _clone_props_with_offsets(
-    peak_properties: pd.DataFrame,
-    anchor: tuple[int, int],
-    offsets: dict[str, int],
-    image_shape: tuple[int, int],
-) -> pd.DataFrame:
-    """Clone one-row peak properties and replace the bbox around the given anchor."""
-
-    prop = peak_properties.copy()
-    bbox0 = max(int(anchor[0]) - int(offsets["top"]), 0)
-    bbox1 = max(int(anchor[1]) - int(offsets["left"]), 0)
-    bbox2 = min(int(anchor[0]) + int(offsets["bottom"]), image_shape[0])
-    bbox3 = min(int(anchor[1]) + int(offsets["right"]), image_shape[1])
-    prop.loc[:, "bbox-0"] = bbox0
-    prop.loc[:, "bbox-1"] = bbox1
-    prop.loc[:, "bbox-2"] = bbox2
-    prop.loc[:, "bbox-3"] = bbox3
-    prop.loc[:, "rt_length"] = bbox2 - bbox0
-    prop.loc[:, "im_length"] = bbox3 - bbox1
-    return prop
-
-
-def _anchor_inside_bbox(
-    anchor: tuple[int, int] | None, peak_properties: pd.DataFrame | None
-) -> bool:
-    """Return True when the anchor lies inside the first-row bbox."""
-
-    if anchor is None or peak_properties is None or peak_properties.empty:
-        return False
-    row = peak_properties.iloc[0]
-    return int(row["bbox-0"]) <= int(anchor[0]) < int(row["bbox-2"]) and int(
-        row["bbox-1"]
-    ) <= int(anchor[1]) < int(row["bbox-3"])
-
-
-def _quantify_peptide_run(
-    act_df,
-    pept_idx,
-    dict_ref,
-    run_name,
-    case: Literal["Reference", "Quant_Only", "Match"],
-    template_anchor_override: Optional[tuple[int, int]] = None,
-    reference_image: np.ndarray | None = None,
-    reference_props: pd.DataFrame | None = None,
-    precomputed_pept_act: tuple[np.ndarray, int, int] | None = None,
-    precomputed_smoothed_image: np.ndarray | None = None,
-    processing_kwargs: dict | None = None,
-    visualize_dir: str | None = None,
-    visualize_name: str | None = None,
-):
-    """Quantify one peptide in one run and return the full quantification state.
-
-    Parameters
-    ----------
-    template_anchor_override : tuple[int, int] | None
-        Position (rt, im) in the *reference* image used to crop the template patch
-        for cross-correlation matching (passed as ``anchor`` to
-        ``quantify_from_coords``).  Represents where the peak lives in the reference
-        run.  Defaults to ``(rt_msms_pos, im_msms_pos)`` when ``None``.
-    """
-
-    if precomputed_pept_act is None:
-        pept_act, rt_msms_pos, im_msms_pos = get_pept_act_from_parquet(
-            act_df, pept_idx, dict_ref, run_name
-        )
-    else:
-        pept_act, rt_msms_pos, im_msms_pos = precomputed_pept_act
-    template_anchor = (
-        template_anchor_override
-        if template_anchor_override
-        else (rt_msms_pos, im_msms_pos)
-    )
-    if visualize_name is None:
-        visualize_name = f"mz{pept_idx}_{run_name}_{case.lower()}.png"
-    match case:
-        case "Match":
-            result = quantify_from_coords(
-                pept_act,
-                template_anchor=(int(template_anchor[0]), int(template_anchor[1])),
-                reference_image=reference_image,
-                propA=reference_props,
-                pre_smoothed_image=precomputed_smoothed_image,
-                patch_size=min(pept_act.shape),
-                **(processing_kwargs or {}),
-                visualize_dir=visualize_dir,
-                visualize_filename=visualize_name,
-            )
-        case "Reference":
-            result = quantify_from_coords(
-                pept_act,
-                template_anchor=(int(template_anchor[0]), int(template_anchor[1])),
-                pre_smoothed_image=precomputed_smoothed_image,
-                patch_size=min(pept_act.shape),
-                **(processing_kwargs or {}),
-                visualize_dir=visualize_dir,
-                visualize_filename=visualize_name,
-            )
-
-        case _:
-            raise ValueError(f"Unknown case: {case}")
-    if isinstance(result, QuantificationResult):
-        result.run_name = run_name
-        result.case = case
-        result.metadata["pept_idx"] = pept_idx
-        return result
-    else:
-        return None
-
-
-def _attach_quant_only_metadata(
-    prop_t: pd.DataFrame,
-    record: dict[str, Any],
-    match_state: "ReferenceMatchState",
-) -> None:
-    """Attach quant-only diagnostic metadata columns to a matched peak-properties row."""
-    quant_direct: QuantificationResult = record["direct"]
-    if quant_direct.snapped_anchor is not None:
-        prop_t["quant_direct_snap_rt"] = int(quant_direct.snapped_anchor[0])
-        prop_t["quant_direct_snap_im"] = int(quant_direct.snapped_anchor[1])
-    if quant_direct.peak_properties is not None:
-        for i, col in enumerate(["bbox-0", "bbox-1", "bbox-2", "bbox-3"]):
-            prop_t[f"quant_direct_bbox_{i}"] = int(
-                quant_direct.peak_properties[col].values[0]
-            )
-    prop_t["quant_anchor_inside_match_bbox"] = bool(record["inside_match_bbox"])
-    prop_t["quant_anchor_expanded_match_bbox"] = bool(record["expanded_match_bbox"])
-    prop_t["bbox_updated_from_original"] = bool(record["bbox_updated_from_original"])
-    for side in ("top", "bottom", "left", "right"):
-        prop_t[f"reference_bbox_{side}"] = int(match_state.bbox_offsets[side])
-
-
-def _visualize_probe_expansion(
-    smoothed_image_raw_file: np.ndarray,
-    smoothed_image_ref_file: np.ndarray,
-    quant_direct_snapped_anchor: tuple[int, int],
-    quant_direct_bbox: tuple[int, int, int, int],
-    ref_snapped_anchor: tuple[int, int],
-    ref_bbox: tuple[int, int, int, int],
-    ref_probe_new_bbox: tuple[int, int, int, int],
-    match_props_bbox_before: tuple[int, int, int, int],
-    match_props_bbox_after: tuple[int, int, int, int],
-    mz_rank: int,
-    raw_file: str,
-    bbox_version: int,
-    visualization_dir: str,
-) -> None:
-    """Visualize a bbox expansion event triggered by a quant-only probe run.
-
-    Two panels:
-      1. Smoothed activation image of *raw_file*:
-         - Yellow star : quant_direct.snapped_anchor
-         - Blue solid  : quant_direct segmentation bbox
-      2. Smoothed activation image of the reference run:
-         - Yellow star : reference_result.snapped_anchor
-         - White solid : original reference segmentation bbox
-         - Blue dashed : ref_probe_new_bbox (aligned probe bbox on reference space)
-         - Red solid   : match_state.match_props bbox *before* _clone_props_with_offsets
-         - Red dashed  : match_state.match_props bbox *after* _clone_props_with_offsets
-
-    The legend is placed to the right of both panels without overlapping them.
-    """
-    import matplotlib.patches as mpatches
-    import matplotlib.lines as mlines
-    import matplotlib.pyplot as plt
-
-    def _draw_bbox(
-        ax, bbox: tuple[int, int, int, int], color: str, linestyle: str
-    ) -> None:
-        rect = plt.Rectangle(
-            (bbox[1], bbox[0]),
-            bbox[3] - bbox[1],
-            bbox[2] - bbox[0],
-            edgecolor=color,
-            facecolor="none",
-            linestyle=linestyle,
-            linewidth=1.5,
-        )
-        ax.add_patch(rect)
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-
-    # Panel 1: quant-only run smoothed image
-    ax0 = axes[0]
-    ax0.set_title(f"{raw_file}\n(smoothed)", fontsize=8)
-    ax0.imshow(smoothed_image_raw_file, aspect="auto", origin="lower")
-    ax0.plot(
-        quant_direct_snapped_anchor[1],
-        quant_direct_snapped_anchor[0],
-        "*",
-        markersize=10,
-        markeredgewidth=1.5,
-        color="yellow",
-    )
-    _draw_bbox(ax0, quant_direct_bbox, color="blue", linestyle="solid")
-
-    # Panel 2: reference run smoothed image
-    ax1 = axes[1]
-    ax1.set_title(f"reference\n(smoothed)", fontsize=8)
-    ax1.imshow(smoothed_image_ref_file, aspect="auto", origin="lower")
-    ax1.plot(
-        ref_snapped_anchor[1],
-        ref_snapped_anchor[0],
-        "*",
-        markersize=10,
-        markeredgewidth=1.5,
-        color="yellow",
-    )
-    _draw_bbox(ax1, ref_bbox, color="white", linestyle="solid")
-    _draw_bbox(ax1, ref_probe_new_bbox, color="blue", linestyle="dashed")
-    _draw_bbox(ax1, match_props_bbox_before, color="red", linestyle="solid")
-    _draw_bbox(ax1, match_props_bbox_after, color="red", linestyle="dashed")
-
-    legend_handles = [
-        mlines.Line2D(
-            [],
-            [],
-            marker="*",
-            color="yellow",
-            linestyle="None",
-            markersize=8,
-            label="snapped anchor",
-        ),
-        mpatches.Patch(
-            edgecolor="blue",
-            facecolor="none",
-            linestyle="solid",
-            label="quant_direct bbox (panel 1)",
-        ),
-        mpatches.Patch(
-            edgecolor="white", facecolor="none", label="original ref bbox (panel 2)"
-        ),
-        mpatches.Patch(
-            edgecolor="blue",
-            facecolor="none",
-            linestyle="dashed",
-            label="ref_probe_new_bbox (panel 2)",
-        ),
-        mpatches.Patch(
-            edgecolor="red",
-            facecolor="none",
-            linestyle="solid",
-            label="match_props bbox before update (panel 2)",
-        ),
-        mpatches.Patch(
-            edgecolor="red",
-            facecolor="none",
-            linestyle="dashed",
-            label="match_props bbox after update (panel 2)",
-        ),
-    ]
-    fig.subplots_adjust(right=0.72)
-    fig.legend(
-        handles=legend_handles,
-        loc="center right",
-        bbox_to_anchor=(1.0, 0.5),
-        fontsize=8,
-        framealpha=0.85,
-        frameon=True,
-    )
-
-    os.makedirs(visualization_dir, exist_ok=True)
-    fname = f"probe_expansion_mz{mz_rank}_{raw_file}_bbox_v{bbox_version}.png"
-    fig.savefig(os.path.join(visualization_dir, fname), dpi=150, bbox_inches="tight")
-    plt.close(fig)
-
-
 def match_features_batch(
     dict_ref,
     raw_file_list,
@@ -668,19 +321,8 @@ def match_features_batch(
     processing_kwargs: dict | None = None,
     visualize_dir: str | None = None,
     match_decoy: bool = True,
-    generate_consensus: bool = False,
 ):
-    """Process one peptide batch with sequential quant-only bbox expansion.
-
-    Workflow per peptide:
-    1. Quantify the main reference run once.
-    2. Use the reference to template-match each quant-only run.
-    3. If a quant-only run's own snapped anchor falls outside the matched bbox,
-       expand the reusable reference bbox.
-    4. Record which quant-only runs were already inside the bbox and which ones
-       caused an expansion.
-    5. Match all regular `Match` and `Quant_only` runs using the final expanded bbox.
-    """
+    """Process one peptide batch using the consensus image path."""
     results_target, results_decoy = [], []
     pp_reference_list, pp_match_target_list, pp_match_decoy_list = [], [], []
     no_quant_log, no_match_log = [], []
@@ -753,184 +395,197 @@ def match_features_batch(
 
         own_anchor_id = 0
         feature_instance_id = _feature_instance_id(pept_idx, own_anchor_id)
-        match_state: ReferenceMatchState | None = None
 
-        if generate_consensus:
-            _consensus_raw_files = [reference_raw_file] + match_raw_files
-            _quant_only_set = set(quant_only_raw_files)
-            _consensus_anchors: list[tuple[int, int] | None] = [
-                (
-                    (int(_get_pept_act_tuple(rf)[1]), int(_get_pept_act_tuple(rf)[2]))
-                    if rf in _quant_only_set or rf == reference_raw_file
-                    else None
-                )
-                for rf in _consensus_raw_files
-            ]
-            _consensus_bundle = build_consensus_feature_bundle(
-                images=[_get_smoothed_pept_act(rf) for rf in _consensus_raw_files],
-                reference_idx=0,
-                template_anchor=_get_pept_act_tuple(reference_raw_file)[1:3],
-                template_frac=0.3,
-                anchors=_consensus_anchors,
-                smooth_kwargs=dict(
-                    (processing_kwargs or {}).get("smooth_consensus_kwargs", {})
-                ),
-                watershed_kwargs=dict(
-                    (processing_kwargs or {}).get("peak_consensus_kwargs", {})
-                ),
-                raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
+        _consensus_raw_files = [reference_raw_file] + match_raw_files
+        _quant_only_set = set(quant_only_raw_files)
+        _consensus_anchors: list[tuple[int, int] | None] = [
+            (
+                (int(_get_pept_act_tuple(rf)[1]), int(_get_pept_act_tuple(rf)[2]))
+                if rf in _quant_only_set or rf == reference_raw_file
+                else None
+            )
+            for rf in _consensus_raw_files
+        ]
+        _consensus_bundle = build_consensus_feature_bundle(
+            images=[_get_smoothed_pept_act(rf) for rf in _consensus_raw_files],
+            reference_idx=0,
+            template_anchor=_get_pept_act_tuple(reference_raw_file)[1:3],
+            template_frac=0.3,
+            anchors=_consensus_anchors,
+            smooth_kwargs=dict(
+                (processing_kwargs or {}).get("smooth_consensus_kwargs", {})
+            ),
+            watershed_kwargs=dict(
+                (processing_kwargs or {}).get("peak_consensus_kwargs", {})
+            ),
+            raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
+            labels=_consensus_raw_files,
+        )
+        if visualize_dir is not None:
+            _visualize_consensus_bundle(
+                _consensus_bundle.alignment,
+                _consensus_bundle.segmentation,
+                fig_dir=visualize_dir,
+                filename=f"mz{pept_idx}_consensus.png",
                 labels=_consensus_raw_files,
             )
-            if visualize_dir is not None:
-                _visualize_consensus_bundle(
-                    _consensus_bundle.alignment,
-                    _consensus_bundle.segmentation,
-                    fig_dir=visualize_dir,
-                    filename=f"mz{pept_idx}_consensus.png",
-                    labels=_consensus_raw_files,
-                )
-            consensus_pp = _consensus_bundle.consensus_pp
-            individual_pps = _consensus_bundle.individual_pps
-            snap_log_collection[int(pept_idx)] = _consensus_bundle.segmentation.snap_log
-            _consensus_decoy_kwargs = dict(
-                (processing_kwargs or {}).get("consensus_decoy_kwargs", {})
+        consensus_pp = _consensus_bundle.consensus_pp
+        individual_pps = _consensus_bundle.individual_pps
+        snap_log_collection[int(pept_idx)] = _consensus_bundle.segmentation.snap_log
+        _consensus_decoy_kwargs = dict(
+            (processing_kwargs or {}).get("consensus_decoy_kwargs", {})
+        )
+        _consensus_decoy_strategies = {
+            str(s)
+            for s in _consensus_decoy_kwargs.get(
+                "strategies", ["peptide_swap", "off_target_shift"]
             )
-            _consensus_decoy_strategies = {
-                str(s)
-                for s in _consensus_decoy_kwargs.get(
-                    "strategies", ["peptide_swap", "off_target_shift"]
-                )
-            }
-            _n_peptide_swap_decoys = max(
-                int(_consensus_decoy_kwargs.get("n_peptide_swap_decoys", 1)), 0
-            )
-            _n_off_target_decoys = max(
-                int(_consensus_decoy_kwargs.get("n_off_target_shift_decoys", 1)), 0
-            )
-            _off_target_min_offset_frac = float(
-                _consensus_decoy_kwargs.get("off_target_min_offset_frac", 0.35)
-            )
-            _off_target_max_overlap_fraction = float(
-                _consensus_decoy_kwargs.get("off_target_max_overlap_fraction", 0.05)
-            )
-            _batch_exclude = (
-                batch_np[batch_np != pept_idx]
-                if match_decoy and batch_np.size > 1
-                else np.array([], dtype=batch_np.dtype)
-            )
-            _peptide_swap_decoys_by_rep: list[dict[str, dict[str, Any]]] = []
-            if (
-                match_decoy
-                and "peptide_swap" in _consensus_decoy_strategies
-                and _n_peptide_swap_decoys > 0
-                and _batch_exclude.size > 0
-            ):
-                for _rep in range(_n_peptide_swap_decoys):
-                    _rep_specs: dict[str, dict[str, Any]] = {}
-                    _plot_raw_images: list[np.ndarray] = []
-                    _plot_smoothed_images: list[np.ndarray] = []
-                    _plot_labels: list[str] = []
-                    for _plot_i, _plot_rf in enumerate(_consensus_raw_files):
-                        if _plot_rf == reference_raw_file:
-                            _ref_raw = _get_pept_act_tuple(_plot_rf)[0]
-                            _plot_raw_images.append(_ref_raw)
-                            _plot_smoothed_images.append(_get_smoothed_pept_act(_plot_rf))
-                            _plot_labels.append(_plot_rf)
-                            continue
-                        _decoy_mz = int(np.random.choice(_batch_exclude))
-                        _decoy_act_df = _select_mz(act_dfs[_plot_rf], _decoy_mz)
-                        _decoy_raw, _, _ = get_pept_act_from_parquet(
-                            _decoy_act_df,
-                            _decoy_mz,
-                            dict_ref_by_mz,
-                            _plot_rf,
-                            shape=_get_pept_act_tuple(_plot_rf)[0].shape,
+        }
+        _n_peptide_swap_decoys = max(
+            int(_consensus_decoy_kwargs.get("n_peptide_swap_decoys", 1)), 0
+        )
+        _n_off_target_decoys = max(
+            int(_consensus_decoy_kwargs.get("n_off_target_shift_decoys", 1)), 0
+        )
+        _off_target_min_offset_frac = float(
+            _consensus_decoy_kwargs.get("off_target_min_offset_frac", 0.35)
+        )
+        _off_target_max_overlap_fraction = float(
+            _consensus_decoy_kwargs.get("off_target_max_overlap_fraction", 0.05)
+        )
+        _batch_exclude = (
+            batch_np[batch_np != pept_idx]
+            if match_decoy and batch_np.size > 1
+            else np.array([], dtype=batch_np.dtype)
+        )
+        _peptide_swap_decoys_by_rep: list[dict[str, dict[str, Any]]] = []
+        if (
+            match_decoy
+            and "peptide_swap" in _consensus_decoy_strategies
+            and _n_peptide_swap_decoys > 0
+            and _batch_exclude.size > 0
+        ):
+            for _rep in range(_n_peptide_swap_decoys):
+                _rep_specs: dict[str, dict[str, Any]] = {}
+                _plot_raw_images: list[np.ndarray] = []
+                _plot_smoothed_images: list[np.ndarray] = []
+                _plot_labels: list[str] = []
+                for _plot_i, _plot_rf in enumerate(_consensus_raw_files):
+                    if _plot_rf == reference_raw_file:
+                        _ref_raw = _get_pept_act_tuple(_plot_rf)[0]
+                        _plot_raw_images.append(_ref_raw)
+                        _plot_smoothed_images.append(
+                            _get_smoothed_pept_act(_plot_rf)
                         )
-                        _decoy_smoothed = smooth_and_denoise_image(
-                            _decoy_raw, **smooth_kwargs
-                        )
-                        _rep_specs[_plot_rf] = {
-                            "decoy_mz_rank": _decoy_mz,
-                            "decoy_raw_image": _decoy_raw,
-                            "decoy_smoothed_image": _decoy_smoothed,
-                        }
-                        _plot_raw_images.append(_decoy_raw)
-                        _plot_smoothed_images.append(_decoy_smoothed)
-                        _plot_labels.append(f"{_plot_rf}\n(decoy mz{_decoy_mz})")
-                    _peptide_swap_decoys_by_rep.append(_rep_specs)
-                    if visualize_dir is not None:
-                        _plot_anchors = [
-                            _consensus_anchors[0]
-                        ] + [None] * (len(_consensus_raw_files) - 1)
-                        _decoy_bundle = build_consensus_feature_bundle(
-                            images=_plot_smoothed_images,
-                            reference_idx=0,
-                            template_anchor=_get_pept_act_tuple(reference_raw_file)[1:3],
-                            template_frac=0.3,
-                            anchors=_plot_anchors,
-                            smooth_kwargs=dict(
-                                (processing_kwargs or {}).get(
-                                    "smooth_consensus_kwargs", {}
-                                )
-                            ),
-                            watershed_kwargs=dict(
-                                (processing_kwargs or {}).get(
-                                    "peak_consensus_kwargs", {}
-                                )
-                            ),
-                            raw_images=_plot_raw_images,
-                            labels=_plot_labels,
-                        )
-                        _visualize_consensus_bundle(
-                            _decoy_bundle.alignment,
-                            _decoy_bundle.segmentation,
-                            fig_dir=visualize_dir,
-                            filename=(
-                                f"mz{pept_idx}_consensus_decoy_peptide_swap_rep{_rep}.png"
-                            ),
-                            labels=_plot_labels,
-                        )
+                        _plot_labels.append(_plot_rf)
+                        continue
+                    _decoy_mz = int(np.random.choice(_batch_exclude))
+                    _decoy_act_df = _select_mz(act_dfs[_plot_rf], _decoy_mz)
+                    _decoy_raw, _, _ = get_pept_act_from_parquet(
+                        _decoy_act_df,
+                        _decoy_mz,
+                        dict_ref_by_mz,
+                        _plot_rf,
+                        shape=_get_pept_act_tuple(_plot_rf)[0].shape,
+                    )
+                    _decoy_smoothed = smooth_and_denoise_image(
+                        _decoy_raw, **smooth_kwargs
+                    )
+                    _rep_specs[_plot_rf] = {
+                        "decoy_mz_rank": _decoy_mz,
+                        "decoy_raw_image": _decoy_raw,
+                        "decoy_smoothed_image": _decoy_smoothed,
+                    }
+                    _plot_raw_images.append(_decoy_raw)
+                    _plot_smoothed_images.append(_decoy_smoothed)
+                    _plot_labels.append(f"{_plot_rf}\n(decoy mz{_decoy_mz})")
+                _peptide_swap_decoys_by_rep.append(_rep_specs)
+                if visualize_dir is not None:
+                    _plot_anchors = [_consensus_anchors[0]] + [None] * (
+                        len(_consensus_raw_files) - 1
+                    )
+                    _decoy_bundle = build_consensus_feature_bundle(
+                        images=_plot_smoothed_images,
+                        reference_idx=0,
+                        template_anchor=_get_pept_act_tuple(reference_raw_file)[
+                            1:3
+                        ],
+                        template_frac=0.3,
+                        anchors=_plot_anchors,
+                        smooth_kwargs=dict(
+                            (processing_kwargs or {}).get(
+                                "smooth_consensus_kwargs", {}
+                            )
+                        ),
+                        watershed_kwargs=dict(
+                            (processing_kwargs or {}).get(
+                                "peak_consensus_kwargs", {}
+                            )
+                        ),
+                        raw_images=_plot_raw_images,
+                        labels=_plot_labels,
+                    )
+                    _visualize_consensus_bundle(
+                        _decoy_bundle.alignment,
+                        _decoy_bundle.segmentation,
+                        fig_dir=visualize_dir,
+                        filename=(
+                            f"mz{pept_idx}_consensus_decoy_peptide_swap_rep{_rep}.png"
+                        ),
+                        labels=_plot_labels,
+                    )
 
-            _off_target_label_shifts: list[tuple[int, int] | None] = []
-            if (
-                match_decoy
-                and "off_target_shift" in _consensus_decoy_strategies
-                and _n_off_target_decoys > 0
+        _off_target_label_shifts: list[tuple[int, int] | None] = []
+        if (
+            match_decoy
+            and "off_target_shift" in _consensus_decoy_strategies
+            and _n_off_target_decoys > 0
+        ):
+            for _rep in range(_n_off_target_decoys):
+                _shift = _choose_off_target_shift(
+                    _consensus_bundle.segmentation.watershed_labels,
+                    _consensus_bundle.segmentation.target_label_ids,
+                    rep=_rep,
+                    min_offset_frac=_off_target_min_offset_frac,
+                    max_overlap_fraction=_off_target_max_overlap_fraction,
+                )
+                _off_target_label_shifts.append(_shift)
+                if visualize_dir is not None and _shift is not None:
+                    _shifted_seg = _make_shifted_consensus_segmentation_state(
+                        _consensus_bundle.segmentation,
+                        _shift,
+                    )
+                    _visualize_consensus_bundle(
+                        _consensus_bundle.alignment,
+                        _shifted_seg,
+                        fig_dir=visualize_dir,
+                        filename=(
+                            f"mz{pept_idx}_consensus_decoy_off_target_shift_rep{_rep}.png"
+                        ),
+                        labels=_consensus_raw_files,
+                    )
+        if consensus_pp is not None:
+            for _ci, (_rf, _ind_pp) in enumerate(
+                zip(_consensus_raw_files, individual_pps)
             ):
-                for _rep in range(_n_off_target_decoys):
-                    _shift = _choose_off_target_shift(
-                        _consensus_bundle.segmentation.watershed_labels,
-                        _consensus_bundle.segmentation.target_label_ids,
-                        rep=_rep,
-                        min_offset_frac=_off_target_min_offset_frac,
-                        max_overlap_fraction=_off_target_max_overlap_fraction,
+                _run_type = (
+                    "reference"
+                    if _rf == reference_raw_file
+                    else (
+                        "quant_only" if _rf in _quant_only_set else "match_target"
                     )
-                    _off_target_label_shifts.append(_shift)
-                    if visualize_dir is not None and _shift is not None:
-                        _shifted_seg = _make_shifted_consensus_segmentation_state(
-                            _consensus_bundle.segmentation,
-                            _shift,
-                        )
-                        _visualize_consensus_bundle(
-                            _consensus_bundle.alignment,
-                            _shifted_seg,
-                            fig_dir=visualize_dir,
-                            filename=(
-                                f"mz{pept_idx}_consensus_decoy_off_target_shift_rep{_rep}.png"
-                            ),
-                            labels=_consensus_raw_files,
-                        )
-            if consensus_pp is not None:
-                for _ci, (_rf, _ind_pp) in enumerate(
-                    zip(_consensus_raw_files, individual_pps)
-                ):
-                    _run_type = (
-                        "reference"
-                        if _rf == reference_raw_file
-                        else ("quant_only" if _rf in _quant_only_set else "match_target")
+                )
+                if _ind_pp is None:
+                    no_quant_log.append(
+                        {
+                            "mz_rank": pept_idx,
+                            "run_name": _rf,
+                            "type": _run_type,
+                            "feature_instance_id": feature_instance_id,
+                        }
                     )
-                    if _ind_pp is None:
-                        no_quant_log.append(
+                    if _rf != reference_raw_file:
+                        no_match_log.append(
                             {
                                 "mz_rank": pept_idx,
                                 "run_name": _rf,
@@ -938,126 +593,118 @@ def match_features_batch(
                                 "feature_instance_id": feature_instance_id,
                             }
                         )
-                        if _rf != reference_raw_file:
+                    continue
+                _annotated_pp = _annotate_peak_properties(
+                    _ind_pp,
+                    mz_rank=pept_idx,
+                    run_name=_rf,
+                    own_anchor_id=own_anchor_id,
+                    assimilated_to_anchor_id=own_anchor_id,
+                    feature_instance_id=feature_instance_id,
+                    own_feature_instance_id=feature_instance_id,
+                    source_run="consensus",
+                    source_type="Consensus",
+                )
+                if _annotated_pp is None:
+                    continue
+                if _rf == reference_raw_file:
+                    pp_reference_list.append(_annotated_pp)
+                    continue
+                _match_t = compare_peak_properties(consensus_pp, _annotated_pp)
+                _match_t["mz_rank"] = pept_idx
+                _match_t["feature_instance_id"] = feature_instance_id
+                _match_t["own_anchor_id"] = own_anchor_id
+                _match_t["assimilated_to_anchor_id"] = own_anchor_id
+                _match_t["source_run"] = "consensus"
+                _match_t["source_type"] = "Consensus"
+                results_target.append(_match_t)
+                pp_match_target_list.append(_annotated_pp)
+
+                if not match_decoy:
+                    continue
+
+                if (
+                    "peptide_swap" in _consensus_decoy_strategies
+                    and _n_peptide_swap_decoys > 0
+                    and _peptide_swap_decoys_by_rep
+                ):
+                    for _rep in range(_n_peptide_swap_decoys):
+                        _rep_spec = _peptide_swap_decoys_by_rep[_rep].get(_rf)
+                        if _rep_spec is None:
+                            continue
+                        decoy_pept_idx = int(_rep_spec["decoy_mz_rank"])
+                        decoy_act = _rep_spec["decoy_raw_image"]
+                        decoy_pp_raw, _, _ = _build_consensus_peptide_swap_decoy(
+                            _consensus_bundle,
+                            decoy_act,
+                            _rf,
+                            smooth_kwargs=smooth_kwargs,
+                        )
+                        if decoy_pp_raw is None:
+                            no_quant_log.append(
+                                {
+                                    "mz_rank": pept_idx,
+                                    "run_name": _rf,
+                                    "type": "match_decoy",
+                                    "feature_instance_id": feature_instance_id,
+                                    "decoy_strategy": "peptide_swap_consensus",
+                                    "decoy_rep": _rep,
+                                    "decoy_mz_rank": decoy_pept_idx,
+                                }
+                            )
                             no_match_log.append(
                                 {
                                     "mz_rank": pept_idx,
                                     "run_name": _rf,
-                                    "type": _run_type,
+                                    "type": "match_decoy",
                                     "feature_instance_id": feature_instance_id,
+                                    "decoy_strategy": "peptide_swap_consensus",
+                                    "decoy_rep": _rep,
+                                    "decoy_mz_rank": decoy_pept_idx,
                                 }
                             )
-                        continue
-                    _annotated_pp = _annotate_peak_properties(
-                        _ind_pp,
-                        mz_rank=pept_idx,
-                        run_name=_rf,
-                        own_anchor_id=own_anchor_id,
-                        assimilated_to_anchor_id=own_anchor_id,
-                        feature_instance_id=feature_instance_id,
-                        own_feature_instance_id=feature_instance_id,
-                        source_run="consensus",
-                        source_type="Consensus",
-                    )
-                    if _annotated_pp is None:
-                        continue
-                    if _rf == reference_raw_file:
-                        pp_reference_list.append(_annotated_pp)
-                        continue
-                    _match_t = compare_peak_properties(consensus_pp, _annotated_pp)
-                    _match_t["mz_rank"] = pept_idx
-                    _match_t["feature_instance_id"] = feature_instance_id
-                    _match_t["own_anchor_id"] = own_anchor_id
-                    _match_t["assimilated_to_anchor_id"] = own_anchor_id
-                    _match_t["source_run"] = "consensus"
-                    _match_t["source_type"] = "Consensus"
-                    results_target.append(_match_t)
-                    pp_match_target_list.append(_annotated_pp)
+                            continue
+                        _prop_d = _annotate_peak_properties(
+                            decoy_pp_raw,
+                            mz_rank=pept_idx,
+                            run_name=_rf,
+                            own_anchor_id=own_anchor_id,
+                            assimilated_to_anchor_id=own_anchor_id,
+                            feature_instance_id=feature_instance_id,
+                            own_feature_instance_id=feature_instance_id,
+                            source_run="consensus",
+                            source_type="Consensus",
+                            decoy_mz_rank=decoy_pept_idx,
+                        )
+                        if _prop_d is None:
+                            continue
+                        _prop_d["decoy_strategy"] = "peptide_swap_consensus"
+                        _prop_d["decoy_rep"] = _rep
+                        pp_match_decoy_list.append(_prop_d)
+                        _match_d = compare_peak_properties(consensus_pp, _prop_d)
+                        _match_d["mz_rank"] = pept_idx
+                        _match_d["decoy_mz_rank"] = decoy_pept_idx
+                        _match_d["feature_instance_id"] = feature_instance_id
+                        _match_d["own_anchor_id"] = own_anchor_id
+                        _match_d["assimilated_to_anchor_id"] = own_anchor_id
+                        _match_d["source_run"] = "consensus"
+                        _match_d["source_type"] = "Consensus"
+                        _match_d["decoy_strategy"] = "peptide_swap_consensus"
+                        _match_d["decoy_rep"] = _rep
+                        results_decoy.append(_match_d)
 
-                    if not match_decoy:
-                        continue
-
-                    if (
-                        "peptide_swap" in _consensus_decoy_strategies
-                        and _n_peptide_swap_decoys > 0
-                        and _peptide_swap_decoys_by_rep
-                    ):
-                        for _rep in range(_n_peptide_swap_decoys):
-                            _rep_spec = _peptide_swap_decoys_by_rep[_rep].get(_rf)
-                            if _rep_spec is None:
-                                continue
-                            decoy_pept_idx = int(_rep_spec["decoy_mz_rank"])
-                            decoy_act = _rep_spec["decoy_raw_image"]
-                            decoy_pp_raw, _, _ = _build_consensus_peptide_swap_decoy(
-                                _consensus_bundle,
-                                decoy_act,
-                                _rf,
-                                smooth_kwargs=smooth_kwargs,
-                            )
-                            if decoy_pp_raw is None:
-                                no_quant_log.append(
-                                    {
-                                        "mz_rank": pept_idx,
-                                        "run_name": _rf,
-                                        "type": "match_decoy",
-                                        "feature_instance_id": feature_instance_id,
-                                        "decoy_strategy": "peptide_swap_consensus",
-                                        "decoy_rep": _rep,
-                                        "decoy_mz_rank": decoy_pept_idx,
-                                    }
-                                )
-                                no_match_log.append(
-                                    {
-                                        "mz_rank": pept_idx,
-                                        "run_name": _rf,
-                                        "type": "match_decoy",
-                                        "feature_instance_id": feature_instance_id,
-                                        "decoy_strategy": "peptide_swap_consensus",
-                                        "decoy_rep": _rep,
-                                        "decoy_mz_rank": decoy_pept_idx,
-                                    }
-                                )
-                                continue
-                            _prop_d = _annotate_peak_properties(
-                                decoy_pp_raw,
-                                mz_rank=pept_idx,
-                                run_name=_rf,
-                                own_anchor_id=own_anchor_id,
-                                assimilated_to_anchor_id=own_anchor_id,
-                                feature_instance_id=feature_instance_id,
-                                own_feature_instance_id=feature_instance_id,
-                                source_run="consensus",
-                                source_type="Consensus",
-                                decoy_mz_rank=decoy_pept_idx,
-                            )
-                            if _prop_d is None:
-                                continue
-                            _prop_d["decoy_strategy"] = "peptide_swap_consensus"
-                            _prop_d["decoy_rep"] = _rep
-                            pp_match_decoy_list.append(_prop_d)
-                            _match_d = compare_peak_properties(consensus_pp, _prop_d)
-                            _match_d["mz_rank"] = pept_idx
-                            _match_d["decoy_mz_rank"] = decoy_pept_idx
-                            _match_d["feature_instance_id"] = feature_instance_id
-                            _match_d["own_anchor_id"] = own_anchor_id
-                            _match_d["assimilated_to_anchor_id"] = own_anchor_id
-                            _match_d["source_run"] = "consensus"
-                            _match_d["source_type"] = "Consensus"
-                            _match_d["decoy_strategy"] = "peptide_swap_consensus"
-                            _match_d["decoy_rep"] = _rep
-                            results_decoy.append(_match_d)
-
-                    if (
-                        "off_target_shift" in _consensus_decoy_strategies
-                        and _n_off_target_decoys > 0
-                    ):
-                        for _rep in range(_n_off_target_decoys):
-                            _precomputed_shift = (
-                                _off_target_label_shifts[_rep]
-                                if _rep < len(_off_target_label_shifts)
-                                else None
-                            )
-                            decoy_pp_raw, label_shift = _build_consensus_off_target_decoy(
+                if (
+                    "off_target_shift" in _consensus_decoy_strategies
+                    and _n_off_target_decoys > 0
+                ):
+                    for _rep in range(_n_off_target_decoys):
+                        _precomputed_shift = (
+                            _off_target_label_shifts[_rep]
+                            if _rep < len(_off_target_label_shifts)
+                            else None
+                        )
+                        decoy_pp_raw, label_shift = (
+                            _build_consensus_off_target_decoy(
                                 _consensus_bundle,
                                 run_index=_ci,
                                 run_name=_rf,
@@ -1066,518 +713,80 @@ def match_features_batch(
                                 max_overlap_fraction=_off_target_max_overlap_fraction,
                                 label_shift=_precomputed_shift,
                             )
-                            if decoy_pp_raw is None or label_shift is None:
-                                no_quant_log.append(
-                                    {
-                                        "mz_rank": pept_idx,
-                                        "run_name": _rf,
-                                        "type": "match_decoy",
-                                        "feature_instance_id": feature_instance_id,
-                                        "decoy_strategy": "off_target_shift_consensus",
-                                        "decoy_rep": _rep,
-                                    }
-                                )
-                                no_match_log.append(
-                                    {
-                                        "mz_rank": pept_idx,
-                                        "run_name": _rf,
-                                        "type": "match_decoy",
-                                        "feature_instance_id": feature_instance_id,
-                                        "decoy_strategy": "off_target_shift_consensus",
-                                        "decoy_rep": _rep,
-                                    }
-                                )
-                                continue
-                            _prop_d = _annotate_peak_properties(
-                                decoy_pp_raw,
-                                mz_rank=pept_idx,
-                                run_name=_rf,
-                                own_anchor_id=own_anchor_id,
-                                assimilated_to_anchor_id=own_anchor_id,
-                                feature_instance_id=feature_instance_id,
-                                own_feature_instance_id=feature_instance_id,
-                                source_run="consensus",
-                                source_type="Consensus",
-                                decoy_mz_rank=-1,
+                        )
+                        if decoy_pp_raw is None or label_shift is None:
+                            no_quant_log.append(
+                                {
+                                    "mz_rank": pept_idx,
+                                    "run_name": _rf,
+                                    "type": "match_decoy",
+                                    "feature_instance_id": feature_instance_id,
+                                    "decoy_strategy": "off_target_shift_consensus",
+                                    "decoy_rep": _rep,
+                                }
                             )
-                            if _prop_d is None:
-                                continue
-                            _prop_d["decoy_strategy"] = "off_target_shift_consensus"
-                            _prop_d["decoy_rep"] = _rep
-                            _prop_d["label_shift_rt"] = int(label_shift[0])
-                            _prop_d["label_shift_im"] = int(label_shift[1])
-                            pp_match_decoy_list.append(_prop_d)
-                            _match_d = compare_peak_properties(consensus_pp, _prop_d)
-                            _match_d["mz_rank"] = pept_idx
-                            _match_d["decoy_mz_rank"] = -1
-                            _match_d["feature_instance_id"] = feature_instance_id
-                            _match_d["own_anchor_id"] = own_anchor_id
-                            _match_d["assimilated_to_anchor_id"] = own_anchor_id
-                            _match_d["source_run"] = "consensus"
-                            _match_d["source_type"] = "Consensus"
-                            _match_d["decoy_strategy"] = "off_target_shift_consensus"
-                            _match_d["decoy_rep"] = _rep
-                            _match_d["label_shift_rt"] = int(label_shift[0])
-                            _match_d["label_shift_im"] = int(label_shift[1])
-                            results_decoy.append(_match_d)
-            else:
-                # consensus_pp is None: consensus generation failed — log all runs
-                for _rf in _consensus_raw_files:
-                    no_quant_log.append(
-                        {
-                            "mz_rank": pept_idx,
-                            "run_name": _rf,
-                            "type": (
-                                "reference"
-                                if _rf == reference_raw_file
-                                else (
-                                    "quant_only"
-                                    if _rf in _quant_only_set
-                                    else "match_target"
-                                )
-                            ),
-                            "feature_instance_id": feature_instance_id,
-                        }
-                    )
-
-        elif not generate_consensus:
-            # --- Step 1: Quantify reference run ---
-            reference_result = _quantify_peptide_run(
-                act_df=_select_mz(act_dfs[reference_raw_file], pept_idx),
-                pept_idx=pept_idx,
-                dict_ref=dict_ref,
-                run_name=reference_raw_file,
-                case="Reference",
-                precomputed_pept_act=_get_pept_act_tuple(reference_raw_file),
-                precomputed_smoothed_image=_get_smoothed_pept_act(reference_raw_file),
-                processing_kwargs=processing_kwargs,
-                visualize_dir=visualize_dir,
-            )
-            if reference_result.succeeded:
-                prop_ref = _annotate_peak_properties(
-                    reference_result.peak_properties,
-                    mz_rank=pept_idx,
-                    run_name=reference_raw_file,
-                    own_anchor_id=own_anchor_id,
-                    assimilated_to_anchor_id=own_anchor_id,
-                    feature_instance_id=feature_instance_id,
-                    own_feature_instance_id=feature_instance_id,
-                    source_run=reference_raw_file,
-                    source_type="Reference",
-                )
-                if prop_ref is not None:
-                    reference_result.peak_properties = prop_ref
-                    pp_reference_list.append(prop_ref)
-                    match_state = ReferenceMatchState(
-                        reference_result=reference_result,
-                        match_props=prop_ref.copy(),
-                        bbox_offsets=_bbox_offsets_from_prop(
-                            prop_ref,
-                            reference_result.snapped_anchor,  # type: ignore[arg-type]
-                        ),
-                    )
-            else:
-                no_quant_log.append(
-                    {
-                        "mz_rank": pept_idx,
-                        "run_name": reference_raw_file,
-                        "type": "reference",
-                    }
-                )
-
-            # --- Step 2: Probe quant-only runs and expand bbox ---
-            bbox_version = 0
-            quant_only_probe_records: dict[str, dict[str, Any]] = {}
-
-            for raw_file in quant_only_raw_files:
-                quant_direct = _quantify_peptide_run(
-                    act_df=_select_mz(act_dfs[raw_file], pept_idx),
-                    pept_idx=pept_idx,
-                    dict_ref=dict_ref,
-                    run_name=raw_file,
-                    case="Reference",
-                    precomputed_pept_act=_get_pept_act_tuple(raw_file),
-                    precomputed_smoothed_image=_get_smoothed_pept_act(raw_file),
-                    processing_kwargs=processing_kwargs,
-                    visualize_dir=visualize_dir,
-                )
-                record: dict[str, Any] = {
-                    "direct": quant_direct,
-                    "probe": None,
-                    "probe_bbox_version": None,
-                    "inside_match_bbox": False,
-                    "expanded_match_bbox": False,
-                    "bbox_updated_from_original": False,
-                    "reference_bbox_before_update": None,
-                    "reference_bbox_after_update": None,
-                    "aligned_bbox_before_update": None,
-                    "aligned_bbox_after_update": None,
-                }
-                quant_only_probe_records[raw_file] = record
-
-                if match_state is None:
-                    if quant_direct.succeeded:
-                        # Reference run failed — promote this quant-only run as the reference
-                        prop_promoted = _annotate_peak_properties(
-                            quant_direct.peak_properties,
+                            no_match_log.append(
+                                {
+                                    "mz_rank": pept_idx,
+                                    "run_name": _rf,
+                                    "type": "match_decoy",
+                                    "feature_instance_id": feature_instance_id,
+                                    "decoy_strategy": "off_target_shift_consensus",
+                                    "decoy_rep": _rep,
+                                }
+                            )
+                            continue
+                        _prop_d = _annotate_peak_properties(
+                            decoy_pp_raw,
                             mz_rank=pept_idx,
-                            run_name=raw_file,
+                            run_name=_rf,
                             own_anchor_id=own_anchor_id,
                             assimilated_to_anchor_id=own_anchor_id,
                             feature_instance_id=feature_instance_id,
                             own_feature_instance_id=feature_instance_id,
-                            source_run=raw_file,
-                            source_type="Reference",
+                            source_run="consensus",
+                            source_type="Consensus",
+                            decoy_mz_rank=-1,
                         )
-                        if prop_promoted is not None:
-                            quant_direct.peak_properties = prop_promoted
-                            pp_reference_list.append(prop_promoted)
-                            match_state = ReferenceMatchState(
-                                reference_result=quant_direct,
-                                match_props=prop_promoted.copy(),
-                                bbox_offsets=_bbox_offsets_from_prop(
-                                    prop_promoted,
-                                    quant_direct.snapped_anchor,  # type: ignore[arg-type]
-                                ),
+                        if _prop_d is None:
+                            continue
+                        _prop_d["decoy_strategy"] = "off_target_shift_consensus"
+                        _prop_d["decoy_rep"] = _rep
+                        _prop_d["label_shift_rt"] = int(label_shift[0])
+                        _prop_d["label_shift_im"] = int(label_shift[1])
+                        pp_match_decoy_list.append(_prop_d)
+                        _match_d = compare_peak_properties(consensus_pp, _prop_d)
+                        _match_d["mz_rank"] = pept_idx
+                        _match_d["decoy_mz_rank"] = -1
+                        _match_d["feature_instance_id"] = feature_instance_id
+                        _match_d["own_anchor_id"] = own_anchor_id
+                        _match_d["assimilated_to_anchor_id"] = own_anchor_id
+                        _match_d["source_run"] = "consensus"
+                        _match_d["source_type"] = "Consensus"
+                        _match_d["decoy_strategy"] = "off_target_shift_consensus"
+                        _match_d["decoy_rep"] = _rep
+                        _match_d["label_shift_rt"] = int(label_shift[0])
+                        _match_d["label_shift_im"] = int(label_shift[1])
+                        results_decoy.append(_match_d)
+        else:
+            # consensus_pp is None: consensus generation failed — log all runs
+            for _rf in _consensus_raw_files:
+                no_quant_log.append(
+                    {
+                        "mz_rank": pept_idx,
+                        "run_name": _rf,
+                        "type": (
+                            "reference"
+                            if _rf == reference_raw_file
+                            else (
+                                "quant_only"
+                                if _rf in _quant_only_set
+                                else "match_target"
                             )
-                            match_raw_files = [
-                                f for f in match_raw_files if f != raw_file
-                            ] + [reference_raw_file]
-                            reference_raw_file = raw_file
-                            Logger.info(
-                                f"mz{pept_idx}: Promoted quant-only run as reference: {raw_file}"
-                            )
-                    else:
-                        no_quant_log.append(
-                            {
-                                "mz_rank": pept_idx,
-                                "run_name": raw_file,
-                                "type": "reference_promoted",
-                            }
-                        )
-                    continue  # promoted run skips probe; failed promotion also skips
-
-                if not quant_direct.succeeded:
-                    continue  # cannot probe without a valid reference
-
-                quant_probe = _quantify_peptide_run(  # match quant_only to reference, this one is on reference space
-                    act_df=_select_mz(act_dfs[reference_raw_file], pept_idx),
-                    pept_idx=pept_idx,
-                    dict_ref=dict_ref,
-                    run_name=reference_raw_file,
-                    case="Match",
-                    template_anchor_override=quant_direct.snapped_anchor,
-                    # anchor_override=quant_direct.snapped_anchor,
-                    reference_image=quant_direct.smoothed_image,
-                    reference_props=quant_direct.peak_properties,
-                    precomputed_pept_act=_get_pept_act_tuple(reference_raw_file),
-                    precomputed_smoothed_image=_get_smoothed_pept_act(
-                        reference_raw_file
-                    ),
-                    processing_kwargs=processing_kwargs,
-                    visualize_dir=visualize_dir,
-                    visualize_name=f"mz{pept_idx}_{raw_file}_quant_only_probe.png",
-                )
-                record["probe"] = quant_probe
-                record["probe_bbox_version"] = bbox_version
-                if not quant_probe.succeeded:
-                    continue  # probe failed, cannot use for bbox expansion or future matching
-
-                inside_match_bbox = _anchor_inside_bbox(
-                    quant_probe.snapped_anchor,
-                    match_state.reference_result.peak_properties,
-                )
-                record["inside_match_bbox"] = bool(inside_match_bbox)
-
-                if not inside_match_bbox:
-                    ref_probe_new_bbox = _bbox_tuple_from_prop(
-                        quant_probe.peak_properties
-                    )
-                    ref_bbox = _bbox_tuple_from_prop(
-                        match_state.reference_result.peak_properties
-                    )
-                    record["reference_bbox_before_update"] = _bbox_tuple_from_prop(
-                        match_state.match_props
-                    )
-                    # record["aligned_bbox_before_update"] = ref_probe_new_bbox
-                    expansion_deltas = _expansion_deltas_from_aligned_and_quant_bbox(
-                        ref_probe_new_bbox, ref_bbox
-                    )
-                    expanded_offsets = _add_offset_deltas(
-                        match_state.bbox_offsets, expansion_deltas
-                    )
-                    bbox_changed = expanded_offsets != match_state.bbox_offsets
-                    match_state.bbox_offsets = expanded_offsets
-                    match_state.match_props = _clone_props_with_offsets(
-                        match_state.match_props,
-                        match_state.reference_result.snapped_anchor,  # type: ignore[arg-type]
-                        match_state.bbox_offsets,
-                        match_state.reference_result.image.shape,  # type: ignore[arg-type]
-                    )
-                    record["expanded_match_bbox"] = True
-                    record["bbox_updated_from_original"] = bool(bbox_changed)
-                    record["reference_bbox_after_update"] = _bbox_tuple_from_prop(
-                        match_state.match_props
-                    )
-                    if (
-                        visualize_dir is not None
-                        and quant_direct.peak_properties is not None
-                    ):
-                        _visualize_probe_expansion(
-                            smoothed_image_raw_file=_get_smoothed_pept_act(raw_file),
-                            smoothed_image_ref_file=_get_smoothed_pept_act(
-                                reference_raw_file
-                            ),
-                            quant_direct_snapped_anchor=quant_direct.snapped_anchor,  # type: ignore[arg-type]
-                            quant_direct_bbox=_bbox_tuple_from_prop(
-                                quant_direct.peak_properties
-                            ),
-                            ref_snapped_anchor=match_state.reference_result.snapped_anchor,  # type: ignore[arg-type]
-                            ref_bbox=ref_bbox,
-                            ref_probe_new_bbox=ref_probe_new_bbox,
-                            match_props_bbox_before=record[
-                                "reference_bbox_before_update"
-                            ],
-                            match_props_bbox_after=record[
-                                "reference_bbox_after_update"
-                            ],
-                            mz_rank=pept_idx,
-                            raw_file=raw_file,
-                            bbox_version=bbox_version,
-                            visualization_dir=visualize_dir,
-                        )
-                    if bbox_changed:
-                        bbox_version += 1
-
-            # --- Step 3: Match all non-reference runs ---
-            if not match_raw_files:
-                continue
-
-            if match_state is None:
-                Logger.info(
-                    f"mz{pept_idx}: No valid reference for matching; {len(quant_only_raw_files)} quant-only runs;"
-                    f"logging all {len(match_raw_files)} non-reference runs as no-quant."
-                )
-                # Reference failed: log all non-reference runs as failures and move on
-                for raw_file in match_raw_files:
-                    is_quant_only = raw_file in quant_only_probe_records
-                    no_quant_log.append(
-                        {
-                            "mz_rank": pept_idx,
-                            "run_name": raw_file,
-                            "type": "quant_only" if is_quant_only else "match_target",
-                        }
-                    )
-                    if not is_quant_only:
-                        if match_decoy:
-                            no_quant_log.append(
-                                {
-                                    "mz_rank": pept_idx,
-                                    "run_name": raw_file,
-                                    "type": "match_decoy",
-                                }
-                            )
-                        no_match_log.append(
-                            {
-                                "mz_rank": pept_idx,
-                                "run_name": raw_file,
-                                "type": "match_target",
-                            }
-                        )
-                        if match_decoy:
-                            no_match_log.append(
-                                {
-                                    "mz_rank": pept_idx,
-                                    "run_name": raw_file,
-                                    "type": "match_decoy",
-                                }
-                            )
-                continue
-
-            if match_decoy:
-                batch_exclude = batch_np[batch_np != pept_idx]
-
-            for raw_file in match_raw_files:
-                target_act_df = _select_mz(act_dfs[raw_file], pept_idx)
-                is_quant_only_run = raw_file in quant_only_probe_records
-
-                target_result = _quantify_peptide_run(
-                    act_df=target_act_df,
-                    pept_idx=pept_idx,
-                    dict_ref=dict_ref,
-                    run_name=raw_file,
-                    case="Match",
-                    template_anchor_override=match_state.reference_result.snapped_anchor,
-                    # anchor_override=match_state.reference_result.snapped_anchor,
-                    reference_image=match_state.reference_result.smoothed_image,
-                    reference_props=match_state.match_props,
-                    precomputed_pept_act=_get_pept_act_tuple(raw_file),
-                    precomputed_smoothed_image=_get_smoothed_pept_act(raw_file),
-                    processing_kwargs=processing_kwargs,
-                    visualize_dir=visualize_dir,
-                )
-
-                if match_decoy:
-                    decoy_pept_idx = np.random.choice(batch_exclude)
-                    decoy_act_df = _select_mz(act_dfs[raw_file], int(decoy_pept_idx))
-                    decoy_act, _, _ = get_pept_act_from_parquet(
-                        decoy_act_df,
-                        decoy_pept_idx,
-                        dict_ref,
-                        raw_file,
-                        shape=target_result.image.shape,  # here enforce the shape of target image
-                    )
-                    decoy_result = _quantify_peptide_run(
-                        act_df=decoy_act_df,
-                        pept_idx=decoy_pept_idx,
-                        dict_ref=dict_ref,
-                        run_name=raw_file,
-                        case="Match",
-                        template_anchor_override=match_state.reference_result.snapped_anchor,
-                        # anchor_override=decoy_anchor,
-                        reference_image=match_state.reference_result.smoothed_image,
-                        reference_props=match_state.match_props,
-                        precomputed_pept_act=(
-                            decoy_act,
-                            int(match_state.reference_result.snapped_anchor[0]),
-                            int(match_state.reference_result.snapped_anchor[1]),
                         ),
-                        processing_kwargs=processing_kwargs,
-                        visualize_dir=visualize_dir,
-                        visualize_name=f"mz{pept_idx}_{raw_file}_match_decoy{decoy_pept_idx}.png",
-                    )
-
-                prop_t = _annotate_peak_properties(
-                    target_result.peak_properties,
-                    mz_rank=pept_idx,
-                    run_name=raw_file,
-                    own_anchor_id=own_anchor_id,
-                    assimilated_to_anchor_id=own_anchor_id,
-                    feature_instance_id=feature_instance_id,
-                    own_feature_instance_id=feature_instance_id,
-                    source_run=reference_raw_file,
-                    source_type="Quant_Only" if is_quant_only_run else "Reference",
+                        "feature_instance_id": feature_instance_id,
+                    }
                 )
-                prop_d = (
-                    _annotate_peak_properties(
-                        decoy_result.peak_properties,
-                        mz_rank=pept_idx,
-                        run_name=raw_file,
-                        own_anchor_id=own_anchor_id,
-                        assimilated_to_anchor_id=own_anchor_id,
-                        feature_instance_id=feature_instance_id,
-                        own_feature_instance_id=feature_instance_id,
-                        source_run=reference_raw_file,
-                        source_type="Quant_Only" if is_quant_only_run else "Reference",
-                        decoy_mz_rank=int(decoy_pept_idx),
-                    )
-                    if match_decoy
-                    else None
-                )
-
-                if is_quant_only_run and prop_t is not None:
-                    _attach_quant_only_metadata(
-                        prop_t, quant_only_probe_records[raw_file], match_state
-                    )
-                    if (
-                        visualize_dir is not None
-                        and quant_only_probe_records[raw_file][
-                            "bbox_updated_from_original"
-                        ]
-                        and quant_only_probe_records[raw_file][
-                            "reference_bbox_before_update"
-                        ]
-                        is not None
-                        and quant_only_probe_records[raw_file][
-                            "reference_bbox_after_update"
-                        ]
-                        is not None
-                        and quant_only_probe_records[raw_file][
-                            "aligned_bbox_before_update"
-                        ]
-                        is not None
-                        and quant_only_probe_records[raw_file][
-                            "aligned_bbox_after_update"
-                        ]
-                        is not None
-                    ):
-                        _visualize_quant_only_bbox_expansion(
-                            pept_idx=pept_idx,
-                            raw_file=raw_file,
-                            match_state=match_state,
-                            target_result=target_result,
-                            prop_t=prop_t,
-                            record=quant_only_probe_records[raw_file],
-                            visualize_dir=visualize_dir,
-                        )
-
-                if prop_t is not None:
-                    target_result.peak_properties = prop_t
-                    pp_match_target_list.append(prop_t)
-                    match_t = compare_peak_properties(
-                        match_state.reference_result.peak_properties, prop_t
-                    )
-                    match_t["mz_rank"] = pept_idx
-                    match_t["feature_instance_id"] = feature_instance_id
-                    match_t["own_anchor_id"] = own_anchor_id
-                    match_t["assimilated_to_anchor_id"] = own_anchor_id
-                    match_t["source_run"] = reference_raw_file
-                    match_t["source_type"] = (
-                        "Quant_Only" if is_quant_only_run else "Reference"
-                    )
-                    results_target.append(match_t)
-                else:
-                    no_quant_log.append(
-                        {
-                            "mz_rank": pept_idx,
-                            "run_name": raw_file,
-                            "type": (
-                                "quant_only" if is_quant_only_run else "match_target"
-                            ),
-                            "feature_instance_id": feature_instance_id,
-                        }
-                    )
-                    no_match_log.append(
-                        {
-                            "mz_rank": pept_idx,
-                            "run_name": raw_file,
-                            "type": "match_target",
-                            "feature_instance_id": feature_instance_id,
-                        }
-                    )
-
-                if match_decoy:
-                    if prop_d is not None:
-                        decoy_result.peak_properties = prop_d
-                        pp_match_decoy_list.append(prop_d)
-                        match_d = compare_peak_properties(
-                            match_state.reference_result.peak_properties, prop_d
-                        )
-                        match_d["mz_rank"] = pept_idx
-                        match_d["decoy_mz_rank"] = decoy_pept_idx
-                        match_d["feature_instance_id"] = feature_instance_id
-                        match_d["own_anchor_id"] = own_anchor_id
-                        match_d["assimilated_to_anchor_id"] = own_anchor_id
-                        match_d["source_run"] = reference_raw_file
-                        match_d["source_type"] = "Reference"
-                        results_decoy.append(match_d)
-                    else:
-                        no_quant_log.append(
-                            {
-                                "mz_rank": pept_idx,
-                                "run_name": raw_file,
-                                "type": "match_decoy",
-                                "feature_instance_id": feature_instance_id,
-                            }
-                        )
-                        no_match_log.append(
-                            {
-                                "mz_rank": pept_idx,
-                                "run_name": raw_file,
-                                "type": "match_decoy",
-                                "feature_instance_id": feature_instance_id,
-                            }
-                        )
 
     return (
         results_target,
@@ -2707,9 +1916,9 @@ def segment_consensus_from_aligned(
     non_none_indices = [
         i for i, aa in enumerate(alignment_state.aligned_anchors) if aa is not None
     ]
-    snapped_per_anchor: list[tuple[int, int] | None] = [
-        None
-    ] * len(alignment_state.aligned_anchors)
+    snapped_per_anchor: list[tuple[int, int] | None] = [None] * len(
+        alignment_state.aligned_anchors
+    )
     watershed_labels: np.ndarray = np.zeros(consensus_smoothed.shape, dtype=int)
     snap_log: dict[str, Any] = {
         "snap_record": {},
@@ -2935,7 +2144,9 @@ def extract_peak_properties_from_consensus_labels(
 ]:
     """Extract per-run and consensus peak properties from consensus labels."""
 
-    individual_pps: list[pd.DataFrame | None] = [None] * len(alignment_state.aligned_images)
+    individual_pps: list[pd.DataFrame | None] = [None] * len(
+        alignment_state.aligned_images
+    )
     if (
         raw_images is None
         or not segmentation_state.non_none_indices
@@ -3142,9 +2353,7 @@ def _visualize_consensus_bundle(
     display_aligned = (
         alignment_state.aligned_images if aligned_images is None else aligned_images
     )
-    display_consensus = (
-        segmentation_state.consensus if consensus is None else consensus
-    )
+    display_consensus = segmentation_state.consensus if consensus is None else consensus
     display_consensus_smoothed = (
         segmentation_state.consensus_smoothed
         if consensus_smoothed is None
@@ -3165,17 +2374,17 @@ def _visualize_consensus_bundle(
     fig, axes = _make_grid_fig(n, max_cols, extra_rows=1)
     _watershed_overlay: np.ma.MaskedArray | None = None
     if segmentation_state.watershed_labels.max() > 0:
-        _target_label_mask = np.zeros_like(segmentation_state.watershed_labels, dtype=float)
+        _target_label_mask = np.zeros_like(
+            segmentation_state.watershed_labels, dtype=float
+        )
         for _snap in segmentation_state.snapped_per_anchor:
             if _snap is None:
                 continue
-            _lid = int(
-                segmentation_state.watershed_labels[_snap[0], _snap[1]]
-            )
+            _lid = int(segmentation_state.watershed_labels[_snap[0], _snap[1]])
             if _lid > 0:
-                _target_label_mask[
-                    segmentation_state.watershed_labels == _lid
-                ] = float(_lid)
+                _target_label_mask[segmentation_state.watershed_labels == _lid] = float(
+                    _lid
+                )
         if _target_label_mask.max() > 0:
             _watershed_overlay = np.ma.masked_where(
                 _target_label_mask == 0, _target_label_mask
@@ -3506,8 +2715,8 @@ def _choose_off_target_shift(
         shifted_area = int(shifted_mask.sum())
         if shifted_area == 0:
             continue
-        overlap = (
-            np.logical_and(base_mask, shifted_mask).sum() / float(max(base_area, 1))
+        overlap = np.logical_and(base_mask, shifted_mask).sum() / float(
+            max(base_area, 1)
         )
         dist = float(np.hypot(candidate[0], candidate[1]))
         record = (float(overlap), -dist, candidate)
@@ -3549,7 +2758,9 @@ def _build_consensus_peptide_swap_decoy(
         bundle.alignment.template_bounds,
         None,
     )
-    decoy_raw_resized = _resize_image_to_shape(decoy_raw_image, bundle.alignment.target_shape)
+    decoy_raw_resized = _resize_image_to_shape(
+        decoy_raw_image, bundle.alignment.target_shape
+    )
     from scipy.ndimage import shift as nd_shift
 
     decoy_raw_aligned = nd_shift(

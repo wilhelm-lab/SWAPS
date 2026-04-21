@@ -12,7 +12,7 @@ __C.SWA = True  # whether to perform scan-wise activation; if False, skips SWA a
 __C.DATA_PATH = ""  # path to raw data directory (.d or .mzml)
 __C.EXCLUDE_DATASET_NAME = (
     []
-)  # list of dataset names to exclude, e.g. ["20230515_HeLa_100ng_1"]
+)  # list of dataset names to exclude, e.g. ["20230515_HeLa_100ng_1", "125pg_ddaPASEF_a000_2R_150ms_500SPD_S2-C7_1_19515.d"]
 __C.RESULT_PATH = ""  # path to save all intermediate and final results
 __C.ADD_TIMESTAMP_TO_RESULT_PATH = False  # disable when reusing the same result path
 __C.EXPORT_DATA_HDF5_DIR = (
@@ -86,7 +86,6 @@ __C.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH = 4  # width for IM peak extraction; o
 
 # match features kwargs (postprocessing peak detection/matching parameters)
 __C.MATCH_FEATURES_KWARGS = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.generate_consensus = False  # whether to use consensus-based feature matching instead of the reference-driven path
 __C.MATCH_FEATURES_KWARGS.smooth_kwargs = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.smooth_kwargs.smooth_filter = "gaussian"
 __C.MATCH_FEATURES_KWARGS.smooth_kwargs.gaussian_kwargs = ConfigurationNode()
