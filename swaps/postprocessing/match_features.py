@@ -28,35 +28,6 @@ _WORKER_CONTEXT: dict[str, Any] = {}
 
 
 @dataclass
-class QuantificationResult:
-    """Container for one quantified peptide feature in one run.
-
-    The result keeps both the raw inputs needed for later re-use as a matching
-    template and the derived peak properties/snapped anchor that downstream
-    anchor-family logic depends on.
-    """
-
-    run_name: str
-    case: Literal["Reference", "Quant_Only", "Match"]
-    image: np.ndarray
-    smoothed_image: np.ndarray
-    input_anchor: tuple[int, int]
-    peak_properties: pd.DataFrame | None
-    snapped_anchor: tuple[int, int] | None
-    labels: np.ndarray | None = None
-    labels_multi_markers: np.ndarray | None = None
-    template_matching_score: float = np.nan
-    shift: tuple[int, int] = (0, 0)
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-    @property
-    def succeeded(self) -> bool:
-        """Return True when a valid quantified feature was produced."""
-
-        return self.peak_properties is not None and self.snapped_anchor is not None
-
-
-@dataclass
 class ConsensusAlignmentState:
     """Aligned image state for consensus generation and consensus decoys."""
 
