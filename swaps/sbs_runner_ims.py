@@ -142,6 +142,15 @@ def opt_scan_by_scan(config_path: str):
                 "Evidence filtered by Oktoberfest rescoring: %d rows retained",
                 len(evidence),
             )
+        if cfg.EXCLUDE_DATASET_NAME:
+            excluded_raw = {name.split(".")[0] for name in cfg.EXCLUDE_DATASET_NAME}
+            before = len(evidence)  # type: ignore
+            evidence = evidence.loc[~evidence["Raw file"].isin(excluded_raw)]  # type: ignore
+            logging.info(
+                "Excluded %d evidence rows from %s",
+                before - len(evidence),
+                excluded_raw,
+            )
         dict_ref = construct_dict_from_search_pivoted(
             cfg_prepare_dict=cfg.PREPARE_DICT,
             evidence=evidence,  # type: ignore
@@ -365,8 +374,8 @@ def opt_scan_by_scan(config_path: str):
         protein_col="Proteins",
         decoy_col="Decoy",
         model=None,
-        train_fdr=0.05,
-        test_fdr=0.01,
+        train_fdr=cfg.FDR.TRAIN,
+        test_fdr=cfg.FDR.TEST,
         filename_col="matched_run",
         work_dir=quant_dir,
     )
