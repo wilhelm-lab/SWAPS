@@ -29,3 +29,4 @@ profile_script.py
 profile.stats
 swaps/match_features_batches_parallel.md
 swaps/feature_match_consensus_workflow.md
+.claude/*
