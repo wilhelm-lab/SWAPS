@@ -63,6 +63,7 @@ def detect_2d_peak_with_watershed(
     # 2. Compute distance (to background) transform inside signal
     distance = image
     mask_signal = distance > int_threshold
+    _coords_provided = coordinates is not None
     # snapped_seed is initialised after coordinates are resolved below.
     snapped_seed = coordinates[0] if coordinates is not None else None
     if not mask_signal.any():
@@ -340,7 +341,25 @@ def detect_2d_peak_with_watershed(
         plt.show()
     # --------------------------------
 
-    return coordinates, labels, image, labels_multi_markers, snapped_seed
+    # When one coordinate was explicitly provided, snapped_seed is the peak that lies
+    # inside the kept label (it may differ from the original coordinate after bg-competition
+    # snapping). In auto-detect mode every detected coordinate is already a watershed marker
+    # and therefore guaranteed to be inside its own label.
+    if _coords_provided:
+        peaks_out = np.atleast_2d(snapped_seed)
+    else:
+        peaks_out = coordinates
+
+    # Invariant: every non-zero label in the returned labels must contain at least one
+    # returned peak. Violated peaks would cause silent discards in the snapping step.
+    if peaks_out.shape[0] > 0 and labels.max() > 0:
+        peak_label_vals = labels[peaks_out[:, 0], peaks_out[:, 1]]
+        for lbl in np.unique(labels[labels > 0]):
+            assert lbl in peak_label_vals, (
+                f"Watershed label {lbl} has no corresponding peak in returned coordinates"
+            )
+
+    return peaks_out, labels, image, labels_multi_markers, snapped_seed
 
 
 def calculate_peak_property_from_labels_and_image(

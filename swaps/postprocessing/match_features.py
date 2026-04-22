@@ -205,9 +205,7 @@ def match_features_batches_parallel(
     )
 
 
-def _init_match_features_worker(
-    dict_ref, raw_file_list, result_dir, processing_kwargs
-):
+def _init_match_features_worker(dict_ref, raw_file_list, result_dir, processing_kwargs):
     """Store immutable batch context once per worker process."""
 
     _WORKER_CONTEXT["dict_ref"] = dict_ref
@@ -283,6 +281,7 @@ def _extract_single_peak_properties(
     if mask.any():
         return peak_properties.loc[mask].iloc[[0]].reset_index(drop=True)
     return peak_properties.iloc[[0]].reset_index(drop=True)
+
 
 def match_features_batch(
     dict_ref,
@@ -445,9 +444,7 @@ def match_features_batch(
                     if _plot_rf == reference_raw_file:
                         _ref_raw = _get_pept_act_tuple(_plot_rf)[0]
                         _plot_raw_images.append(_ref_raw)
-                        _plot_smoothed_images.append(
-                            _get_smoothed_pept_act(_plot_rf)
-                        )
+                        _plot_smoothed_images.append(_get_smoothed_pept_act(_plot_rf))
                         _plot_labels.append(_plot_rf)
                         continue
                     _decoy_mz = int(np.random.choice(_batch_exclude))
@@ -478,20 +475,14 @@ def match_features_batch(
                     _decoy_bundle = build_consensus_feature_bundle(
                         images=_plot_smoothed_images,
                         reference_idx=0,
-                        template_anchor=_get_pept_act_tuple(reference_raw_file)[
-                            1:3
-                        ],
+                        template_anchor=_get_pept_act_tuple(reference_raw_file)[1:3],
                         template_frac=0.3,
                         anchors=_plot_anchors,
                         smooth_kwargs=dict(
-                            (processing_kwargs or {}).get(
-                                "smooth_consensus_kwargs", {}
-                            )
+                            (processing_kwargs or {}).get("smooth_consensus_kwargs", {})
                         ),
                         watershed_kwargs=dict(
-                            (processing_kwargs or {}).get(
-                                "peak_consensus_kwargs", {}
-                            )
+                            (processing_kwargs or {}).get("peak_consensus_kwargs", {})
                         ),
                         raw_images=_plot_raw_images,
                         labels=_plot_labels,
@@ -542,9 +533,7 @@ def match_features_batch(
                 _run_type = (
                     "reference"
                     if _rf == reference_raw_file
-                    else (
-                        "quant_only" if _rf in _quant_only_set else "match_target"
-                    )
+                    else ("quant_only" if _rf in _quant_only_set else "match_target")
                 )
                 if _ind_pp is None:
                     no_quant_log.append(
@@ -674,91 +663,14 @@ def match_features_batch(
                             if _rep < len(_off_target_label_shifts)
                             else None
                         )
-                        decoy_pp_raw, label_shift = (
-                            _build_consensus_off_target_decoy(
-                                _consensus_bundle,
-                                run_index=_ci,
-                                run_name=_rf,
-                                rep=_rep,
-                                min_offset_frac=_off_target_min_offset_frac,
-                                max_overlap_fraction=_off_target_max_overlap_fraction,
-                                label_shift=_precomputed_shift,
-                            )
-                        )
-                        if decoy_pp_raw is None or label_shift is None:
-                            no_quant_log.append(
-                                {
-                                    "mz_rank": pept_idx,
-                                    "run_name": _rf,
-                                    "type": "match_decoy",
-                                    "feature_instance_id": feature_instance_id,
-                                    "decoy_strategy": "off_target_shift_consensus",
-                                    "decoy_rep": _rep,
-                                }
-                            )
-                            no_match_log.append(
-                                {
-                                    "mz_rank": pept_idx,
-                                    "run_name": _rf,
-                                    "type": "match_decoy",
-                                    "feature_instance_id": feature_instance_id,
-                                    "decoy_strategy": "off_target_shift_consensus",
-                                    "decoy_rep": _rep,
-                                }
-                            )
-                            continue
-                        _prop_d = _annotate_peak_properties(
-                            decoy_pp_raw,
-                            mz_rank=pept_idx,
+                        decoy_pp_raw, label_shift = _build_consensus_off_target_decoy(
+                            _consensus_bundle,
+                            run_index=_ci,
                             run_name=_rf,
-                            own_anchor_id=own_anchor_id,
-                            assimilated_to_anchor_id=own_anchor_id,
-                            feature_instance_id=feature_instance_id,
-                            own_feature_instance_id=feature_instance_id,
-                            source_run="consensus",
-                            source_type="Consensus",
-                            decoy_mz_rank=-1,
-                        )
-                        if _prop_d is None:
-                            continue
-                        _prop_d["decoy_strategy"] = "off_target_shift_consensus"
-                        _prop_d["decoy_rep"] = _rep
-                        _prop_d["label_shift_rt"] = int(label_shift[0])
-                        _prop_d["label_shift_im"] = int(label_shift[1])
-                        pp_match_decoy_list.append(_prop_d)
-                        _match_d = compare_peak_properties(consensus_pp, _prop_d)
-                        _match_d["mz_rank"] = pept_idx
-                        _match_d["decoy_mz_rank"] = -1
-                        _match_d["feature_instance_id"] = feature_instance_id
-                        _match_d["own_anchor_id"] = own_anchor_id
-                        _match_d["assimilated_to_anchor_id"] = own_anchor_id
-                        _match_d["source_run"] = "consensus"
-                        _match_d["source_type"] = "Consensus"
-                        _match_d["decoy_strategy"] = "off_target_shift_consensus"
-                        _match_d["decoy_rep"] = _rep
-                        _match_d["label_shift_rt"] = int(label_shift[0])
-                        _match_d["label_shift_im"] = int(label_shift[1])
-                        results_decoy.append(_match_d)
-        else:
-            # consensus_pp is None: consensus generation failed — log all runs
-            for _rf in _consensus_raw_files:
-                no_quant_log.append(
-                    {
-                        "mz_rank": pept_idx,
-                        "run_name": _rf,
-                        "type": (
-                            "reference"
-                            if _rf == reference_raw_file
-                            else (
-                                "quant_only"
-                                if _rf in _quant_only_set
-                                else "match_target"
-                            )
-                        ),
-                        "feature_instance_id": feature_instance_id,
-                    }
-                )
-                            )
+                            rep=_rep,
+                            min_offset_frac=_off_target_min_offset_frac,
+                            max_overlap_fraction=_off_target_max_overlap_fraction,
+                            label_shift=_precomputed_shift,
                         )
                         if decoy_pp_raw is None or label_shift is None:
                             no_quant_log.append(
@@ -844,6 +756,7 @@ def match_features_batch(
         no_match_log,
         snap_log_collection,
     )
+
 
 def compare_peak_properties(peak_properties_a, peak_properties_b):
     return {
@@ -1228,7 +1141,7 @@ def segment_consensus_from_aligned(
         "snap_record": {},
         "discard_record": {},
         "no_seg_log": None,
-        "jump_anchor_log": None,
+        "jump_anchor_log": {},
     }
     target_label_ids: list[int] = []
     seen_label_ids: set[int] = set()
@@ -1248,6 +1161,7 @@ def segment_consensus_from_aligned(
             )
         )
         if all_peaks.shape[0] == 0 or watershed_labels.max() == 0:
+            # No peaks detected — fallback to snapping anchors to a bbox around their mean position.
             _anchor_rs = [
                 int(np.clip(round(_aa[0]), 0, rows - 1))
                 for i in non_none_indices
@@ -1273,6 +1187,9 @@ def segment_consensus_from_aligned(
                 "anchor_positions": list(zip(_anchor_rs, _anchor_cs)),
                 "rect": (_rt_start, _im_start, _rt_end, _im_end),
             }
+            Logger.info(
+                "No peaks detected in watershed segmentation; using fallback anchor-based bbox segmentation."
+            )
             for i, (r_i, c_i) in zip(non_none_indices, zip(_anchor_rs, _anchor_cs)):
                 snapped_per_anchor[i] = (r_i, c_i)
                 snap_log["snap_record"][i] = ((r_i, c_i), (r_i, c_i))
@@ -1281,73 +1198,62 @@ def segment_consensus_from_aligned(
                 seen_label_ids.add(1)
                 label_to_snap[1] = (_anchor_rs[0], _anchor_cs[0])
         else:
+            # Normal case: peaks and watershed labels detected successfully.
+            # Hoist once: used by any anchor that falls in background (anchor_ws == 0)
+            labeled_coords = np.argwhere(watershed_labels > 0)
             for i in non_none_indices:
                 aa = alignment_state.aligned_anchors[i]
                 assert aa is not None
                 r = int(np.clip(round(aa[0]), 0, rows - 1))
                 c = int(np.clip(round(aa[1]), 0, cols - 1))
                 anchor_ws = int(watershed_labels[r, c])
-                if anchor_ws == 0:
-                    snap_log["discard_record"][i] = (r, c)
-                    continue
-                same_ws_peak_as_anchor = all_peaks[
-                    watershed_labels[all_peaks[:, 0], all_peaks[:, 1]] == anchor_ws
-                ]
-                if same_ws_peak_as_anchor.shape[0] == 0:
-                    snap_log["discard_record"][i] = (r, c)
-                    continue
-                dists = np.hypot(
-                    same_ws_peak_as_anchor[:, 0] - r,
-                    same_ws_peak_as_anchor[:, 1] - c,
-                )
-                nearest = same_ws_peak_as_anchor[int(np.argmin(dists))]
-                snapped_rc = (int(nearest[0]), int(nearest[1]))
-                snapped_per_anchor[i] = snapped_rc
-                snap_log["snap_record"][i] = ((r, c), snapped_rc)
-                if anchor_ws not in seen_label_ids:
-                    target_label_ids.append(anchor_ws)
-                    seen_label_ids.add(anchor_ws)
-                    label_to_snap[anchor_ws] = snapped_rc
-
-            if all(snapped_per_anchor[i] is None for i in non_none_indices):
-                _anchor_rcs = np.array(
-                    [
-                        [
-                            int(np.clip(round(_aa[0]), 0, rows - 1)),
-                            int(np.clip(round(_aa[1]), 0, cols - 1)),
-                        ]
-                        for i in non_none_indices
-                        for _aa in (alignment_state.aligned_anchors[i],)
-                        if _aa is not None
-                    ],
-                    dtype=float,
-                )
-                _dist_matrix = np.hypot(
-                    all_peaks[:, 0:1] - _anchor_rcs[:, 0],
-                    all_peaks[:, 1:2] - _anchor_rcs[:, 1],
-                )
-                _peak_total_dists = _dist_matrix.sum(axis=1)
-                _best_j = int(np.argmin(_peak_total_dists))
-                _jump_peak = (int(all_peaks[_best_j, 0]), int(all_peaks[_best_j, 1]))
-                snap_log["jump_anchor_log"] = {
-                    "jump_peak": _jump_peak,
-                    "per_anchor_distances": {
-                        i: float(_dist_matrix[_best_j, k])
-                        for k, i in enumerate(non_none_indices)
-                    },
-                    "total_distance": float(_peak_total_dists[_best_j]),
-                }
-                for _arc, i in zip(_anchor_rcs.astype(int), non_none_indices):
-                    snapped_per_anchor[i] = _jump_peak
-                    snap_log["snap_record"][i] = (
-                        (int(_arc[0]), int(_arc[1])),
-                        _jump_peak,
+                if anchor_ws > 0:
+                    # Anchor is inside a labeled region — snap to nearest peak in that label.
+                    # The watershed invariant guarantees every label has at least one peak.
+                    same_ws_peaks = all_peaks[
+                        watershed_labels[all_peaks[:, 0], all_peaks[:, 1]] == anchor_ws
+                    ]
+                    dists = np.hypot(same_ws_peaks[:, 0] - r, same_ws_peaks[:, 1] - c)
+                    nearest = same_ws_peaks[int(np.argmin(dists))]
+                    snapped_rc = (int(nearest[0]), int(nearest[1]))
+                    snapped_per_anchor[i] = snapped_rc
+                    snap_log["snap_record"][i] = ((r, c), snapped_rc)
+                    if anchor_ws not in seen_label_ids:
+                        target_label_ids.append(anchor_ws)
+                        seen_label_ids.add(anchor_ws)
+                        label_to_snap[anchor_ws] = snapped_rc
+                else:
+                    # Anchor is in background — jump to the nearest labeled region.
+                    dists = np.hypot(labeled_coords[:, 0] - r, labeled_coords[:, 1] - c)
+                    nearest_idx = int(np.argmin(dists))
+                    nearest_labeled_rc = labeled_coords[nearest_idx]
+                    jump_ws = int(
+                        watershed_labels[nearest_labeled_rc[0], nearest_labeled_rc[1]]
                     )
-                _jump_label = int(watershed_labels[_jump_peak[0], _jump_peak[1]])
-                if _jump_label > 0 and _jump_label not in seen_label_ids:
-                    target_label_ids.append(_jump_label)
-                    seen_label_ids.add(_jump_label)
-                    label_to_snap[_jump_label] = _jump_peak
+                    same_ws_peaks = all_peaks[
+                        watershed_labels[all_peaks[:, 0], all_peaks[:, 1]] == jump_ws
+                    ]
+                    dists_peak = np.hypot(
+                        same_ws_peaks[:, 0] - r, same_ws_peaks[:, 1] - c
+                    )
+                    nearest_peak = same_ws_peaks[int(np.argmin(dists_peak))]
+                    snapped_rc = (int(nearest_peak[0]), int(nearest_peak[1]))
+                    snapped_per_anchor[i] = snapped_rc
+                    snap_log["jump_anchor_log"][i] = {
+                        "anchor": (r, c),
+                        "nearest_labeled_pixel": (
+                            int(nearest_labeled_rc[0]),
+                            int(nearest_labeled_rc[1]),
+                        ),
+                        "jumped_label": jump_ws,
+                        "snapped_peak": snapped_rc,
+                        "dist_to_label": float(dists[nearest_idx]),
+                    }
+                    snap_log["snap_record"][i] = ((r, c), snapped_rc)
+                    if jump_ws not in seen_label_ids:
+                        target_label_ids.append(jump_ws)
+                        seen_label_ids.add(jump_ws)
+                        label_to_snap[jump_ws] = snapped_rc
 
     return ConsensusSegmentationState(
         consensus=consensus,
@@ -1449,9 +1355,7 @@ def extract_peak_properties_from_consensus_labels(
     """Extract per-run and consensus peak properties from consensus labels."""
 
     individual_pps: list[pd.DataFrame | None] = [None] * len(
-        
         alignment_state.aligned_images
-    
     )
     if (
         raw_images is None
