@@ -8,6 +8,7 @@ import time
 import argparse
 import yaml
 import pandas as pd
+import numpy as np
 import directlfq.lfq_manager as lfq_manager
 
 from utils.tools import get_dot_d_paths
@@ -345,6 +346,35 @@ def opt_scan_by_scan(config_path: str):
             f.result()
 
     logging.info("=================FDR control==================")
+
+    if cfg.FDR.INT_THRES > 0:
+        pp_target_passing = pp_match_target.loc[
+            pp_match_target["intensity_sum"] >= cfg.FDR.INT_THRES,
+            ["feature_instance_id", "Run_name"],
+        ].drop_duplicates()
+        pp_decoy_passing = pp_match_decoy.loc[
+            pp_match_decoy["intensity_sum"] >= cfg.FDR.INT_THRES,
+            ["feature_instance_id", "Run_name"],
+        ].drop_duplicates()
+        valid_target = pd.MultiIndex.from_frame(pp_target_passing)
+        valid_decoy = pd.MultiIndex.from_frame(pp_decoy_passing)
+        matches_target = matches_target[
+            pd.MultiIndex.from_arrays(
+                [matches_target["feature_instance_id"], matches_target["matched_run"]]
+            ).isin(valid_target)
+        ]
+        matches_decoy = matches_decoy[
+            pd.MultiIndex.from_arrays(
+                [matches_decoy["feature_instance_id"], matches_decoy["matched_run"]]
+            ).isin(valid_decoy)
+        ]
+        logging.info(
+            "After intensity filtering (>= %s): %d target, %d decoy matches",
+            cfg.FDR.INT_THRES,
+            len(matches_target),
+            len(matches_decoy),
+        )
+
     matches_target_normalized, matches_decoy_normalized = normalize_shift_by_runs(
         matches_target, matches_decoy
     )

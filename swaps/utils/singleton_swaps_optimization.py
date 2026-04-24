@@ -131,3 +131,4 @@ __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.off_target_max_overlap_fraction
 __C.FDR = ConfigurationNode()
 __C.FDR.TRAIN = 0.05
 __C.FDR.TEST = 0.01
+__C.FDR.INT_THRES = 0  # intensity threshold for FDR; 0 means no threshold

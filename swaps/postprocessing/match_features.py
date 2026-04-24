@@ -390,6 +390,7 @@ def match_features_batch(
             ),
             raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
             labels=_consensus_raw_files,
+            apply_seg=bool((processing_kwargs or {}).get("apply_seg", True)),
         )
         if visualize_dir is not None:
             _visualize_consensus_bundle(
@@ -486,6 +487,9 @@ def match_features_batch(
                         ),
                         raw_images=_plot_raw_images,
                         labels=_plot_labels,
+                        apply_seg=bool(
+                            (processing_kwargs or {}).get("apply_seg", True)
+                        ),
                     )
                     _visualize_consensus_bundle(
                         _decoy_bundle.alignment,
@@ -1124,6 +1128,7 @@ def segment_consensus_from_aligned(
     alignment_state: ConsensusAlignmentState,
     smooth_kwargs: dict | None = None,
     watershed_kwargs: dict | None = None,
+    apply_seg: bool = True,
 ) -> ConsensusSegmentationState:
     """Segment a consensus image and track which labels belong to target anchors."""
 
@@ -1148,18 +1153,21 @@ def segment_consensus_from_aligned(
     label_to_snap: dict[int, tuple[int, int]] = {}
 
     if non_none_indices:
-        _wkwargs = dict(watershed_kwargs or {})
-        _int_threshold = _wkwargs.get("int_threshold", 0.5)
-        _min_distance = _wkwargs.get("min_distance", 15)
-        _threshold_rel = _wkwargs.get("threshold_rel", 0.2)
-        all_peaks, _unused_labels, _, watershed_labels, _ = (
-            detect_2d_peak_with_watershed(
-                consensus_smoothed,
-                int_threshold=_int_threshold,
-                min_distance=_min_distance,
-                threshold_rel=_threshold_rel,
+        if apply_seg:
+            _wkwargs = dict(watershed_kwargs or {})
+            _int_threshold = _wkwargs.get("int_threshold", 0.5)
+            _min_distance = _wkwargs.get("min_distance", 15)
+            _threshold_rel = _wkwargs.get("threshold_rel", 0.2)
+            all_peaks, _unused_labels, _, watershed_labels, _ = (
+                detect_2d_peak_with_watershed(
+                    consensus_smoothed,
+                    int_threshold=_int_threshold,
+                    min_distance=_min_distance,
+                    threshold_rel=_threshold_rel,
+                )
             )
-        )
+        else:
+            all_peaks = np.empty((0, 2), dtype=int)
         if all_peaks.shape[0] == 0 or watershed_labels.max() == 0:
             # No peaks detected — fallback to snapping anchors to a bbox around their mean position.
             _anchor_rs = [
@@ -1187,9 +1195,9 @@ def segment_consensus_from_aligned(
                 "anchor_positions": list(zip(_anchor_rs, _anchor_cs)),
                 "rect": (_rt_start, _im_start, _rt_end, _im_end),
             }
-            Logger.info(
-                "No peaks detected in watershed segmentation; using fallback anchor-based bbox segmentation."
-            )
+            # Logger.info(
+            #     "No peaks detected in watershed segmentation; using fallback anchor-based bbox segmentation."
+            # )
             for i, (r_i, c_i) in zip(non_none_indices, zip(_anchor_rs, _anchor_cs)):
                 snapped_per_anchor[i] = (r_i, c_i)
                 snap_log["snap_record"][i] = ((r_i, c_i), (r_i, c_i))
@@ -1430,6 +1438,7 @@ def build_consensus_feature_bundle(
     watershed_kwargs: dict | None = None,
     labels: list[str] | None = None,
     raw_images: list[np.ndarray] | None = None,
+    apply_seg: bool = True,
 ) -> ConsensusFeatureBundle:
     """Build alignment, segmentation, and feature tables for consensus scoring."""
 
@@ -1450,6 +1459,7 @@ def build_consensus_feature_bundle(
         alignment_state,
         smooth_kwargs=smooth_kwargs,
         watershed_kwargs=watershed_kwargs,
+        apply_seg=apply_seg,
     )
     (
         consensus_pp,
@@ -2061,6 +2071,7 @@ def generate_consensus_image(
     raw_images: list[np.ndarray] | None = None,
     fig_dir: str | None = None,
     filename: str = "consensus_image.png",
+    apply_seg: bool = True,
 ) -> tuple[
     np.ndarray,
     list[np.ndarray],
@@ -2131,6 +2142,7 @@ def generate_consensus_image(
         watershed_kwargs=watershed_kwargs,
         labels=labels,
         raw_images=raw_images,
+        apply_seg=apply_seg,
     )
     alignment = bundle.alignment
     segmentation = bundle.segmentation
