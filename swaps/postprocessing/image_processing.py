@@ -1,5 +1,5 @@
 import logging
-from typing import Any, Literal, Optional, Tuple
+from typing import Any, Optional, Tuple
 import numpy as np
 import pandas as pd
 from scipy import ndimage as ndi
@@ -558,60 +558,55 @@ def compute_row_smoothness_and_apex_index(
 
 
 def smooth_and_denoise_image(
-    image,
-    smooth_filter: Literal["gaussian", "uniform"] = "gaussian",
-    log_transform: bool = True,
-    threshold: float = 10,
-    gaussian_kwargs: dict | None = None,
-    uniform_kwargs: dict | None = None,
-    remove_kwargs: dict | None = None,
-):
-    """Smooth image with filters and denoise by remove small objects
+    image: np.ndarray,
+    smooth: dict | None = None,
+    clean: dict | None = None,
+    log_transform: bool = False,
+) -> np.ndarray:
+    """Apply denoising steps independently to a 2D image.
+
+    Each step is optional (None / False skips it). Steps run in order:
+    smooth → clean → log_transform.
 
     Parameters
     ----------
     image : 2D array
-        Input image to be smoothed.
-    smooth_filter : str, optional
-        Type of filter to use. Options are "gaussian" or "uniform". Default is "gaussian".
-    threshold : float, optional
-        Threshold used to create a mask before removing small objects.
-    gaussian_kwargs : dict, optional
-        Keyword arguments for scipy.ndimage.gaussian_filter.
-    uniform_kwargs : dict, optional
-        Keyword arguments for scipy.ndimage.uniform_filter.
-    remove_kwargs : dict, optional
-        Keyword arguments for skimage.morphology.remove_small_objects.
+    smooth : dict or None
+        ``{"filter": "gaussian"|"uniform",
+           "gaussian_kwargs": {"sigma": ..., "mode": ...},
+           "uniform_kwargs": {"size": ...}}``
+    clean : dict or None
+        ``{"threshold": float, "remove_kwargs": {"min_size": int}}``
+    log_transform : bool
+        Apply ``log2(1 + x)`` after smooth/clean.
     """
-    gaussian_kwargs = {} if gaussian_kwargs is None else dict(gaussian_kwargs)
-    uniform_kwargs = {} if uniform_kwargs is None else dict(uniform_kwargs)
-    remove_kwargs = {} if remove_kwargs is None else dict(remove_kwargs)
-
-    if "sigma" not in gaussian_kwargs:
-        gaussian_kwargs["sigma"] = 2  # (rt, im)
-        gaussian_kwargs["mode"] = "nearest"
-    if "size" not in uniform_kwargs:
-        uniform_kwargs["size"] = (1, 5)
-    if "min_size" not in remove_kwargs:
-        remove_kwargs["min_size"] = 5
-
-    match smooth_filter:
-        case "gaussian":
-            image_smoothed = gaussian_filter(image, **gaussian_kwargs)
-        case "uniform":
-            blurred = uniform_filter(image, **uniform_kwargs)
-            image_smoothed = np.maximum(image, blurred)
-        case _:
-            # Logger.info(f"Unknown smooth_filter: {smooth_filter}")
-            image_smoothed = image
-    # remove small objects after smoothing
-    cleaned_mask = remove_small_objects(image_smoothed >= threshold, **remove_kwargs)
-    image_smoothed = image_smoothed * cleaned_mask
-
-    # log transform smoothed and cleaned up
+    result = image
+    if smooth is not None:
+        smooth = dict(smooth)
+        filter_type = smooth.get("filter", "gaussian")
+        g_kw = dict(smooth.get("gaussian_kwargs") or {})
+        u_kw = dict(smooth.get("uniform_kwargs") or {})
+        if "sigma" not in g_kw:
+            g_kw["sigma"] = 2
+            g_kw["mode"] = "nearest"
+        if "size" not in u_kw:
+            u_kw["size"] = (1, 5)
+        if filter_type == "gaussian":
+            result = gaussian_filter(result, **g_kw)
+        elif filter_type == "uniform":
+            blurred = uniform_filter(result, **u_kw)
+            result = np.maximum(result, blurred)
+    if clean is not None:
+        clean = dict(clean)
+        threshold = clean.get("threshold", 10)
+        r_kw = dict(clean.get("remove_kwargs") or {})
+        if "min_size" not in r_kw:
+            r_kw["min_size"] = 5
+        cleaned_mask = remove_small_objects(result >= threshold, **r_kw)
+        result = result * cleaned_mask
     if log_transform:
-        image_smoothed = np.log2(1 + image_smoothed)
-    return image_smoothed
+        result = np.log2(1 + result)
+    return result
 
 
 def get_orb_peak_descriptor(

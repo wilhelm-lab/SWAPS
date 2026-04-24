@@ -53,7 +53,7 @@ class ConsensusSegmentationState:
     """Consensus segmentation, snap decisions, and tracked target labels."""
 
     consensus: np.ndarray
-    consensus_smoothed: np.ndarray
+    consensus_denoised: np.ndarray
     snapped_per_anchor: list[tuple[int, int] | None]
     watershed_labels: np.ndarray
     snap_log: dict[str, Any]
@@ -71,9 +71,9 @@ class ConsensusFeatureBundle:
     consensus_pp: pd.DataFrame | None
     individual_pps: list[pd.DataFrame | None]
     raw_aligned_images: list[np.ndarray] = field(default_factory=list)
-    raw_aligned_smoothed_images: list[np.ndarray] = field(default_factory=list)
+    raw_aligned_denoised_images: list[np.ndarray] = field(default_factory=list)
     raw_consensus: np.ndarray | None = None
-    raw_consensus_smoothed: np.ndarray | None = None
+    raw_consensus_denoised: np.ndarray | None = None
 
 
 def match_features_batches_parallel(
@@ -235,6 +235,29 @@ def _feature_instance_id(mz_rank: int, anchor_id: int) -> str:
     return f"{mz_rank}_{anchor_id}"
 
 
+def _denoise_kwargs_for_stage(denoise_cfg: dict, stage: str) -> dict:
+    """Build smooth_and_denoise_image kwargs for ops whose ``at`` field == stage."""
+    kwargs: dict = {}
+    smooth = dict(denoise_cfg.get("smooth") or {})
+    clean = dict(denoise_cfg.get("clean") or {})
+    log_tf = dict(denoise_cfg.get("log_transform") or {})
+    if smooth.get("at") == stage:
+        kwargs["smooth"] = {k: v for k, v in smooth.items() if k != "at"}
+    if clean.get("at") == stage:
+        kwargs["clean"] = {k: v for k, v in clean.items() if k != "at"}
+    if log_tf.get("at") == stage:
+        kwargs["log_transform"] = bool(log_tf.get("enabled", True))
+    return kwargs
+
+
+def _denoise_kwargs_all(denoise_cfg: dict) -> dict:
+    """Combine raw + consensus stage kwargs (for full-pipeline denoising of raw_aligned)."""
+    return {
+        **_denoise_kwargs_for_stage(denoise_cfg, "raw"),
+        **_denoise_kwargs_for_stage(denoise_cfg, "consensus"),
+    }
+
+
 def _annotate_peak_properties(
     peak_properties: pd.DataFrame | None,
     *,
@@ -309,7 +332,9 @@ def match_features_batch(
             else dict_ref.drop_duplicates("mz_rank").set_index("mz_rank")
         )
     )
-    smooth_kwargs = dict((processing_kwargs or {}).get("smooth_kwargs", {}))
+    denoise_cfg = dict((processing_kwargs or {}).get("denoise", {}))
+    raw_denoise_kwargs = _denoise_kwargs_for_stage(denoise_cfg, "raw")
+    full_denoise_kwargs = _denoise_kwargs_all(denoise_cfg)
 
     # Load activation data for this mz_rank batch from the pre-built sorted parquet.
     # DuckDB skips row groups outside [min(batch_np), max(batch_np)], so I/O scales
@@ -335,7 +360,7 @@ def match_features_batch(
 
     for pept_idx in batch_np:
         pept_act_cache: dict[str, tuple[np.ndarray, int, int]] = {}
-        pept_act_smoothed_cache: dict[str, np.ndarray] = {}
+        pept_act_raw_denoised_cache: dict[str, np.ndarray] = {}
 
         def _get_pept_act_tuple(raw_file: str) -> tuple[np.ndarray, int, int]:
             if raw_file not in pept_act_cache:
@@ -347,12 +372,12 @@ def match_features_batch(
                 )
             return pept_act_cache[raw_file]
 
-        def _get_smoothed_pept_act(raw_file: str) -> np.ndarray:
-            if raw_file not in pept_act_smoothed_cache:
-                pept_act_smoothed_cache[raw_file] = smooth_and_denoise_image(
-                    _get_pept_act_tuple(raw_file)[0], **smooth_kwargs
+        def _get_raw_denoised_pept_act(raw_file: str) -> np.ndarray:
+            if raw_file not in pept_act_raw_denoised_cache:
+                pept_act_raw_denoised_cache[raw_file] = smooth_and_denoise_image(
+                    _get_pept_act_tuple(raw_file)[0], **raw_denoise_kwargs
                 )
-            return pept_act_smoothed_cache[raw_file]
+            return pept_act_raw_denoised_cache[raw_file]
 
         row_series = dict_ref_by_mz.loc[pept_idx, :]
         str_values = row_series[row_series.map(lambda x: isinstance(x, str))]
@@ -377,20 +402,19 @@ def match_features_batch(
             for rf in _consensus_raw_files
         ]
         _consensus_bundle = build_consensus_feature_bundle(
-            images=[_get_smoothed_pept_act(rf) for rf in _consensus_raw_files],
+            images=[_get_raw_denoised_pept_act(rf) for rf in _consensus_raw_files],
             reference_idx=0,
             template_anchor=_get_pept_act_tuple(reference_raw_file)[1:3],
             template_frac=0.3,
             anchors=_consensus_anchors,
-            smooth_kwargs=dict(
-                (processing_kwargs or {}).get("smooth_consensus_kwargs", {})
-            ),
+            denoise_cfg=denoise_cfg,
             watershed_kwargs=dict(
                 (processing_kwargs or {}).get("peak_consensus_kwargs", {})
             ),
             raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
             labels=_consensus_raw_files,
             apply_seg=bool((processing_kwargs or {}).get("apply_seg", True)),
+            seg_mask_thres=int((processing_kwargs or {}).get("seg_mask_thres", 9)),
         )
         if visualize_dir is not None:
             _visualize_consensus_bundle(
@@ -439,13 +463,13 @@ def match_features_batch(
             for _rep in range(_n_peptide_swap_decoys):
                 _rep_specs: dict[str, dict[str, Any]] = {}
                 _plot_raw_images: list[np.ndarray] = []
-                _plot_smoothed_images: list[np.ndarray] = []
+                _plot_raw_denoised_images: list[np.ndarray] = []
                 _plot_labels: list[str] = []
                 for _plot_i, _plot_rf in enumerate(_consensus_raw_files):
                     if _plot_rf == reference_raw_file:
                         _ref_raw = _get_pept_act_tuple(_plot_rf)[0]
                         _plot_raw_images.append(_ref_raw)
-                        _plot_smoothed_images.append(_get_smoothed_pept_act(_plot_rf))
+                        _plot_raw_denoised_images.append(_get_raw_denoised_pept_act(_plot_rf))
                         _plot_labels.append(_plot_rf)
                         continue
                     _decoy_mz = int(np.random.choice(_batch_exclude))
@@ -457,16 +481,16 @@ def match_features_batch(
                         _plot_rf,
                         shape=_get_pept_act_tuple(_plot_rf)[0].shape,
                     )
-                    _decoy_smoothed = smooth_and_denoise_image(
-                        _decoy_raw, **smooth_kwargs
+                    _decoy_raw_denoised = smooth_and_denoise_image(
+                        _decoy_raw, **raw_denoise_kwargs
                     )
                     _rep_specs[_plot_rf] = {
                         "decoy_mz_rank": _decoy_mz,
                         "decoy_raw_image": _decoy_raw,
-                        "decoy_smoothed_image": _decoy_smoothed,
+                        "decoy_raw_denoised_image": _decoy_raw_denoised,
                     }
                     _plot_raw_images.append(_decoy_raw)
-                    _plot_smoothed_images.append(_decoy_smoothed)
+                    _plot_raw_denoised_images.append(_decoy_raw_denoised)
                     _plot_labels.append(f"{_plot_rf}\n(decoy mz{_decoy_mz})")
                 _peptide_swap_decoys_by_rep.append(_rep_specs)
                 if visualize_dir is not None:
@@ -474,14 +498,12 @@ def match_features_batch(
                         len(_consensus_raw_files) - 1
                     )
                     _decoy_bundle = build_consensus_feature_bundle(
-                        images=_plot_smoothed_images,
+                        images=_plot_raw_denoised_images,
                         reference_idx=0,
                         template_anchor=_get_pept_act_tuple(reference_raw_file)[1:3],
                         template_frac=0.3,
                         anchors=_plot_anchors,
-                        smooth_kwargs=dict(
-                            (processing_kwargs or {}).get("smooth_consensus_kwargs", {})
-                        ),
+                        denoise_cfg=denoise_cfg,
                         watershed_kwargs=dict(
                             (processing_kwargs or {}).get("peak_consensus_kwargs", {})
                         ),
@@ -489,6 +511,9 @@ def match_features_batch(
                         labels=_plot_labels,
                         apply_seg=bool(
                             (processing_kwargs or {}).get("apply_seg", True)
+                        ),
+                        seg_mask_thres=int(
+                            (processing_kwargs or {}).get("seg_mask_thres", 9)
                         ),
                     )
                     _visualize_consensus_bundle(
@@ -602,7 +627,8 @@ def match_features_batch(
                             _consensus_bundle,
                             decoy_act,
                             _rf,
-                            smooth_kwargs=smooth_kwargs,
+                            raw_denoise_kwargs=raw_denoise_kwargs,
+                            full_denoise_kwargs=full_denoise_kwargs,
                         )
                         if decoy_pp_raw is None:
                             no_quant_log.append(
@@ -1126,14 +1152,15 @@ def align_images_to_reference(
 
 def segment_consensus_from_aligned(
     alignment_state: ConsensusAlignmentState,
-    smooth_kwargs: dict | None = None,
+    denoise_kwargs: dict | None = None,
     watershed_kwargs: dict | None = None,
     apply_seg: bool = True,
+    seg_mask_thres: int = 9,
 ) -> ConsensusSegmentationState:
     """Segment a consensus image and track which labels belong to target anchors."""
 
     consensus = np.stack(alignment_state.aligned_images, axis=0).mean(axis=0)
-    consensus_smoothed = smooth_and_denoise_image(consensus, **(smooth_kwargs or {}))
+    consensus_denoised = smooth_and_denoise_image(consensus, **(denoise_kwargs or {}))
     rows, cols = alignment_state.target_shape
     non_none_indices = [
         i for i, aa in enumerate(alignment_state.aligned_anchors) if aa is not None
@@ -1141,7 +1168,7 @@ def segment_consensus_from_aligned(
     snapped_per_anchor: list[tuple[int, int] | None] = [None] * len(
         alignment_state.aligned_anchors
     )
-    watershed_labels: np.ndarray = np.zeros(consensus_smoothed.shape, dtype=int)
+    watershed_labels: np.ndarray = np.zeros(consensus_denoised.shape, dtype=int)
     snap_log: dict[str, Any] = {
         "snap_record": {},
         "discard_record": {},
@@ -1160,7 +1187,7 @@ def segment_consensus_from_aligned(
             _threshold_rel = _wkwargs.get("threshold_rel", 0.2)
             all_peaks, _unused_labels, _, watershed_labels, _ = (
                 detect_2d_peak_with_watershed(
-                    consensus_smoothed,
+                    consensus_denoised,
                     int_threshold=_int_threshold,
                     min_distance=_min_distance,
                     threshold_rel=_threshold_rel,
@@ -1168,44 +1195,10 @@ def segment_consensus_from_aligned(
             )
         else:
             all_peaks = np.empty((0, 2), dtype=int)
-        if all_peaks.shape[0] == 0 or watershed_labels.max() == 0:
-            # No peaks detected — fallback to snapping anchors to a bbox around their mean position.
-            _anchor_rs = [
-                int(np.clip(round(_aa[0]), 0, rows - 1))
-                for i in non_none_indices
-                for _aa in (alignment_state.aligned_anchors[i],)
-                if _aa is not None
-            ]
-            _anchor_cs = [
-                int(np.clip(round(_aa[1]), 0, cols - 1))
-                for i in non_none_indices
-                for _aa in (alignment_state.aligned_anchors[i],)
-                if _aa is not None
-            ]
-            _ctr_r = int(round(float(np.mean(_anchor_rs))))
-            _ctr_c = int(round(float(np.mean(_anchor_cs))))
-            _rt_start = max(int(_ctr_r - 0.3 * rows), 0)
-            _rt_end = min(int(_ctr_r + 0.3 * rows), rows)
-            _im_start = max(int(_ctr_c - 0.3 * cols), 0)
-            _im_end = min(int(_ctr_c + 0.3 * cols), cols)
-            watershed_labels[_rt_start:_rt_end, _im_start:_im_end] = (
-                consensus[_rt_start:_rt_end, _im_start:_im_end] > 0
-            ).astype(int)
-            snap_log["no_seg_log"] = {
-                "anchor_positions": list(zip(_anchor_rs, _anchor_cs)),
-                "rect": (_rt_start, _im_start, _rt_end, _im_end),
-            }
-            # Logger.info(
-            #     "No peaks detected in watershed segmentation; using fallback anchor-based bbox segmentation."
-            # )
-            for i, (r_i, c_i) in zip(non_none_indices, zip(_anchor_rs, _anchor_cs)):
-                snapped_per_anchor[i] = (r_i, c_i)
-                snap_log["snap_record"][i] = ((r_i, c_i), (r_i, c_i))
-            if watershed_labels.max() > 0:
-                target_label_ids.append(1)
-                seen_label_ids.add(1)
-                label_to_snap[1] = (_anchor_rs[0], _anchor_cs[0])
-        else:
+
+        use_bbox_fallback = all_peaks.shape[0] == 0 or watershed_labels.max() == 0
+
+        if not use_bbox_fallback:
             # Normal case: peaks and watershed labels detected successfully.
             # Hoist once: used by any anchor that falls in background (anchor_ws == 0)
             labeled_coords = np.argwhere(watershed_labels > 0)
@@ -1263,9 +1256,63 @@ def segment_consensus_from_aligned(
                         seen_label_ids.add(jump_ws)
                         label_to_snap[jump_ws] = snapped_rc
 
+            # Roll back to bbox if target-label area is below threshold.
+            if seg_mask_thres > 0 and target_label_ids:
+                _target_area = sum(
+                    int(np.sum(watershed_labels == lid)) for lid in target_label_ids
+                )
+                if _target_area < seg_mask_thres:
+                    use_bbox_fallback = True
+                    watershed_labels = np.zeros(consensus_denoised.shape, dtype=int)
+                    snapped_per_anchor = [None] * len(alignment_state.aligned_anchors)
+                    snap_log = {
+                        "snap_record": {},
+                        "discard_record": {},
+                        "no_seg_log": None,
+                        "jump_anchor_log": {},
+                    }
+                    target_label_ids.clear()
+                    seen_label_ids.clear()
+                    label_to_snap.clear()
+
+        if use_bbox_fallback:
+            # No usable watershed — fallback to snapping anchors to a bbox around their mean position.
+            _anchor_rs = [
+                int(np.clip(round(_aa[0]), 0, rows - 1))
+                for i in non_none_indices
+                for _aa in (alignment_state.aligned_anchors[i],)
+                if _aa is not None
+            ]
+            _anchor_cs = [
+                int(np.clip(round(_aa[1]), 0, cols - 1))
+                for i in non_none_indices
+                for _aa in (alignment_state.aligned_anchors[i],)
+                if _aa is not None
+            ]
+            _ctr_r = int(round(float(np.mean(_anchor_rs))))
+            _ctr_c = int(round(float(np.mean(_anchor_cs))))
+            _rt_start = max(int(_ctr_r - 0.3 * rows), 0)
+            _rt_end = min(int(_ctr_r + 0.3 * rows), rows)
+            _im_start = max(int(_ctr_c - 0.3 * cols), 0)
+            _im_end = min(int(_ctr_c + 0.3 * cols), cols)
+            watershed_labels[_rt_start:_rt_end, _im_start:_im_end] = (
+                consensus[_rt_start:_rt_end, _im_start:_im_end] > 0
+            ).astype(int)
+            snap_log["no_seg_log"] = {
+                "anchor_positions": list(zip(_anchor_rs, _anchor_cs)),
+                "rect": (_rt_start, _im_start, _rt_end, _im_end),
+            }
+            for i, (r_i, c_i) in zip(non_none_indices, zip(_anchor_rs, _anchor_cs)):
+                snapped_per_anchor[i] = (r_i, c_i)
+                snap_log["snap_record"][i] = ((r_i, c_i), (r_i, c_i))
+            if watershed_labels.max() > 0:
+                target_label_ids.append(1)
+                seen_label_ids.add(1)
+                label_to_snap[1] = (_anchor_rs[0], _anchor_cs[0])
+
     return ConsensusSegmentationState(
         consensus=consensus,
-        consensus_smoothed=consensus_smoothed,
+        consensus_denoised=consensus_denoised,
         snapped_per_anchor=snapped_per_anchor,
         watershed_labels=watershed_labels,
         snap_log=snap_log,
@@ -1298,7 +1345,7 @@ def _extract_feature_rows_for_label_ids(
     label_ids: list[int],
     label_image: np.ndarray,
     raw_image: np.ndarray,
-    smoothed_image: np.ndarray,
+    denoised_image: np.ndarray,
     *,
     run_name: str,
     shift: tuple[int, int],
@@ -1327,15 +1374,15 @@ def _extract_feature_rows_for_label_ids(
         peak_properties["template_matching_score"] = float(template_matching_score)
         peak_properties["sift_des"] = None
         peak_properties.at[0, "sift_des"] = get_sift_descriptor(
-            np.log1p(smoothed_image),
+            np.log1p(denoised_image),
             (int(snap_rc[0]), int(snap_rc[1])),
-            patch_size=min(smoothed_image.shape),
+            patch_size=min(denoised_image.shape),
         )
         _r0 = int(peak_properties["bbox-0"].values[0])
         _r1 = int(peak_properties["bbox-2"].values[0])
         _c0 = int(peak_properties["bbox-1"].values[0])
         _c1 = int(peak_properties["bbox-3"].values[0])
-        seg_bbox = smoothed_image[_r0:_r1, _c0:_c1]
+        seg_bbox = denoised_image[_r0:_r1, _c0:_c1]
         peak_properties["zernike"] = None
         peak_properties.at[0, "zernike"] = get_roi_descriptor(seg_bbox)
         peak_properties["Run_name"] = run_name
@@ -1350,7 +1397,7 @@ def extract_peak_properties_from_consensus_labels(
     segmentation_state: ConsensusSegmentationState,
     *,
     raw_images: list[np.ndarray] | None = None,
-    smooth_kwargs: dict | None = None,
+    denoise_kwargs: dict | None = None,
     labels: list[str] | None = None,
 ) -> tuple[
     pd.DataFrame | None,
@@ -1377,13 +1424,13 @@ def extract_peak_properties_from_consensus_labels(
         alignment_state.target_shape,
         alignment_state.shifts,
     )
-    raw_aligned_smoothed = [
-        smooth_and_denoise_image(raw_image, **(smooth_kwargs or {}))
+    raw_aligned_denoised = [
+        smooth_and_denoise_image(raw_image, **(denoise_kwargs or {}))
         for raw_image in raw_aligned
     ]
     raw_consensus = np.stack(raw_aligned, axis=0).mean(axis=0)
-    raw_consensus_smoothed = smooth_and_denoise_image(
-        raw_consensus, **(smooth_kwargs or {})
+    raw_consensus_denoised = smooth_and_denoise_image(
+        raw_consensus, **(denoise_kwargs or {})
     )
 
     consensus_pp: pd.DataFrame | None = None
@@ -1394,7 +1441,7 @@ def extract_peak_properties_from_consensus_labels(
                 segmentation_state.target_label_ids,
                 segmentation_state.watershed_labels,
                 raw_aligned[i],
-                raw_aligned_smoothed[i],
+                raw_aligned_denoised[i],
                 run_name=run_name,
                 shift=alignment_state.shifts[i],
                 template_matching_score=alignment_state.max_scores[i],
@@ -1408,7 +1455,7 @@ def extract_peak_properties_from_consensus_labels(
             segmentation_state.target_label_ids,
             segmentation_state.watershed_labels,
             raw_consensus,
-            raw_consensus_smoothed,
+            raw_consensus_denoised,
             run_name="consensus",
             shift=(0, 0),
             template_matching_score=1.0,
@@ -1421,9 +1468,9 @@ def extract_peak_properties_from_consensus_labels(
         consensus_pp,
         individual_pps,
         raw_aligned,
-        raw_aligned_smoothed,
+        raw_aligned_denoised,
         raw_consensus,
-        raw_consensus_smoothed,
+        raw_consensus_denoised,
     )
 
 
@@ -1434,11 +1481,12 @@ def build_consensus_feature_bundle(
     template_anchor: tuple[int, int] | None = None,
     template_frac: float = 0.3,
     anchors: list[tuple[int, int] | None] | None = None,
-    smooth_kwargs: dict | None = None,
+    denoise_cfg: dict | None = None,
     watershed_kwargs: dict | None = None,
     labels: list[str] | None = None,
     raw_images: list[np.ndarray] | None = None,
     apply_seg: bool = True,
+    seg_mask_thres: int = 9,
 ) -> ConsensusFeatureBundle:
     """Build alignment, segmentation, and feature tables for consensus scoring."""
 
@@ -1447,6 +1495,9 @@ def build_consensus_feature_bundle(
             "labels must have the same length as images "
             f"(got {len(labels)}, expected {len(images)})."
         )
+    _denoise_cfg = denoise_cfg or {}
+    _consensus_denoise_kwargs = _denoise_kwargs_for_stage(_denoise_cfg, "consensus")
+    _full_denoise_kwargs = _denoise_kwargs_all(_denoise_cfg)
     alignment_state = align_images_to_reference(
         images=images,
         reference_idx=reference_idx,
@@ -1457,22 +1508,23 @@ def build_consensus_feature_bundle(
     )
     segmentation_state = segment_consensus_from_aligned(
         alignment_state,
-        smooth_kwargs=smooth_kwargs,
+        denoise_kwargs=_consensus_denoise_kwargs,
         watershed_kwargs=watershed_kwargs,
         apply_seg=apply_seg,
+        seg_mask_thres=int(seg_mask_thres),
     )
     (
         consensus_pp,
         individual_pps,
         raw_aligned,
-        raw_aligned_smoothed,
+        raw_aligned_denoised,
         raw_consensus,
-        raw_consensus_smoothed,
+        raw_consensus_denoised,
     ) = extract_peak_properties_from_consensus_labels(
         alignment_state,
         segmentation_state,
         raw_images=raw_images,
-        smooth_kwargs=smooth_kwargs,
+        denoise_kwargs=_full_denoise_kwargs,
         labels=labels,
     )
     return ConsensusFeatureBundle(
@@ -1481,9 +1533,9 @@ def build_consensus_feature_bundle(
         consensus_pp=consensus_pp,
         individual_pps=individual_pps,
         raw_aligned_images=raw_aligned,
-        raw_aligned_smoothed_images=raw_aligned_smoothed,
+        raw_aligned_denoised_images=raw_aligned_denoised,
         raw_consensus=raw_consensus,
-        raw_consensus_smoothed=raw_consensus_smoothed,
+        raw_consensus_denoised=raw_consensus_denoised,
     )
 
 
@@ -1542,7 +1594,7 @@ def _make_shifted_consensus_segmentation_state(
     }
     return ConsensusSegmentationState(
         consensus=segmentation_state.consensus,
-        consensus_smoothed=segmentation_state.consensus_smoothed,
+        consensus_denoised=segmentation_state.consensus_denoised,
         snapped_per_anchor=shifted_snapped_per_anchor,
         watershed_labels=shifted_labels,
         snap_log=shifted_snap_log,
@@ -1561,7 +1613,7 @@ def _visualize_consensus_bundle(
     labels: list[str] | None = None,
     aligned_images: list[np.ndarray] | None = None,
     consensus: np.ndarray | None = None,
-    consensus_smoothed: np.ndarray | None = None,
+    consensus_denoised: np.ndarray | None = None,
 ) -> None:
     """Visualize aligned images plus consensus panels for targets or decoys."""
 
@@ -1574,10 +1626,10 @@ def _visualize_consensus_bundle(
         alignment_state.aligned_images if aligned_images is None else aligned_images
     )
     display_consensus = segmentation_state.consensus if consensus is None else consensus
-    display_consensus_smoothed = (
-        segmentation_state.consensus_smoothed
-        if consensus_smoothed is None
-        else consensus_smoothed
+    display_consensus_denoised = (
+        segmentation_state.consensus_denoised
+        if consensus_denoised is None
+        else consensus_denoised
     )
 
     max_cols = 5
@@ -1677,7 +1729,7 @@ def _visualize_consensus_bundle(
     ax_craw.set_ylabel("RT axis")
     fig.colorbar(im_craw, ax=ax_craw, shrink=0.8, label="Intensity")
 
-    ax_csm.imshow(display_consensus_smoothed, aspect="auto", origin="lower")
+    ax_csm.imshow(display_consensus_denoised, aspect="auto", origin="lower")
     ax_csm.set_title("Consensus (smoothed)", fontsize=9)
     ax_csm.set_xlabel("IM axis")
     ax_csm.set_ylabel("RT axis")
@@ -1956,16 +2008,17 @@ def _build_consensus_peptide_swap_decoy(
     bundle: ConsensusFeatureBundle,
     decoy_raw_image: np.ndarray,
     run_name: str,
-    smooth_kwargs: dict | None = None,
+    raw_denoise_kwargs: dict | None = None,
+    full_denoise_kwargs: dict | None = None,
 ) -> tuple[pd.DataFrame | None, tuple[int, int], float]:
     """Align a wrong same-run peptide image and score it under target consensus labels."""
 
-    decoy_smoothed = smooth_and_denoise_image(decoy_raw_image, **(smooth_kwargs or {}))
-    decoy_smoothed_resized = _resize_image_to_shape(
-        decoy_smoothed, bundle.alignment.target_shape
+    decoy_raw_denoised = smooth_and_denoise_image(decoy_raw_image, **(raw_denoise_kwargs or {}))
+    decoy_raw_denoised_resized = _resize_image_to_shape(
+        decoy_raw_denoised, bundle.alignment.target_shape
     )
     (
-        _aligned_smoothed,
+        _aligned_denoised,
         _matched_box,
         _aligned_anchor,
         shift,
@@ -1973,7 +2026,7 @@ def _build_consensus_peptide_swap_decoy(
         _match_score_map,
         _match_score_peak,
     ) = _align_resized_image_to_template(
-        decoy_smoothed_resized,
+        decoy_raw_denoised_resized,
         bundle.alignment.template,
         bundle.alignment.template_bounds,
         None,
@@ -1986,14 +2039,14 @@ def _build_consensus_peptide_swap_decoy(
     decoy_raw_aligned = nd_shift(
         decoy_raw_resized, shift=shift, mode="constant", cval=0.0
     )
-    decoy_raw_aligned_smoothed = smooth_and_denoise_image(
-        decoy_raw_aligned, **(smooth_kwargs or {})
+    decoy_raw_aligned_denoised = smooth_and_denoise_image(
+        decoy_raw_aligned, **(full_denoise_kwargs or {})
     )
     decoy_pp = _extract_feature_rows_for_label_ids(
         bundle.segmentation.target_label_ids,
         bundle.segmentation.watershed_labels,
         decoy_raw_aligned,
-        decoy_raw_aligned_smoothed,
+        decoy_raw_aligned_denoised,
         run_name=run_name,
         shift=shift,
         template_matching_score=max_score,
@@ -2013,7 +2066,7 @@ def _build_consensus_off_target_decoy(
 ) -> tuple[pd.DataFrame | None, tuple[int, int] | None]:
     """Quantify the target run against a deliberately shifted consensus label mask."""
 
-    if not bundle.raw_aligned_images or not bundle.raw_aligned_smoothed_images:
+    if not bundle.raw_aligned_images or not bundle.raw_aligned_denoised_images:
         return None, None
     resolved_label_shift = (
         _choose_off_target_shift(
@@ -2035,7 +2088,7 @@ def _build_consensus_off_target_decoy(
         bundle.segmentation.target_label_ids,
         shifted_labels,
         bundle.raw_aligned_images[run_index],
-        bundle.raw_aligned_smoothed_images[run_index],
+        bundle.raw_aligned_denoised_images[run_index],
         run_name=run_name,
         shift=bundle.alignment.shifts[run_index],
         template_matching_score=bundle.alignment.max_scores[run_index],
@@ -2064,7 +2117,7 @@ def generate_consensus_image(
     template_anchor: tuple[int, int] | None = None,
     template_frac: float = 0.3,
     anchors: list[tuple[int, int] | None] | None = None,
-    smooth_kwargs: dict | None = None,
+    denoise_cfg: dict | None = None,
     watershed_kwargs: dict | None = None,
     visualize: bool = False,
     labels: list[str] | None = None,
@@ -2072,6 +2125,7 @@ def generate_consensus_image(
     fig_dir: str | None = None,
     filename: str = "consensus_image.png",
     apply_seg: bool = True,
+    seg_mask_thres: int = 9,
 ) -> tuple[
     np.ndarray,
     list[np.ndarray],
@@ -2081,7 +2135,7 @@ def generate_consensus_image(
     pd.DataFrame | None,
     list[pd.DataFrame | None],
 ]:
-    """Resize, align, and average a collection of smoothed images into a consensus.
+    """Resize, align, and average a collection of denoised images into a consensus.
 
     A patch of size ``±template_frac * dim`` is extracted from the (resized)
     reference image centred on *template_anchor*, then
@@ -2138,11 +2192,12 @@ def generate_consensus_image(
         template_anchor=template_anchor,
         template_frac=template_frac,
         anchors=anchors,
-        smooth_kwargs=smooth_kwargs,
+        denoise_cfg=denoise_cfg,
         watershed_kwargs=watershed_kwargs,
         labels=labels,
         raw_images=raw_images,
         apply_seg=apply_seg,
+        seg_mask_thres=seg_mask_thres,
     )
     alignment = bundle.alignment
     segmentation = bundle.segmentation
@@ -2155,7 +2210,7 @@ def generate_consensus_image(
     match_score_peaks = alignment.match_score_peaks
     match_score_label_indices = alignment.match_score_label_indices
     consensus = segmentation.consensus
-    consensus_smoothed = segmentation.consensus_smoothed
+    consensus_denoised = segmentation.consensus_denoised
     non_none_indices = segmentation.non_none_indices
     snapped_per_anchor = segmentation.snapped_per_anchor
     watershed_labels = segmentation.watershed_labels

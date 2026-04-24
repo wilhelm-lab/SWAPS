@@ -86,35 +86,30 @@ __C.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH = 4  # width for IM peak extraction; o
 
 # match features kwargs (postprocessing peak detection/matching parameters)
 __C.MATCH_FEATURES_KWARGS = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.smooth_kwargs = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.smooth_kwargs.smooth_filter = "gaussian"
-__C.MATCH_FEATURES_KWARGS.smooth_kwargs.gaussian_kwargs = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.smooth_kwargs.gaussian_kwargs.sigma = [2, 2]
-__C.MATCH_FEATURES_KWARGS.smooth_kwargs.gaussian_kwargs.mode = "nearest"
-__C.MATCH_FEATURES_KWARGS.smooth_kwargs.uniform_kwargs = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.smooth_kwargs.uniform_kwargs.size = [1, 5]
-__C.MATCH_FEATURES_KWARGS.smooth_kwargs.threshold = 10
-__C.MATCH_FEATURES_KWARGS.smooth_kwargs.remove_kwargs = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.smooth_kwargs.remove_kwargs.min_size = 5
-__C.MATCH_FEATURES_KWARGS.peak_kwargs = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.peak_kwargs.int_threshold = 1
-__C.MATCH_FEATURES_KWARGS.peak_kwargs.min_distance = 10
-__C.MATCH_FEATURES_KWARGS.peak_kwargs.threshold_rel = 0.2
-__C.MATCH_FEATURES_KWARGS.filter_kwargs = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.filter_kwargs.min_peak_area = 10
-__C.MATCH_FEATURES_KWARGS.filter_kwargs.min_peak_sum_intensity = 500
 __C.MATCH_FEATURES_KWARGS.apply_seg = True
-__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.smooth_filter = "uniform"
-__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.log_transform = False
-__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.threshold = 0
-__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.gaussian_kwargs = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.gaussian_kwargs.sigma = [2, 2]
-__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.gaussian_kwargs.mode = "nearest"
-__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.uniform_kwargs = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.uniform_kwargs.size = [3, 5]
-__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.remove_kwargs = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.smooth_consensus_kwargs.remove_kwargs.min_size = 3
+__C.MATCH_FEATURES_KWARGS.seg_mask_thres = 9  # min target-label area; below this rolls back to bbox segmentation
+# denoise: three sequential ops applied across two pipeline stages.
+#   smooth.at / clean.at / log_transform.at controls which stage each op executes.
+#   "raw"       → applied to raw images before SIFT template-matching alignment
+#   "consensus" → applied to the averaged consensus image before watershed segmentation
+#   At peak-property extraction, raw_aligned images are compensated by applying all ops.
+__C.MATCH_FEATURES_KWARGS.denoise = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.denoise.smooth = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.denoise.smooth.at = "consensus"
+__C.MATCH_FEATURES_KWARGS.denoise.smooth.filter = "uniform"
+__C.MATCH_FEATURES_KWARGS.denoise.smooth.gaussian_kwargs = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.denoise.smooth.gaussian_kwargs.sigma = [2, 2]
+__C.MATCH_FEATURES_KWARGS.denoise.smooth.gaussian_kwargs.mode = "nearest"
+__C.MATCH_FEATURES_KWARGS.denoise.smooth.uniform_kwargs = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.denoise.smooth.uniform_kwargs.size = [3, 5]
+__C.MATCH_FEATURES_KWARGS.denoise.clean = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.denoise.clean.at = "consensus"
+__C.MATCH_FEATURES_KWARGS.denoise.clean.threshold = 0
+__C.MATCH_FEATURES_KWARGS.denoise.clean.remove_kwargs = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.denoise.clean.remove_kwargs.min_size = 3
+__C.MATCH_FEATURES_KWARGS.denoise.log_transform = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.denoise.log_transform.at = "raw"
+__C.MATCH_FEATURES_KWARGS.denoise.log_transform.enabled = True
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.int_threshold = 1
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.min_distance = 10
@@ -131,4 +126,4 @@ __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.off_target_max_overlap_fraction
 __C.FDR = ConfigurationNode()
 __C.FDR.TRAIN = 0.05
 __C.FDR.TEST = 0.01
-__C.FDR.INT_THRES = 0  # intensity threshold for FDR; 0 means no threshold
+__C.FDR.INT_THRES = 100  # intensity threshold for FDR; 0 means no threshold
