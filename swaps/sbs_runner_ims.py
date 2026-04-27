@@ -2,6 +2,7 @@
 
 import logging
 import os
+import pickle
 from concurrent.futures import ThreadPoolExecutor, as_completed as tpe_as_completed
 from datetime import datetime
 import time
@@ -78,7 +79,6 @@ def opt_scan_by_scan(config_path: str):
         merge_cfg_from_file(cfg, config_path)
         logging.info("merge with cfg file %s", config_path)
     processing_kwargs = yaml.safe_load(cfg.MATCH_FEATURES_KWARGS.dump())
-    processing_kwargs.pop("generate_consensus", None)
 
     if cfg.ADD_TIMESTAMP_TO_RESULT_PATH:
         cfg.RESULT_PATH = cfg.RESULT_PATH + "_" + name_timestamp
@@ -325,7 +325,7 @@ def opt_scan_by_scan(config_path: str):
         max_workers=cfg.N_CPU,
         processing_kwargs=processing_kwargs,
     )
-    quant_dir = os.path.join(cfg.RESULT_PATH, "quantification")
+    quant_dir = os.path.join(cfg.RESULT_PATH, cfg.MATCH_FEATURES_KWARGS.dir_name)
     os.makedirs(quant_dir, exist_ok=True)
     dfs_to_save = {
         "no_quant_log.parquet": df_no_quant,
@@ -344,7 +344,9 @@ def opt_scan_by_scan(config_path: str):
         ]
         for f in futs:
             f.result()
-
+    with open(os.path.join(quant_dir, "snap_log_collection.pkl"), "wb") as f:
+        pickle.dump(snap_log_collection, f, protocol=pickle.HIGHEST_PROTOCOL)
+    _save_effective_cfg(cfg, processing_kwargs, quant_dir)
     logging.info("=================FDR control==================")
 
     if cfg.FDR.INT_THRES > 0:
@@ -396,7 +398,13 @@ def opt_scan_by_scan(config_path: str):
             "zernike_distance",
             "template_matching_score",
         ],
-        normalize_features=False,
+        normalize_feature_cols=[
+            "sift_similarities",
+            "zernike_similarities",
+            "sift_distance",
+            "zernike_distance",
+            "template_matching_score",
+        ],
         scannr_col="feature_instance_id_with_label",  # No deduplication btw target and decoy for now
         psmid_col="Sequence_with_runs",
         specid_col="Sequence_with_runs",

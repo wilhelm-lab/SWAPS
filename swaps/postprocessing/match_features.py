@@ -289,23 +289,6 @@ def _annotate_peak_properties(
     return peak_properties
 
 
-def _extract_single_peak_properties(
-    peak_properties: pd.DataFrame | None,
-    snapped_anchor: tuple[int, int] | None,
-) -> pd.DataFrame | None:
-    """Pick the row corresponding to the snapped anchor from a multi-label table."""
-
-    if peak_properties is None or snapped_anchor is None:
-        return None
-    peak_properties = peak_properties.copy()
-    mask = (peak_properties["snap_rt"].astype(int) == int(snapped_anchor[0])) & (
-        peak_properties["snap_im"].astype(int) == int(snapped_anchor[1])
-    )
-    if mask.any():
-        return peak_properties.loc[mask].iloc[[0]].reset_index(drop=True)
-    return peak_properties.iloc[[0]].reset_index(drop=True)
-
-
 def match_features_batch(
     dict_ref,
     raw_file_list,
@@ -469,7 +452,9 @@ def match_features_batch(
                     if _plot_rf == reference_raw_file:
                         _ref_raw = _get_pept_act_tuple(_plot_rf)[0]
                         _plot_raw_images.append(_ref_raw)
-                        _plot_raw_denoised_images.append(_get_raw_denoised_pept_act(_plot_rf))
+                        _plot_raw_denoised_images.append(
+                            _get_raw_denoised_pept_act(_plot_rf)
+                        )
                         _plot_labels.append(_plot_rf)
                         continue
                     _decoy_mz = int(np.random.choice(_batch_exclude))
@@ -804,10 +789,12 @@ def compare_peak_properties(peak_properties_a, peak_properties_b):
         "sift_distance": compare_image_descriptors_euclidean(
             peak_properties_a["sift_des"].values[0],
             peak_properties_b["sift_des"].values[0],
+            l2_norm=False,
         ),
         "zernike_distance": compare_image_descriptors_euclidean(
             peak_properties_a["zernike"].values[0],
             peak_properties_b["zernike"].values[0],
+            l2_norm=True,
         ),
         "rt_shift": abs(
             peak_properties_a["shift_rt"].values[0]
@@ -854,7 +841,7 @@ def compare_peak_properties(peak_properties_a, peak_properties_b):
     }
 
 
-def compare_image_descriptors_cosine(des1, des2):
+def compare_image_descriptors_cosine(des1, des2, log_transform: bool = True):
     if des1 is None or des2 is None:
         return 0.0
 
@@ -868,10 +855,12 @@ def compare_image_descriptors_cosine(des1, des2):
 
     # Option 2: rescale from [-1, 1] to [0, 1] (preserves information)
     similarity = (1 - cosine(d1, d2) + 1) / 2
+    if log_transform:
+        similarity = -np.log(1 - similarity + 1e-8)
     return similarity
 
 
-def compare_image_descriptors_euclidean(des1, des2):
+def compare_image_descriptors_euclidean(des1, des2, l2_norm: bool = False):
     if des1 is None or des2 is None:
         return 0.0
 
@@ -879,6 +868,10 @@ def compare_image_descriptors_euclidean(des1, des2):
     # This line prevents the "Assertion failed" error
     d1 = des1.astype(np.float32).flatten()
     d2 = des2.astype(np.float32).flatten()
+    if l2_norm:
+        # L2 normalize (unit vectors) — critical for fair comparison
+        d1 = d1 / (np.linalg.norm(d1) + 1e-8)
+        d2 = d2 / (np.linalg.norm(d2) + 1e-8)
 
     dist = np.linalg.norm(d1 - d2)
 
@@ -1311,8 +1304,8 @@ def segment_consensus_from_aligned(
                 label_to_snap[1] = (_anchor_rs[0], _anchor_cs[0])
 
     return ConsensusSegmentationState(
-        consensus=consensus,
-        consensus_denoised=consensus_denoised,
+        consensus=consensus,  # stacked mean of aligned_images
+        consensus_denoised=consensus_denoised,  # denoised with consensus_denoise_kwar
         snapped_per_anchor=snapped_per_anchor,
         watershed_labels=watershed_labels,
         snap_log=snap_log,
@@ -1374,7 +1367,7 @@ def _extract_feature_rows_for_label_ids(
         peak_properties["template_matching_score"] = float(template_matching_score)
         peak_properties["sift_des"] = None
         peak_properties.at[0, "sift_des"] = get_sift_descriptor(
-            np.log1p(denoised_image),
+            denoised_image,
             (int(snap_rc[0]), int(snap_rc[1])),
             patch_size=min(denoised_image.shape),
         )
@@ -1423,16 +1416,19 @@ def extract_peak_properties_from_consensus_labels(
         raw_images,
         alignment_state.target_shape,
         alignment_state.shifts,
-    )
+    )  # no raw denoise kwargs
     raw_aligned_denoised = [
         smooth_and_denoise_image(raw_image, **(denoise_kwargs or {}))
         for raw_image in raw_aligned
     ]
-    raw_consensus = np.stack(raw_aligned, axis=0).mean(axis=0)
-    raw_consensus_denoised = smooth_and_denoise_image(
-        raw_consensus, **(denoise_kwargs or {})
-    )
-
+    # raw_consensus = np.stack(raw_aligned, axis=0).mean(axis=0)
+    # raw_consensus_denoised = smooth_and_denoise_image(
+    #     raw_consensus, **(denoise_kwargs or {})
+    # )
+    raw_consensus = segmentation_state.consensus  # with raw denoise kwargs
+    raw_consensus_denoised = (
+        segmentation_state.consensus_denoised
+    )  # with raw denoise kwargs + consensus_denoise_kwargs
     consensus_pp: pd.DataFrame | None = None
     if segmentation_state.target_label_ids:
         for i in range(len(raw_aligned)):
@@ -2013,7 +2009,9 @@ def _build_consensus_peptide_swap_decoy(
 ) -> tuple[pd.DataFrame | None, tuple[int, int], float]:
     """Align a wrong same-run peptide image and score it under target consensus labels."""
 
-    decoy_raw_denoised = smooth_and_denoise_image(decoy_raw_image, **(raw_denoise_kwargs or {}))
+    decoy_raw_denoised = smooth_and_denoise_image(
+        decoy_raw_image, **(raw_denoise_kwargs or {})
+    )
     decoy_raw_denoised_resized = _resize_image_to_shape(
         decoy_raw_denoised, bundle.alignment.target_shape
     )
@@ -2039,14 +2037,14 @@ def _build_consensus_peptide_swap_decoy(
     decoy_raw_aligned = nd_shift(
         decoy_raw_resized, shift=shift, mode="constant", cval=0.0
     )
-    decoy_raw_aligned_denoised = smooth_and_denoise_image(
+    decoy_raw_aligned_full_denoised = smooth_and_denoise_image(
         decoy_raw_aligned, **(full_denoise_kwargs or {})
     )
     decoy_pp = _extract_feature_rows_for_label_ids(
         bundle.segmentation.target_label_ids,
         bundle.segmentation.watershed_labels,
         decoy_raw_aligned,
-        decoy_raw_aligned_denoised,
+        decoy_raw_aligned_full_denoised,
         run_name=run_name,
         shift=shift,
         template_matching_score=max_score,

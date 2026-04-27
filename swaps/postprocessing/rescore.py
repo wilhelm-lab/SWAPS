@@ -1,5 +1,5 @@
 import os
-from typing import Literal, Optional
+from typing import Literal, Optional, List
 import pandas as pd
 import numpy as np
 import mokapot
@@ -18,7 +18,7 @@ def prepare_mokapot_input(
     scannr_col: Optional[str] = None,
     psmid_col: Optional[str] = None,
     specid_col: Optional[str] = None,
-    normalize_features: bool = True,
+    normalize_feature_cols: List[str] = [],
     decoy_col: str = "decoy",
     peptide_col: str = "modified_sequence",
     protein_col: str = "proteins",
@@ -98,14 +98,15 @@ def prepare_mokapot_input(
         df_pin["filename"] = "file"
         id_col.append("filename")
     df_pin = df_pin[id_col + feature_cols]
-    if normalize_features:
-        for col in tqdm(feature_cols, desc="Normalizing features"):
+    no_normalize_cols = list(set(feature_cols) - set(normalize_feature_cols))
+    if len(normalize_feature_cols) > 0:
+        for col in tqdm(normalize_feature_cols, desc="Normalizing features"):
             col_z = col + "_z"
             df_pin[col_z] = (df_pin[col] - df_pin[col].mean()) / df_pin[col].std()
-        feature_cols = [col + "_z" for col in feature_cols]
-        df_pin = df_pin[id_col + feature_cols]
+        normalize_feature_cols = [col + "_z" for col in normalize_feature_cols]
+        df_pin = df_pin[id_col + no_normalize_cols + normalize_feature_cols]
     Logger.info("Prepared mokapot input: %s", df_pin.head(5))
-    return df_pin
+    return df_pin, no_normalize_cols + normalize_feature_cols
 
 
 def brew_with_mokapot(
@@ -145,11 +146,11 @@ def brew_with_mokapot(
     else:
         os.makedirs(work_dir, exist_ok=True)
     # Prepare mokapot input
-    mokapot_input = prepare_mokapot_input(
+    mokapot_input, new_feature_cols = prepare_mokapot_input(
         peptide_info_dataframe,
         **kwargs,
     )
-    for col in kwargs.get("feature_cols", []):
+    for col in new_feature_cols:
         if col in mokapot_input.columns:
             for label, group in mokapot_input.groupby("label"):
                 group[col].hist(bins=100, alpha=0.5, label=label)

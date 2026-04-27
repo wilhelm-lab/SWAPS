@@ -87,7 +87,10 @@ __C.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH = 4  # width for IM peak extraction; o
 # match features kwargs (postprocessing peak detection/matching parameters)
 __C.MATCH_FEATURES_KWARGS = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.apply_seg = True
-__C.MATCH_FEATURES_KWARGS.seg_mask_thres = 9  # min target-label area; below this rolls back to bbox segmentation
+__C.MATCH_FEATURES_KWARGS.dir_name = "quantification"
+__C.MATCH_FEATURES_KWARGS.seg_mask_thres = (
+    9  # min target-label area; below this rolls back to bbox segmentation
+)
 # denoise: three sequential ops applied across two pipeline stages.
 #   smooth.at / clean.at / log_transform.at controls which stage each op executes.
 #   "raw"       → applied to raw images before SIFT template-matching alignment
