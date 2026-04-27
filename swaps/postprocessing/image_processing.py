@@ -4,10 +4,9 @@ import numpy as np
 import pandas as pd
 from scipy import ndimage as ndi
 from scipy.ndimage import gaussian_filter, uniform_filter, gaussian_filter1d
-from skimage.morphology import remove_small_objects
+from skimage.morphology import remove_small_objects, h_maxima
 from skimage.feature import match_template
 
-from skimage.feature import peak_local_max
 from skimage.segmentation import watershed
 from skimage.measure import regionprops_table
 from skimage.filters import sobel
@@ -23,8 +22,8 @@ Logger = logging.getLogger(__name__)
 def detect_2d_peak_with_watershed(
     image,
     int_threshold=0.5,
-    min_distance=15,
-    threshold_rel=0.2,
+    h_rel: float = 0.15,
+    norm_percentile: int = 95,
     coordinates: Optional[np.ndarray] = None,
     seed_radius: int = 0,
     use_competing_peaks: bool = True,  # new: enable/disable the feature
@@ -39,10 +38,11 @@ def detect_2d_peak_with_watershed(
         The input image in which to detect peaks. Usually log10 transformed intensity.
     - log_threshold: float
         Threshold for log-transformed intensity to create the signal mask.
-    - min_distance: int
-        Minimum distance between detected peaks.
-    - threshold_rel: float
-        Minimum intensity of peaks, calculated as max(image) * threshold_rel.
+    - h_rel: float
+        Prominence threshold for h-maxima: a peak must rise ≥ h_rel × norm_percentile
+        of the signal above its surrounding saddle.
+    - norm_percentile: int
+        Percentile of in-mask intensity used to normalise the image before h-maxima.
     - visualize: bool
         If True, show a step-by-step matplotlib figure of each stage.
     Returns:
@@ -61,13 +61,12 @@ def detect_2d_peak_with_watershed(
                     ax.scatter(coords[:, 1], coords[:, 0], **kwargs)
 
     # 2. Compute distance (to background) transform inside signal
-    distance = image
-    mask_signal = distance > int_threshold
+    mask_signal = image > int_threshold
     _coords_provided = coordinates is not None
     # snapped_seed is initialised after coordinates are resolved below.
     snapped_seed = coordinates[0] if coordinates is not None else None
     if not mask_signal.any():
-        distance[~mask_signal] = 0
+        image[~mask_signal] = 0
         return (
             np.empty((0, 2), dtype=int),
             np.zeros_like(image, dtype=int),
@@ -76,14 +75,27 @@ def detect_2d_peak_with_watershed(
             np.empty((0, 2), dtype=int),
         )
 
+    # Normalise once; shared by both auto-detect and competing-peaks branches.
+    _pN = np.percentile(image[mask_signal], norm_percentile)
+    _norm_image = image / _pN if _pN > 0 else image
+
     if coordinates is None:
-        # Auto-detect mode: find all local maxima and use them as seeds.
-        coordinates = peak_local_max(
-            distance,
-            min_distance=min_distance,
-            threshold_rel=threshold_rel,
-            labels=mask_signal,
-        )
+        # Auto-detect mode: peaks must rise ≥ h_rel × p(norm_percentile) above saddle.
+        hmax = h_maxima(_norm_image, h=h_rel) & mask_signal
+        if hmax.any():
+            peak_labels, n_peaks = ndi.label(hmax)
+            coordinates = np.array(
+                [
+                    np.unravel_index(
+                        np.argmax(np.where(peak_labels == k, image, -np.inf)),
+                        image.shape,
+                    )
+                    for k in range(1, n_peaks + 1)
+                ],
+                dtype=int,
+            )
+        else:
+            coordinates = np.empty((0, 2), dtype=int)
         # In multi-peak mode snapped_seed is not meaningful; initialise to
         # first detected peak as a safe fallback for the return value.
         if coordinates.size > 0:
@@ -112,12 +124,21 @@ def detect_2d_peak_with_watershed(
     if use_competing_peaks and coordinates.shape[0] == 1:
         # gradient = sobel(image)
 
-        bg_peaks = peak_local_max(
-            image,
-            min_distance=min_distance,
-            threshold_rel=threshold_rel,
-            labels=mask_signal,
-        )
+        _hmax_bg = h_maxima(_norm_image, h=h_rel) & mask_signal
+        if _hmax_bg.any():
+            _lbl_bg, _n_bg = ndi.label(_hmax_bg)
+            bg_peaks = np.array(
+                [
+                    np.unravel_index(
+                        np.argmax(np.where(_lbl_bg == k, image, -np.inf)),
+                        image.shape,
+                    )
+                    for k in range(1, _n_bg + 1)
+                ],
+                dtype=int,
+            )
+        else:
+            bg_peaks = np.empty((0, 2), dtype=int)
 
         if len(bg_peaks) > 0:
             true_seed = coordinates[0]
@@ -333,7 +354,7 @@ def detect_2d_peak_with_watershed(
 
         fig.suptitle(
             f"detect_2d_peak_with_watershed  |  int_threshold={int_threshold}  "
-            f"min_distance={min_distance}  threshold_rel={threshold_rel}  "
+            f"h_rel={h_rel}  norm_percentile={norm_percentile}  "
             f"seed_radius={seed_radius}",
             fontsize=9,
         )
@@ -355,9 +376,9 @@ def detect_2d_peak_with_watershed(
     if peaks_out.shape[0] > 0 and labels.max() > 0:
         peak_label_vals = labels[peaks_out[:, 0], peaks_out[:, 1]]
         for lbl in np.unique(labels[labels > 0]):
-            assert lbl in peak_label_vals, (
-                f"Watershed label {lbl} has no corresponding peak in returned coordinates"
-            )
+            assert (
+                lbl in peak_label_vals
+            ), f"Watershed label {lbl} has no corresponding peak in returned coordinates"
 
     return peaks_out, labels, image, labels_multi_markers, snapped_seed
 

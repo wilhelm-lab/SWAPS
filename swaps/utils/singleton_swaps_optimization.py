@@ -115,8 +115,8 @@ __C.MATCH_FEATURES_KWARGS.denoise.log_transform.at = "raw"
 __C.MATCH_FEATURES_KWARGS.denoise.log_transform.enabled = True
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.int_threshold = 1
-__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.min_distance = 10
-__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.threshold_rel = 0.1
+__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.h_rel = 0.15
+__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.norm_percentile = 95
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.strategies = [
     "peptide_swap",

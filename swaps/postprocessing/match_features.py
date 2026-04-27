@@ -1176,14 +1176,14 @@ def segment_consensus_from_aligned(
         if apply_seg:
             _wkwargs = dict(watershed_kwargs or {})
             _int_threshold = _wkwargs.get("int_threshold", 0.5)
-            _min_distance = _wkwargs.get("min_distance", 15)
-            _threshold_rel = _wkwargs.get("threshold_rel", 0.2)
+            _h_rel = _wkwargs.get("h_rel", 0.15)
+            _norm_percentile = _wkwargs.get("norm_percentile", 95)
             all_peaks, _unused_labels, _, watershed_labels, _ = (
                 detect_2d_peak_with_watershed(
                     consensus_denoised,
                     int_threshold=_int_threshold,
-                    min_distance=_min_distance,
-                    threshold_rel=_threshold_rel,
+                    h_rel=_h_rel,
+                    norm_percentile=_norm_percentile,
                 )
             )
         else:
