@@ -12,7 +12,7 @@ import pandas as pd
 import numpy as np
 import directlfq.lfq_manager as lfq_manager
 
-from utils.tools import get_dot_d_paths
+from utils.tools import get_dot_d_paths, report_snap_log_collection
 from utils.ims_utils import (
     load_dotd_data,
     export_im_and_ms1scans,
@@ -346,6 +346,7 @@ def opt_scan_by_scan(config_path: str):
             f.result()
     with open(os.path.join(quant_dir, "snap_log_collection.pkl"), "wb") as f:
         pickle.dump(snap_log_collection, f, protocol=pickle.HIGHEST_PROTOCOL)
+    report_snap_log_collection(snap_log_collection, quant_dir)
     _save_effective_cfg(cfg, processing_kwargs, quant_dir)
     logging.info("=================FDR control==================")
 

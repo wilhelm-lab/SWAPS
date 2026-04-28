@@ -263,3 +263,61 @@ def get_dot_d_paths(root_path, exclude_list):
         exclude_list,
     )
     return found_paths
+
+
+def report_snap_log_collection(snap_log_collection: dict, quant_dir: str) -> None:
+    no_seg_count = sum(
+        1 for v in snap_log_collection.values() if v.get("no_seg_log") is not None
+    )
+    discard_count = sum(
+        1 for v in snap_log_collection.values() if v.get("discard_record")
+    )
+    Logger.info(
+        "snap_log_collection: total mz_ranks=%d | no_seg_log=%d | discard_record=%d",
+        len(snap_log_collection),
+        no_seg_count,
+        discard_count,
+    )
+
+    total_dists, rt_dists, im_dists = [], [], []
+    for v in snap_log_collection.values():
+        jal = v.get("jump_anchor_log")
+        if not jal:
+            continue
+        for entry in jal.values():
+            total_dists.append(entry["dist_to_label"])
+            anchor = entry["anchor"]
+            nlp = entry["nearest_labeled_pixel"]
+            rt_dists.append(abs(anchor[0] - nlp[0]))
+            im_dists.append(abs(anchor[1] - nlp[1]))
+
+    if not total_dists:
+        Logger.info("jump_anchor_log: no jump events recorded")
+        return
+
+    arr_total = np.array(total_dists)
+    arr_rt = np.array(rt_dists)
+    arr_im = np.array(im_dists)
+    Logger.info(
+        "jump_anchor_log: n=%d | total dist mean=%.2f median=%.2f max=%.2f"
+        " | rt dist mean=%.2f median=%.2f max=%.2f"
+        " | im dist mean=%.2f median=%.2f max=%.2f",
+        len(arr_total),
+        arr_total.mean(), np.median(arr_total), arr_total.max(),
+        arr_rt.mean(), np.median(arr_rt), arr_rt.max(),
+        arr_im.mean(), np.median(arr_im), arr_im.max(),
+    )
+
+    for arr, label, fname in [
+        (arr_total, "Total jump distance (px)", "jump_anchor_dist_total.png"),
+        (arr_rt, "RT jump distance (rows)", "jump_anchor_dist_rt.png"),
+        (arr_im, "IM jump distance (cols)", "jump_anchor_dist_im.png"),
+    ]:
+        fig, ax = plt.subplots(figsize=(6, 4))
+        ax.hist(arr, bins=50, edgecolor="none")
+        ax.set_xlabel(label)
+        ax.set_ylabel("Count")
+        ax.set_title(f"{label} (n={len(arr)})")
+        fig.tight_layout()
+        fig.savefig(os.path.join(quant_dir, fname), dpi=300)
+        plt.close(fig)
