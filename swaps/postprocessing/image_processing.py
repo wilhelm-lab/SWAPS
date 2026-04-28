@@ -686,19 +686,38 @@ def get_sift_descriptor(img, peak_coords, patch_size=31):
     return des
 
 
-def get_roi_descriptor(roi, radius=None):
-    if roi.max() == roi.min():
-        roi_norm = np.zeros_like(roi, dtype=np.float32)
-    else:
-        roi_norm = (roi - roi.min()) / (roi.max() - roi.min())
+def get_roi_descriptor(roi, radius=None, degree=8):
+    roi = roi.astype(np.float32)
 
-    # Zernike Moments
-    roi_uint8 = (roi_norm * 255).astype(np.uint8)
-    radius = radius if radius is not None else max(roi.shape) // 2
-    zernike = zernike_moments(
-        roi_uint8, radius, cm=(roi.shape[1] // 2, roi.shape[0] // 2), degree=8
+    # 1. Percentile clip BEFORE normalization — kills hot pixels
+    p1, p99 = np.percentile(roi, 1), np.percentile(roi, 99)
+    roi_clipped = np.clip(roi, p1, p99)
+
+    # 2. Check for flat patch AFTER clipping
+    if roi_clipped.max() - roi_clipped.min() < 1e-6:
+        n_moments = len(
+            zernike_moments(np.zeros((3, 3), dtype=np.uint8), 1, degree=degree)
+        )
+        Logger.warning(
+            f"Flat ROI detected (shape={roi.shape}), returning zero zernike descriptor."
+        )
+        return np.zeros(n_moments, dtype=np.float64)
+
+    # 3. Normalize clipped patch
+    roi_norm = (roi_clipped - roi_clipped.min()) / (
+        roi_clipped.max() - roi_clipped.min()
     )
-    return zernike
+    roi_uint8 = (roi_norm * 255).astype(np.uint8)
+
+    # 4. Radius based on min dimension so circle fits within patch
+    if radius is None:
+        radius = min(roi.shape) // 2
+
+    # 5. Center: mahotas cm is (row, col)
+    cm = (roi.shape[0] // 2, roi.shape[1] // 2)
+
+    moments = zernike_moments(roi_uint8, radius, cm=cm, degree=degree)
+    return moments
 
 
 def fast_intensity_weighted_ncc(image, template, power=2.0):
