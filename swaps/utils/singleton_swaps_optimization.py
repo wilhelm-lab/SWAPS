@@ -88,9 +88,9 @@ __C.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH = 4  # width for IM peak extraction; o
 __C.MATCH_FEATURES_KWARGS = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.apply_seg = True
 __C.MATCH_FEATURES_KWARGS.dir_name = "quantification"
-__C.MATCH_FEATURES_KWARGS.seg_mask_thres = (
-    9  # min target-label area; below this rolls back to bbox segmentation
-)
+__C.MATCH_FEATURES_KWARGS.seg_mask_thres = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.seg_mask_thres.rt = 2  # min RT span of target labels
+__C.MATCH_FEATURES_KWARGS.seg_mask_thres.im = 5  # min IM span of target labels
 # denoise: three sequential ops applied across two pipeline stages.
 #   smooth.at / clean.at / log_transform.at controls which stage each op executes.
 #   "raw"       → applied to raw images before SIFT template-matching alignment
@@ -99,9 +99,9 @@ __C.MATCH_FEATURES_KWARGS.seg_mask_thres = (
 __C.MATCH_FEATURES_KWARGS.denoise = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.denoise.smooth = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.denoise.smooth.at = "consensus"
-__C.MATCH_FEATURES_KWARGS.denoise.smooth.filter = "uniform"
+__C.MATCH_FEATURES_KWARGS.denoise.smooth.filter = "gaussian"
 __C.MATCH_FEATURES_KWARGS.denoise.smooth.gaussian_kwargs = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.denoise.smooth.gaussian_kwargs.sigma = [2, 2]
+__C.MATCH_FEATURES_KWARGS.denoise.smooth.gaussian_kwargs.sigma = [1, 2]
 __C.MATCH_FEATURES_KWARGS.denoise.smooth.gaussian_kwargs.mode = "nearest"
 __C.MATCH_FEATURES_KWARGS.denoise.smooth.uniform_kwargs = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.denoise.smooth.uniform_kwargs.size = [3, 5]
@@ -114,7 +114,7 @@ __C.MATCH_FEATURES_KWARGS.denoise.log_transform = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.denoise.log_transform.at = "raw"
 __C.MATCH_FEATURES_KWARGS.denoise.log_transform.enabled = True
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.int_threshold = 1
+__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.int_threshold = 2
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.h_rel = 0.15
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.norm_percentile = 95
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs = ConfigurationNode()

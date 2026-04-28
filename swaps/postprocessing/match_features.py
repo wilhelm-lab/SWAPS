@@ -60,6 +60,7 @@ class ConsensusSegmentationState:
     target_label_ids: list[int]
     label_to_snap: dict[int, tuple[int, int]]
     non_none_indices: list[int]
+    apply_seg: bool
 
 
 @dataclass
@@ -235,6 +236,18 @@ def _feature_instance_id(mz_rank: int, anchor_id: int) -> str:
     return f"{mz_rank}_{anchor_id}"
 
 
+def _parse_seg_mask_thres(val, default: tuple[int, int] = (3, 3)) -> tuple[int, int]:
+    if isinstance(val, dict):
+        return (int(val.get("rt", default[0])), int(val.get("im", default[1])))
+    if isinstance(val, (list, tuple)) and len(val) == 2:
+        return (int(val[0]), int(val[1]))
+    if val is None:
+        return default
+    # legacy scalar: treat as minimum total area, derive square side
+    side = max(1, int(val) // 3)
+    return (side, side)
+
+
 def _denoise_kwargs_for_stage(denoise_cfg: dict, stage: str) -> dict:
     """Build smooth_and_denoise_image kwargs for ops whose ``at`` field == stage."""
     kwargs: dict = {}
@@ -397,7 +410,9 @@ def match_features_batch(
             raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
             labels=_consensus_raw_files,
             apply_seg=bool((processing_kwargs or {}).get("apply_seg", True)),
-            seg_mask_thres=int((processing_kwargs or {}).get("seg_mask_thres", 9)),
+            seg_mask_thres=_parse_seg_mask_thres(
+                (processing_kwargs or {}).get("seg_mask_thres")
+            ),
         )
         if visualize_dir is not None:
             _visualize_consensus_bundle(
@@ -497,8 +512,8 @@ def match_features_batch(
                         apply_seg=bool(
                             (processing_kwargs or {}).get("apply_seg", True)
                         ),
-                        seg_mask_thres=int(
-                            (processing_kwargs or {}).get("seg_mask_thres", 9)
+                        seg_mask_thres=_parse_seg_mask_thres(
+                            (processing_kwargs or {}).get("seg_mask_thres")
                         ),
                     )
                     _visualize_consensus_bundle(
@@ -613,7 +628,6 @@ def match_features_batch(
                             decoy_act,
                             _rf,
                             raw_denoise_kwargs=raw_denoise_kwargs,
-                            full_denoise_kwargs=full_denoise_kwargs,
                         )
                         if decoy_pp_raw is None:
                             no_quant_log.append(
@@ -778,7 +792,7 @@ def compare_peak_properties(peak_properties_a, peak_properties_b):
         "template_matching_score": peak_properties_b["template_matching_score"].values[
             0
         ],
-        "sift_similarities": compare_sift_descriptors(
+        "sift_similarities": compare_sift_descriptors_similarities(
             peak_properties_a["sift_des"].values[0],
             peak_properties_b["sift_des"].values[0],
         ),
@@ -880,7 +894,7 @@ def compare_image_descriptors_euclidean(des1, des2, l2_norm: bool = False):
     return dist
 
 
-def compare_sift_descriptors(des1, des2):
+def compare_sift_descriptors_similarities(des1, des2):
     if des1 is None or des2 is None:
         return 0.0
 
@@ -895,7 +909,7 @@ def compare_sift_descriptors(des1, des2):
 
     # Convert distance to a 0-1 similarity score
     # SIFT distances for a match are usually < 200
-    similarity = np.exp(-dist / 100.0)
+    similarity = np.exp(-dist / 362.0)  # mid-point of range
     return similarity
 
 
@@ -1148,7 +1162,7 @@ def segment_consensus_from_aligned(
     denoise_kwargs: dict | None = None,
     watershed_kwargs: dict | None = None,
     apply_seg: bool = True,
-    seg_mask_thres: int = 9,
+    seg_mask_thres: tuple[int, int] = (2, 5),
 ) -> ConsensusSegmentationState:
     """Segment a consensus image and track which labels belong to target anchors."""
 
@@ -1171,7 +1185,7 @@ def segment_consensus_from_aligned(
     target_label_ids: list[int] = []
     seen_label_ids: set[int] = set()
     label_to_snap: dict[int, tuple[int, int]] = {}
-
+    use_bbox_fallback = not apply_seg
     if non_none_indices:
         if apply_seg:
             _wkwargs = dict(watershed_kwargs or {})
@@ -1249,12 +1263,12 @@ def segment_consensus_from_aligned(
                         seen_label_ids.add(jump_ws)
                         label_to_snap[jump_ws] = snapped_rc
 
-            # Roll back to bbox if target-label area is below threshold.
-            if seg_mask_thres > 0 and target_label_ids:
-                _target_area = sum(
-                    int(np.sum(watershed_labels == lid)) for lid in target_label_ids
-                )
-                if _target_area < seg_mask_thres:
+            # Roll back to bbox if target-label span is below (rt, im) thresholds.
+            if any(t > 0 for t in seg_mask_thres) and target_label_ids:
+                _target_mask = np.isin(watershed_labels, target_label_ids)
+                _rt_span = int(np.any(_target_mask, axis=1).sum())
+                _im_span = int(np.any(_target_mask, axis=0).sum())
+                if _rt_span < seg_mask_thres[0] or _im_span < seg_mask_thres[1]:
                     use_bbox_fallback = True
                     watershed_labels = np.zeros(consensus_denoised.shape, dtype=int)
                     snapped_per_anchor = [None] * len(alignment_state.aligned_anchors)
@@ -1302,7 +1316,7 @@ def segment_consensus_from_aligned(
                 target_label_ids.append(1)
                 seen_label_ids.add(1)
                 label_to_snap[1] = (_anchor_rs[0], _anchor_cs[0])
-
+            # if we're using bbox fallback, skip the denoising that was tuned for watershed-based peaks
     return ConsensusSegmentationState(
         consensus=consensus,  # stacked mean of aligned_images
         consensus_denoised=consensus_denoised,  # denoised with consensus_denoise_kwar
@@ -1312,6 +1326,7 @@ def segment_consensus_from_aligned(
         target_label_ids=target_label_ids,
         label_to_snap=label_to_snap,
         non_none_indices=non_none_indices,
+        apply_seg=not use_bbox_fallback,
     )
 
 
@@ -1345,44 +1360,52 @@ def _extract_feature_rows_for_label_ids(
     template_matching_score: float,
     snap_resolver: Callable[[int], tuple[int, int] | None],
 ) -> pd.DataFrame | None:
-    rows: list[pd.DataFrame] = []
-    for label_id in label_ids:
-        single_label = (label_image == label_id).astype(int)
-        peak_properties = calculate_peak_property_from_labels_and_image(
-            single_label,
-            raw_image,
-            min_peak_area=0,
-            min_peak_sum_intensity=0,
-        )
-        if peak_properties is None:
-            continue
-        snap_rc = snap_resolver(label_id)
-        if snap_rc is None:
-            continue
-        peak_properties = peak_properties.reset_index(drop=True)
-        peak_properties["snap_rt"] = int(snap_rc[0])
-        peak_properties["snap_im"] = int(snap_rc[1])
-        peak_properties["shift_rt"] = int(shift[0])
-        peak_properties["shift_im"] = int(shift[1])
-        peak_properties["template_matching_score"] = float(template_matching_score)
-        peak_properties["sift_des"] = None
-        peak_properties.at[0, "sift_des"] = get_sift_descriptor(
-            denoised_image,
-            (int(snap_rc[0]), int(snap_rc[1])),
-            patch_size=min(denoised_image.shape),
-        )
-        _r0 = int(peak_properties["bbox-0"].values[0])
-        _r1 = int(peak_properties["bbox-2"].values[0])
-        _c0 = int(peak_properties["bbox-1"].values[0])
-        _c1 = int(peak_properties["bbox-3"].values[0])
-        seg_bbox = denoised_image[_r0:_r1, _c0:_c1]
-        peak_properties["zernike"] = None
-        peak_properties.at[0, "zernike"] = get_roi_descriptor(seg_bbox)
-        peak_properties["Run_name"] = run_name
-        rows.append(peak_properties)
-    if rows:
-        return pd.concat(rows, ignore_index=True)
-    return None
+    # Pick the dominant label by area in label_image (deterministic across runs
+    # sharing the same segmentation).
+    dominant_label_id = max(label_ids, key=lambda lid: int((label_image == lid).sum()))
+    snap_rc = snap_resolver(dominant_label_id)
+    if snap_rc is None:
+        return None
+
+    merged_mask = np.isin(label_image, label_ids).astype(np.int32)
+    peak_properties = calculate_peak_property_from_labels_and_image(
+        merged_mask,
+        raw_image,
+        min_peak_area=0,
+        min_peak_sum_intensity=0,
+    )
+    if peak_properties is None:
+        return None
+
+    peak_properties = peak_properties.reset_index(drop=True)
+    peak_properties["snap_rt"] = int(snap_rc[0])
+    peak_properties["snap_im"] = int(snap_rc[1])
+    peak_properties["shift_rt"] = int(shift[0])
+    peak_properties["shift_im"] = int(shift[1])
+    peak_properties["template_matching_score"] = float(template_matching_score)
+    peak_properties["sift_des"] = None
+    peak_properties.at[0, "sift_des"] = get_sift_descriptor(
+        denoised_image,
+        (int(snap_rc[0]), int(snap_rc[1])),
+        patch_size=int(0.6 * min(denoised_image.shape)),
+    )
+    _r0 = int(peak_properties["bbox-0"].values[0])
+    _r1 = int(peak_properties["bbox-2"].values[0])
+    _c0 = int(peak_properties["bbox-1"].values[0])
+    _c1 = int(peak_properties["bbox-3"].values[0])
+    _min_side = 18
+    _H, _W = denoised_image.shape
+    if _r1 - _r0 < _min_side:
+        _pad = (_min_side - (_r1 - _r0) + 1) // 2
+        _r0, _r1 = max(0, _r0 - _pad), min(_H, _r1 + _pad)
+    if _c1 - _c0 < _min_side:
+        _pad = (_min_side - (_c1 - _c0) + 1) // 2
+        _c0, _c1 = max(0, _c0 - _pad), min(_W, _c1 + _pad)
+    seg_bbox = denoised_image[_r0:_r1, _c0:_c1]
+    peak_properties["zernike"] = None
+    peak_properties.at[0, "zernike"] = get_roi_descriptor(seg_bbox)
+    peak_properties["Run_name"] = run_name
+    return peak_properties
 
 
 def extract_peak_properties_from_consensus_labels(
@@ -1390,7 +1413,6 @@ def extract_peak_properties_from_consensus_labels(
     segmentation_state: ConsensusSegmentationState,
     *,
     raw_images: list[np.ndarray] | None = None,
-    denoise_kwargs: dict | None = None,
     labels: list[str] | None = None,
 ) -> tuple[
     pd.DataFrame | None,
@@ -1417,18 +1439,10 @@ def extract_peak_properties_from_consensus_labels(
         alignment_state.target_shape,
         alignment_state.shifts,
     )  # no raw denoise kwargs
-    raw_aligned_denoised = [
-        smooth_and_denoise_image(raw_image, **(denoise_kwargs or {}))
-        for raw_image in raw_aligned
-    ]
-    # raw_consensus = np.stack(raw_aligned, axis=0).mean(axis=0)
-    # raw_consensus_denoised = smooth_and_denoise_image(
-    #     raw_consensus, **(denoise_kwargs or {})
-    # )
+
     raw_consensus = segmentation_state.consensus  # with raw denoise kwargs
-    raw_consensus_denoised = (
-        segmentation_state.consensus_denoised
-    )  # with raw denoise kwargs + consensus_denoise_kwargs
+    raw_aligned_logged = alignment_state.aligned_images
+    raw_consensus_logged_mean = raw_consensus
     consensus_pp: pd.DataFrame | None = None
     if segmentation_state.target_label_ids:
         for i in range(len(raw_aligned)):
@@ -1437,7 +1451,7 @@ def extract_peak_properties_from_consensus_labels(
                 segmentation_state.target_label_ids,
                 segmentation_state.watershed_labels,
                 raw_aligned[i],
-                raw_aligned_denoised[i],
+                raw_aligned_logged[i],
                 run_name=run_name,
                 shift=alignment_state.shifts[i],
                 template_matching_score=alignment_state.max_scores[i],
@@ -1451,7 +1465,7 @@ def extract_peak_properties_from_consensus_labels(
             segmentation_state.target_label_ids,
             segmentation_state.watershed_labels,
             raw_consensus,
-            raw_consensus_denoised,
+            raw_consensus_logged_mean,
             run_name="consensus",
             shift=(0, 0),
             template_matching_score=1.0,
@@ -1464,9 +1478,9 @@ def extract_peak_properties_from_consensus_labels(
         consensus_pp,
         individual_pps,
         raw_aligned,
-        raw_aligned_denoised,
+        raw_aligned_logged,
         raw_consensus,
-        raw_consensus_denoised,
+        raw_consensus_logged_mean,
     )
 
 
@@ -1482,7 +1496,7 @@ def build_consensus_feature_bundle(
     labels: list[str] | None = None,
     raw_images: list[np.ndarray] | None = None,
     apply_seg: bool = True,
-    seg_mask_thres: int = 9,
+    seg_mask_thres: tuple[int, int] = (3, 3),
 ) -> ConsensusFeatureBundle:
     """Build alignment, segmentation, and feature tables for consensus scoring."""
 
@@ -1507,7 +1521,7 @@ def build_consensus_feature_bundle(
         denoise_kwargs=_consensus_denoise_kwargs,
         watershed_kwargs=watershed_kwargs,
         apply_seg=apply_seg,
-        seg_mask_thres=int(seg_mask_thres),
+        seg_mask_thres=seg_mask_thres,
     )
     (
         consensus_pp,
@@ -1520,7 +1534,6 @@ def build_consensus_feature_bundle(
         alignment_state,
         segmentation_state,
         raw_images=raw_images,
-        denoise_kwargs=_full_denoise_kwargs,
         labels=labels,
     )
     return ConsensusFeatureBundle(
@@ -2005,15 +2018,14 @@ def _build_consensus_peptide_swap_decoy(
     decoy_raw_image: np.ndarray,
     run_name: str,
     raw_denoise_kwargs: dict | None = None,
-    full_denoise_kwargs: dict | None = None,
 ) -> tuple[pd.DataFrame | None, tuple[int, int], float]:
     """Align a wrong same-run peptide image and score it under target consensus labels."""
 
-    decoy_raw_denoised = smooth_and_denoise_image(
+    decoy_raw_logged = smooth_and_denoise_image(
         decoy_raw_image, **(raw_denoise_kwargs or {})
     )
-    decoy_raw_denoised_resized = _resize_image_to_shape(
-        decoy_raw_denoised, bundle.alignment.target_shape
+    decoy_raw_logged_resized = _resize_image_to_shape(
+        decoy_raw_logged, bundle.alignment.target_shape
     )
     (
         _aligned_denoised,
@@ -2024,7 +2036,7 @@ def _build_consensus_peptide_swap_decoy(
         _match_score_map,
         _match_score_peak,
     ) = _align_resized_image_to_template(
-        decoy_raw_denoised_resized,
+        decoy_raw_logged_resized,
         bundle.alignment.template,
         bundle.alignment.template_bounds,
         None,
@@ -2037,14 +2049,12 @@ def _build_consensus_peptide_swap_decoy(
     decoy_raw_aligned = nd_shift(
         decoy_raw_resized, shift=shift, mode="constant", cval=0.0
     )
-    decoy_raw_aligned_full_denoised = smooth_and_denoise_image(
-        decoy_raw_aligned, **(full_denoise_kwargs or {})
-    )
+
     decoy_pp = _extract_feature_rows_for_label_ids(
         bundle.segmentation.target_label_ids,
         bundle.segmentation.watershed_labels,
         decoy_raw_aligned,
-        decoy_raw_aligned_full_denoised,
+        decoy_raw_logged_resized,
         run_name=run_name,
         shift=shift,
         template_matching_score=max_score,
@@ -2123,7 +2133,7 @@ def generate_consensus_image(
     fig_dir: str | None = None,
     filename: str = "consensus_image.png",
     apply_seg: bool = True,
-    seg_mask_thres: int = 9,
+    seg_mask_thres: tuple[int, int] = (3, 3),
 ) -> tuple[
     np.ndarray,
     list[np.ndarray],
