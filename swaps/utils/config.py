@@ -44,6 +44,8 @@ def merge_cfg_from_file(cfg: ConfigurationNode, cfg_filename: str) -> None:
         user_dict = yaml.safe_load(f)
     if not user_dict:
         return
+    if "DATA_PATH" in user_dict and isinstance(user_dict["DATA_PATH"], str):
+        user_dict["DATA_PATH"] = [user_dict["DATA_PATH"]]
     filtered_dict, unknown_keys = _filter_cfg_dict(cfg, user_dict)
     if unknown_keys:
         Logger.warning(

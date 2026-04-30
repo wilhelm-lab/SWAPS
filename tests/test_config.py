@@ -29,7 +29,7 @@ def minimal_yaml(tmp_path):
     """Write a minimal override YAML and return its path."""
     data = {
         "RESULT_PATH": str(tmp_path / "results"),
-        "DATA_PATH": str(tmp_path / "data"),
+        "DATA_PATH": [str(tmp_path / "data")],
         "N_CPU": 4,
         "PREPARE_DICT": {
             "SEARCH_ENGINE": "fragpipe",
@@ -123,6 +123,9 @@ class TestGetCfgDefaults:
     def test_default_n_batch_is_negative(self, cfg):
         assert cfg.OPTIMIZATION.N_BATCH < 0
 
+    def test_default_data_path_is_empty_list(self, cfg):
+        assert cfg.DATA_PATH == []
+
     def test_default_ok_dir_is_empty(self, cfg):
         assert cfg.PREPARE_DICT.OK.DIR == ""
 
@@ -199,6 +202,42 @@ class TestNestedSubNodeMerge:
         assert cfg.PREPARE_DICT.PRED.IM_TRAIN_EPOCHS == 8  # default untouched
         assert cfg.PREPARE_DICT.REF.IM_LENGTH == 10  # overridden
         assert cfg.N_CPU < 0  # top-level default untouched
+
+
+# ---------------------------------------------------------------------------
+# DATA_PATH normalization (string → list)
+# ---------------------------------------------------------------------------
+
+
+class TestDataPathNormalization:
+    def test_scalar_string_is_wrapped_in_list(self, cfg, tmp_path):
+        """A YAML with DATA_PATH as a plain string must be normalized to a 1-element list."""
+        from utils.config import merge_cfg_from_file
+
+        p = tmp_path / "scalar_path.yaml"
+        p.write_text(f"DATA_PATH: {tmp_path}/data\n")
+        merge_cfg_from_file(cfg, str(p))
+        assert cfg.DATA_PATH == [str(tmp_path / "data")]
+
+    def test_list_of_paths_is_preserved(self, cfg, tmp_path):
+        """A YAML with DATA_PATH as a list stays a list with all entries."""
+        import yaml as _yaml
+        from utils.config import merge_cfg_from_file
+
+        paths = [str(tmp_path / "run1"), str(tmp_path / "run2")]
+        p = tmp_path / "list_path.yaml"
+        p.write_text(_yaml.dump({"DATA_PATH": paths}))
+        merge_cfg_from_file(cfg, str(p))
+        assert list(cfg.DATA_PATH) == paths
+
+    def test_default_data_path_not_set_stays_empty(self, cfg, tmp_path):
+        """When DATA_PATH is absent from the YAML, it stays as the default []."""
+        from utils.config import merge_cfg_from_file
+
+        p = tmp_path / "no_data_path.yaml"
+        p.write_text("N_CPU: 2\n")
+        merge_cfg_from_file(cfg, str(p))
+        assert cfg.DATA_PATH == []
 
 
 # ---------------------------------------------------------------------------

@@ -96,7 +96,9 @@ def match_features_batches_parallel(
 
     # Sort mz_ranks so each batch is a contiguous range — this lets DuckDB skip
     # row groups in the mz-sorted parquet (produced by build_mz_sorted_activation).
-    sorted_mz = np.sort(peptide_indicies)
+    sorted_mz = np.sort(
+        peptide_indicies
+    )  # pyright: ignore[reportArgumentType, reportCallIssue]
     n_total = len(sorted_mz)
 
     # Number of batches: enough so every batch ≤ batch_size_max, AND enough for

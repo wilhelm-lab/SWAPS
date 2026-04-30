@@ -167,7 +167,9 @@ def opt_scan_by_scan(config_path: str):
             cfg.DATA_PATH,
             cfg.EXCLUDE_DATASET_NAME,
         )
-        dot_d_paths = get_dot_d_paths(cfg.DATA_PATH, cfg.EXCLUDE_DATASET_NAME)
+        dot_d_paths = []
+        for data_path in cfg.DATA_PATH:
+            dot_d_paths.extend(get_dot_d_paths(data_path, cfg.EXCLUDE_DATASET_NAME))
         for dot_d_path in dot_d_paths:
             dot_d_dir = os.path.basename(dot_d_path)
             logging.info(

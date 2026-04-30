@@ -9,7 +9,7 @@ swaps_optimization_cfg = __C
 __C.DESCRIPTION = "Default config from the Singleton"
 __C.DEBUG = False
 __C.SWA = True  # whether to perform scan-wise activation; if False, skips SWA and saves dict_ref with empty activation, useful for debugging downstream steps without running SWA
-__C.DATA_PATH = ""  # path to raw data directory (.d or .mzml)
+__C.DATA_PATH = []  # path(s) to raw data directories (.d or .mzml); accepts a single string or a list of strings
 __C.EXCLUDE_DATASET_NAME = (
     []
 )  # list of dataset names to exclude, e.g. ["20230515_HeLa_100ng_1", "125pg_ddaPASEF_a000_2R_150ms_500SPD_S2-C7_1_19515.d"]
