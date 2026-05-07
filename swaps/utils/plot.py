@@ -1893,6 +1893,271 @@ def plot_match_type_from_combined(
     )
 
 
+def plot_intensity_coverage_by_species(
+    df: pd.DataFrame,
+    *,
+    int_col_keyword: str = "Intensity",
+    species_col: str = "species",
+    threshold: float = 10,
+    species_order: Optional[list[str]] = None,
+    species_colors: Optional[dict[str, str]] = None,
+    missing_color: str = "#D3D3D3",
+    label_shorten_fn=None,
+    sort_columns: bool = False,
+    dataset_name: str = "",
+    fig_name_suffix: str = "",
+    ax: Optional[plt.Axes] = None,
+    fig_dir: Optional[str] = None,
+) -> tuple[plt.Figure, plt.Axes]:
+    """Stacked bar plot of intensity coverage broken down by species and missing values.
+
+    Each bar corresponds to one intensity column. Values are counted as present
+    when they are non-NaN and >= *threshold*; all others are counted as missing.
+
+    Parameters
+    ----------
+    df:
+        DataFrame containing intensity columns and a species column.
+    int_col_keyword:
+        Only columns whose name contains this substring are plotted.
+    species_col:
+        Column that holds the species label for each row.
+    threshold:
+        Minimum value to count as present (exclusive lower bound; NaN always missing).
+    species_order:
+        Ordered list of species to show; inferred from the data when None.
+    species_colors:
+        Dict mapping species label → hex color. Unmapped species get automatic colors.
+    missing_color:
+        Color for missing / below-threshold bars.
+    label_shorten_fn:
+        Optional callable ``(col_name: str) -> str`` to derive x-tick labels.
+    sort_columns:
+        Sort bars by total present count descending.
+    dataset_name:
+        Used in the plot title and saved filename.
+    fig_name_suffix:
+        Appended to the saved filename.
+    ax:
+        Optional existing Axes to draw on.
+    fig_dir:
+        Directory to save PNG + SVG; if None the figure is shown interactively.
+    """
+    int_cols = [c for c in df.columns if int_col_keyword in c]
+    if not int_cols:
+        raise ValueError(f"No columns containing '{int_col_keyword}' found.")
+
+    if species_order is None:
+        species_order = sorted(df[species_col].dropna().unique().tolist())
+
+    default_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    color_map = {
+        sp: default_colors[i % len(default_colors)]
+        for i, sp in enumerate(species_order)
+    }
+    if species_colors:
+        color_map.update(species_colors)
+
+    records = []
+    for col in int_cols:
+        present = df[col].notna() & (df[col] >= threshold)
+        row: dict = {"col": col, "Missing": int((~present).sum())}
+        for sp in species_order:
+            row[sp] = int((present & (df[species_col] == sp)).sum())
+        records.append(row)
+
+    counts = pd.DataFrame(records).set_index("col")
+
+    if sort_columns:
+        total_present = counts[species_order].sum(axis=1)
+        counts = counts.loc[total_present.sort_values(ascending=False).index]
+
+    x_labels = (
+        [label_shorten_fn(c) for c in counts.index]
+        if label_shorten_fn is not None
+        else list(counts.index)
+    )
+
+    if ax is None:
+        fig, ax = plt.subplots(
+            figsize=(max(10, 0.6 * len(counts) + 2), 6),
+            constrained_layout=True,
+        )
+    else:
+        fig = ax.figure
+
+    bottom = np.zeros(len(counts))
+    for sp in species_order:
+        vals = counts[sp].values
+        ax.bar(x_labels, vals, bottom=bottom, color=color_map[sp], label=sp, width=0.7)
+        bottom += vals
+    ax.bar(
+        x_labels,
+        counts["Missing"].values,
+        bottom=bottom,
+        color=missing_color,
+        label="Missing",
+        width=0.7,
+    )
+
+    ax.set_xlabel("Run")
+    ax.set_ylabel("Ion count")
+    ax.set_title(
+        f"Intensity coverage by species (threshold={threshold})"
+        + (f" — {dataset_name}" if dataset_name else "")
+    )
+    ax.tick_params(axis="x", labelsize=8, rotation=90)
+    ax.legend(title="Species", bbox_to_anchor=(1.01, 1), loc="upper left")
+
+    fig_name = f"intensity_coverage_by_species{fig_name_suffix}"
+    if fig_dir is not None:
+        os.makedirs(fig_dir, exist_ok=True)
+        fig.savefig(
+            os.path.join(fig_dir, f"{fig_name}_{dataset_name}.png"),
+            dpi=300,
+            bbox_inches="tight",
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f"{fig_name}_{dataset_name}.svg"),
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close(fig)
+    else:
+        plt.show()
+
+    return fig, ax, counts
+
+
+def plot_dict_ref_search_windows(
+    dict_ref: pd.DataFrame,
+    mz_bin: float,
+    tolerance: float,
+    figsize_windows: tuple = (8, 6),
+    iso_row_height: float = 2.0,
+    save_dir: Optional[str] = None,
+) -> tuple["plt.Figure", "plt.Figure"]:
+    """
+    Two-panel diagnostic for dict_ref entries near a given mz_bin.
+
+    Plot 1 – RT/IM search windows: one rectangle per row, colored by mz_bin,
+    annotated with mz_rank.  X-axis = 1/K0, Y-axis = RT (min).
+
+    Plot 2 – Isotope spike plots: one row of stacked subplots (shared x-axis)
+    per dict_ref entry; X = IsoMZ, Y = IsoAbundance.
+    """
+    filtered = dict_ref[np.abs(dict_ref["mz_bin"] - mz_bin) <= tolerance].copy()
+    if filtered.empty:
+        raise ValueError(f"No entries within tolerance {tolerance} of mz_bin {mz_bin}")
+    filtered = filtered.sort_values("mz_rank")
+
+    unique_bins = sorted(filtered["mz_bin"].unique())
+    cmap = colormaps["tab10"] if len(unique_bins) <= 10 else colormaps["viridis"]
+    n_bins = max(len(unique_bins) - 1, 1)
+    bin_color = {b: cmap(i / n_bins) for i, b in enumerate(unique_bins)}
+
+    # ── Plot 1: RT/IM rectangles ──────────────────────────────────────────────
+    fig1, ax1 = plt.subplots(figsize=figsize_windows)
+    for _, row in filtered.iterrows():
+        im_l, im_r = row["IM_search_left"], row["IM_search_right"]
+        rt_l, rt_r = row["RT_search_left"], row["RT_search_right"]
+        c = bin_color[row["mz_bin"]]
+        ax1.add_patch(
+            Rectangle(
+                (im_l, rt_l),
+                im_r - im_l,
+                rt_r - rt_l,
+                linewidth=1.5,
+                edgecolor=c,
+                facecolor=(*c[:3], 0.15),
+            )
+        )
+        ax1.text(
+            (im_l + im_r) / 2,
+            (rt_l + rt_r) / 2,
+            str(row["mz_rank"]),
+            ha="center",
+            va="center",
+            fontsize=7,
+            color=c[:3],
+        )
+
+    from matplotlib.patches import Patch
+
+    ax1.legend(
+        handles=[
+            Patch(facecolor=bin_color[b], edgecolor=bin_color[b], label=f"{b:.4f}")
+            for b in unique_bins
+        ],
+        title="mz_bin",
+        bbox_to_anchor=(1.01, 1),
+        loc="upper left",
+        fontsize=8,
+    )
+    ax1.autoscale_view()
+    ax1.set_xlabel("1/K0 (ion mobility)")
+    ax1.set_ylabel("RT (min)")
+    ax1.set_title(f"RT/IM Search Windows  mz_bin≈{mz_bin}  tol={tolerance}")
+    fig1.tight_layout()
+
+    # ── Plot 2: Isotope spike subplots ────────────────────────────────────────
+    n = len(filtered)
+    fig2, axes = plt.subplots(
+        n,
+        1,
+        figsize=(8, max(n * iso_row_height, 3)),
+        sharex=True,
+        squeeze=False,
+    )
+    axes = axes.flatten()
+
+    all_mz = np.concatenate([np.asarray(r["IsoMZ"]) for _, r in filtered.iterrows()])
+    x_min, x_max = all_mz.min() - 0.5, all_mz.max() + 0.5
+
+    for i, (_, row) in enumerate(filtered.iterrows()):
+        ax = axes[i]
+        iso_mz = np.asarray(row["IsoMZ"])
+        iso_abu = np.asarray(row["IsoAbundance"])
+        c = bin_color[row["mz_bin"]]
+        ax.vlines(iso_mz, ymin=0, ymax=iso_abu, color=c, linewidth=1)
+        ax.set_xlim(x_min, x_max)
+        ax.set_ylim(bottom=0)
+        ax.tick_params(axis="y", labelsize=7)
+        ax.set_ylabel(
+            f"rank {row['mz_rank']}", fontsize=7, rotation=0, labelpad=50, va="center"
+        )
+
+    axes[-1].set_xlabel("m/z")
+    fig2.suptitle(f"Isotope Patterns  mz_bin≈{mz_bin}  tol={tolerance}")
+    fig2.tight_layout()
+
+    if save_dir is not None:
+        os.makedirs(save_dir, exist_ok=True)
+        for fmt in ["png", "svg"]:
+            fig1.savefig(
+                os.path.join(
+                    save_dir,
+                    f"DictRefWindows_{mz_bin}_{tolerance}.{fmt}",
+                ),
+                dpi=300,
+                bbox_inches="tight",
+            )
+            fig2.savefig(
+                os.path.join(
+                    save_dir,
+                    f"DictRefIsoPatterns_{mz_bin}_{tolerance}.{fmt}",
+                ),
+                dpi=300,
+                bbox_inches="tight",
+            )
+        plt.close(fig1)
+        plt.close(fig2)
+    else:
+        plt.show()
+
+    return fig1, fig2
+
+
 def plot_quantification_by_run(
     df: pd.DataFrame,
     *,

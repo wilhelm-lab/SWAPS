@@ -2213,3 +2213,75 @@ def add_im_index_to_pivot(
         )
         pivot_df.drop(columns=["mobility_values"], inplace=True)
     return pivot_df
+
+
+def find_confounded_pairs(
+    dict_ref: pd.DataFrame,
+    overlap_threshold: float = 0.5,
+) -> pd.DataFrame:
+    """
+    Within each mz_bin, flag every pair of entries whose RT×IM search windows
+    overlap by more than *overlap_threshold* (fraction) of either member's area.
+
+    Parameters
+    ----------
+    dict_ref : pd.DataFrame
+        Reference dictionary with columns RT_search_left/right, IM_search_left/right,
+        mz_bin, mz_rank.
+    overlap_threshold : float
+        Pair is confounded when overlap_area / area_i > threshold for either i.
+
+    Returns
+    -------
+    pd.DataFrame with columns:
+        mz_bin, mz_rank_a, mz_rank_b,
+        overlap_area, area_a, area_b,
+        overlap_frac_a, overlap_frac_b
+    """
+    records = []
+
+    for mz_bin_val, grp in dict_ref.groupby("mz_bin"):
+        if len(grp) < 2:
+            continue
+
+        rt_l = grp["RT_search_left"].to_numpy()
+        rt_r = grp["RT_search_right"].to_numpy()
+        im_l = grp["IM_search_left"].to_numpy()
+        im_r = grp["IM_search_right"].to_numpy()
+        ranks = grp["mz_rank"].to_numpy()
+
+        areas = (rt_r - rt_l) * (im_r - im_l)
+
+        # vectorised pairwise overlap via broadcasting
+        overlap_rt = np.maximum(
+            0.0, np.minimum(rt_r[:, None], rt_r[None, :]) - np.maximum(rt_l[:, None], rt_l[None, :])
+        )
+        overlap_im = np.maximum(
+            0.0, np.minimum(im_r[:, None], im_r[None, :]) - np.maximum(im_l[:, None], im_l[None, :])
+        )
+        overlap_area = overlap_rt * overlap_im
+
+        # only upper triangle (i < j) to avoid duplicate pairs
+        n = len(grp)
+        for i in range(n):
+            for j in range(i + 1, n):
+                ov = overlap_area[i, j]
+                if ov == 0:
+                    continue
+                frac_a = ov / areas[i] if areas[i] > 0 else 0.0
+                frac_b = ov / areas[j] if areas[j] > 0 else 0.0
+                if frac_a > overlap_threshold or frac_b > overlap_threshold:
+                    records.append(
+                        {
+                            "mz_bin": mz_bin_val,
+                            "mz_rank_a": ranks[i],
+                            "mz_rank_b": ranks[j],
+                            "overlap_area": ov,
+                            "area_a": areas[i],
+                            "area_b": areas[j],
+                            "overlap_frac_a": frac_a,
+                            "overlap_frac_b": frac_b,
+                        }
+                    )
+
+    return pd.DataFrame(records)

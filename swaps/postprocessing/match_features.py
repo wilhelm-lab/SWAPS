@@ -246,7 +246,18 @@ def _parse_seg_mask_thres(val, default: tuple[int, int] = (3, 3)) -> tuple[int, 
     if val is None:
         return default
     # legacy scalar: treat as minimum total area, derive square side
-    side = max(1, int(val) // 3)
+    side = max(1, int(val) // 3)  # pyright: ignore[reportArgumentType]
+    return (side, side)
+
+
+def _parse_jump_dist_thres(val, default: tuple[int, int] = (0, 0)) -> tuple[int, int]:
+    if isinstance(val, dict):
+        return (int(val.get("rt", default[0])), int(val.get("im", default[1])))
+    if isinstance(val, (list, tuple)) and len(val) == 2:
+        return (int(val[0]), int(val[1]))
+    if val is None:
+        return default
+    side = max(0, int(val))  # pyright: ignore[reportArgumentType]
     return (side, side)
 
 
@@ -362,11 +373,13 @@ def match_features_batch(
 
         def _get_pept_act_tuple(raw_file: str) -> tuple[np.ndarray, int, int]:
             if raw_file not in pept_act_cache:
-                pept_act_cache[raw_file] = get_pept_act_from_parquet(
-                    _select_mz(act_dfs[raw_file], int(pept_idx)),
-                    int(pept_idx),
-                    dict_ref_by_mz,
-                    raw_file,
+                pept_act_cache[raw_file] = (
+                    get_pept_act_from_parquet(  # pyright: ignore[reportArgumentType]
+                        _select_mz(act_dfs[raw_file], int(pept_idx)),
+                        int(pept_idx),
+                        dict_ref_by_mz,
+                        raw_file,
+                    )
                 )
             return pept_act_cache[raw_file]
 
@@ -414,6 +427,9 @@ def match_features_batch(
             apply_seg=bool((processing_kwargs or {}).get("apply_seg", True)),
             seg_mask_thres=_parse_seg_mask_thres(
                 (processing_kwargs or {}).get("seg_mask_thres")
+            ),
+            jump_dist_thres=_parse_jump_dist_thres(
+                (processing_kwargs or {}).get("jump_dist_thres")
             ),
         )
         if visualize_dir is not None:
@@ -516,6 +532,9 @@ def match_features_batch(
                         ),
                         seg_mask_thres=_parse_seg_mask_thres(
                             (processing_kwargs or {}).get("seg_mask_thres")
+                        ),
+                        jump_dist_thres=_parse_jump_dist_thres(
+                            (processing_kwargs or {}).get("jump_dist_thres")
                         ),
                     )
                     _visualize_consensus_bundle(
@@ -1165,10 +1184,12 @@ def segment_consensus_from_aligned(
     watershed_kwargs: dict | None = None,
     apply_seg: bool = True,
     seg_mask_thres: tuple[int, int] = (2, 5),
+    jump_dist_thres: tuple[int, int] = (0, 0),
 ) -> ConsensusSegmentationState:
     """Segment a consensus image and track which labels belong to target anchors."""
 
-    consensus = np.stack(alignment_state.aligned_images, axis=0).mean(axis=0)
+    seg_mask_thres = _parse_seg_mask_thres(seg_mask_thres)
+    jump_dist_thres = _parse_jump_dist_thres(jump_dist_thres)
     consensus_denoised = smooth_and_denoise_image(consensus, **(denoise_kwargs or {}))
     rows, cols = alignment_state.target_shape
     non_none_indices = [
@@ -1237,6 +1258,22 @@ def segment_consensus_from_aligned(
                     dists = np.hypot(labeled_coords[:, 0] - r, labeled_coords[:, 1] - c)
                     nearest_idx = int(np.argmin(dists))
                     nearest_labeled_rc = labeled_coords[nearest_idx]
+                    rt_dist = abs(r - int(nearest_labeled_rc[0]))
+                    im_dist = abs(c - int(nearest_labeled_rc[1]))
+                    if (jump_dist_thres[0] > 0 and rt_dist > jump_dist_thres[0]) or (
+                        jump_dist_thres[1] > 0 and im_dist > jump_dist_thres[1]
+                    ):
+                        snap_log["discard_record"][i] = {
+                            "anchor": (r, c),
+                            "nearest_labeled_pixel": (
+                                int(nearest_labeled_rc[0]),
+                                int(nearest_labeled_rc[1]),
+                            ),
+                            "rt_dist": rt_dist,
+                            "im_dist": im_dist,
+                            "dist_to_label": float(dists[nearest_idx]),
+                        }
+                        continue
                     jump_ws = int(
                         watershed_labels[nearest_labeled_rc[0], nearest_labeled_rc[1]]
                     )
@@ -1276,7 +1313,7 @@ def segment_consensus_from_aligned(
                     snapped_per_anchor = [None] * len(alignment_state.aligned_anchors)
                     snap_log = {
                         "snap_record": {},
-                        "discard_record": {},
+                        "discard_record": snap_log["discard_record"],
                         "no_seg_log": None,
                         "jump_anchor_log": {},
                     }
@@ -1499,6 +1536,7 @@ def build_consensus_feature_bundle(
     raw_images: list[np.ndarray] | None = None,
     apply_seg: bool = True,
     seg_mask_thres: tuple[int, int] = (3, 3),
+    jump_dist_thres: tuple[int, int] = (0, 0),
 ) -> ConsensusFeatureBundle:
     """Build alignment, segmentation, and feature tables for consensus scoring."""
 
@@ -1524,6 +1562,7 @@ def build_consensus_feature_bundle(
         watershed_kwargs=watershed_kwargs,
         apply_seg=apply_seg,
         seg_mask_thres=seg_mask_thres,
+        jump_dist_thres=jump_dist_thres,
     )
     (
         consensus_pp,
@@ -1612,6 +1651,7 @@ def _make_shifted_consensus_segmentation_state(
         target_label_ids=list(segmentation_state.target_label_ids),
         label_to_snap=shifted_label_to_snap,
         non_none_indices=list(segmentation_state.non_none_indices),
+        apply_seg=segmentation_state.apply_seg,
     )
 
 
@@ -1807,7 +1847,7 @@ def _visualize_consensus_bundle(
                     zorder=7,
                 )
             elif i_idx in discard_record:
-                _orig_rc = discard_record[i_idx]
+                _orig_rc = discard_record[i_idx]["anchor"]
                 _ax.plot(
                     _orig_rc[1],
                     _orig_rc[0],

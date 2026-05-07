@@ -348,7 +348,9 @@ def opt_scan_by_scan(config_path: str):
             f.result()
     with open(os.path.join(quant_dir, "snap_log_collection.pkl"), "wb") as f:
         pickle.dump(snap_log_collection, f, protocol=pickle.HIGHEST_PROTOCOL)
-    report_snap_log_collection(snap_log_collection, quant_dir)
+    df_jump = report_snap_log_collection(snap_log_collection, quant_dir)
+    if df_jump is not None:
+        df_jump.to_csv(os.path.join(quant_dir, "jump_anchor_log.csv"), index=True)
     _save_effective_cfg(cfg, processing_kwargs, quant_dir)
     logging.info("=================FDR control==================")
 
@@ -401,13 +403,6 @@ def opt_scan_by_scan(config_path: str):
             "zernike_distance",
             "template_matching_score",
         ],
-        # normalize_feature_cols=[
-        #     "sift_similarities",
-        #     "zernike_similarities",
-        #     "sift_distance",
-        #     "zernike_distance",
-        #     "template_matching_score",
-        # ],
         scannr_col="feature_instance_id",  # No deduplication btw target and decoy for now
         psmid_col="Sequence_with_runs",
         specid_col="Sequence_with_runs",
