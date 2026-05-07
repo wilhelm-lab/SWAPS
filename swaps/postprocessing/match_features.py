@@ -412,6 +412,11 @@ def match_features_batch(
             )
             for rf in _consensus_raw_files
         ]
+        # Only files with known anchors contribute to the consensus average;
+        # files without anchors are still aligned and quantified from the labels.
+        _anchor_image_indices = [
+            i for i, a in enumerate(_consensus_anchors) if a is not None
+        ]
         _consensus_bundle = build_consensus_feature_bundle(
             images=[_get_raw_denoised_pept_act(rf) for rf in _consensus_raw_files],
             reference_idx=0,
@@ -431,6 +436,7 @@ def match_features_batch(
             jump_dist_thres=_parse_jump_dist_thres(
                 (processing_kwargs or {}).get("jump_dist_thres")
             ),
+            consensus_image_indices=_anchor_image_indices,
         )
         if visualize_dir is not None:
             _visualize_consensus_bundle(
@@ -1185,11 +1191,18 @@ def segment_consensus_from_aligned(
     apply_seg: bool = True,
     seg_mask_thres: tuple[int, int] = (2, 5),
     jump_dist_thres: tuple[int, int] = (0, 0),
+    consensus_image_indices: list[int] | None = None,
 ) -> ConsensusSegmentationState:
     """Segment a consensus image and track which labels belong to target anchors."""
 
     seg_mask_thres = _parse_seg_mask_thres(seg_mask_thres)
     jump_dist_thres = _parse_jump_dist_thres(jump_dist_thres)
+    _imgs_for_consensus = (
+        [alignment_state.aligned_images[i] for i in consensus_image_indices]
+        if consensus_image_indices is not None
+        else alignment_state.aligned_images
+    )
+    consensus = np.stack(_imgs_for_consensus, axis=0).mean(axis=0)
     consensus_denoised = smooth_and_denoise_image(consensus, **(denoise_kwargs or {}))
     rows, cols = alignment_state.target_shape
     non_none_indices = [
@@ -1537,6 +1550,7 @@ def build_consensus_feature_bundle(
     apply_seg: bool = True,
     seg_mask_thres: tuple[int, int] = (3, 3),
     jump_dist_thres: tuple[int, int] = (0, 0),
+    consensus_image_indices: list[int] | None = None,
 ) -> ConsensusFeatureBundle:
     """Build alignment, segmentation, and feature tables for consensus scoring."""
 
@@ -1563,6 +1577,7 @@ def build_consensus_feature_bundle(
         apply_seg=apply_seg,
         seg_mask_thres=seg_mask_thres,
         jump_dist_thres=jump_dist_thres,
+        consensus_image_indices=consensus_image_indices,
     )
     (
         consensus_pp,
