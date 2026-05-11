@@ -19,6 +19,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import IsoSpecPy as iso
 import torch
+from yacs.config import CfgNode as ConfigurationNode
 from utils.constants import decoy_mutation_rule
 from utils.plot import save_plot
 from utils.tools import cleanup_maxquant
@@ -1370,6 +1371,7 @@ def filter_maxquant_by_ok(
 def construct_dict_from_search_pivoted(
     cfg_prepare_dict,
     evidence: pd.DataFrame,
+    cfg,
     # rt_values_df: pd.DataFrame,
     # mobility_values_df: pd.DataFrame,
     n_blocks_by_pept: int = 1,
@@ -1408,9 +1410,10 @@ def construct_dict_from_search_pivoted(
                 still_null.sum(),
             )
             evidence_cleaned = evidence_cleaned[~still_null]
-    evidence_pivoted = pivot_psm_by_mz_rank(evidence_cleaned)
+    evidence_pivoted = pivot_psm_by_mz_rank(evidence_cleaned, cfg)
     evidence_group_summary = get_rt_im_range(
         evidence_cleaned,
+        cfg,
         id_cols=["Sequence", "Modifications", "Charge", "Proteins"],
         summarize_without_match=cfg_prepare_dict.REF.SUMMARIZE_WITHOUT_MATCH,
     )
@@ -1488,7 +1491,10 @@ def construct_dict(
         "sage_discriminant_score" in maxquant_exp_df.columns
     ):  # infer search engine, remap column names
         Logger.debug("Sage discriminant score found, parsing sage results")
-        maxquant_exp_df = sage_parser(maxquant_exp_df)
+        # Create a simple config object for sage_parser
+        cfg_for_parser = ConfigurationNode()
+        cfg_for_parser.USE_IMS = use_ims
+        maxquant_exp_df = sage_parser(maxquant_exp_df, cfg=cfg_for_parser)
         Logger.debug("Renamed columns: %s", maxquant_exp_df.columns)
     Logger.info("maxquant_exp_df size: %s", maxquant_exp_df.shape)
     maxquant_exp_df = maxquant_exp_df.loc[
@@ -1917,6 +1923,7 @@ def align_rt_from_multiple_source(
 
 def get_rt_im_range(
     evidence: pd.DataFrame,
+    cfg,
     match_col: str = "Type",
     id_cols: List[str] = ["Sequence", "Modifications", "Charge"],
     rt_col: str = "Retention time",
@@ -1932,38 +1939,44 @@ def get_rt_im_range(
         evidence = evidence[
             ~evidence[match_col].str.contains("MATCH", na=False)
         ]  # only keep not-matched for summary
+    common_dict = {
+        "modified_sequence": (
+            "Modified sequence",
+            lambda x: x.dropna().iloc[0] if x.notna().any() else np.nan,
+        ),
+        "mz": ("m/z", "mean"),
+        "count": (rt_col, "count"),
+        "rt_apex_mean": (rt_col, "mean"),
+        "rt_apex_std": (rt_col, "std"),
+        "rt_apex_min": (rt_col, "min"),
+        "rt_apex_max": (rt_col, "max"),
+        # rt_start_mean=(rt_start_col, "mean"),
+        # rt_start_std=(rt_start_col, "std"),
+        # rt_start_min=(rt_start_col, "min"),
+        # rt_finish_mean=(rt_finish_col, "mean"),
+        # rt_finish_std=(rt_finish_col, "std"),
+        # rt_finish_max=(rt_finish_col, "max"),
+        "rt_length_mean": (rt_length_col, "mean"),
+        "rt_length_std": (rt_length_col, "std"),
+        "rt_length_min": (rt_length_col, "min"),
+        "rt_length_max": (rt_length_col, "max"),
+    }
+
+    if cfg.USE_IMS:
+        common_dict.update({
+            "mobility_exp_mean": (mobility_col, "mean"),
+            "mobility_exp_std": (mobility_col, "std"),
+            "mobility_exp_min": (mobility_col, "min"),
+            "mobility_exp_max": (mobility_col, "max"),
+            "mobility_length_mean": (mobility_length_col, "mean"),
+            "mobility_length_std": (mobility_length_col, "std"),
+            "mobility_length_min": (mobility_length_col, "min"),
+            "mobility_length_max": (mobility_length_col, "max"),
+        })
+
     evidence_group_summary = (
         evidence.groupby(id_cols)
-        .agg(
-            modified_sequence=(
-                "Modified sequence",
-                lambda x: x.dropna().iloc[0] if x.notna().any() else np.nan,
-            ),
-            mz=("m/z", "mean"),
-            count=(rt_col, "count"),
-            rt_apex_mean=(rt_col, "mean"),
-            rt_apex_std=(rt_col, "std"),
-            rt_apex_min=(rt_col, "min"),
-            rt_apex_max=(rt_col, "max"),
-            mobility_exp_mean=(mobility_col, "mean"),
-            mobility_exp_std=(mobility_col, "std"),
-            mobility_exp_min=(mobility_col, "min"),
-            mobility_exp_max=(mobility_col, "max"),
-            # rt_start_mean=(rt_start_col, "mean"),
-            # rt_start_std=(rt_start_col, "std"),
-            # rt_start_min=(rt_start_col, "min"),
-            # rt_finish_mean=(rt_finish_col, "mean"),
-            # rt_finish_std=(rt_finish_col, "std"),
-            # rt_finish_max=(rt_finish_col, "max"),
-            rt_length_mean=(rt_length_col, "mean"),
-            rt_length_std=(rt_length_col, "std"),
-            rt_length_min=(rt_length_col, "min"),
-            rt_length_max=(rt_length_col, "max"),
-            mobility_length_mean=(mobility_length_col, "mean"),
-            mobility_length_std=(mobility_length_col, "std"),
-            mobility_length_min=(mobility_length_col, "min"),
-            mobility_length_max=(mobility_length_col, "max"),
-        )
+        .agg(**common_dict)
         .reset_index()
     )
     evidence_group_summary = evidence_group_summary.rename(
@@ -1975,30 +1988,38 @@ def get_rt_im_range(
     evidence_group_summary["rt_length_std"] = evidence_group_summary[
         "rt_length_std"
     ].fillna(evidence_group_summary["rt_length_std"].mean())
-    evidence_group_summary["mobility_exp_std"] = evidence_group_summary[
-        "mobility_exp_std"
-    ].fillna(evidence_group_summary["mobility_exp_std"].mean())
-    evidence_group_summary["mobility_length_std"] = evidence_group_summary[
-        "mobility_length_std"
-    ].fillna(evidence_group_summary["mobility_length_std"].mean())
+    if cfg.USE_IMS:
+        evidence_group_summary["mobility_exp_std"] = evidence_group_summary[
+            "mobility_exp_std"
+        ].fillna(evidence_group_summary["mobility_exp_std"].mean())
+        evidence_group_summary["mobility_length_std"] = evidence_group_summary[
+            "mobility_length_std"
+        ].fillna(evidence_group_summary["mobility_length_std"].mean())
+        
+    
     rt_length_max_left_clip = evidence_group_summary.loc[
         evidence_group_summary["rt_length_max"] > 0, "rt_length_max"
     ].quantile(0.01)
     rt_length_max_right_clip = evidence_group_summary.loc[
         evidence_group_summary["rt_length_max"] > 0, "rt_length_max"
     ].quantile(0.99)
-    im_length_max_left_clip = evidence_group_summary.loc[
-        evidence_group_summary["mobility_length_max"] > 0, "mobility_length_max"
-    ].quantile(0.01)
-    im_length_max_right_clip = evidence_group_summary.loc[
-        evidence_group_summary["mobility_length_max"] > 0, "mobility_length_max"
-    ].quantile(0.99)
+    
+    if cfg.USE_IMS:
+        im_length_max_left_clip = evidence_group_summary.loc[
+            evidence_group_summary["mobility_length_max"] > 0, "mobility_length_max"
+        ].quantile(0.01)
+        im_length_max_right_clip = evidence_group_summary.loc[
+            evidence_group_summary["mobility_length_max"] > 0, "mobility_length_max"
+        ].quantile(0.99)
+
+        Logger.info(
+            f"IM length max left clip: {im_length_max_left_clip}, IM length max right clip: {im_length_max_right_clip}"
+        )
+        
     Logger.info(
         f"RT length max left clip: {rt_length_max_left_clip}, RT length max right clip: {rt_length_max_right_clip}"
     )
-    Logger.info(
-        f"IM length max left clip: {im_length_max_left_clip}, IM length max right clip: {im_length_max_right_clip}"
-    )
+    
     evidence_group_summary["RT_search_left"] = (
         evidence_group_summary["rt_apex_min"]
         - evidence_group_summary["rt_apex_std"]
@@ -2020,34 +2041,36 @@ def get_rt_im_range(
         )
         + evidence_group_summary["rt_length_std"]
     )
-    evidence_group_summary["IM_search_left"] = (
-        evidence_group_summary["mobility_exp_min"]
-        - evidence_group_summary["mobility_exp_std"]
-        - np.clip(
-            evidence_group_summary["mobility_length_max"],
-            im_length_max_left_clip,
-            im_length_max_right_clip,
+    if cfg.USE_IMS:
+        evidence_group_summary["IM_search_left"] = (
+            evidence_group_summary["mobility_exp_min"]
+            - evidence_group_summary["mobility_exp_std"]
+            - np.clip(
+                evidence_group_summary["mobility_length_max"],
+                im_length_max_left_clip,
+                im_length_max_right_clip,
+            )
+            - evidence_group_summary["mobility_length_std"]
         )
-        - evidence_group_summary["mobility_length_std"]
-    )
-    evidence_group_summary["IM_search_right"] = (
-        evidence_group_summary["mobility_exp_max"]
-        + evidence_group_summary["mobility_exp_std"]
-        + np.clip(
-            evidence_group_summary["mobility_length_max"],
-            im_length_max_left_clip,
-            im_length_max_right_clip,
+        evidence_group_summary["IM_search_right"] = (
+            evidence_group_summary["mobility_exp_max"]
+            + evidence_group_summary["mobility_exp_std"]
+            + np.clip(
+                evidence_group_summary["mobility_length_max"],
+                im_length_max_left_clip,
+                im_length_max_right_clip,
+            )
+            + evidence_group_summary["mobility_length_std"]
         )
-        + evidence_group_summary["mobility_length_std"]
-    )
-    evidence_group_summary["IM_search_center"] = evidence_group_summary[
-        "mobility_exp_mean"
-    ]
+        evidence_group_summary["IM_search_center"] = evidence_group_summary[
+            "mobility_exp_mean"
+        ]
     return evidence_group_summary
 
 
 def pivot_psm_by_mz_rank(
     evidence: pd.DataFrame,
+    cfg,
     match_keyword: str = "MATCH",
     msms_keyword: str = "MSMS",
     metric_col: str = "Score",
@@ -2131,9 +2154,13 @@ def pivot_psm_by_mz_rank(
     pivot_status = pivot_status.map(lambda x: mapping.get(x, "Not_Match"))
 
     # --- Step 4: Pivot Metrics (RT and 1/K0) ---
+    
+    cols_to_agg = [rt_col]
+    if cfg.USE_IMS:
+        cols_to_agg.append(mobility_col)
     # We take the mean or first if multiple entries exist per raw file
     metrics_summary = (
-        evidence.groupby(id_cols + ["Raw file"])[[rt_col, mobility_col]]
+        evidence.groupby(id_cols + ["Raw file"])[cols_to_agg]
         .mean()
         .reset_index()
     )
@@ -2143,16 +2170,20 @@ def pivot_psm_by_mz_rank(
     pivot_rt.fillna(
         0, inplace=True
     )  # fill missing RT with 0, can be changed to other value if needed
-    pivot_mobility = metrics_summary.pivot(
-        index=id_cols, columns="Raw file", values=mobility_col
-    )
-    pivot_mobility.columns = [f"{col}_1K0" for col in pivot_mobility.columns]
-    pivot_mobility.fillna(
-        0, inplace=True
-    )  # fill missing mobility with 0, can be changed to other value if needed
+    dfs_to_concat = [pivot_status, pivot_rt]
+    if cfg.USE_IMS:
+        pivot_mobility = metrics_summary.pivot(
+            index=id_cols, columns="Raw file", values=mobility_col
+        )
+        pivot_mobility.columns = [f"{col}_1K0" for col in pivot_mobility.columns]
+        pivot_mobility.fillna(
+            0, inplace=True
+        )  # fill missing mobility with 0, can be changed to other value if needed
+        dfs_to_concat.append(pivot_mobility)
+        
     # --- Step 5: Combine everything ---
     # join=inner ensures we keep only rows consistent across pivots
-    result_df = pd.concat([pivot_status, pivot_rt, pivot_mobility], axis=1)
+    result_df = pd.concat(dfs_to_concat, axis=1)
 
     # --- Step 6: Validation ---
     ref_counts = (pivot_status == "Reference").sum(axis=1)

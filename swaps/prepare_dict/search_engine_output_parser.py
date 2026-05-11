@@ -1,6 +1,7 @@
 import pandas as pd
 import logging
 import numpy as np
+from yacs.config import CfgNode as ConfigurationNode
 
 Logger = logging.getLogger(__name__)
 sage_rename_dict = {
@@ -55,6 +56,7 @@ def sage_parser(
     sage_rename_dict: dict = sage_rename_dict,
     rt_window: float = 0.0,
     im_window: float = 0.0,
+    cfg: ConfigurationNode = None,
 ) -> pd.DataFrame:
     """
     Parse the SAGE output DataFrame and rename columns based on the provided dictionary.
@@ -66,10 +68,15 @@ def sage_parser(
             0 (default) triggers auto-calculation: 1% of the maximum observed RT.
         im_window (float): IM elution window in 1/K0 units to add as ``1/K0 length``.
             0 (default) triggers auto-calculation: 0.1 1/K0 units.
+        cfg (ConfigurationNode, optional): Configuration object with USE_IMS flag. If None, defaults to True.
 
     Returns:
         pd.DataFrame: The parsed DataFrame with renamed columns.
     """
+    if cfg is None:
+        # Default to USE_IMS=True if no config provided
+        cfg = ConfigurationNode()
+        cfg.USE_IMS = True
     sage_output["filename"] = sage_output["filename"].str[:-2]
     sage_output["Is_Decoy"] = sage_output["proteins"].str.contains("rev_")
     sage_output["m/z"] = sage_output["expmass"] / sage_output["charge"]
@@ -86,11 +93,18 @@ def sage_parser(
     # Rename columns based on the provided dictionary
     sage_output.rename(columns=sage_rename_dict, inplace=True)
 
-    sage_output["Type"] = "TIMS-MULTI-MSMS"
+    if not cfg.USE_IMS:
+        sage_output["Type"] = "MULTI-MSMS"
+        logging.info("sage_parser: non-IMS data")
+    else:
+        sage_output["Type"] = "TIMS-MULTI-MSMS"
+    
     sage_output["Calibrated retention time"] = sage_output["Retention time"]
     sage_output["Calibrated retention time start"] = sage_output["Retention time"]
     sage_output["Calibrated retention time finish"] = sage_output["Retention time"]
-    sage_output["Ion mobility length"] = 80  # FIXME: very dirty fix
+    
+    if cfg.USE_IMS:
+        sage_output["Ion mobility length"] = 80  # FIXME: very dirty fix
 
     # RT elution window: SAGE reports apex only, so we synthesise a window.
     if rt_window == 0.0:
@@ -101,12 +115,13 @@ def sage_parser(
     sage_output["Retention length"] = rt_window
 
     # IM elution window: SAGE reports apex only, so we use a fixed default.
-    if im_window == 0.0:
-        im_window = 0.1
-        Logger.warning(
-            "SAGE_IM_WINDOW not set; defaulting to %.2f 1/K0 units", im_window
-        )
-    sage_output["1/K0 length"] = im_window
+    if cfg.USE_IMS:
+        if im_window == 0.0:
+            im_window = 0.1
+            Logger.warning(
+                "SAGE_IM_WINDOW not set; defaulting to %.2f 1/K0 units", im_window
+            )
+        sage_output["1/K0 length"] = im_window
 
     sage_output.loc[sage_output["Is_Decoy"], "Reverse"] = "+"
     sage_output["Sequence"] = sage_output["Modified sequence"].str.replace(
@@ -126,16 +141,21 @@ def sage_parser(
     return sage_output
 
 
-def fragpipe_psm_parser(fragpipe_output: pd.DataFrame) -> pd.DataFrame:
+def fragpipe_psm_parser(fragpipe_output: pd.DataFrame, cfg: ConfigurationNode = None) -> pd.DataFrame:
     """
     Parse the FragPipe output DataFrame and rename columns based on the provided dictionary.
 
     Args:
         fragpipe_output (pd.DataFrame): The FragPipe output DataFrame.
-        exp_name (Optional[str]): The experiment name to filter columns. If None, prepares a reference dictionary.
+        cfg (ConfigurationNode, optional): Configuration object with USE_IMS flag. If None, defaults to True.
     Returns:
         pd.DataFrame: The parsed DataFrame with renamed columns.
     """
+    if cfg is None:
+        # Default to USE_IMS=True if no config provided
+        cfg = ConfigurationNode()
+        cfg.USE_IMS = True
+    
     fragpipe_output_copy = fragpipe_output.copy(deep=True)
     fragpipe_output_copy["Modified Peptide"] = fragpipe_output_copy[
         "Modified Peptide"
@@ -147,7 +167,14 @@ def fragpipe_psm_parser(fragpipe_output: pd.DataFrame) -> pd.DataFrame:
         "+",
         np.nan,
     )
-    fragpipe_output_copy["Type"] = "TIMS-MULTI-MSMS"
+    
+
+    if not cfg.USE_IMS: 
+        fragpipe_output_copy["Type"] = "MULTI-MSMS"
+        logging.info("fragpipe parser: non IMS data")
+    else:
+        fragpipe_output_copy["Type"] = "TIMS-MULTI-MSMS"
+    
     # Convert Retention time to minute
     for rt_col in [
         "Calibrated retention time",
@@ -161,9 +188,11 @@ def fragpipe_psm_parser(fragpipe_output: pd.DataFrame) -> pd.DataFrame:
         fragpipe_output_copy["Calibrated retention time finish"]
         - fragpipe_output_copy["Calibrated retention time start"]
     )
-    fragpipe_output_copy["1/K0 length"] = (
+    if cfg.USE_IMS: 
+        fragpipe_output_copy["1/K0 length"] = (
         fragpipe_output_copy["1/K0 finish"] - fragpipe_output_copy["1/K0 start"]
-    )
+        )
+    
     fragpipe_output_copy["Modifications"] = fragpipe_output_copy[
         "Modifications"
     ].fillna("-")

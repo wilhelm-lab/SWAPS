@@ -12,14 +12,15 @@ import pandas as pd
 import numpy as np
 import directlfq.lfq_manager as lfq_manager
 
-from utils.tools import get_dot_d_paths, report_snap_log_collection
+from swaps.utils.tools import get_dot_d_paths, report_snap_log_collection
+from utils.tools import load_mzml
 from utils.ims_utils import (
     load_dotd_data,
     export_im_and_ms1scans,
 )
 from utils.config import get_cfg_defaults, merge_cfg_from_file
 from utils.singleton_swaps_optimization import swaps_optimization_cfg
-from optimization.inference import process_frames_parallel, generate_id_partitions
+from .optimization.inference import process_frames_parallel, generate_id_partitions
 from prepare_dict.prepare_dict import (
     construct_dict_from_search_pivoted,
     dict_add_index_to_raw_file,
@@ -114,6 +115,7 @@ def opt_scan_by_scan(config_path: str):
                     evidence,
                     rt_window=cfg.PREPARE_DICT.SAGE.RT_WINDOW,
                     im_window=cfg.PREPARE_DICT.SAGE.IM_WINDOW,
+                    cfg=cfg,
                 )
             case "fragpipe":
                 evidence = pd.DataFrame()
@@ -131,7 +133,7 @@ def opt_scan_by_scan(config_path: str):
                             "Loaded evidence with %s rows from %s", len(tmp), exp_dir
                         )
 
-                evidence = fragpipe_psm_parser(evidence)
+                evidence = fragpipe_psm_parser(evidence, cfg=cfg)
         if len(cfg.PREPARE_DICT.OK.DIR) > 0:
             evidence = filter_maxquant_by_ok(
                 evidence_100fdr=evidence,  # type: ignore
@@ -155,6 +157,7 @@ def opt_scan_by_scan(config_path: str):
         dict_ref = construct_dict_from_search_pivoted(
             cfg_prepare_dict=cfg.PREPARE_DICT,
             evidence=evidence,  # type: ignore
+            cfg=cfg,
             n_blocks_by_pept=1,
         )
         dict_ref.to_pickle(os.path.join(cfg.RESULT_PATH, "dict_ref.pkl"))
@@ -163,31 +166,42 @@ def opt_scan_by_scan(config_path: str):
     # added_im_and_rt_index = False
     if cfg.SWA:
         logging.info(
-            "Processing Scan-Wise Activation for each .d dataset in %s excluding %s",
+            "Processing Scan-Wise Activation for each dataset in %s excluding %s",
             cfg.DATA_PATH,
             cfg.EXCLUDE_DATASET_NAME,
         )
-        dot_d_paths = []
-        for data_path in cfg.DATA_PATH:
-            dot_d_paths.extend(get_dot_d_paths(data_path, cfg.EXCLUDE_DATASET_NAME))
-        for dot_d_path in dot_d_paths:
-            dot_d_dir = os.path.basename(dot_d_path)
+        
+        if cfg.USE_IMS:
+            # For IMS data, use .d 
+            data_paths = get_dot_d_paths(cfg.DATA_PATH, cfg.EXCLUDE_DATASET_NAME)
+        else:
+            all_files = os.listdir(cfg.DATA_PATH)
+            exclude_names = cfg.EXCLUDE_DATASET_NAME if isinstance(cfg.EXCLUDE_DATASET_NAME, list) else [cfg.EXCLUDE_DATASET_NAME]
+            data_paths = [
+                os.path.join(cfg.DATA_PATH, f)
+                for f in all_files
+                if f.endswith(".mzML") and not any(excl in f for excl in exclude_names)
+            ]
+            logging.info("Found %d mzML files to process", len(data_paths))
+        
+        for data_path in data_paths:
+            data_dir = os.path.basename(data_path)
             logging.info(
                 "============Scan-Wise Activation for dataset: %s============",
-                dot_d_dir,
+                data_dir,
             )
             logging.info(
                 "--------------------------Load Data--------------------------"
             )
-            # Get the lowest level directory name with .d extension
-            dir_wo_extension = dot_d_dir.split(".")[0]
+            # Get the lowest level directory/filename name without extension
+            dir_wo_extension = data_dir.rsplit(".", 1)[0] if "." in data_dir else data_dir
             act_dir = os.path.join(cfg.RESULT_PATH, dir_wo_extension, "activation")
             os.makedirs(act_dir, exist_ok=True)
 
             # Load data
             if cfg.USE_IMS:
                 data, hdf_file_name = load_dotd_data(
-                    dot_d_path,
+                    data_path,
                     swaps_result_dir=cfg.EXPORT_DATA_HDF5_DIR,
                 )
                 ms1scans, mobility_values_df = export_im_and_ms1scans(
@@ -220,13 +234,26 @@ def opt_scan_by_scan(config_path: str):
                 dict_ref.to_pickle(
                     os.path.join(cfg.RESULT_PATH, "dict_ref_with_activation.pkl")
                 )
+                logging.info("Saved dict_ref_with_activation.pkl for IMS data")
             else:
-                raise NotImplementedError(
-                    "Currently only support IMS data. Please set USE_IMS to True."
-                )
-                # mzml_data = load_mzml(cfg.DATA_PATH, unify_format=True)
-                # ms1scans = mzml_data
-                # mobility_values_df = None
+                # For non-IMS data, load mzML file
+                logging.info("Loading non-IMS mzML data from %s", data_path)
+                ms1scans = load_mzml(data_path, unify_format=True)
+                ms1scans.set_index("Id", inplace=True)
+                mobility_values_df = None
+                data = None
+                
+                # Add RT index if available
+                if ms1scans is not None:
+                    dict_ref = dict_add_rt_index(
+                        dict_ref,
+                        ms1scans,
+                        idx_suffix=f"_ref_{dir_wo_extension}",
+                    )
+                    dict_ref.to_pickle(
+                        os.path.join(cfg.RESULT_PATH, "dict_ref_with_activation.pkl")
+                    )
+                    logging.info("Saved dict_ref_with_activation.pkl for non-IMS data")
 
             # Optimization
             start_time = time.time()

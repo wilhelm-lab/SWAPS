@@ -187,35 +187,35 @@ def process_one_frame(
     ms1scans: pd.DataFrame,
     ms1_frame_idx: int,
     maxquant_result_ref_with_im_index_sortmz: pd.DataFrame,
-    mz_bin_digits: int = 3,
+    ppm_tol: int = 20,
+    bin_frame_mz: bool = True,
+    bin_width: float = 0.01,
     debug: bool = False,
+    return_res_coo_dict: bool = False,
+    **process_frame_kwargs,
 ):
-    """Process one frame data without IMS dimension with sparse encoding and peak selection."""
-    # Logger.debug("Start data preparation.")
+    """Process one frame data without IMS dimension with sparse encoding."""
     # prepare data
     frame_data = ms1scans.loc[ms1scans["MS1_frame_idx"] == ms1_frame_idx]
-    # Logger.debug("Frame data shape: %s", frame_data.shape[0])
-    peaks_df = pd.DataFrame()
     pept_act_coo = {
+        "coord_frame_indices": [],
+        "coord_pept_indices": [],
+        "data": [],
+    }
+    pept_res_coo = {
         "coord_frame_indices": [],
         "coord_pept_indices": [],
         "data": [],
     }
     if frame_data.shape[0] > 0:
         scan_time = np.round(ms1scans.loc[ms1_frame_idx, "Time_minute"], decimals=4)  # type: ignore[arg-type]
-        # Logger.debug("Scan time: %s", scan_time)
         candidate_precursor_by_rt = maxquant_result_ref_with_im_index_sortmz.loc[
             (maxquant_result_ref_with_im_index_sortmz["RT_search_left"] <= scan_time)
             & (maxquant_result_ref_with_im_index_sortmz["RT_search_right"] >= scan_time)
         ]
-        # Logger.debug(
-        #     "Number of candidates by RT in frame %s: %s",
-        #     ms1_frame_idx,
-        #     candidate_precursor_by_rt.shape[0],
-        # )
         if candidate_precursor_by_rt.shape[0] > 0:
-            candidate_precursor_by_rt.sort_values(
-                "mz_rank", ascending=True, inplace=True
+            candidate_precursor_by_rt = candidate_precursor_by_rt.sort_values(
+                "mz_rank", ascending=True
             )
             all_frame_pept_idx = candidate_precursor_by_rt.mz_rank.values
             (
@@ -225,44 +225,61 @@ def process_one_frame(
                 candidate_precursor_by_rt=candidate_precursor_by_rt,
                 frame_data=frame_data,
                 all_id=all_frame_pept_idx,
-                ppm_tol=mz_bin_digits,
+                bin_frame_mz=bin_frame_mz,
+                ppm_tol=ppm_tol,
+                bin_width=bin_width,
                 use_ims=False,
             )
+            if frame_array is None:
+                pept_act = None
+                Logger.warning("No sparse matrices return for frame %s", ms1_frame_idx)
+            else:
+                deconv_results = sparse_encode_divide_and_conquer_with_residual_stats(
+                    frame_array, candidate_array, return_act_res=return_res_coo_dict
+                )
+                if return_res_coo_dict:
+                    pept_act, pept_res = deconv_results  # type: ignore[assignment]
+                    nonzero_indices_res = np.nonzero(pept_res)
+                    pept_res_coo["data"] = pept_res[nonzero_indices_res].tolist()  # type: ignore[assignment]
+                    pept_res_coo["coord_frame_indices"] = np.repeat(
+                        ms1_frame_idx, len(pept_res_coo["data"])
+                    ).tolist()
+                    pept_res_coo["coord_pept_indices"] = all_frame_pept_idx[
+                        nonzero_indices_res[1]
+                    ].tolist()
+                else:
+                    pept_act = deconv_results  # type: ignore[assignment]
+                assert isinstance(pept_act, np.ndarray)
 
-            im_pept_act = sparse_encode_divide_and_conquer_with_residual_stats(
-                frame_array, candidate_array
-            )  # TODO: not yet hanlding returning residues
-
-            nonzero_indices = np.nonzero(im_pept_act)
-            pept_act_coo["data"] = im_pept_act[nonzero_indices].tolist()  # type: ignore[assignment]
-            pept_act_coo["coord_frame_indices"] = np.repeat(
-                ms1_frame_idx, len(pept_act_coo["data"])
-            ).tolist()
-            pept_act_coo["coord_pept_indices"] = all_frame_pept_idx[
-                nonzero_indices[1]
-            ].tolist()
+                nonzero_indices = np.nonzero(pept_act)
+                pept_act_coo["data"] = pept_act[nonzero_indices].tolist()  # type: ignore[assignment]
+                pept_act_coo["coord_frame_indices"] = np.repeat(
+                    ms1_frame_idx, len(pept_act_coo["data"])
+                ).tolist()
+                pept_act_coo["coord_pept_indices"] = all_frame_pept_idx[
+                    nonzero_indices[1]
+                ].tolist()
         else:
             Logger.info("No candidate precursor by RT from frame %s", ms1_frame_idx)
     else:
         Logger.info("No data for frame index %s", ms1_frame_idx)
     if debug:
         return (
-            peaks_df,
             pept_act_coo,
             frame_array,
             candidate_array,
-            im_pept_act,
+            pept_act,
             candidate_precursor_by_rt,
             all_frame_pept_idx,
         )
     else:
-        return (
-            peaks_df,
-            pept_act_coo,
-            # candidate_array,
-            # frame_array,
-            # im_pept_act,
-        )  # TODO: remove candidate array
+        if return_res_coo_dict:
+            return (
+                pept_act_coo,
+                pept_res_coo,
+            )
+        else:
+            return (pept_act_coo,)
 
 
 def process_one_frame_ims(
@@ -571,16 +588,21 @@ def process_batch_frame(
                         frame_im_pept_res_coo_dict[key]  # type: ignore[assignment]
                     )  # type: ignore[assignment]
         else:
-            peaks_df, frame_im_pept_act_coo = process_one_frame(  # type: ignore[assignment]
+            one_frame_results = process_one_frame(  # type: ignore[assignment]
                 ms1scans=ms1scans,
                 ms1_frame_idx=scan_idx,
                 maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
                 debug=False,
+                return_res_coo_dict=return_res_coo_dict,
                 **process_frame_kwargs,
             )
+            if return_res_coo_dict:
+                frame_rt_pept_act_coo, frame_rt_pept_res_coo = one_frame_results  # type: ignore[assignment]
+            else:
+                frame_rt_pept_act_coo = one_frame_results[0]  # type: ignore[assignment]
 
             for key in batch_rt_pept_act_coo_dict.keys():
-                batch_rt_pept_act_coo_dict[key].extend(frame_im_pept_act_coo[key])
+                batch_rt_pept_act_coo_dict[key].extend(frame_rt_pept_act_coo[key])
 
     if use_ims and extract_im_peak:
         batch_peaks_df = pd.concat(batch_peaks_df).reset_index(drop=True)
@@ -761,16 +783,21 @@ def process_batch_frame_save_parquet(
                             frame_im_pept_res_coo_dict[key]  # type: ignore[assignment]
                         )  # type: ignore[assignment]
             else:
-                peaks_df, frame_im_pept_act_coo = process_one_frame(  # type: ignore[assignment]
+                one_frame_results = process_one_frame(  # type: ignore[assignment]
                     ms1scans=ms1scans,
                     ms1_frame_idx=scan_idx,
                     maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
                     debug=False,
+                    return_res_coo_dict=return_res_coo_dict,
                     **process_frame_kwargs,
                 )
+                if return_res_coo_dict:
+                    frame_rt_pept_act_coo, frame_rt_pept_res_coo = one_frame_results  # type: ignore[assignment]
+                else:
+                    frame_rt_pept_act_coo = one_frame_results[0]  # type: ignore[assignment]
 
                 for key in batch_rt_pept_act_coo_dict.keys():
-                    batch_rt_pept_act_coo_dict[key].extend(frame_im_pept_act_coo[key])
+                    batch_rt_pept_act_coo_dict[key].extend(frame_rt_pept_act_coo[key])
 
         if use_ims and extract_im_peak:
             batch_peaks_df = pd.concat(batch_peaks_df).reset_index(drop=True)
@@ -1135,8 +1162,8 @@ def _prepare_sparse_matrices(
         frame_mz = frame_data["mz_values"].values
         frame_int = frame_data["intensity_values"]
     else:
-        frame_mz = frame_data["mzarray"].values[0]
-        frame_int = frame_data["intarray"].values[0]
+        frame_mz = np.asarray(frame_data["mzarray"].values[0])
+        frame_int = np.asarray(frame_data["intarray"].values[0])
 
     # --- Match candidate m/z to frame m/z with ppm tolerance and binning ---
     if bin_frame_mz:

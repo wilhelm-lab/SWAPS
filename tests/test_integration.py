@@ -170,6 +170,7 @@ class TestDictConstructionIntegration:
         dict_ref = construct_dict_from_search_pivoted(
             cfg_prepare_dict=cfg.PREPARE_DICT,
             evidence=fragpipe_evidence_subset,
+            cfg=cfg,
             n_blocks_by_pept=1,
         )
         assert isinstance(dict_ref, pd.DataFrame)
@@ -186,6 +187,7 @@ class TestDictConstructionIntegration:
         dict_ref = construct_dict_from_search_pivoted(
             cfg_prepare_dict=cfg.PREPARE_DICT,
             evidence=fragpipe_evidence_subset,
+            cfg=cfg,
             n_blocks_by_pept=1,
         )
         for col in ["mz_rank", "Sequence", "Proteins"]:
@@ -202,6 +204,7 @@ class TestDictConstructionIntegration:
         dict_ref = construct_dict_from_search_pivoted(
             cfg_prepare_dict=cfg.PREPARE_DICT,
             evidence=fragpipe_evidence_subset,
+            cfg=cfg,
             n_blocks_by_pept=1,
         )
         assert dict_ref["mz_rank"].is_unique
@@ -335,6 +338,7 @@ class TestSageParsingIntegration:
         dict_ref = construct_dict_from_search_pivoted(
             cfg_prepare_dict=cfg.PREPARE_DICT,
             evidence=parsed_sage,
+            cfg=cfg,
             n_blocks_by_pept=1,
         )
         assert isinstance(dict_ref, pd.DataFrame)
@@ -397,6 +401,7 @@ class TestMaxQuantParsingIntegration:
         dict_ref = construct_dict_from_search_pivoted(
             cfg_prepare_dict=cfg.PREPARE_DICT,
             evidence=maxquant_evidence,
+            cfg=cfg,
             n_blocks_by_pept=1,
         )
         assert isinstance(dict_ref, pd.DataFrame)
