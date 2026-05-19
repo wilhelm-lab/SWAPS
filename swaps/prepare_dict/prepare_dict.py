@@ -600,6 +600,50 @@ def dict_add_mz_bin(maxquant_dict_df: pd.DataFrame, mz_bin_digits: int = 2):
     return maxquant_dict_df
 
 
+def dict_add_confounding_groups(
+    maxquant_dict_df: pd.DataFrame, mz_bin_digits: int = 2
+) -> pd.DataFrame:
+    """
+    For each candidate find all others within |Δmz_bin| ≤ 10^-mz_bin_digits
+    that also overlap in both RT and IM search windows. Adds column
+    'confounders' — a numpy int array of confounding mz_rank values per row.
+    Used downstream to constrain decoy mz sampling away from occupied regions.
+    """
+    mz_tol = 10.0 ** (-mz_bin_digits) + 1e-9
+
+    sorted_df = maxquant_dict_df.sort_values("mz_bin")
+    orig_index = sorted_df.index
+
+    mz_bins = sorted_df["mz_bin"].to_numpy(dtype=float)
+    rt_left = sorted_df["RT_search_left"].to_numpy(dtype=float)
+    rt_right = sorted_df["RT_search_right"].to_numpy(dtype=float)
+    im_left = sorted_df["IM_search_left"].to_numpy(dtype=float)
+    im_right = sorted_df["IM_search_right"].to_numpy(dtype=float)
+    mz_ranks = sorted_df["mz_rank"].to_numpy(dtype=int)
+
+    n = len(sorted_df)
+    confounders = np.empty(n, dtype=object)
+
+    for i in range(n):
+        lo = np.searchsorted(mz_bins, mz_bins[i] - mz_tol, side="left")
+        hi = np.searchsorted(mz_bins, mz_bins[i] + mz_tol, side="right")
+        ni = np.arange(lo, hi)
+        ni = ni[ni != i]
+
+        if len(ni) == 0:
+            confounders[i] = np.empty(0, dtype=int)
+            continue
+
+        rt_overlap = (rt_left[ni] <= rt_right[i]) & (rt_left[i] <= rt_right[ni])
+        im_overlap = (im_left[ni] <= im_right[i]) & (im_left[i] <= im_right[ni])
+        confounders[i] = mz_ranks[ni[rt_overlap & im_overlap]]
+
+    result = maxquant_dict_df.copy()
+    result["confounders"] = pd.Series(confounders, index=orig_index)
+    result["count_confounders"] = result["confounders"].apply(len)
+    return result
+
+
 def dict_add_iso_pattern(maxquant_dict_df: pd.DataFrame, ab_thres: float = 0.01):
     """
     Get isotopic pattern as indicated in iso_pattern_df for each row in maxquant_dict_df
@@ -1425,6 +1469,11 @@ def construct_dict_from_search_pivoted(
         maxquant_dict_df=evidence_group_summary,
         mz_bin_digits=cfg_prepare_dict.MZ_BIN_DIGITS,
     )
+    evidence_group_summary = dict_add_confounding_groups(
+        maxquant_dict_df=evidence_group_summary,
+        mz_bin_digits=cfg_prepare_dict.MZ_BIN_DIGITS,
+    )
+
     evidence_group_summary = dict_add_mz_len(maxquant_dict_df=evidence_group_summary)
 
     pept_batch_size = ceil(evidence_group_summary.shape[0] / n_blocks_by_pept) + 1
@@ -1552,7 +1601,9 @@ def construct_dict(
     maxquant_exp_df.to_csv(maxquant_exp_filtered_path, sep="\t")
 
     _LOADED_ALPHA_DATASET = False
-    rt_max_grad = 0.0  # LC gradient length; set from data when model retraining is triggered
+    rt_max_grad = (
+        0.0  # LC gradient length; set from data when model retraining is triggered
+    )
     # RT
     if cfg_prepare_dict.RT_REF == "pred":
         if cfg_prepare_dict.PRED.UPDATED_RT_MODEL_PATH == "":
@@ -1803,6 +1854,10 @@ def construct_dict(
     maxquant_dict = dict_add_mz_rank(maxquant_dict_df=maxquant_dict)
     maxquant_dict["TD pair id"] = maxquant_dict["mz_rank"]
     maxquant_dict = dict_add_mz_bin(
+        maxquant_dict_df=maxquant_dict,
+        mz_bin_digits=cfg_prepare_dict.MZ_BIN_DIGITS,
+    )
+    maxquant_dict = dict_add_confounding_groups(
         maxquant_dict_df=maxquant_dict,
         mz_bin_digits=cfg_prepare_dict.MZ_BIN_DIGITS,
     )
@@ -2254,10 +2309,14 @@ def find_confounded_pairs(
 
         # vectorised pairwise overlap via broadcasting
         overlap_rt = np.maximum(
-            0.0, np.minimum(rt_r[:, None], rt_r[None, :]) - np.maximum(rt_l[:, None], rt_l[None, :])
+            0.0,
+            np.minimum(rt_r[:, None], rt_r[None, :])
+            - np.maximum(rt_l[:, None], rt_l[None, :]),
         )
         overlap_im = np.maximum(
-            0.0, np.minimum(im_r[:, None], im_r[None, :]) - np.maximum(im_l[:, None], im_l[None, :])
+            0.0,
+            np.minimum(im_r[:, None], im_r[None, :])
+            - np.maximum(im_l[:, None], im_l[None, :]),
         )
         overlap_area = overlap_rt * overlap_im
 
