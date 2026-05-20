@@ -4,6 +4,7 @@ from typing import List, Set, Union, Literal, Optional
 
 import matplotlib.pyplot as plt
 from matplotlib import colormaps, patches  # type: ignore
+from matplotlib.figure import Figure
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -1903,12 +1904,13 @@ def plot_intensity_coverage_by_species(
     species_colors: Optional[dict[str, str]] = None,
     missing_color: str = "#D3D3D3",
     label_shorten_fn=None,
+    match_filters: Optional[dict[str, list]] = None,
     sort_columns: bool = False,
     dataset_name: str = "",
     fig_name_suffix: str = "",
     ax: Optional[plt.Axes] = None,
     fig_dir: Optional[str] = None,
-) -> tuple[plt.Figure, plt.Axes]:
+) -> tuple[Figure, plt.Axes, pd.DataFrame]:
     """Stacked bar plot of intensity coverage broken down by species and missing values.
 
     Each bar corresponds to one intensity column. Values are counted as present
@@ -1931,7 +1933,15 @@ def plot_intensity_coverage_by_species(
     missing_color:
         Color for missing / below-threshold bars.
     label_shorten_fn:
-        Optional callable ``(col_name: str) -> str`` to derive x-tick labels.
+        Optional callable ``(col_name: str) -> str`` applied to each column name
+        to produce x-tick labels, e.g. ``lambda x: "_".join([x.split("_")[0], x.split("_")[-2]])``.
+    match_filters:
+        Optional dict ``{match_col_keyword: allowed_values}``.  For each intensity
+        column whose name is ``"<stem> <int_col_keyword>"``, the corresponding
+        column ``"<stem> <match_col_keyword>"`` is used to pre-filter rows: only
+        rows whose value is in *allowed_values* are counted.
+        Example: ``{"Match Type": ["unmatched"]}`` restricts every bar to rows
+        where the paired Match Type column contains ``"unmatched"``.
     sort_columns:
         Sort bars by total present count descending.
     dataset_name:
@@ -1960,10 +1970,18 @@ def plot_intensity_coverage_by_species(
 
     records = []
     for col in int_cols:
-        present = df[col].notna() & (df[col] >= threshold)
+        stem = col[: col.rfind(int_col_keyword)].rstrip()
+        row_mask = pd.Series(True, index=df.index)
+        if match_filters:
+            for match_kw, allowed_values in match_filters.items():
+                match_col = f"{stem} {match_kw}"
+                if match_col in df.columns:
+                    row_mask = row_mask & df[match_col].isin(allowed_values)
+        sub = df[row_mask]
+        present = sub[col].notna() & (sub[col] >= threshold)
         row: dict = {"col": col, "Missing": int((~present).sum())}
         for sp in species_order:
-            row[sp] = int((present & (df[species_col] == sp)).sum())
+            row[sp] = int((present & (sub[species_col] == sp)).sum())
         records.append(row)
 
     counts = pd.DataFrame(records).set_index("col")
@@ -2036,7 +2054,7 @@ def plot_dict_ref_search_windows(
     figsize_windows: tuple = (8, 6),
     iso_row_height: float = 2.0,
     save_dir: Optional[str] = None,
-) -> tuple["plt.Figure", "plt.Figure"]:
+) -> tuple[Figure, Figure]:
     """
     Two-panel diagnostic for dict_ref entries near a given mz_bin.
 
@@ -2050,7 +2068,10 @@ def plot_dict_ref_search_windows(
     if filtered.empty:
         raise ValueError(f"No entries within tolerance {tolerance} of mz_bin {mz_bin}")
     filtered = filtered.sort_values("mz_rank")
-
+    Logger.info(
+        "Filtered dict_ref: %s",
+        filtered[["mz_rank", "mz_bin", "confounders", "count_confounders"]],
+    )
     unique_bins = sorted(filtered["mz_bin"].unique())
     cmap = colormaps["tab10"] if len(unique_bins) <= 10 else colormaps["viridis"]
     n_bins = max(len(unique_bins) - 1, 1)
@@ -2167,7 +2188,7 @@ def plot_quantification_by_run(
     nonzero_color: str = "#1a9850",
     sort_columns: bool = False,
     label_char_range: Optional[tuple[int, int]] = None,
-    dataset_name: Optional[str] = "",
+    dataset_name: str = "",
     fig_dir: Optional[str] = None,
     ax: Optional[plt.Axes] = None,
 ):
