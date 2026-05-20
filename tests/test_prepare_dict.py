@@ -34,18 +34,45 @@ def confound_df():
         |500.02 - 500.00| = 0.02 > 0.01 → outside mz tolerance
         → row 4 has NO confounders
     """
-    return _make_df([
-        {"mz_bin": 500.00, "RT_search_left": 1.0, "RT_search_right": 2.0,
-         "IM_search_left": 0.5, "IM_search_right": 0.7},
-        {"mz_bin": 500.00, "RT_search_left": 1.5, "RT_search_right": 2.5,
-         "IM_search_left": 0.6, "IM_search_right": 0.8},
-        {"mz_bin": 500.00, "RT_search_left": 1.5, "RT_search_right": 2.5,
-         "IM_search_left": 0.9, "IM_search_right": 1.1},
-        {"mz_bin": 500.01, "RT_search_left": 1.0, "RT_search_right": 2.0,
-         "IM_search_left": 0.5, "IM_search_right": 0.7},
-        {"mz_bin": 500.02, "RT_search_left": 1.0, "RT_search_right": 2.0,
-         "IM_search_left": 0.5, "IM_search_right": 0.7},
-    ])
+    return _make_df(
+        [
+            {
+                "mz_bin": 500.00,
+                "RT_search_left": 1.0,
+                "RT_search_right": 2.0,
+                "IM_search_left": 0.5,
+                "IM_search_right": 0.7,
+            },
+            {
+                "mz_bin": 500.00,
+                "RT_search_left": 1.5,
+                "RT_search_right": 2.5,
+                "IM_search_left": 0.6,
+                "IM_search_right": 0.8,
+            },
+            {
+                "mz_bin": 500.00,
+                "RT_search_left": 1.5,
+                "RT_search_right": 2.5,
+                "IM_search_left": 0.9,
+                "IM_search_right": 1.1,
+            },
+            {
+                "mz_bin": 500.01,
+                "RT_search_left": 1.0,
+                "RT_search_right": 2.0,
+                "IM_search_left": 0.5,
+                "IM_search_right": 0.7,
+            },
+            {
+                "mz_bin": 500.02,
+                "RT_search_left": 1.0,
+                "RT_search_right": 2.0,
+                "IM_search_left": 0.5,
+                "IM_search_right": 0.7,
+            },
+        ]
+    )
 
 
 def test_confounders_column_added(confound_df):
@@ -97,7 +124,7 @@ def test_beyond_mz_tolerance_excluded(confound_df):
     assert 1 not in row4_conf  # mz_rank of row 0, |Δmz_bin|=0.02
     assert 2 not in row4_conf  # mz_rank of row 1
     assert 3 not in row4_conf  # mz_rank of row 2
-    assert 4 in row4_conf      # mz_rank of row 3, |Δmz_bin|=0.01 → included
+    assert 4 in row4_conf  # mz_rank of row 3, |Δmz_bin|=0.01 → included
     # row 0 should not see row 4 either
     row0_conf = set(result.loc[result["mz_rank"] == 1, "confounders"].iloc[0])
     assert 5 not in row0_conf

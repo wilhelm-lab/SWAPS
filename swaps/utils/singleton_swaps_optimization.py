@@ -128,6 +128,9 @@ __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.n_peptide_swap_decoys = 1
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.n_off_target_shift_decoys = 1
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.off_target_min_offset_frac = 0.35
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.off_target_max_overlap_fraction = 0.05
+# peptide_swap only: prefer near-isobaric co-eluting candidates (confounders column
+# in dict_ref) as decoy source; falls back to full batch if none are in-batch
+__C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.use_confounder_sampling = True
 
 __C.FDR = ConfigurationNode()
 __C.FDR.TRAIN = 0.05
