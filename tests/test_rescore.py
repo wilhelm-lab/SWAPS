@@ -2,13 +2,19 @@
 Unit tests for postprocessing.rescore:
   - normalize_shift_by_runs
   - combine_matches_target_decoy
+  - brew_with_percolator
 """
 
 import numpy as np
 import pandas as pd
 import pytest
+from unittest.mock import patch, MagicMock
 
-from postprocessing.rescore import combine_matches_target_decoy, normalize_shift_by_runs
+from postprocessing.rescore import (
+    combine_matches_target_decoy,
+    normalize_shift_by_runs,
+    brew_with_percolator,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -138,3 +144,140 @@ class TestCombineMatchesTargetDecoy:
         )
         target_rows = result[result["label"] == True]
         assert (target_rows["decoy_mz_rank"] == -1).all()
+
+
+# ---------------------------------------------------------------------------
+# brew_with_percolator
+# ---------------------------------------------------------------------------
+
+_PERC_PSM_COLS = ["PSMId", "score", "q-value", "posterior_error_prob", "peptide", "proteinIds"]
+
+
+@pytest.fixture
+def percolator_input_df():
+    rng = np.random.default_rng(42)
+    n = 20
+    return pd.DataFrame(
+        {
+            "mz_rank": [f"rank_{i}" for i in range(n)],
+            "Run_name": ["run_A"] * n,
+            "decoy": [False] * (n // 2) + [True] * (n // 2),
+            "modified_sequence": [f"PEP{i}K" for i in range(n)],
+            "proteins": [f"PROT{i}" for i in range(n)],
+            "feature1": rng.normal(0, 1, n),
+            "feature2": rng.uniform(0, 1, n),
+        }
+    )
+
+
+def _make_mock_run(tmp_path):
+    """Returns a subprocess.run side_effect that writes fake percolator output files."""
+    fake_target = pd.DataFrame(
+        {
+            "PSMId": ["id0", "id1"],
+            "score": [0.9, 0.5],
+            "q-value": [0.01, 0.05],
+            "posterior_error_prob": [0.01, 0.05],
+            "peptide": ["PEP0K", "PEP1K"],
+            "proteinIds": ["PROT0", "PROT1"],
+        }
+    )
+    fake_decoy = pd.DataFrame(
+        {
+            "PSMId": ["id10", "id11"],
+            "score": [-0.3, -0.8],
+            "q-value": [0.5, 0.9],
+            "posterior_error_prob": [0.5, 0.9],
+            "peptide": ["PEP10K", "PEP11K"],
+            "proteinIds": ["PROT10", "PROT11"],
+        }
+    )
+    fake_peptides = pd.DataFrame(
+        {
+            "PSMId": ["id0"],
+            "score": [0.9],
+            "q-value": [0.01],
+            "posterior_error_prob": [0.01],
+            "peptide": ["PEP0K"],
+            "proteinIds": ["PROT0"],
+        }
+    )
+
+    def side_effect(cmd, **kwargs):
+        psms_path = cmd[cmd.index("-m") + 1]
+        decoy_psms_path = cmd[cmd.index("-M") + 1]
+        peptides_path = cmd[cmd.index("-r") + 1]
+        fake_target.to_csv(psms_path, sep="\t", index=False)
+        fake_decoy.to_csv(decoy_psms_path, sep="\t", index=False)
+        fake_peptides.to_csv(peptides_path, sep="\t", index=False)
+        return MagicMock(stdout="", stderr="", returncode=0)
+
+    return side_effect
+
+
+class TestBrewWithPercolator:
+    def test_returns_three_dataframes(self, percolator_input_df, tmp_path):
+        with patch("postprocessing.rescore.subprocess.run", side_effect=_make_mock_run(tmp_path)):
+            psms_df, peptides_df, all_psms = brew_with_percolator(
+                percolator_input_df,
+                feature_cols=["feature1", "feature2"],
+                work_dir=str(tmp_path),
+            )
+        assert isinstance(psms_df, pd.DataFrame)
+        assert isinstance(peptides_df, pd.DataFrame)
+        assert isinstance(all_psms, pd.DataFrame)
+
+    def test_all_psms_contains_target_and_decoy(self, percolator_input_df, tmp_path):
+        with patch("postprocessing.rescore.subprocess.run", side_effect=_make_mock_run(tmp_path)):
+            psms_df, _, all_psms = brew_with_percolator(
+                percolator_input_df,
+                feature_cols=["feature1", "feature2"],
+                work_dir=str(tmp_path),
+            )
+        assert set(all_psms["label"].unique()) == {1, -1}
+        assert len(all_psms) == len(psms_df) + len(all_psms[all_psms["label"] == -1])
+
+    def test_percolator_called_with_decoy_flag(self, percolator_input_df, tmp_path):
+        captured = {}
+
+        def capturing_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return _make_mock_run(tmp_path)(cmd, **kwargs)
+
+        with patch("postprocessing.rescore.subprocess.run", side_effect=capturing_run):
+            brew_with_percolator(
+                percolator_input_df,
+                feature_cols=["feature1", "feature2"],
+                work_dir=str(tmp_path),
+            )
+        assert "-M" in captured["cmd"]
+        assert "-m" in captured["cmd"]
+        assert "-r" in captured["cmd"]
+
+    def test_train_test_fdr_passed_to_command(self, percolator_input_df, tmp_path):
+        captured = {}
+
+        def capturing_run(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return _make_mock_run(tmp_path)(cmd, **kwargs)
+
+        with patch("postprocessing.rescore.subprocess.run", side_effect=capturing_run):
+            brew_with_percolator(
+                percolator_input_df,
+                train_fdr=0.05,
+                test_fdr=0.01,
+                feature_cols=["feature1", "feature2"],
+                work_dir=str(tmp_path),
+            )
+        cmd = captured["cmd"]
+        assert cmd[cmd.index("-F") + 1] == "0.05"
+        assert cmd[cmd.index("-f") + 1] == "0.01"
+
+    def test_input_tsv_written(self, percolator_input_df, tmp_path):
+        with patch("postprocessing.rescore.subprocess.run", side_effect=_make_mock_run(tmp_path)):
+            brew_with_percolator(
+                percolator_input_df,
+                feature_cols=["feature1", "feature2"],
+                work_dir=str(tmp_path),
+            )
+        assert (tmp_path / "percolator_input.tsv").exists()

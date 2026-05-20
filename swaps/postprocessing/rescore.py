@@ -1,5 +1,6 @@
 import os
-from typing import Literal, Optional, List
+import subprocess
+from typing import Optional, List
 import pandas as pd
 import numpy as np
 import mokapot
@@ -10,6 +11,66 @@ from tqdm import tqdm
 from sklearn.base import BaseEstimator
 
 Logger = logging.getLogger(__name__)
+
+
+def prepare_percolator_input(
+    df,
+    feature_cols: list,
+    scannr_col: str = "mz_rank",
+    filename_col: str = "Run_name",
+    decoy_col: str = "decoy",
+    peptide_col: str = "modified_sequence",
+    protein_col: str = "proteins",
+):
+    """
+    Prepares input dataframe for percolator analysis by standardizing column names and format.
+    This function takes a pandas DataFrame containing PSM data and reformats it to be compatible
+    with percolator's expected input format. It handles scan numbers, PSM IDs, labels for target/decoy,
+    peptide sequences, and protein information.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Input DataFrame containing PSM data
+    feature_cols : list
+        List of column names containing features to be used for classification
+    scannr_col : str, optional
+        Column name containing MS/MS scan numbers (default: "mz_rank"), this column should be unique
+    filename_col : str, optional
+        Column name containing raw file names (default: "Run_name")
+    decoy_col : str, optional
+        Column name indicating decoy status (default: "decoy")
+    peptide_col : str, optional
+        Column name containing peptide sequences (default: "modified_sequence")
+    protein_col : str, optional
+        Column name containing protein identifiers (default: "proteins")
+    Returns
+    -------
+    pandas.DataFrame
+        Reformatted DataFrame with standardized column names ready for percolator input:
+        id <tab> label <tab> scannr <tab> feature1 <tab> ... <tab>
+            featureN <tab> peptide <tab> proteinId1 <tab> .. <tab> proteinIdM
+        Labels are interpreted as 1 -- positive set and test set, -1 -- negative set.
+        scannr should be integer
+        id should be unique
+    """
+    df_pin = df.copy()
+    df_pin["label"] = 1
+    df_pin.loc[df_pin[decoy_col], "label"] = -1
+    df_pin["id"] = (
+        df_pin["mz_rank"]
+        + "_"
+        + df_pin[filename_col]
+        + "_"
+        + df_pin[decoy_col].astype(str)
+    )
+    df_pin.rename(
+        {scannr_col: "scannr", protein_col: "protein", peptide_col: "peptide"},
+        axis=1,
+        inplace=True,
+    )
+    df_pin = df_pin[["id", "label", "scannr"] + feature_cols + ["peptide", "protein"]]
+    return df_pin
 
 
 def prepare_mokapot_input(
@@ -222,6 +283,132 @@ def brew_with_mokapot(
     )
     plt.close()
     return result, model, psms
+
+
+def brew_with_percolator(
+    peptide_info_dataframe: pd.DataFrame,
+    train_fdr: float = 0.1,
+    test_fdr: float = 0.1,
+    model: Optional[BaseEstimator] = None,
+    work_dir: Optional[str] = None,
+    **kwargs,
+):
+    """
+    Wrapper function to run Percolator rescoring on a given peptide information DataFrame.
+
+    Parameters
+    ----------
+    peptide_info_dataframe : pandas.DataFrame
+        DataFrame containing peptide information and features for Percolator input.
+    train_fdr : float, optional
+        FDR threshold for training (default: 0.1). Passed as -F to percolator.
+    test_fdr : float, optional
+        FDR threshold for reporting results (default: 0.1). Passed as -f to percolator.
+    model : BaseEstimator, optional
+        Unused — kept for API symmetry with brew_with_mokapot.
+    work_dir : str, optional
+        Directory to write input/output files (default: current working directory).
+    **kwargs
+        Forwarded to prepare_percolator_input (e.g. feature_cols, decoy_col, peptide_col).
+
+    Returns
+    -------
+    tuple
+        (psms_df, peptides_df, all_psms) where psms_df contains target PSMs,
+        peptides_df contains target peptides, and all_psms is target + decoy PSMs
+        concatenated with a "label" column (1 = target, -1 = decoy) — mirrors the
+        mokapot return convention.
+    """
+    if work_dir is None:
+        work_dir = os.getcwd()
+    else:
+        os.makedirs(work_dir, exist_ok=True)
+
+    input_path = os.path.join(work_dir, "percolator_input.tsv")
+    psms_path = os.path.join(work_dir, "percolator_psms.tsv")
+    decoy_psms_path = os.path.join(work_dir, "percolator_decoy_psms.tsv")
+    peptides_path = os.path.join(work_dir, "percolator_peptides.tsv")
+
+    pin_df = prepare_percolator_input(peptide_info_dataframe, **kwargs)
+    pin_df.to_csv(input_path, sep="\t", index=False)
+
+    feature_cols = kwargs.get("feature_cols", [])
+    for col in feature_cols:
+        if col in pin_df.columns:
+            for label, group in pin_df.groupby("label"):
+                group[col].hist(bins=100, alpha=0.5, label=label)
+            plt.legend()
+            plt.savefig(
+                os.path.join(work_dir, f"feature_{col}_distr.png"),
+                dpi=300,
+                bbox_inches="tight",
+            )
+            plt.close()
+        else:
+            Logger.info(
+                "Feature column %s not found in percolator input, skipping distribution plot.",
+                col,
+            )
+
+    cmd = [
+        "percolator", "-y", "-I", "separate",
+        "-F", str(train_fdr),
+        "-f", str(test_fdr),
+        "-m", psms_path,
+        "-M", decoy_psms_path,
+        "-r", peptides_path,
+        input_path,
+    ]
+    Logger.info("Running percolator: %s", " ".join(cmd))
+    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    Logger.info("Percolator stdout: %s", proc.stdout)
+    if proc.stderr:
+        Logger.info("Percolator stderr: %s", proc.stderr)
+
+    psms_df = pd.read_csv(psms_path, sep="\t")
+    decoy_psms_df = pd.read_csv(decoy_psms_path, sep="\t")
+    peptides_df = pd.read_csv(peptides_path, sep="\t")
+
+    psms_df["label"] = 1
+    decoy_psms_df["label"] = -1
+    all_psms = pd.concat([psms_df, decoy_psms_df], ignore_index=True)
+
+    Logger.info(
+        "Percolator results: %d target PSMs, %d decoy PSMs, %d peptides",
+        len(psms_df), len(decoy_psms_df), len(peptides_df),
+    )
+
+    psms_sorted = psms_df.sort_values("q-value")
+    psms_sorted = psms_sorted.assign(n_accepted=np.arange(1, len(psms_sorted) + 1))
+    plt.plot(psms_sorted["q-value"], psms_sorted["n_accepted"])
+    plt.xlabel("q-value")
+    plt.ylabel("Number of PSMs")
+    plt.savefig(
+        os.path.join(work_dir, "percolator_qvalues.png"), dpi=300, bbox_inches="tight"
+    )
+    plt.close()
+
+    sns.histplot(data=all_psms, x="score", hue="label", bins=100, multiple="dodge")
+    plt.savefig(
+        os.path.join(work_dir, "percolator_score_distr.png"),
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+    # percolator scores can be negative — log scale on count axis only
+    sns.histplot(
+        data=all_psms, x="score", hue="label", bins=100,
+        multiple="dodge", log_scale=(False, True),
+    )
+    plt.savefig(
+        os.path.join(work_dir, "percolator_score_distr_log.png"),
+        dpi=300,
+        bbox_inches="tight",
+    )
+    plt.close()
+
+    return psms_df, peptides_df, all_psms
 
 
 def combine_matches_target_decoy(matches_target, matches_decoy, dict_ref):
