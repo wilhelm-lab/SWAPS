@@ -698,9 +698,9 @@ def get_roi_descriptor(roi, radius=None, degree=8):
         n_moments = len(
             zernike_moments(np.zeros((3, 3), dtype=np.uint8), 1, degree=degree)
         )
-        Logger.warning(
-            f"Flat ROI detected (shape={roi.shape}), returning zero zernike descriptor."
-        )
+        # Logger.debug(
+        #     f"Flat ROI detected (shape={roi.shape}), returning zero zernike descriptor."
+        # )
         return np.zeros(n_moments, dtype=np.float64)
 
     # 3. Normalize clipped patch

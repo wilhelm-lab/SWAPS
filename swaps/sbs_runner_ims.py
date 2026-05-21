@@ -9,7 +9,6 @@ import time
 import argparse
 import yaml
 import pandas as pd
-import numpy as np
 import directlfq.lfq_manager as lfq_manager
 
 from utils.tools import get_dot_d_paths, report_snap_log_collection
@@ -29,7 +28,7 @@ from prepare_dict.prepare_dict import (
 )
 from prepare_dict.search_engine_output_parser import sage_parser, fragpipe_psm_parser
 from postprocessing.rescore import (
-    brew_with_mokapot,
+    brew_with_percolator,
     normalize_shift_by_runs,
     combine_matches_target_decoy,
 )
@@ -388,7 +387,10 @@ def opt_scan_by_scan(config_path: str):
     tdc_df = combine_matches_target_decoy(
         matches_target_normalized, matches_decoy_normalized, dict_ref
     )
-    result, model, psms = brew_with_mokapot(
+    tdc_df = tdc_df.merge(
+        dict_ref[["mz_rank", "count_confounders"]], on="mz_rank", how="left"
+    )
+    psms, peptide, all_psms = brew_with_percolator(
         tdc_df,
         feature_cols=[
             "im_shift_abs_scaled",
@@ -402,34 +404,28 @@ def opt_scan_by_scan(config_path: str):
             "sift_distance",
             "zernike_distance",
             "template_matching_score",
+            "count_confounders",
         ],
-        scannr_col="feature_instance_id",  # No deduplication btw target and decoy for now
-        psmid_col="Sequence_with_runs",
-        specid_col="Sequence_with_runs",
-        peptide_col="Sequence",
-        protein_col="Proteins",
-        decoy_col="Decoy",
-        model=None,
         train_fdr=cfg.FDR.TRAIN,
         test_fdr=cfg.FDR.TEST,
+        work_dir=os.path.join(quant_dir, "tmp_percolator"),
+        decoy_col="Decoy",
         filename_col="matched_run",
-        work_dir=quant_dir,
+        peptide_col="Sequence",
+        protein_col="Proteins",
     )
     # Filter for the columns passed the makopot filter
-    psms_filtered = psms.loc[(psms["mokapot q-value"] < 0.01) & (psms["label"] == True)]
-    psms_filtered["feature_instance_id"] = psms_filtered["scannr"].str.replace(
-        "_True", "", regex=True
-    )
-    psms_filtered["mz_rank"] = (
-        psms_filtered["feature_instance_id"].str.split("_").str[0].astype(int)
-    )
+    psms["filename"] = psms["PSMId"].str.split("_").apply(lambda x: "_".join(x[1:-1]))
+    psms["mz_rank"] = psms["PSMId"].str.split("_").str[0].astype(int)
+
+    # Filter for the columns passed the makopot filter
+    psms_filtered = psms.loc[(psms["q-value"] < 0.01)]
     pp_match_target_filtered = pp_match_target.merge(
-        psms_filtered[["filename", "mz_rank", "feature_instance_id"]],
-        left_on=["mz_rank", "Run_name", "feature_instance_id"],
-        right_on=["mz_rank", "filename", "feature_instance_id"],
+        psms_filtered[["filename", "mz_rank"]],
+        left_on=["mz_rank", "Run_name"],
+        right_on=["mz_rank", "filename"],
         how="inner",
     )
-    # TODO: filter for intensity threshold
     pp_match_target_filtered.to_parquet(
         os.path.join(quant_dir, "pp_match_target_filtered.parquet"), index=False
     )

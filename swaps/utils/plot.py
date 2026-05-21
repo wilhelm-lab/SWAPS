@@ -1910,6 +1910,9 @@ def plot_intensity_coverage_by_species(
     fig_name_suffix: str = "",
     ax: Optional[plt.Axes] = None,
     fig_dir: Optional[str] = None,
+    separate_by_match_type: bool = False,
+    match_type_col_keyword: str = "Match Type",
+    match_types: Optional[list[str]] = None,
 ) -> tuple[Figure, plt.Axes, pd.DataFrame]:
     """Stacked bar plot of intensity coverage broken down by species and missing values.
 
@@ -1952,6 +1955,20 @@ def plot_intensity_coverage_by_species(
         Optional existing Axes to draw on.
     fig_dir:
         Directory to save PNG + SVG; if None the figure is shown interactively.
+    separate_by_match_type:
+        When True, each run gets two side-by-side grouped bars — one for "MS/MS"
+        identifications (solid) and one for "MBR" match-between-runs (hatched).
+        The match type is read from ``"<stem> <match_type_col_keyword>"`` for each
+        intensity column. Returns a ``dict[str, pd.DataFrame]`` keyed by match type
+        instead of a single DataFrame.
+    match_type_col_keyword:
+        Column keyword used to locate the Match Type columns (default ``"Match Type"``).
+        Only used when ``separate_by_match_type=True``.
+    match_types:
+        Ordered list of match type values to plot as grouped bars (default
+        ``["MS/MS", "MBR", "unmatched"]``). Offsets and hatch patterns are
+        assigned automatically based on the list length. Only used when
+        ``separate_by_match_type=True``.
     """
     int_cols = [c for c in df.columns if int_col_keyword in c]
     if not int_cols:
@@ -1968,6 +1985,135 @@ def plot_intensity_coverage_by_species(
     if species_colors:
         color_map.update(species_colors)
 
+    if separate_by_match_type:
+        if match_types is None:
+            match_types = ["MS/MS", "MBR", "unmatched"]
+        counts_by_type: dict[str, pd.DataFrame] = {}
+        for mt in match_types:
+            mt_records = []
+            for col in int_cols:
+                stem = col[: col.rfind(int_col_keyword)].rstrip()
+                row_mask = pd.Series(True, index=df.index)
+                if match_filters:
+                    for match_kw, allowed_values in match_filters.items():
+                        match_col = f"{stem} {match_kw}"
+                        if match_col in df.columns:
+                            row_mask = row_mask & df[match_col].isin(allowed_values)
+                mt_col = f"{stem} {match_type_col_keyword}"
+                if mt_col in df.columns:
+                    row_mask = row_mask & (df[mt_col] == mt)
+                sub = df[row_mask]
+                present = sub[col].notna() & (sub[col] >= threshold)
+                row: dict = {"col": col, "Not Quantified": int((~present).sum())}
+                for sp in species_order:
+                    row[sp] = int((present & (sub[species_col] == sp)).sum())
+                mt_records.append(row)
+            counts_by_type[mt] = pd.DataFrame(mt_records).set_index("col")
+
+        counts = counts_by_type[match_types[0]]
+        for mt in match_types[1:]:
+            counts = counts.add(counts_by_type[mt], fill_value=0)
+        counts = counts.astype(int)
+        if sort_columns:
+            total_present = counts[species_order].sum(axis=1)
+            counts = counts.loc[total_present.sort_values(ascending=False).index]
+            for mt in match_types:
+                counts_by_type[mt] = counts_by_type[mt].loc[counts.index]
+
+        x_labels = (
+            [label_shorten_fn(c) for c in counts.index]
+            if label_shorten_fn is not None
+            else list(counts.index)
+        )
+        n = len(counts)
+        bar_width = 0.7 / len(match_types)
+        _default_hatches = [None, "///", "xxx", "...", "---", "|||"]
+        offsets = {
+            mt: (i - (len(match_types) - 1) / 2) * bar_width
+            for i, mt in enumerate(match_types)
+        }
+        hatch_map = {mt: _default_hatches[i % len(_default_hatches)] for i, mt in enumerate(match_types)}
+        x = np.arange(n)
+
+        if ax is None:
+            fig, ax = plt.subplots(
+                figsize=(max(10, 1.8 * n + 2), 6),
+                constrained_layout=True,
+            )
+        else:
+            fig = ax.figure
+
+        for mt in match_types:
+            ct = counts_by_type[mt].loc[counts.index]
+            bottom = np.zeros(n)
+            hatch = hatch_map[mt]
+            for sp in species_order:
+                vals = ct[sp].values.astype(float)
+                ax.bar(
+                    x + offsets[mt],
+                    vals,
+                    bottom=bottom,
+                    color=color_map[sp],
+                    width=bar_width,
+                    hatch=hatch,
+                    edgecolor="white",
+                )
+                bottom += vals
+            ax.bar(
+                x + offsets[mt],
+                ct["Not Quantified"].values.astype(float),
+                bottom=bottom,
+                color=missing_color,
+                width=bar_width,
+                hatch=hatch,
+                edgecolor="white",
+            )
+
+        ax.set_xticks(x)
+        ax.set_xticklabels(x_labels, rotation=90, fontsize=8)
+        ax.set_xlabel("Run")
+        ax.set_ylabel("Ion count")
+        ax.set_title(
+            f"Intensity coverage by species — {' vs '.join(match_types)} (threshold={threshold})"
+            + (f" — {dataset_name}" if dataset_name else "")
+        )
+        legend_handles = [
+            patches.Patch(color=color_map[sp], label=sp) for sp in species_order
+        ]
+        legend_handles.append(patches.Patch(color=missing_color, label="Not Quantified"))
+        for mt in match_types:
+            legend_handles.append(
+                patches.Patch(
+                    facecolor="white", edgecolor="black",
+                    hatch=hatch_map[mt] or "", label=mt,
+                )
+            )
+        ax.legend(
+            handles=legend_handles,
+            title="Species / Match Type",
+            bbox_to_anchor=(1.01, 1),
+            loc="upper left",
+        )
+
+        fig_name = f"intensity_coverage_by_species{fig_name_suffix}"
+        if fig_dir is not None:
+            os.makedirs(fig_dir, exist_ok=True)
+            fig.savefig(
+                os.path.join(fig_dir, f"{fig_name}_{dataset_name}.png"),
+                dpi=300,
+                bbox_inches="tight",
+            )
+            fig.savefig(
+                os.path.join(fig_dir, f"{fig_name}_{dataset_name}.svg"),
+                dpi=300,
+                bbox_inches="tight",
+            )
+            plt.close(fig)
+        else:
+            plt.show()
+
+        return fig, ax, pd.concat(counts_by_type, names=["match_type"])
+
     records = []
     for col in int_cols:
         stem = col[: col.rfind(int_col_keyword)].rstrip()
@@ -1979,7 +2125,7 @@ def plot_intensity_coverage_by_species(
                     row_mask = row_mask & df[match_col].isin(allowed_values)
         sub = df[row_mask]
         present = sub[col].notna() & (sub[col] >= threshold)
-        row: dict = {"col": col, "Missing": int((~present).sum())}
+        row: dict = {"col": col, "Not Quantified": int((~present).sum())}
         for sp in species_order:
             row[sp] = int((present & (sub[species_col] == sp)).sum())
         records.append(row)
@@ -2011,10 +2157,10 @@ def plot_intensity_coverage_by_species(
         bottom += vals
     ax.bar(
         x_labels,
-        counts["Missing"].values,
+        counts["Not Quantified"].values,
         bottom=bottom,
         color=missing_color,
-        label="Missing",
+        label="Not Quantified",
         width=0.7,
     )
 

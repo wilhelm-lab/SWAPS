@@ -58,18 +58,19 @@ def prepare_percolator_input(
     df_pin["label"] = 1
     df_pin.loc[df_pin[decoy_col], "label"] = -1
     df_pin["id"] = (
-        df_pin["mz_rank"]
+        df_pin["mz_rank"].astype(str)
         + "_"
         + df_pin[filename_col]
         + "_"
         + df_pin[decoy_col].astype(str)
     )
     df_pin.rename(
-        {scannr_col: "scannr", protein_col: "protein", peptide_col: "peptide"},
+        {scannr_col: "scannr", protein_col: "proteins", peptide_col: "peptide"},
         axis=1,
         inplace=True,
     )
-    df_pin = df_pin[["id", "label", "scannr"] + feature_cols + ["peptide", "protein"]]
+    df_pin["peptide"] = "-." + df_pin["peptide"] + ".-"
+    df_pin = df_pin[["id", "label", "scannr"] + feature_cols + ["peptide", "proteins"]]
     return df_pin
 
 
@@ -289,7 +290,6 @@ def brew_with_percolator(
     peptide_info_dataframe: pd.DataFrame,
     train_fdr: float = 0.1,
     test_fdr: float = 0.1,
-    model: Optional[BaseEstimator] = None,
     work_dir: Optional[str] = None,
     **kwargs,
 ):
@@ -327,55 +327,71 @@ def brew_with_percolator(
     input_path = os.path.join(work_dir, "percolator_input.tsv")
     psms_path = os.path.join(work_dir, "percolator_psms.tsv")
     decoy_psms_path = os.path.join(work_dir, "percolator_decoy_psms.tsv")
-    peptides_path = os.path.join(work_dir, "percolator_peptides.tsv")
 
-    pin_df = prepare_percolator_input(peptide_info_dataframe, **kwargs)
-    pin_df.to_csv(input_path, sep="\t", index=False)
+    if not os.path.exists(input_path):
+        pin_df = prepare_percolator_input(peptide_info_dataframe, **kwargs)
+        pin_df.to_csv(input_path, sep="\t", index=False)
 
-    feature_cols = kwargs.get("feature_cols", [])
-    for col in feature_cols:
-        if col in pin_df.columns:
-            for label, group in pin_df.groupby("label"):
-                group[col].hist(bins=100, alpha=0.5, label=label)
-            plt.legend()
-            plt.savefig(
-                os.path.join(work_dir, f"feature_{col}_distr.png"),
-                dpi=300,
-                bbox_inches="tight",
-            )
-            plt.close()
-        else:
-            Logger.info(
-                "Feature column %s not found in percolator input, skipping distribution plot.",
-                col,
-            )
+        feature_cols = kwargs.get("feature_cols", [])
+        for col in feature_cols:
+            if col in pin_df.columns:
+                for label, group in pin_df.groupby("label"):
+                    group[col].hist(bins=100, alpha=0.5, label=label)
+                plt.legend()
+                plt.savefig(
+                    os.path.join(work_dir, f"feature_{col}_distr.png"),
+                    dpi=300,
+                    bbox_inches="tight",
+                )
+                plt.close()
+            else:
+                Logger.info(
+                    "Feature column %s not found in percolator input, skipping distribution plot.",
+                    col,
+                )
+    else:
+        Logger.info(
+            "Percolator input already exists, skipping preparation: %s", input_path
+        )
 
     cmd = [
-        "percolator", "-y", "-I", "separate",
-        "-F", str(train_fdr),
-        "-f", str(test_fdr),
-        "-m", psms_path,
-        "-M", decoy_psms_path,
-        "-r", peptides_path,
+        "percolator",
+        "-y",
+        "--only-psms",
+        "-I",
+        "separate",
+        # "-F",
+        # str(train_fdr),
+        # "-f",
+        # str(test_fdr),
+        "-m",
+        psms_path,
+        "-M",
+        decoy_psms_path,
         input_path,
     ]
     Logger.info("Running percolator: %s", " ".join(cmd))
-    proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"Percolator failed (exit {e.returncode}):\n{e.stderr}"
+        ) from e
     Logger.info("Percolator stdout: %s", proc.stdout)
     if proc.stderr:
         Logger.info("Percolator stderr: %s", proc.stderr)
 
     psms_df = pd.read_csv(psms_path, sep="\t")
     decoy_psms_df = pd.read_csv(decoy_psms_path, sep="\t")
-    peptides_df = pd.read_csv(peptides_path, sep="\t")
 
     psms_df["label"] = 1
     decoy_psms_df["label"] = -1
     all_psms = pd.concat([psms_df, decoy_psms_df], ignore_index=True)
 
     Logger.info(
-        "Percolator results: %d target PSMs, %d decoy PSMs, %d peptides",
-        len(psms_df), len(decoy_psms_df), len(peptides_df),
+        "Percolator results: %d target PSMs, %d decoy PSMs",
+        len(psms_df),
+        len(decoy_psms_df),
     )
 
     psms_sorted = psms_df.sort_values("q-value")
@@ -398,8 +414,12 @@ def brew_with_percolator(
 
     # percolator scores can be negative — log scale on count axis only
     sns.histplot(
-        data=all_psms, x="score", hue="label", bins=100,
-        multiple="dodge", log_scale=(False, True),
+        data=all_psms,
+        x="score",
+        hue="label",
+        bins=100,
+        multiple="dodge",
+        log_scale=(False, True),
     )
     plt.savefig(
         os.path.join(work_dir, "percolator_score_distr_log.png"),
@@ -408,7 +428,7 @@ def brew_with_percolator(
     )
     plt.close()
 
-    return psms_df, peptides_df, all_psms
+    return psms_df, None, all_psms
 
 
 def combine_matches_target_decoy(matches_target, matches_decoy, dict_ref):
