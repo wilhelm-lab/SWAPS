@@ -288,8 +288,6 @@ def brew_with_mokapot(
 
 def brew_with_percolator(
     peptide_info_dataframe: pd.DataFrame,
-    train_fdr: float = 0.1,
-    test_fdr: float = 0.1,
     work_dir: Optional[str] = None,
     **kwargs,
 ):
@@ -429,6 +427,51 @@ def brew_with_percolator(
     plt.close()
 
     return psms_df, None, all_psms
+
+
+def split_pp_by_match_status(
+    dict_ref: pd.DataFrame,
+    pp_match_target: pd.DataFrame,
+    pp_match_decoy: pd.DataFrame,
+) -> tuple:
+    """Split pp_match_target/decoy into Not_Match vs Reference/Quant_Only subsets.
+
+    Returns (pp_not_match, pp_msms, pp_decoy_not_match).  pp_not_match and
+    pp_decoy_not_match contain only run-peptide pairs labelled Not_Match in
+    dict_ref (candidates for MBR rescoring); pp_msms contains pairs labelled
+    Reference or Quant_Only (passed through directly as MS/MS identifications).
+    """
+    file_cols = [
+        col
+        for col in dict_ref.columns
+        if dict_ref[col].dtype == object
+        and dict_ref[col].isin(["Not_Match", "Reference", "Quant_Only"]).any()
+    ]
+    long = dict_ref[["mz_rank"] + file_cols].melt(
+        id_vars="mz_rank", var_name="Run_name", value_name="match_type"
+    )
+    not_match_keys = long.loc[
+        long["match_type"] == "Not_Match", ["mz_rank", "Run_name"]
+    ].drop_duplicates()
+    msms_keys = long.loc[
+        long["match_type"].isin(["Reference", "Quant_Only"]), ["mz_rank", "Run_name"]
+    ].drop_duplicates()
+
+    pp_not_match = pp_match_target.merge(
+        not_match_keys, on=["mz_rank", "Run_name"], how="inner"
+    )
+    pp_msms = pp_match_target.merge(msms_keys, on=["mz_rank", "Run_name"], how="inner")
+    pp_decoy_not_match = pp_match_decoy.merge(
+        not_match_keys, on=["mz_rank", "Run_name"], how="inner"
+    )
+
+    Logger.info(
+        "split_pp_by_match_status: %d Not_Match target, %d MS/MS target, %d Not_Match decoy",
+        len(pp_not_match),
+        len(pp_msms),
+        len(pp_decoy_not_match),
+    )
+    return pp_not_match, pp_msms, pp_decoy_not_match
 
 
 def combine_matches_target_decoy(matches_target, matches_decoy, dict_ref):

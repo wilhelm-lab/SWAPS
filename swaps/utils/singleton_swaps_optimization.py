@@ -136,3 +136,4 @@ __C.FDR = ConfigurationNode()
 __C.FDR.TRAIN = 0.05
 __C.FDR.TEST = 0.01
 __C.FDR.INT_THRES = 100  # intensity threshold for FDR; 0 means no threshold
+__C.FDR.ONLY_SCORE_MATCH = False  # if True, exclude Reference/Quant_Only run-peptide pairs from rescoring and pass them directly as "MS/MS" in the output
