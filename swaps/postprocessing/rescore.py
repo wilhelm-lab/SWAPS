@@ -358,6 +358,7 @@ def brew_with_percolator(
         "--only-psms",
         "-I",
         "separate",
+        "--no-terminate",
         # "-F",
         # str(train_fdr),
         # "-f",
