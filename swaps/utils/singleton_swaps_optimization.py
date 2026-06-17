@@ -9,7 +9,9 @@ swaps_optimization_cfg = __C
 __C.DESCRIPTION = "Default config from the Singleton"
 __C.DEBUG = False
 __C.SWA = True  # whether to perform scan-wise activation; if False, skips SWA and saves dict_ref with empty activation, useful for debugging downstream steps without running SWA
-__C.DATA_PATH = []  # path(s) to raw data directories (.d or .mzml); accepts a single string or a list of strings
+__C.DATA_PATH = (
+    []
+)  # path(s) to raw data directories (.d or .mzml); accepts a single string or a list of strings
 __C.EXCLUDE_DATASET_NAME = (
     []
 )  # list of dataset names to exclude, e.g. ["20230515_HeLa_100ng_1", "125pg_ddaPASEF_a000_2R_150ms_500SPD_S2-C7_1_19515.d"]
@@ -128,8 +130,12 @@ __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.n_peptide_swap_decoys = 1
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.n_off_target_shift_decoys = 1
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.off_target_min_offset_frac = 0.35
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.off_target_max_overlap_fraction = 0.05
+# peptide_swap only: prefer near-isobaric co-eluting candidates (confounders column
+# in dict_ref) as decoy source; falls back to full batch if none are in-batch
+__C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.use_confounder_sampling = True
 
 __C.FDR = ConfigurationNode()
 __C.FDR.TRAIN = 0.05
 __C.FDR.TEST = 0.01
 __C.FDR.INT_THRES = 100  # intensity threshold for FDR; 0 means no threshold
+__C.FDR.ONLY_SCORE_MATCH = True  # if True, exclude Reference/Quant_Only run-peptide pairs from rescoring and pass them directly as "MS/MS" in the output

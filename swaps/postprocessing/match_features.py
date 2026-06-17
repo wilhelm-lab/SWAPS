@@ -238,6 +238,25 @@ def _feature_instance_id(mz_rank: int, anchor_id: int) -> str:
     return f"{mz_rank}_{anchor_id}"
 
 
+def _confounder_pool(
+    pept_idx: int, batch_np: np.ndarray, dict_ref_by_mz: pd.DataFrame
+) -> np.ndarray:
+    """Return mz_ranks of in-batch confounders for pept_idx, empty if unavailable.
+
+    Confounders are near-isobaric co-eluting candidates stored in dict_ref.
+    We restrict to the current batch because activation data is only loaded
+    for in-batch mz_ranks.  Cross-batch splits are rare (~1% of candidates)
+    since confounder groups span at most ~28 mz_ranks vs batch sizes of ~1500.
+    """
+    if "confounders" not in dict_ref_by_mz.columns:
+        return np.empty(0, dtype=batch_np.dtype)
+    conf = dict_ref_by_mz.at[pept_idx, "confounders"]
+    if not isinstance(conf, np.ndarray) or conf.size == 0:
+        return np.empty(0, dtype=batch_np.dtype)
+    in_batch = np.intersect1d(conf, batch_np)
+    return in_batch[in_batch != pept_idx].astype(batch_np.dtype)
+
+
 def _parse_seg_mask_thres(val, default: tuple[int, int] = (3, 3)) -> tuple[int, int]:
     if isinstance(val, dict):
         return (int(val.get("rt", default[0])), int(val.get("im", default[1])))
@@ -475,6 +494,14 @@ def match_features_batch(
             if match_decoy and batch_np.size > 1
             else np.array([], dtype=batch_np.dtype)
         )
+        _use_confounder_sampling = bool(
+            _consensus_decoy_kwargs.get("use_confounder_sampling", True)
+        )
+        _confounder_in_batch = (
+            _confounder_pool(int(pept_idx), batch_np, dict_ref_by_mz)
+            if _use_confounder_sampling
+            else np.array([], dtype=batch_np.dtype)
+        )
         _peptide_swap_decoys_by_rep: list[dict[str, dict[str, Any]]] = []
         if (
             match_decoy
@@ -496,7 +523,12 @@ def match_features_batch(
                         )
                         _plot_labels.append(_plot_rf)
                         continue
-                    _decoy_mz = int(np.random.choice(_batch_exclude))
+                    _decoy_pool = (
+                        _confounder_in_batch
+                        if _confounder_in_batch.size > 0
+                        else _batch_exclude
+                    )
+                    _decoy_mz = int(np.random.choice(_decoy_pool))
                     _decoy_act_df = _select_mz(act_dfs[_plot_rf], _decoy_mz)
                     _decoy_raw, _, _ = get_pept_act_from_parquet(
                         _decoy_act_df,
