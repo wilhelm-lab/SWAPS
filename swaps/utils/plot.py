@@ -1924,6 +1924,365 @@ def plot_match_type_from_combined(
     )
 
 
+
+def label_fn_from_part(n: int):
+    """Return a label_fn that extracts the nth underscore-separated part (1-based) from a column name."""
+    def _fn(col: str) -> str:
+        parts = col.split("_")
+        return parts[n - 1] if len(parts) >= n else col
+    return _fn
+
+
+def _default_label_fn(col: str) -> str:
+    import re
+    m = re.search(r"\d{5,6}", col)
+    return m.group(0) if m else col
+
+
+def plot_match_type_comparison(
+    df_swaps: pd.DataFrame,
+    df_ionquant: pd.DataFrame,
+    *,
+    match_type_col_keyword: str = "Match Type",
+    int_col_keyword: Optional[str] = None,
+    colors: Optional[dict] = None,
+    stack_order: Optional[list] = None,
+    iq_stack_order: Optional[list] = None,
+    label_fn=None,
+    is_quant: bool = False,
+    swaps_quant_keyword: Optional[str] = None,
+    iq_quant_keyword: Optional[str] = None,
+    quant_thres: float = 0,
+    fig_dir: Optional[str] = None,
+    fig_name_suffix: str = "",
+) -> tuple:
+    """Side-by-side stacked bar comparison of Match Type counts for SWAPS vs IonQuant.
+
+    For each experiment extracted from column names, draws two adjacent stacked
+    bars — IonQuant (left, solid) and SWAPS (right, hatched). Experiments are
+    sorted lexicographically by their extracted label.
+
+    ``label_fn``: callable ``(col_name: str) -> str`` applied to each Match Type
+    column to produce the x-axis label. Defaults to extracting the first 5-or-6
+    digit run number. Use ``label_fn_from_part(n)`` to extract the nth
+    underscore-separated field instead.
+    ``iq_stack_order`` controls the stacking order for the IonQuant bars
+    independently of ``stack_order`` used for SWAPS.
+    When ``is_quant=True``, columns matching ``swaps_quant_keyword`` /
+    ``iq_quant_keyword`` are used instead of Match Type columns: values above
+    ``quant_thres`` count as "Quantified", all others as "Not Quantified".
+    """
+    import re  # noqa: F401 – kept for potential use in label_fn closures
+    if label_fn is None:
+        label_fn = _default_label_fn
+
+    if colors is None:
+        colors = {
+            "MS/MS": "#55A868",
+            "MS/MS Quant": "#55A868",
+            "MS/MS Ref": "#4C72B0",
+            "MBR": "#C44E52",
+            "unmatched": "#BBBBBB",
+            "Zero Quant": "#DD8452",
+            "Quantified": "#55A868",
+            "Not Quantified": "#BBBBBB",
+        }
+    if is_quant:
+        if stack_order is None:
+            stack_order = ["Quantified", "Not Quantified"]
+        if iq_stack_order is None:
+            iq_stack_order = ["Quantified", "Not Quantified"]
+    else:
+        if stack_order is None:
+            stack_order = ["MS/MS", "MS/MS Quant", "MS/MS Ref", "MBR", "unmatched", "Zero Quant"]
+        if iq_stack_order is None:
+            iq_stack_order = ["MS/MS", "Zero Quant", "MBR", "unmatched"]
+
+    def _build_counts(df: pd.DataFrame, quant_keyword: Optional[str] = None) -> pd.DataFrame:
+        if is_quant:
+            assert quant_keyword, "swaps_quant_keyword / iq_quant_keyword must be set when is_quant=True"
+            quant_cols = [c for c in df.columns if quant_keyword in c]
+            counts_dict = {}
+            for col in quant_cols:
+                label = label_fn(col)
+                vals = pd.to_numeric(df[col], errors="coerce")
+                vc = pd.Series({
+                    "Quantified": (vals > quant_thres).sum(),
+                    "Not Quantified": (vals <= quant_thres).sum(),
+                })
+                counts_dict[label] = vc
+        else:
+            match_cols = [c for c in df.columns if match_type_col_keyword in c]
+            counts_dict = {}
+            for col in match_cols:
+                label = label_fn(col)
+                int_col = (
+                    col.replace(match_type_col_keyword, int_col_keyword)
+                    if int_col_keyword
+                    else None
+                )
+                mt_series = df[col].replace("MS/MS Ref", "MS/MS")
+                if int_col and int_col in df.columns and int_col != col:
+                    mask_zero = (df[int_col] == 0) & (mt_series != "unmatched")
+                    vc = mt_series.loc[~mask_zero].value_counts(dropna=True)
+                    vc["Zero Quant"] = mask_zero.sum()
+                else:
+                    vc = mt_series.value_counts(dropna=True)
+                counts_dict[label] = vc
+        counts = pd.DataFrame(counts_dict).T.fillna(0)
+        ordered = [c for c in stack_order if c in counts.columns]
+        return counts[ordered]
+
+    counts_iq = _build_counts(df_ionquant, quant_keyword=iq_quant_keyword)
+    counts_sw = _build_counts(df_swaps, quant_keyword=swaps_quant_keyword)
+
+    # align both to the same experiment order; each source keeps its own category order
+    exp_ids = sorted(counts_iq.index.union(counts_sw.index))
+    iq_cats = [c for c in iq_stack_order if c in counts_iq.columns]
+    sw_cats = [c for c in stack_order if c in counts_sw.columns]
+    counts_iq = counts_iq.reindex(index=exp_ids, columns=iq_cats, fill_value=0)
+    counts_sw = counts_sw.reindex(index=exp_ids, columns=sw_cats, fill_value=0)
+
+    n = len(exp_ids)
+    bar_w = 0.38
+    gap = 0.06
+    group_spacing = 1.0
+    x_centers = np.arange(n) * group_spacing
+    x_iq = x_centers - (bar_w / 2 + gap / 2)
+    x_sw = x_centers + (bar_w / 2 + gap / 2)
+
+    fig, ax = plt.subplots(figsize=(max(8, n * 1.2 + 2), 6), constrained_layout=True)
+
+    def _draw_stacked(x_pos, counts_df, cats, hatch=None):
+        bottoms = np.zeros(n)
+        for cat in cats:
+            vals = counts_df[cat].values
+            bars = ax.bar(
+                x_pos,
+                vals,
+                width=bar_w,
+                bottom=bottoms,
+                color=colors.get(cat, "#999999"),
+                hatch=hatch,
+                edgecolor="white" if hatch is None else "black",
+                label=cat,
+            )
+            for bar, v in zip(bars, vals):
+                if v > 0:
+                    ax.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        bar.get_y() + v / 2,
+                        str(int(v)),
+                        ha="center",
+                        va="center",
+                        fontsize=7,
+                    )
+            bottoms += vals
+
+    _draw_stacked(x_iq, counts_iq, iq_cats, hatch=None)
+    _draw_stacked(x_sw, counts_sw, sw_cats, hatch="//")
+
+    ax.set_xlim(x_iq[0] - bar_w / 2 - 0.25, x_sw[-1] + bar_w / 2 + 0.25)
+    ax.set_xticks(x_centers)
+    ax.set_xticklabels(list(exp_ids), rotation=45, ha="right")
+    ax.set_xlabel("Experiment")
+    ax.set_ylabel("Count")
+    ax.set_title(
+        f"Match Type Counts: IonQuant vs SWAPS{' (' + fig_name_suffix.strip('_') + ')' if fig_name_suffix else ''}"
+    )
+
+    # deduplicated legend: categories + source hatching
+    seen = set()
+    handles, lbls = [], []
+    for h, l in zip(*ax.get_legend_handles_labels()):
+        if l not in seen:
+            seen.add(l)
+            handles.append(h)
+            lbls.append(l)
+    handles += [
+        patches.Patch(facecolor="white", edgecolor="black", label="IonQuant (solid)"),
+        patches.Patch(
+            facecolor="white", edgecolor="black", hatch="//", label="SWAPS (hatched)"
+        ),
+    ]
+    lbls += ["IonQuant (solid)", "SWAPS (hatched)"]
+    ax.legend(
+        handles=handles,
+        labels=lbls,
+        title="Category / Source",
+        bbox_to_anchor=(1.02, 1),
+        loc="upper left",
+    )
+
+    fig_name = f"match_type_comparison{fig_name_suffix}"
+    if fig_dir is not None:
+        os.makedirs(fig_dir, exist_ok=True)
+        fig.savefig(
+            os.path.join(fig_dir, f"{fig_name}.png"), dpi=300, bbox_inches="tight"
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f"{fig_name}.svg"), dpi=300, bbox_inches="tight"
+        )
+        plt.close(fig)
+    else:
+        plt.show()
+    return fig, ax
+
+
+def plot_intensity_correlation_by_match_type(
+    df_swaps: pd.DataFrame,
+    df_ionquant: pd.DataFrame,
+    *,
+    match_type_col_keyword: str = "Match Type",
+    int_col_keyword: str = "Intensity",
+    mbr_label: str = "MBR",
+    unmatched_label: str = "unmatched",
+    min_rows: int = 10,
+    fig_dir: Optional[str] = None,
+    fig_name_suffix: str = "",
+) -> tuple:
+    """Bar plot with error bars of pairwise Pearson correlations of log2 intensities.
+
+    For each of the C(n_runs, 2) experiment pairs, computes Pearson r on
+    log2-transformed intensities after filtering rows by Match Type combination.
+    Bars show mean ± std across all valid pairs (>= min_rows rows after filtering).
+
+    Four conditions:
+      1. MS/MS – MS/MS : both runs identified via MS/MS (any "MS/MS*" label)
+      2. MS/MS – MBR   : one run MS/MS, the other MBR (order-symmetric)
+      3. MBR – MBR     : both runs matched via MBR
+      4. All identified : neither unmatched nor zero-intensity in either run
+    """
+    from itertools import combinations
+
+    def _pairwise_corrs(
+        df: pd.DataFrame,
+    ) -> tuple[dict[str, list[float]], dict[str, list[int]]]:
+        mt_cols = [c for c in df.columns if match_type_col_keyword in c]
+        runs = []
+        for mt_col in mt_cols:
+            int_col = mt_col.replace(match_type_col_keyword, int_col_keyword)
+            if int_col in df.columns:
+                runs.append((mt_col, int_col))
+
+        condition_labels = [
+            "MS/MS – MS/MS",
+            "MS/MS – MBR",
+            "MBR – MBR",
+            "All Quantified",
+        ]
+        corrs: dict[str, list[float]] = {k: [] for k in condition_labels}
+        counts: dict[str, list[int]] = {k: [] for k in condition_labels}
+
+        for (mt_i, int_i), (mt_j, int_j) in combinations(runs, 2):
+            mti = df[mt_i]
+            mtj = df[mt_j]
+            vi = df[int_i]
+            vj = df[int_j]
+
+            ms2_i = mti.str.contains("MS/MS", na=False)
+            ms2_j = mtj.str.contains("MS/MS", na=False)
+            mbr_i = mti == mbr_label
+            mbr_j = mtj == mbr_label
+            pos = (vi > 0) & (vj > 0)
+
+            masks = {
+                "MS/MS – MS/MS": ms2_i & ms2_j & pos,
+                "MS/MS – MBR": ((ms2_i & mbr_j) | (mbr_i & ms2_j)) & pos,
+                "MBR – MBR": mbr_i & mbr_j & pos,
+                "All Quantified": ~(mti == unmatched_label)
+                & ~(mtj == unmatched_label)
+                & pos,
+            }
+            for cond, mask in masks.items():
+                sub_i = vi[mask]
+                sub_j = vj[mask]
+                n_rows = len(sub_i)
+                if n_rows >= min_rows:
+                    r, _ = stats.pearsonr(np.log2(sub_i), np.log2(sub_j))
+                    corrs[cond].append(r)
+                    counts[cond].append(n_rows)
+        return corrs, counts
+
+    corrs_iq, counts_iq = _pairwise_corrs(df_ionquant)
+    corrs_sw, counts_sw = _pairwise_corrs(df_swaps)
+
+    conditions = list(corrs_iq.keys())
+    n = len(conditions)
+    bar_w = 0.35
+    gap = 0.06
+    x_centers = np.arange(n, dtype=float)
+    x_iq = x_centers - (bar_w / 2 + gap / 2)
+    x_sw = x_centers + (bar_w / 2 + gap / 2)
+
+    iq_color = "#4C72B0"
+    sw_color = "#C44E52"
+
+    fig, ax = plt.subplots(figsize=(max(8, n * 1.5 + 2), 5), constrained_layout=True)
+
+    def _draw_bars(x_pos, corrs, color, hatch, label):
+        means = [np.mean(corrs[c]) if corrs[c] else np.nan for c in conditions]
+        stds = [
+            np.std(corrs[c], ddof=1) if len(corrs[c]) > 1 else 0.0 for c in conditions
+        ]
+        bar_containers = ax.bar(
+            x_pos,
+            means,
+            width=bar_w,
+            yerr=stds,
+            color=color,
+            hatch=hatch,
+            edgecolor="black",
+            capsize=5,
+            error_kw={"elinewidth": 1.2, "capthick": 1.2},
+            label=label,
+        )
+        for bar, m in zip(bar_containers, means):
+            if not np.isnan(m):
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    bar.get_height() + 0.005,
+                    f"{m:.3f}",
+                    ha="center",
+                    va="bottom",
+                    fontsize=7,
+                )
+
+    _draw_bars(x_iq, corrs_iq, iq_color, hatch=None, label="IonQuant")
+    _draw_bars(x_sw, corrs_sw, sw_color, hatch="//", label="SWAPS")
+
+    ax.set_xticks(x_centers)
+    ax.set_xticklabels(conditions, rotation=20, ha="right")
+    ax.set_xlabel("Match Type Combination")
+    ax.set_ylabel("Pearson r  (log₂ intensity)")
+    ax.set_ylim(bottom=0)
+    ax.set_title(
+        f"Pairwise Intensity Correlation by Match Type{' (' + fig_name_suffix.strip('_') + ')' if fig_name_suffix else ''}"
+    )
+    ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left")
+
+    fig_name = f"intensity_correlation_match_type{fig_name_suffix}"
+    if fig_dir is not None:
+        os.makedirs(fig_dir, exist_ok=True)
+        fig.savefig(
+            os.path.join(fig_dir, f"{fig_name}.png"), dpi=300, bbox_inches="tight"
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f"{fig_name}.svg"), dpi=300, bbox_inches="tight"
+        )
+        plt.close(fig)
+    else:
+        plt.show()
+
+    data = {
+        "corrs_ionquant": corrs_iq,
+        "corrs_swaps": corrs_sw,
+        "row_counts_ionquant": counts_iq,
+        "row_counts_swaps": counts_sw,
+    }
+    return fig, ax, data
+
+
 def plot_intensity_coverage_by_species(
     df: pd.DataFrame,
     *,
