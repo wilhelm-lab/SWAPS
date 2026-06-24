@@ -1663,6 +1663,10 @@ def plot_run_summary(
     id_cols
         [nonzero_quant] Columns to exclude from plotting.
     int_col_keyword
+        [match_type] Keyword identifying the intensity column per run (e.g. ``"Intensity"``).
+        Derived by replacing ``"Match Type"`` in each match-type column name. When found,
+        rows with zero intensity are counted as ``"Zero Quant"`` and match types are only
+        counted for non-zero rows.
         [nonzero_quant] Only columns whose name contains this substring are plotted.
     zero_color
         [nonzero_quant] Color for zero / missing counts.
@@ -1696,14 +1700,33 @@ def plot_run_summary(
                 "MS/MS Ref": "#4C72B0",
                 "MBR": "#C44E52",
                 "unmatched": "#BBBBBB",
+                "Zero Quant": "#DD8452",
             }
         if stack_order is None:
-            stack_order = ["MS/MS", "MS/MS Quant", "MS/MS Ref", "MBR", "unmatched"]
+            stack_order = [
+                "MS/MS",
+                "MS/MS Quant",
+                "MS/MS Ref",
+                "MBR",
+                "unmatched",
+                "Zero Quant",
+            ]
 
         match_type_cols = [col for col in df.columns if "Match Type" in col]
-        counts_dict = {
-            col: df[col].value_counts(dropna=True) for col in match_type_cols
-        }
+        counts_dict = {}
+        for col in match_type_cols:
+            int_col = (
+                col.replace("Match Type", int_col_keyword)
+                if int_col_keyword is not None
+                else None
+            )
+            if int_col is not None and int_col in df.columns and int_col != col:
+                mask_zero_quant = (df[int_col] == 0) & (df[col] != "unmatched")
+                mt_counts = df.loc[~mask_zero_quant, col].value_counts(dropna=True)
+                mt_counts["Zero Quant"] = mask_zero_quant.sum()
+            else:
+                mt_counts = df[col].value_counts(dropna=True)
+            counts_dict[col] = mt_counts
         counts = pd.DataFrame(counts_dict).T.fillna(0)
         ordered_cols = [c for c in stack_order if c in counts.columns]
         counts = counts[ordered_cols]
@@ -1880,12 +1903,19 @@ def plot_run_summary(
 
 
 def plot_match_type_from_combined(
-    df, colors=None, labels=None, stack_order=None, fig_dir=None, fig_name_suffix=""
+    df,
+    int_col_keyword=None,
+    colors=None,
+    labels=None,
+    stack_order=None,
+    fig_dir=None,
+    fig_name_suffix="",
 ):
     """Backward-compatible wrapper around plot_run_summary(mode='match_type')."""
     return plot_run_summary(
         df,
         mode="match_type",
+        int_col_keyword=int_col_keyword,
         colors=colors,
         labels=labels,
         stack_order=stack_order,
@@ -1986,10 +2016,20 @@ def plot_intensity_coverage_by_species(
         color_map.update(species_colors)
 
     if separate_by_match_type:
-        if match_types is None:
-            match_types = ["MS/MS", "MBR", "unmatched"]
+        # Discover match types from data (like value_counts in plot_match_type_comparison)
+        if match_types is not None:
+            found_types = list(match_types)
+        else:
+            all_mt: set[str] = set()
+            for col in int_cols:
+                stem = col[: col.rfind(int_col_keyword)].rstrip()
+                mt_col = f"{stem} {match_type_col_keyword}"
+                if mt_col in df.columns:
+                    all_mt.update(df[mt_col].dropna().unique())
+            found_types = sorted(all_mt)
+
         counts_by_type: dict[str, pd.DataFrame] = {}
-        for mt in match_types:
+        for mt in found_types:
             mt_records = []
             for col in int_cols:
                 stem = col[: col.rfind(int_col_keyword)].rstrip()
@@ -2003,22 +2043,58 @@ def plot_intensity_coverage_by_species(
                 if mt_col in df.columns:
                     row_mask = row_mask & (df[mt_col] == mt)
                 sub = df[row_mask]
-                present = sub[col].notna() & (sub[col] >= threshold)
-                row: dict = {"col": col, "Not Quantified": int((~present).sum())}
+                # unmatched rows have no intensity by definition — count all of them
+                if mt == "unmatched":
+                    mask = pd.Series(True, index=sub.index)
+                else:
+                    mask = sub[col].notna() & (sub[col] >= threshold)
+                row: dict = {"col": col}
                 for sp in species_order:
-                    row[sp] = int((present & (sub[species_col] == sp)).sum())
+                    row[sp] = int((mask & (sub[species_col] == sp)).sum())
                 mt_records.append(row)
             counts_by_type[mt] = pd.DataFrame(mt_records).set_index("col")
 
-        counts = counts_by_type[match_types[0]]
-        for mt in match_types[1:]:
+        # Add "Zero Quant" only when matched (MS/MS or MBR) entries fall below threshold
+        # (mirrors Zero Quant logic in plot_match_type_comparison)
+        nq_records = []
+        has_zero_quant = False
+        for col in int_cols:
+            stem = col[: col.rfind(int_col_keyword)].rstrip()
+            row_mask = pd.Series(True, index=df.index)
+            if match_filters:
+                for match_kw, allowed_values in match_filters.items():
+                    match_col = f"{stem} {match_kw}"
+                    if match_col in df.columns:
+                        row_mask = row_mask & df[match_col].isin(allowed_values)
+            sub = df[row_mask]
+            mt_col = f"{stem} {match_type_col_keyword}"
+            not_unmatched = (
+                sub[mt_col] != "unmatched"
+                if mt_col in sub.columns
+                else pd.Series(True, index=sub.index)
+            )
+            below_threshold = sub[col].isna() | (sub[col] < threshold)
+            zero_quant_mask = not_unmatched & below_threshold
+            row: dict = {"col": col}
+            for sp in species_order:
+                row[sp] = int((zero_quant_mask & (sub[species_col] == sp)).sum())
+            if not has_zero_quant and any(row[sp] > 0 for sp in species_order):
+                has_zero_quant = True
+            nq_records.append(row)
+
+        if has_zero_quant:
+            counts_by_type["Zero Quant"] = pd.DataFrame(nq_records).set_index("col")
+        all_bar_types = found_types + (["Zero Quant"] if has_zero_quant else [])
+
+        counts = counts_by_type[found_types[0]].copy()
+        for mt in found_types[1:]:
             counts = counts.add(counts_by_type[mt], fill_value=0)
         counts = counts.astype(int)
         if sort_columns:
             total_present = counts[species_order].sum(axis=1)
             counts = counts.loc[total_present.sort_values(ascending=False).index]
-            for mt in match_types:
-                counts_by_type[mt] = counts_by_type[mt].loc[counts.index]
+            for bt in all_bar_types:
+                counts_by_type[bt] = counts_by_type[bt].loc[counts.index]
 
         x_labels = (
             [label_shorten_fn(c) for c in counts.index]
@@ -2026,13 +2102,16 @@ def plot_intensity_coverage_by_species(
             else list(counts.index)
         )
         n = len(counts)
-        bar_width = 0.7 / len(match_types)
+        bar_width = 0.7 / len(all_bar_types)
         _default_hatches = [None, "///", "xxx", "...", "---", "|||"]
         offsets = {
-            mt: (i - (len(match_types) - 1) / 2) * bar_width
-            for i, mt in enumerate(match_types)
+            bt: (i - (len(all_bar_types) - 1) / 2) * bar_width
+            for i, bt in enumerate(all_bar_types)
         }
-        hatch_map = {mt: _default_hatches[i % len(_default_hatches)] for i, mt in enumerate(match_types)}
+        hatch_map = {
+            bt: _default_hatches[i % len(_default_hatches)]
+            for i, bt in enumerate(all_bar_types)
+        }
         x = np.arange(n)
 
         if ax is None:
@@ -2043,14 +2122,14 @@ def plot_intensity_coverage_by_species(
         else:
             fig = ax.figure
 
-        for mt in match_types:
-            ct = counts_by_type[mt].loc[counts.index]
+        for bt in all_bar_types:
+            ct = counts_by_type[bt].loc[counts.index]
             bottom = np.zeros(n)
-            hatch = hatch_map[mt]
+            hatch = hatch_map[bt]
             for sp in species_order:
                 vals = ct[sp].values.astype(float)
                 ax.bar(
-                    x + offsets[mt],
+                    x + offsets[bt],
                     vals,
                     bottom=bottom,
                     color=color_map[sp],
@@ -2059,33 +2138,25 @@ def plot_intensity_coverage_by_species(
                     edgecolor="white",
                 )
                 bottom += vals
-            ax.bar(
-                x + offsets[mt],
-                ct["Not Quantified"].values.astype(float),
-                bottom=bottom,
-                color=missing_color,
-                width=bar_width,
-                hatch=hatch,
-                edgecolor="white",
-            )
 
         ax.set_xticks(x)
-        ax.set_xticklabels(x_labels, rotation=90, fontsize=8)
+        ax.set_xticklabels(x_labels, rotation=90)
         ax.set_xlabel("Run")
         ax.set_ylabel("Ion count")
         ax.set_title(
-            f"Intensity coverage by species — {' vs '.join(match_types)} (threshold={threshold})"
+            f"Intensity coverage by species — {' vs '.join(found_types)} (threshold={threshold})"
             + (f" — {dataset_name}" if dataset_name else "")
         )
         legend_handles = [
             patches.Patch(color=color_map[sp], label=sp) for sp in species_order
         ]
-        legend_handles.append(patches.Patch(color=missing_color, label="Not Quantified"))
-        for mt in match_types:
+        for bt in all_bar_types:
             legend_handles.append(
                 patches.Patch(
-                    facecolor="white", edgecolor="black",
-                    hatch=hatch_map[mt] or "", label=mt,
+                    facecolor="white",
+                    edgecolor="black",
+                    hatch=hatch_map[bt] or "",
+                    label=bt,
                 )
             )
         ax.legend(
