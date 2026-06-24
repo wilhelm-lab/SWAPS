@@ -21,11 +21,14 @@ def reformat_swaps_combined_for_directlfq(
     combined_ion,
     dict_ref,
     output_dir,
+    keep_match_type_col: bool = False,
     ion_id_col="mz_rank",
     protein_id_col="Proteins",
     output_name="swaps.aq_reformat.tsv",
 ):
     intensity_cols = [col for col in combined_ion.columns if col.endswith("Intensity")]
+    if keep_match_type_col:
+        intensity_cols += [col for col in combined_ion.columns if col == "Match Type"]
     reformatted_df = pd.merge(
         combined_ion[intensity_cols + [ion_id_col]],
         dict_ref[[ion_id_col, protein_id_col]],
