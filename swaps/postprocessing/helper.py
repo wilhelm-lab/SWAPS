@@ -45,20 +45,27 @@ def build_mz_sorted_activation(
     if os.path.exists(out_path):
         Logger.info("mz-sorted activation already exists, skipping: %s", out_path)
         return out_path
-    con = duckdb.connect()
-    con.execute("SET enable_progress_bar = false")
-    con.execute(
-        f"""
-        COPY (
-            SELECT * FROM parquet_scan(
-                '{activation_dir}/swa_frame_batch_*_activation.parquet'
-            )
-            ORDER BY mz_rank
-        ) TO '{out_path}'
-        (FORMAT PARQUET, COMPRESSION SNAPPY, ROW_GROUP_SIZE {row_group_size})
-    """
+
+    batch_files = sorted(
+        os.path.join(activation_dir, f)
+        for f in os.listdir(activation_dir)
+        if f.startswith("swa_frame_batch_") and f.endswith(".parquet")
     )
-    con.close()
+    # Read one file at a time to avoid exhausting OS file descriptors when many
+    # runs are processed concurrently (DuckDB glob opens all ~128 files per
+    # connection simultaneously, hitting ulimit with N concurrent workers).
+    tables = [pq.read_table(f) for f in batch_files]
+    combined = pa.concat_tables(tables, promote_options="none")
+    del tables
+    combined = combined.sort_by("mz_rank")
+    pq.write_table(
+        combined,
+        out_path,
+        compression="snappy",
+        row_group_size=row_group_size,
+    )
+    del combined
+
     if delete_input_files:
         for filename in os.listdir(activation_dir):
             if filename.startswith("swa_frame_batch_"):
