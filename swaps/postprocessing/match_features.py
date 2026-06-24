@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 import numpy as np
@@ -342,6 +343,7 @@ def match_features_batch(
     processing_kwargs: dict | None = None,
     visualize_dir: str | None = None,
     match_decoy: bool = True,
+    illustration_dir: str | None = None,
 ):
     """Process one peptide batch using the consensus image path."""
     results_target, results_decoy = [], []
@@ -465,6 +467,22 @@ def match_features_batch(
                 filename=f"mz{pept_idx}_consensus.png",
                 labels=_consensus_raw_files,
             )
+        _batch_svg_dir = (
+            os.path.join(
+                illustration_dir,
+                f"batch_mz{int(batch_np.min())}-{int(batch_np.max())}",
+            )
+            if illustration_dir is not None
+            else None
+        )
+        if _batch_svg_dir is not None:
+            _save_illustration_svgs(
+                int(pept_idx),
+                _consensus_bundle,
+                _consensus_raw_files,
+                _batch_svg_dir,
+                raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
+            )
         consensus_pp = _consensus_bundle.consensus_pp
         individual_pps = _consensus_bundle.individual_pps
         snap_log_collection[int(pept_idx)] = _consensus_bundle.segmentation.snap_log
@@ -549,7 +567,7 @@ def match_features_batch(
                     _plot_raw_denoised_images.append(_decoy_raw_denoised)
                     _plot_labels.append(f"{_plot_rf}\n(decoy mz{_decoy_mz})")
                 _peptide_swap_decoys_by_rep.append(_rep_specs)
-                if visualize_dir is not None:
+                if visualize_dir is not None or _batch_svg_dir is not None:
                     _plot_anchors = [_consensus_anchors[0]] + [None] * (
                         len(_consensus_raw_files) - 1
                     )
@@ -575,15 +593,25 @@ def match_features_batch(
                             (processing_kwargs or {}).get("jump_dist_thres")
                         ),
                     )
-                    _visualize_consensus_bundle(
-                        _decoy_bundle.alignment,
-                        _decoy_bundle.segmentation,
-                        fig_dir=visualize_dir,
-                        filename=(
-                            f"mz{pept_idx}_consensus_decoy_peptide_swap_rep{_rep}.png"
-                        ),
-                        labels=_plot_labels,
-                    )
+                    if visualize_dir is not None:
+                        _visualize_consensus_bundle(
+                            _decoy_bundle.alignment,
+                            _decoy_bundle.segmentation,
+                            fig_dir=visualize_dir,
+                            filename=(
+                                f"mz{pept_idx}_consensus_decoy_peptide_swap_rep{_rep}.png"
+                            ),
+                            labels=_plot_labels,
+                        )
+                    if _batch_svg_dir is not None:
+                        _save_illustration_svgs(
+                            int(pept_idx),
+                            _decoy_bundle,
+                            _plot_labels,
+                            _batch_svg_dir,
+                            raw_images=_plot_raw_images,
+                            filename_prefix=f"decoy_peptide_swap_rep{_rep}_",
+                        )
 
         _off_target_label_shifts: list[tuple[int, int] | None] = []
         if (
@@ -600,20 +628,33 @@ def match_features_batch(
                     max_overlap_fraction=_off_target_max_overlap_fraction,
                 )
                 _off_target_label_shifts.append(_shift)
-                if visualize_dir is not None and _shift is not None:
+                if _shift is not None and (
+                    visualize_dir is not None or _batch_svg_dir is not None
+                ):
                     _shifted_seg = _make_shifted_consensus_segmentation_state(
                         _consensus_bundle.segmentation,
                         _shift,
                     )
-                    _visualize_consensus_bundle(
-                        _consensus_bundle.alignment,
-                        _shifted_seg,
-                        fig_dir=visualize_dir,
-                        filename=(
-                            f"mz{pept_idx}_consensus_decoy_off_target_shift_rep{_rep}.png"
-                        ),
-                        labels=_consensus_raw_files,
-                    )
+                    if visualize_dir is not None:
+                        _visualize_consensus_bundle(
+                            _consensus_bundle.alignment,
+                            _shifted_seg,
+                            fig_dir=visualize_dir,
+                            filename=(
+                                f"mz{pept_idx}_consensus_decoy_off_target_shift_rep{_rep}.png"
+                            ),
+                            labels=_consensus_raw_files,
+                        )
+                    if _batch_svg_dir is not None:
+                        _save_illustration_svgs(
+                            int(pept_idx),
+                            _consensus_bundle,
+                            _consensus_raw_files,
+                            _batch_svg_dir,
+                            segmentation_override=_shifted_seg,
+                            filename_prefix=f"decoy_off_target_shift_rep{_rep}_",
+                            skip_per_run=True,
+                        )
         if consensus_pp is not None:
             for _ci, (_rf, _ind_pp) in enumerate(
                 zip(_consensus_raw_files, individual_pps)
@@ -1994,6 +2035,157 @@ def _visualize_consensus_bundle(
     fig.suptitle("Resized, aligned images and mean consensus", fontsize=11)
     plt.tight_layout(rect=[0, 0.05, 1, 1])
     _save_or_show(fig, fig_dir, filename)
+
+
+def _save_illustration_svgs(
+    pept_idx: int,
+    bundle: "ConsensusFeatureBundle",
+    labels: list[str],
+    svg_dir: str,
+    raw_images: list[np.ndarray] | None = None,
+    filename_prefix: str = "",
+    segmentation_override: "ConsensusSegmentationState | None" = None,
+    skip_per_run: bool = False,
+) -> None:
+    """Save individual clean SVG images for one peptide: raw, aligned, consensus, watershed.
+
+    raw_images: original (pre-alignment) raw images, one per run in labels order.
+                When provided, raw SVGs are always generated even if watershed failed.
+    filename_prefix: prepended to every output filename (e.g. "decoy_peptide_swap_rep0_").
+    segmentation_override: if provided, use instead of bundle.segmentation for consensus panels.
+    skip_per_run: if True, skip per-run raw/aligned panels (useful for off-target decoys where
+                  per-run images are identical to the target).
+    """
+    import matplotlib.pyplot as plt
+
+    os.makedirs(svg_dir, exist_ok=True)
+
+    seg = segmentation_override if segmentation_override is not None else bundle.segmentation
+
+    def _sanitize(s: str) -> str:
+        return re.sub(r"[^\w\-]", "_", os.path.basename(s))[:60]
+
+    def _make_ax(
+        img: np.ndarray,
+        cmap: str = "viridis",
+        vmin: float | None = None,
+        vmax: float | None = None,
+    ) -> "tuple[plt.Figure, plt.Axes]":
+        fig, ax = plt.subplots(figsize=(3, 3))
+        ax.imshow(img, aspect="auto", origin="lower", cmap=cmap, vmin=vmin, vmax=vmax)
+        ax.axis("off")
+        return fig, ax
+
+    def _save_fig(fig: "plt.Figure", fname: str) -> None:
+        fig.savefig(
+            os.path.join(svg_dir, f"{filename_prefix}{fname}"),
+            format="svg",
+            bbox_inches="tight",
+            pad_inches=0.02,
+        )
+        plt.close(fig)
+
+    # bundle.raw_aligned_images is only populated when watershed succeeds; fall
+    # back to aligning the raw images ourselves using the same shifts.
+    raw_aligned = bundle.raw_aligned_images
+    if not raw_aligned and raw_images is not None:
+        raw_aligned = _align_raw_images_with_shifts(
+            raw_images,
+            bundle.alignment.target_shape,
+            bundle.alignment.shifts,
+        )
+    aligned_imgs = bundle.alignment.aligned_images
+
+    def _range(imgs: list[np.ndarray]) -> tuple[float | None, float | None]:
+        if not imgs:
+            return None, None
+        return float(min(img.min() for img in imgs)), float(max(img.max() for img in imgs))
+
+    # raw and denoised-aligned images live on different intensity scales — keep
+    # them separate so neither set looks empty next to the other
+    raw_vmin, raw_vmax = _range(raw_aligned)
+    aligned_vmin, aligned_vmax = _range(aligned_imgs)
+
+    # anchor colour map — same indexing as _visualize_consensus_bundle
+    non_none_indices = seg.non_none_indices
+    anchor_color_map: dict[int, Any] = {
+        i_idx: plt.cm.tab10(k % 10) for k, i_idx in enumerate(non_none_indices)
+    }
+    snap_record: dict = seg.snap_log.get("snap_record", {})
+    discard_record: dict = seg.snap_log.get("discard_record", {})
+
+    def _overlay_run_anchor(ax: "plt.Axes", i: int) -> None:
+        """Star at the template centre (reference only) + coloured dot for aligned anchor."""
+        if i == bundle.alignment.reference_idx:
+            ax.plot(
+                bundle.alignment.anchor_col,
+                bundle.alignment.anchor_row,
+                "*",
+                color="white",
+                markersize=10,
+                markeredgewidth=1,
+                zorder=5,
+            )
+        aa = bundle.alignment.aligned_anchors[i]
+        if aa is not None and i in anchor_color_map:
+            ax.plot(
+                aa[1],
+                aa[0],
+                "o",
+                color=anchor_color_map[i],
+                markersize=7,
+                markeredgecolor="black",
+                markeredgewidth=0.8,
+                zorder=5,
+            )
+
+    def _overlay_consensus_anchors(ax: "plt.Axes") -> None:
+        """Star (original) + dot (snapped) or × (discarded) for each anchor."""
+        for i_idx in non_none_indices:
+            c = anchor_color_map[i_idx]
+            if i_idx in snap_record:
+                orig_rc, snap_rc = snap_record[i_idx]
+                ax.plot(
+                    orig_rc[1], orig_rc[0],
+                    "*", color=c, markersize=10,
+                    markeredgecolor="black", markeredgewidth=0.5, zorder=6,
+                )
+                ax.plot(
+                    snap_rc[1], snap_rc[0],
+                    "o", color=c, markersize=7,
+                    markeredgecolor="black", markeredgewidth=0.8, zorder=7,
+                )
+            elif i_idx in discard_record:
+                orig_rc = discard_record[i_idx]["anchor"]
+                ax.plot(
+                    orig_rc[1], orig_rc[0],
+                    "x", color=c, markersize=9, markeredgewidth=1.5, zorder=6,
+                )
+
+    if not skip_per_run:
+        for i, label in enumerate(labels):
+            safe = _sanitize(label)
+            if i < len(raw_aligned):
+                fig, ax = _make_ax(raw_aligned[i], vmin=raw_vmin, vmax=raw_vmax)
+                _overlay_run_anchor(ax, i)
+                _save_fig(fig, f"mz{pept_idx}_raw_{i:02d}_{safe}.svg")
+            if i < len(aligned_imgs):
+                fig, ax = _make_ax(aligned_imgs[i], vmin=aligned_vmin, vmax=aligned_vmax)
+                _overlay_run_anchor(ax, i)
+                _save_fig(fig, f"mz{pept_idx}_aligned_{i:02d}_{safe}.svg")
+
+    fig, ax = _make_ax(seg.consensus, vmin=aligned_vmin, vmax=aligned_vmax)
+    _overlay_consensus_anchors(ax)
+    _save_fig(fig, f"mz{pept_idx}_consensus.svg")
+
+    fig, ax = _make_ax(seg.consensus_denoised)
+    _overlay_consensus_anchors(ax)
+    _save_fig(fig, f"mz{pept_idx}_consensus_denoised.svg")
+
+    if seg.watershed_labels.max() > 0:
+        fig, ax = _make_ax(seg.watershed_labels, cmap="tab20")
+        _overlay_consensus_anchors(ax)
+        _save_fig(fig, f"mz{pept_idx}_watershed.svg")
 
 
 def _shift_integer_label_image(
