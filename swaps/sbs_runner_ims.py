@@ -352,6 +352,7 @@ def opt_scan_by_scan(config_path: str):
     if df_jump is not None:
         df_jump.to_csv(os.path.join(quant_dir, "jump_anchor_log.csv"), index=True)
     _save_effective_cfg(cfg, processing_kwargs, quant_dir)
+
     logging.info("=================FDR control==================")
 
     pp_match_target_msms = None
@@ -446,14 +447,13 @@ def opt_scan_by_scan(config_path: str):
         feature_cols=_feature_cols,
         # train_fdr=cfg.FDR.TRAIN,
         # test_fdr=cfg.FDR.TEST,
-        work_dir=os.path.join(quant_dir, "tmp_percolator"),
+        work_dir=os.path.join(quant_dir, percolator_dir_name),
         decoy_col="Decoy",
         filename_col="matched_run",
         peptide_col="Sequence",
         protein_col="Proteins",
     )
     # Filter for the columns passed the makopot filter
-    psms["filename"] = psms["PSMId"].str.split("_").apply(lambda x: "_".join(x[1:-1]))
     psms["mz_rank"] = psms["PSMId"].str.split("_").str[0].astype(int)
 
     # Filter for the columns passed the makopot filter
@@ -465,7 +465,10 @@ def opt_scan_by_scan(config_path: str):
         how="inner",
     )
     pp_match_target_filtered.to_parquet(
-        os.path.join(quant_dir, "pp_match_target_filtered.parquet"), index=False
+        os.path.join(
+            quant_dir, percolator_dir_name, "pp_match_target_filtered.parquet"
+        ),
+        index=False,
     )
     dfs_to_concat = {
         "MBR": pp_match_target_filtered.drop(columns=["filename"]),
@@ -483,12 +486,17 @@ def opt_scan_by_scan(config_path: str):
             ex.submit(
                 pp_all.to_parquet,
                 os.path.join(
-                    quant_dir, "pp_reference_quant_only_match_target_filtered.parquet"
+                    quant_dir,
+                    percolator_dir_name,
+                    "pp_reference_quant_only_match_target_filtered.parquet",
                 ),
                 index=False,
             ),
             ex.submit(
-                pivot.to_parquet, os.path.join(quant_dir, "swaps_combined_ions.parquet")
+                pivot.to_parquet,
+                os.path.join(
+                    quant_dir, percolator_dir_name, "swaps_combined_ions.parquet"
+                ),
             ),
         ]
         for f in futs:
@@ -502,15 +510,20 @@ def opt_scan_by_scan(config_path: str):
         ion_id_col="mz_rank",
         protein_id_col="Proteins",
     )
-    lfq_manager.run_lfq(input_file=os.path.join(quant_dir, "swaps.aq_reformat.tsv"))
+    lfq_manager.run_lfq(
+        input_file=os.path.join(quant_dir, percolator_dir_name, "swaps.aq_reformat.tsv")
+    )
 
     logging.info("=================Result Analysis==================")
+    result_analysis_dir = os.path.join(
+        quant_dir, percolator_dir_name, "result_analysis"
+    )
     calc_quant_corr(
         pp_reference,
         pp_match_target_filtered,
-        quant_dir,
+        result_analysis_dir,
     )
-    plot_match_type_from_combined(df=pivot, fig_dir=quant_dir)
+    plot_match_type_from_combined(df=pivot, fig_dir=result_analysis_dir)
     try:
         # compare with IonQuant results
         combined_ionquant = pd.read_csv(
@@ -518,7 +531,9 @@ def opt_scan_by_scan(config_path: str):
             sep="\t",
         )
         plot_match_type_from_combined(
-            df=combined_ionquant, fig_dir=quant_dir, fig_name_suffix="_ionquant"
+            df=combined_ionquant,
+            fig_dir=result_analysis_dir,
+            fig_name_suffix="_ionquant",
         )
     except FileNotFoundError:
         logging.info(
@@ -529,20 +544,27 @@ def opt_scan_by_scan(config_path: str):
         dataset_name="SWAPS_ions_raw",
         int_col_keyword="Intensity",
         label_char_range=(0, 10),
-        fig_dir=quant_dir,
+        fig_dir=result_analysis_dir,
     )
     lfq_swaps_ion = pd.read_csv(
-        os.path.join(quant_dir, "swaps.aq_reformat.tsv.ion_intensities.tsv"), sep="\t"
+        os.path.join(
+            quant_dir, percolator_dir_name, "swaps.aq_reformat.tsv.ion_intensities.tsv"
+        ),
+        sep="\t",
     )
     plot_quantification_by_run(
         lfq_swaps_ion,
         dataset_name="SWAPS_ions_directLFQ",
         label_char_range=(0, 14),
         id_cols=["protein", "ion"],
-        fig_dir=quant_dir,
+        fig_dir=result_analysis_dir,
     )
     lfq_swaps_protein = pd.read_csv(
-        os.path.join(quant_dir, "swaps.aq_reformat.tsv.protein_intensities.tsv"),
+        os.path.join(
+            quant_dir,
+            percolator_dir_name,
+            "swaps.aq_reformat.tsv.protein_intensities.tsv",
+        ),
         sep="\t",
     )
     plot_quantification_by_run(
@@ -550,7 +572,7 @@ def opt_scan_by_scan(config_path: str):
         dataset_name="SWAPS_proteins_directLFQ",
         label_char_range=(0, 14),
         id_cols=["protein", "Protein"],
-        fig_dir=quant_dir,
+        fig_dir=result_analysis_dir,
     )
 
 
