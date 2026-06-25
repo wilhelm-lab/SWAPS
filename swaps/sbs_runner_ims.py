@@ -418,22 +418,32 @@ def opt_scan_by_scan(config_path: str):
     tdc_df = tdc_df.merge(
         dict_ref[["mz_rank", "count_confounders"]], on="mz_rank", how="left"
     )
+    _align_images = bool(processing_kwargs.get("align_images", True))
+    _alignment_feature_cols = [
+        "im_shift_abs_scaled",
+        "rt_shift_abs_scaled",
+        "rt_shift",
+        "im_shift",
+        "template_matching_score",
+    ]
+    _base_feature_cols = [
+        # "im_shift_scaled",
+        # "rt_shift_scaled",
+        "sift_similarities",
+        "zernike_similarities",
+        "sift_distance",
+        "zernike_distance",
+        "count_confounders",
+    ]
+    _feature_cols = (
+        _alignment_feature_cols + _base_feature_cols
+        if _align_images
+        else _base_feature_cols
+    )
+    percolator_dir_name = "percolator"
     psms, peptide, all_psms = brew_with_percolator(
         tdc_df,
-        feature_cols=[
-            "im_shift_abs_scaled",
-            "rt_shift_abs_scaled",
-            "rt_shift",
-            "im_shift",
-            # "im_shift_scaled",
-            # "rt_shift_scaled",
-            "sift_similarities",
-            "zernike_similarities",
-            "sift_distance",
-            "zernike_distance",
-            "template_matching_score",
-            "count_confounders",
-        ],
+        feature_cols=_feature_cols,
         # train_fdr=cfg.FDR.TRAIN,
         # test_fdr=cfg.FDR.TEST,
         work_dir=os.path.join(quant_dir, "tmp_percolator"),

@@ -89,6 +89,7 @@ __C.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH = 4  # width for IM peak extraction; o
 # match features kwargs (postprocessing peak detection/matching parameters)
 __C.MATCH_FEATURES_KWARGS = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.apply_seg = True
+__C.MATCH_FEATURES_KWARGS.align_images = True  # set False to skip template-matching alignment; rt/im shift and template_matching_score will be 0
 __C.MATCH_FEATURES_KWARGS.dir_name = "quantification"
 __C.MATCH_FEATURES_KWARGS.seg_mask_thres = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.seg_mask_thres.rt = 2  # min RT span of target labels

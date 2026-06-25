@@ -42,6 +42,7 @@ class ConsensusAlignmentState:
     aligned_images: list[np.ndarray]
     matched_boxes: list[tuple[int, int, int, int]]
     aligned_anchors: list[tuple[float, float] | None]
+    scaled_anchors: list[tuple[float, float] | None]
     shifts: list[tuple[int, int]]
     max_scores: list[float]
     match_score_maps: list[np.ndarray] = field(default_factory=list)
@@ -365,6 +366,7 @@ def match_features_batch(
     denoise_cfg = dict((processing_kwargs or {}).get("denoise", {}))
     raw_denoise_kwargs = _denoise_kwargs_for_stage(denoise_cfg, "raw")
     full_denoise_kwargs = _denoise_kwargs_all(denoise_cfg)
+    _align_images = bool((processing_kwargs or {}).get("align_images", True))
 
     # Load activation data for this mz_rank batch from the pre-built sorted parquet.
     # DuckDB skips row groups outside [min(batch_np), max(batch_np)], so I/O scales
@@ -458,6 +460,7 @@ def match_features_batch(
                 (processing_kwargs or {}).get("jump_dist_thres")
             ),
             consensus_image_indices=_anchor_image_indices,
+            align_images=_align_images,
         )
         if visualize_dir is not None:
             _visualize_consensus_bundle(
@@ -592,6 +595,7 @@ def match_features_batch(
                         jump_dist_thres=_parse_jump_dist_thres(
                             (processing_kwargs or {}).get("jump_dist_thres")
                         ),
+                        align_images=_align_images,
                     )
                     if visualize_dir is not None:
                         _visualize_consensus_bundle(
@@ -1157,6 +1161,7 @@ def align_images_to_reference(
     template_anchor: tuple[int, int] | None = None,
     template_frac: float = 0.3,
     anchors: list[tuple[int, int] | None] | None = None,
+    align_images: bool = True,
 ) -> ConsensusAlignmentState:
     """Resize and align images to a reference template for consensus scoring."""
 
@@ -1215,6 +1220,13 @@ def align_images_to_reference(
             shifts.append((0, 0))
             max_scores.append(1.0)
             continue
+        if not align_images:
+            aligned_images.append(resized_image.copy())
+            matched_boxes.append(template_bounds)
+            aligned_anchors.append(scaled_anchors[i])
+            shifts.append((0, 0))
+            max_scores.append(0.0)
+            continue
         (
             aligned_image,
             matched_box,
@@ -1249,6 +1261,7 @@ def align_images_to_reference(
         aligned_images=aligned_images,
         matched_boxes=matched_boxes,
         aligned_anchors=aligned_anchors,
+        scaled_anchors=scaled_anchors,
         shifts=shifts,
         max_scores=max_scores,
         match_score_maps=match_score_maps,
@@ -1624,6 +1637,7 @@ def build_consensus_feature_bundle(
     seg_mask_thres: tuple[int, int] = (3, 3),
     jump_dist_thres: tuple[int, int] = (0, 0),
     consensus_image_indices: list[int] | None = None,
+    align_images: bool = True,
 ) -> ConsensusFeatureBundle:
     """Build alignment, segmentation, and feature tables for consensus scoring."""
 
@@ -1642,6 +1656,7 @@ def build_consensus_feature_bundle(
         template_anchor=template_anchor,
         template_frac=template_frac,
         anchors=anchors,
+        align_images=align_images,
     )
     segmentation_state = segment_consensus_from_aligned(
         alignment_state,
@@ -2060,7 +2075,11 @@ def _save_illustration_svgs(
 
     os.makedirs(svg_dir, exist_ok=True)
 
-    seg = segmentation_override if segmentation_override is not None else bundle.segmentation
+    seg = (
+        segmentation_override
+        if segmentation_override is not None
+        else bundle.segmentation
+    )
 
     def _sanitize(s: str) -> str:
         return re.sub(r"[^\w\-]", "_", os.path.basename(s))[:60]
@@ -2099,11 +2118,13 @@ def _save_illustration_svgs(
     def _range(imgs: list[np.ndarray]) -> tuple[float | None, float | None]:
         if not imgs:
             return None, None
-        return float(min(img.min() for img in imgs)), float(max(img.max() for img in imgs))
+        return float(min(img.min() for img in imgs)), float(
+            max(img.max() for img in imgs)
+        )
 
     # raw and denoised-aligned images live on different intensity scales — keep
     # them separate so neither set looks empty next to the other
-    raw_vmin, raw_vmax = _range(raw_aligned)
+    raw_vmin, raw_vmax = _range([np.log2(1 + img) for img in raw_aligned])
     aligned_vmin, aligned_vmax = _range(aligned_imgs)
 
     # anchor colour map — same indexing as _visualize_consensus_bundle
@@ -2114,8 +2135,11 @@ def _save_illustration_svgs(
     snap_record: dict = seg.snap_log.get("snap_record", {})
     discard_record: dict = seg.snap_log.get("discard_record", {})
 
-    def _overlay_run_anchor(ax: "plt.Axes", i: int) -> None:
-        """Star at the template centre (reference only) + coloured dot for aligned anchor."""
+    def _overlay_run_anchor(ax: "plt.Axes", i: int, *, aligned: bool) -> None:
+        """Star at the template centre (reference only) + coloured dot for anchor.
+
+        aligned=False → use pre-alignment (scaled) anchor; aligned=True → use post-alignment anchor.
+        """
         if i == bundle.alignment.reference_idx:
             ax.plot(
                 bundle.alignment.anchor_col,
@@ -2126,7 +2150,12 @@ def _save_illustration_svgs(
                 markeredgewidth=1,
                 zorder=5,
             )
-        aa = bundle.alignment.aligned_anchors[i]
+        anchors = (
+            bundle.alignment.aligned_anchors
+            if aligned
+            else bundle.alignment.scaled_anchors
+        )
+        aa = anchors[i]
         if aa is not None and i in anchor_color_map:
             ax.plot(
                 aa[1],
@@ -2146,32 +2175,51 @@ def _save_illustration_svgs(
             if i_idx in snap_record:
                 orig_rc, snap_rc = snap_record[i_idx]
                 ax.plot(
-                    orig_rc[1], orig_rc[0],
-                    "*", color=c, markersize=10,
-                    markeredgecolor="black", markeredgewidth=0.5, zorder=6,
+                    orig_rc[1],
+                    orig_rc[0],
+                    "*",
+                    color=c,
+                    markersize=10,
+                    markeredgecolor="black",
+                    markeredgewidth=0.5,
+                    zorder=6,
                 )
                 ax.plot(
-                    snap_rc[1], snap_rc[0],
-                    "o", color=c, markersize=7,
-                    markeredgecolor="black", markeredgewidth=0.8, zorder=7,
+                    snap_rc[1],
+                    snap_rc[0],
+                    "o",
+                    color=c,
+                    markersize=7,
+                    markeredgecolor="black",
+                    markeredgewidth=0.8,
+                    zorder=7,
                 )
             elif i_idx in discard_record:
                 orig_rc = discard_record[i_idx]["anchor"]
                 ax.plot(
-                    orig_rc[1], orig_rc[0],
-                    "x", color=c, markersize=9, markeredgewidth=1.5, zorder=6,
+                    orig_rc[1],
+                    orig_rc[0],
+                    "x",
+                    color=c,
+                    markersize=9,
+                    markeredgewidth=1.5,
+                    zorder=6,
                 )
 
     if not skip_per_run:
         for i, label in enumerate(labels):
             safe = _sanitize(label)
             if i < len(raw_aligned):
-                fig, ax = _make_ax(raw_aligned[i], vmin=raw_vmin, vmax=raw_vmax)
-                _overlay_run_anchor(ax, i)
+                fig, ax = _make_ax(
+                    np.log2(1 + raw_aligned[i]), vmin=raw_vmin, vmax=raw_vmax
+                )
+                _overlay_run_anchor(ax, i, aligned=False)
                 _save_fig(fig, f"mz{pept_idx}_raw_{i:02d}_{safe}.svg")
             if i < len(aligned_imgs):
-                fig, ax = _make_ax(aligned_imgs[i], vmin=aligned_vmin, vmax=aligned_vmax)
-                _overlay_run_anchor(ax, i)
+                fig, ax = _make_ax(
+                    aligned_imgs[i], vmin=aligned_vmin, vmax=aligned_vmax
+                )
+                _overlay_run_anchor(ax, i, aligned=True)
                 _save_fig(fig, f"mz{pept_idx}_aligned_{i:02d}_{safe}.svg")
 
     fig, ax = _make_ax(seg.consensus, vmin=aligned_vmin, vmax=aligned_vmax)
