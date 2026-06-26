@@ -70,7 +70,10 @@ def prepare_percolator_input(
         inplace=True,
     )
     df_pin["peptide"] = "-." + df_pin["peptide"] + ".-"
-    df_pin = df_pin[["id", "label", "scannr"] + feature_cols + ["peptide", "proteins"]]
+    df_pin["filename"] = df_pin[filename_col]
+    df_pin = df_pin[
+        ["id", "label", "scannr", "filename"] + feature_cols + ["peptide", "proteins"]
+    ]
     return df_pin
 
 
@@ -287,7 +290,7 @@ def brew_with_mokapot(
 
 
 def brew_with_percolator(
-    peptide_info_dataframe: pd.DataFrame,
+    peptide_info_dataframe: pd.DataFrame | None = None,
     work_dir: Optional[str] = None,
     **kwargs,
 ):
@@ -354,7 +357,7 @@ def brew_with_percolator(
 
     cmd = [
         "percolator",
-        "-y",
+        "-Y",
         "--only-psms",
         "-I",
         "separate",
