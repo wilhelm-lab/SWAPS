@@ -12,6 +12,7 @@ import seaborn as sns
 from matplotlib_venn import venn2, venn3
 from matplotlib.patches import Rectangle
 from scipy import stats
+from sklearn.metrics import roc_auc_score, roc_curve
 from sparse import SparseArray
 from utils.tools import ExtractPeak
 from postprocessing.ims_3d import (
@@ -2231,8 +2232,8 @@ def plot_intensity_correlation_by_match_type(
     x_iq = x_centers - (bar_w / 2 + gap / 2)
     x_sw = x_centers + (bar_w / 2 + gap / 2)
 
-    iq_color = "#4C72B0"
-    sw_color = "#C44E52"
+    iq_color = "tomato"
+    sw_color = "steelblue"
 
     fig, ax = plt.subplots(figsize=(max(8, n * 1.5 + 2), 5), constrained_layout=True)
 
@@ -2265,7 +2266,7 @@ def plot_intensity_correlation_by_match_type(
                 )
 
     _draw_bars(x_iq, corrs_iq, iq_color, hatch=None, label="IonQuant")
-    _draw_bars(x_sw, corrs_sw, sw_color, hatch="//", label="SWAPS")
+    _draw_bars(x_sw, corrs_sw, sw_color, hatch=None, label="SWAPS")
 
     ax.set_xticks(x_centers)
     ax.set_xticklabels(conditions, rotation=20, ha="right")
@@ -2297,6 +2298,57 @@ def plot_intensity_correlation_by_match_type(
         "row_counts_swaps": counts_sw,
     }
     return fig, ax, data
+
+
+def plot_feature_roc_curves(
+    percolator_input: pd.DataFrame,
+    features: List[str],
+    *,
+    label_col: str = "label",
+    fig_dir: Optional[str] = None,
+    fig_name_suffix: str = "",
+) -> tuple:
+    """ROC curve per feature (target vs. decoy) from a percolator input table.
+
+    Each feature column is treated as a classifier score against `label_col`
+    (+1 target, -1 decoy). A feature anti-correlated with the label
+    (AUC < 0.5) has its score sign-flipped so the curve/AUC reflect
+    discriminative power regardless of polarity.
+    """
+    y = (percolator_input[label_col] == 1).astype(int)
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+    palette = sns.color_palette("tab10", n_colors=len(features))
+    for feat, color in zip(features, palette):
+        score = percolator_input[feat]
+        auc = roc_auc_score(y, score)
+        if auc < 0.5:
+            score, auc = -score, 1 - auc
+        fpr, tpr, _ = roc_curve(y, score)
+        ax.plot(fpr, tpr, color=color, label=f"{feat} (AUC={auc:.3f})")
+
+    ax.plot([0, 1], [0, 1], color="gray", linestyle="--", linewidth=0.8, alpha=0.6)
+    ax.set_xlabel("False positive rate")
+    ax.set_ylabel("True positive rate")
+    ax.set_title(
+        f"Feature ROC curves{' (' + fig_name_suffix.strip('_') + ')' if fig_name_suffix else ''}"
+    )
+    ax.legend(loc="lower right", fontsize=8)
+    fig.tight_layout()
+
+    fig_name = f"feature_roc_curves{fig_name_suffix}"
+    if fig_dir is not None:
+        os.makedirs(fig_dir, exist_ok=True)
+        fig.savefig(
+            os.path.join(fig_dir, f"{fig_name}.png"), dpi=300, bbox_inches="tight"
+        )
+        fig.savefig(
+            os.path.join(fig_dir, f"{fig_name}.svg"), dpi=300, bbox_inches="tight"
+        )
+        plt.close(fig)
+    else:
+        plt.show()
+    return fig, ax
 
 
 def plot_intensity_coverage_by_species(
