@@ -1924,17 +1924,19 @@ def plot_match_type_from_combined(
     )
 
 
-
 def label_fn_from_part(n: int):
     """Return a label_fn that extracts the nth underscore-separated part (1-based) from a column name."""
+
     def _fn(col: str) -> str:
         parts = col.split("_")
         return parts[n - 1] if len(parts) >= n else col
+
     return _fn
 
 
 def _default_label_fn(col: str) -> str:
     import re
+
     m = re.search(r"\d{5,6}", col)
     return m.group(0) if m else col
 
@@ -1973,6 +1975,7 @@ def plot_match_type_comparison(
     ``quant_thres`` count as "Quantified", all others as "Not Quantified".
     """
     import re  # noqa: F401 – kept for potential use in label_fn closures
+
     if label_fn is None:
         label_fn = _default_label_fn
 
@@ -1994,22 +1997,35 @@ def plot_match_type_comparison(
             iq_stack_order = ["Quantified", "Not Quantified"]
     else:
         if stack_order is None:
-            stack_order = ["MS/MS", "MS/MS Quant", "MS/MS Ref", "MBR", "unmatched", "Zero Quant"]
+            stack_order = [
+                "MS/MS",
+                "MS/MS Quant",
+                "MS/MS Ref",
+                "MBR",
+                "unmatched",
+                "Zero Quant",
+            ]
         if iq_stack_order is None:
             iq_stack_order = ["MS/MS", "Zero Quant", "MBR", "unmatched"]
 
-    def _build_counts(df: pd.DataFrame, quant_keyword: Optional[str] = None) -> pd.DataFrame:
+    def _build_counts(
+        df: pd.DataFrame, quant_keyword: Optional[str] = None
+    ) -> pd.DataFrame:
         if is_quant:
-            assert quant_keyword, "swaps_quant_keyword / iq_quant_keyword must be set when is_quant=True"
+            assert (
+                quant_keyword
+            ), "swaps_quant_keyword / iq_quant_keyword must be set when is_quant=True"
             quant_cols = [c for c in df.columns if quant_keyword in c]
             counts_dict = {}
             for col in quant_cols:
                 label = label_fn(col)
                 vals = pd.to_numeric(df[col], errors="coerce")
-                vc = pd.Series({
-                    "Quantified": (vals > quant_thres).sum(),
-                    "Not Quantified": (vals <= quant_thres).sum(),
-                })
+                vc = pd.Series(
+                    {
+                        "Quantified": (vals > quant_thres).sum(),
+                        "Not Quantified": (vals <= quant_thres).sum(),
+                    }
+                )
                 counts_dict[label] = vc
         else:
             match_cols = [c for c in df.columns if match_type_col_keyword in c]
