@@ -353,6 +353,36 @@ def opt_scan_by_scan(config_path: str):
         df_jump.to_csv(os.path.join(quant_dir, "jump_anchor_log.csv"), index=True)
     _save_effective_cfg(cfg, processing_kwargs, quant_dir)
 
+    run_fdr_control_onwards(
+        cfg,
+        processing_kwargs,
+        dict_ref,
+        quant_dir,
+        matches_target,
+        matches_decoy,
+        pp_reference,
+        pp_match_target,
+        pp_match_decoy,
+    )
+
+
+def run_fdr_control_onwards(
+    cfg,
+    processing_kwargs: dict,
+    dict_ref: pd.DataFrame,
+    quant_dir: str,
+    matches_target: pd.DataFrame,
+    matches_decoy: pd.DataFrame,
+    pp_reference: pd.DataFrame,
+    pp_match_target: pd.DataFrame,
+    pp_match_decoy: pd.DataFrame,
+):
+    """Run FDR control, DirectLFQ quantification, and result analysis.
+
+    Takes the feature-feature-match outputs (either freshly computed by
+    opt_scan_by_scan, or loaded from a prior run's quant_dir) and carries the
+    pipeline through to the final result analysis plots.
+    """
     logging.info("=================FDR control==================")
 
     pp_match_target_msms = None
@@ -441,7 +471,7 @@ def opt_scan_by_scan(config_path: str):
         if _align_images
         else _base_feature_cols
     )
-    percolator_dir_name = "percolator"
+    percolator_dir_name = "percolator_postprocessing_tdc"
     psms, peptide, all_psms = brew_with_percolator(
         tdc_df,
         feature_cols=_feature_cols,
@@ -506,7 +536,7 @@ def opt_scan_by_scan(config_path: str):
     _ = reformat_swaps_combined_for_directlfq(
         pivot,
         dict_ref,
-        output_dir=quant_dir,
+        output_dir=os.path.join(quant_dir, percolator_dir_name),
         ion_id_col="mz_rank",
         protein_id_col="Proteins",
     )
@@ -576,6 +606,48 @@ def opt_scan_by_scan(config_path: str):
     )
 
 
+def run_from_fdr_control(config_path: str):
+    """Resume the pipeline at FDR control, reusing a prior run's match outputs.
+
+    Loads dict_ref and the matches_target/decoy + pp_reference/pp_match_target/
+    pp_match_decoy parquets from quant_dir = RESULT_PATH/MATCH_FEATURES_KWARGS.dir_name
+    (as resolved from config_path) instead of recomputing them via
+    match_features_batches_parallel.
+    """
+    cfg = get_cfg_defaults(swaps_optimization_cfg)  # type: ignore
+    merge_cfg_from_file(cfg, config_path)
+    logging.info("merge with cfg file %s", config_path)
+    processing_kwargs = yaml.safe_load(cfg.MATCH_FEATURES_KWARGS.dump())
+
+    dict_ref_path = os.path.join(cfg.RESULT_PATH, "dict_ref_with_activation.pkl")
+    if not os.path.exists(dict_ref_path):
+        dict_ref_path = os.path.join(cfg.RESULT_PATH, "dict_ref.pkl")
+    dict_ref = pd.read_pickle(dict_ref_path)
+    logging.info("Loaded dict_ref from %s with %s entries", dict_ref_path, len(dict_ref))
+
+    quant_dir = os.path.join(cfg.RESULT_PATH, cfg.MATCH_FEATURES_KWARGS.dir_name)
+    logging.info("Resuming from FDR control using quant_dir: %s", quant_dir)
+    matches_target = pd.read_parquet(os.path.join(quant_dir, "matches_target.parquet"))
+    matches_decoy = pd.read_parquet(os.path.join(quant_dir, "matches_decoy.parquet"))
+    pp_reference = pd.read_parquet(os.path.join(quant_dir, "pp_reference.parquet"))
+    pp_match_target = pd.read_parquet(
+        os.path.join(quant_dir, "pp_match_target.parquet")
+    )
+    pp_match_decoy = pd.read_parquet(os.path.join(quant_dir, "pp_match_decoy.parquet"))
+
+    run_fdr_control_onwards(
+        cfg,
+        processing_kwargs,
+        dict_ref,
+        quant_dir,
+        matches_target,
+        matches_decoy,
+        pp_reference,
+        pp_match_target,
+        pp_match_decoy,
+    )
+
+
 def main():
     """
     Entry point for the CLI tool. Wraps the opt_scan_by_scan function.
@@ -585,10 +657,22 @@ def main():
     """
     parser = argparse.ArgumentParser(description="Run ScanByScan processing.")
     parser.add_argument("config_path", help="Path to the configuration YAML file")
+    parser.add_argument(
+        "--from-fdr",
+        action="store_true",
+        help=(
+            "Skip prepare-dict/SWA/feature-feature-matching and resume at FDR "
+            "control, reusing matches_target/decoy + pp_reference/pp_match_target/"
+            "pp_match_decoy parquets from RESULT_PATH/MATCH_FEATURES_KWARGS.dir_name."
+        ),
+    )
     args = parser.parse_args()
 
     # Call the actual function with the parsed argument
-    opt_scan_by_scan(args.config_path)
+    if args.from_fdr:
+        run_from_fdr_control(args.config_path)
+    else:
+        opt_scan_by_scan(args.config_path)
 
 
 if __name__ == "__main__":
