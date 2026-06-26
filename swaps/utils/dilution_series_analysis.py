@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import os
 import re
 from itertools import combinations
 from pathlib import Path
@@ -15,11 +16,12 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
+import yaml
 from scipy import stats
 from sklearn.metrics import roc_auc_score
 
 BENCHMARK_DIR = Path("/cmnfs/proj/ORIGINS/data/SWAPS_FFM_timsTOF_benchmark")
-PERCOLATOR_SUBDIR = "quantification/tmp_percolator_ONLY_SCORE_MATCH"
+PERCOLATOR_SUBDIR = "quantification/percolator_postprocessing_tdc"
 FEATURES = [
     "im_shift_abs_scaled",
     "rt_shift_abs_scaled",
@@ -33,8 +35,9 @@ FEATURES = [
     "count_confounders",
 ]
 
-# Dilution amount sort order (ascending = more challenging first)
-_AMOUNT_ORDER = {"125pg": 0, "250pg": 1, "1ng": 2, "5ng": 3}
+# Dilution amount sort order (ascending = high to low input amount)
+_AMOUNT_ORDER = {"125pg": 3, "250pg": 2, "1ng": 1, "5ng": 0}
+_X_ORDER = ["5ng", "1ng", "250pg", "125pg"]
 
 
 def _extract_amount(dir_name: str) -> str:
@@ -86,7 +89,7 @@ def plot_line(auc_df: pd.DataFrame, out_dir: Path) -> None:
 
     ax.axhline(1.0, color="gray", linestyle="--", linewidth=0.8, alpha=0.5)
     ax.set_ylabel("Relative AUC (normalized to best dataset)")
-    ax.set_xlabel("Dataset (increasing input amount →)")
+    ax.set_xlabel("Dataset (decreasing input amount →)")
     ax.set_ylim(0, 1.08)
     ax.legend(bbox_to_anchor=(1.02, 1), loc="upper left", fontsize=8)
     ax.set_title("Feature discriminability across dilution series")
@@ -129,8 +132,13 @@ def plot_auc_vs_ids(auc_df: pd.DataFrame, ids_series: pd.Series, out_dir: Path) 
     fig, ax = plt.subplots(figsize=(4, 4))
     for ds in datasets:
         ax.scatter(mean_auc[ds], ids_series[ds], zorder=3)
-        ax.annotate(ds, (mean_auc[ds], ids_series[ds]), textcoords="offset points",
-                    xytext=(5, 3), fontsize=8)
+        ax.annotate(
+            ds,
+            (mean_auc[ds], ids_series[ds]),
+            textcoords="offset points",
+            xytext=(5, 3),
+            fontsize=8,
+        )
 
     ax.set_xlabel("Mean feature AUC across all features")
     ax.set_ylabel("PSMs at 1% FDR (%)")
@@ -179,8 +187,6 @@ def plot_mbr_fill_rate(
 
     Returns the Figure for inline display in Jupyter.
     """
-    x_order = ["5ng", "1ng", "250pg", "125pg"]
-
     dirs = {
         _extract_amount(d.name): d
         for d in benchmark_dir.iterdir()
@@ -191,7 +197,7 @@ def plot_mbr_fill_rate(
     swaps_mean, swaps_std = [], []
     fp_mean, fp_std = [], []
 
-    for amount in x_order:
+    for amount in _X_ORDER:
         d = dirs[amount]
         perc_dir = d / PERCOLATOR_SUBDIR
 
@@ -209,7 +215,7 @@ def plot_mbr_fill_rate(
 
     swaps_mean, swaps_std = np.array(swaps_mean), np.array(swaps_std)
     fp_mean, fp_std = np.array(fp_mean), np.array(fp_std)
-    xs = np.arange(len(x_order))
+    xs = np.arange(len(_X_ORDER))
 
     fig, ax = plt.subplots(figsize=(5, 4))
     for mean, std, marker, label, color in (
@@ -220,7 +226,7 @@ def plot_mbr_fill_rate(
         ax.fill_between(xs, mean - std, mean + std, alpha=0.2, color=color)
 
     ax.set_xticks(xs)
-    ax.set_xticklabels(x_order)
+    ax.set_xticklabels(_X_ORDER)
     ax.set_xlabel("Dataset (decreasing input amount →)")
     ax.set_ylabel("MBR fill rate (MBR / non-MS/MS, %)")
     ax.set_title(f"MBR fill rate across dilution series\n(min_count={min_count})")
@@ -302,7 +308,6 @@ def plot_intensity_correlation_by_dilution(
 
     Returns the Figure for inline display in Jupyter.
     """
-    x_order = ["5ng", "1ng", "250pg", "125pg"]
 
     dirs = {
         _extract_amount(d.name): d
@@ -320,7 +325,7 @@ def plot_intensity_correlation_by_dilution(
         "FragPipe": {c: [] for c in _CORR_CONDITIONS},
     }
 
-    for amount in x_order:
+    for amount in _X_ORDER:
         d = dirs[amount]
         perc_dir = d / PERCOLATOR_SUBDIR
 
@@ -336,11 +341,9 @@ def plot_intensity_correlation_by_dilution(
             for tool, corrs in (("SWAPS", swaps_corrs), ("FragPipe", fp_corrs)):
                 vals = np.array(corrs[cond])
                 tool_means[tool][cond].append(vals.mean() if len(vals) else np.nan)
-                tool_stds[tool][cond].append(
-                    vals.std(ddof=1) if len(vals) > 1 else 0.0
-                )
+                tool_stds[tool][cond].append(vals.std(ddof=1) if len(vals) > 1 else 0.0)
 
-    xs = np.arange(len(x_order))
+    xs = np.arange(len(_X_ORDER))
     tool_colors = {"SWAPS": "steelblue", "FragPipe": "tomato"}
 
     fig, ax = plt.subplots(figsize=(6, 4))
@@ -349,12 +352,18 @@ def plot_intensity_correlation_by_dilution(
             mean = np.array(tool_means[tool][cond])
             std = np.array(tool_stds[tool][cond])
             ls = _CONDITION_LINESTYLES[cond]
-            ax.plot(xs, mean, color=color, linestyle=ls, marker="o",
-                    label=f"{tool} · {cond}")
+            ax.plot(
+                xs,
+                mean,
+                color=color,
+                linestyle=ls,
+                marker="o",
+                label=f"{tool} · {cond}",
+            )
             ax.fill_between(xs, mean - std, mean + std, color=color, alpha=0.1)
 
     ax.set_xticks(xs)
-    ax.set_xticklabels(x_order)
+    ax.set_xticklabels(_X_ORDER)
     ax.set_xlabel("Dataset (decreasing input amount →)")
     ax.set_ylabel("Pearson r (log₂ intensity)")
     ax.set_title(f"Intensity correlation by match-type pair\n(min_count={min_count})")
@@ -372,6 +381,132 @@ def plot_intensity_correlation_by_dilution(
     return fig
 
 
+def _precursor_match_status(
+    d: Path, percolator_subdir: str = PERCOLATOR_SUBDIR
+) -> pd.DataFrame:
+    """Per-precursor mz_rank + % unmatched across runs, indexed by (Modified sequence, Charge)."""
+    dict_ref = pd.read_pickle(d / "dict_ref.pkl")
+    combined = pd.read_parquet(d / percolator_subdir / "swaps_combined_ions.parquet")
+
+    mt_cols = [c for c in combined.columns if c.endswith("Match Type")]
+    pct_unmatched = (combined[mt_cols] == "unmatched").mean(axis=1) * 100
+
+    merged = (
+        combined[["mz_rank"]]
+        .assign(pct_unmatched=pct_unmatched)
+        .merge(
+            dict_ref[["mz_rank", "Modified sequence", "Charge"]],
+            on="mz_rank",
+            how="left",
+        )
+    )
+    return merged.set_index(["Modified sequence", "Charge"])[
+        ["mz_rank", "pct_unmatched"]
+    ]
+
+
+def unmatched_pct_by_dilution(
+    benchmark_dir: Path = BENCHMARK_DIR,
+    percolator_subdir: str = PERCOLATOR_SUBDIR,
+) -> pd.DataFrame:
+    """mz_rank + % unmatched per precursor x dilution dataset, for precursors quantified
+    in all datasets.
+
+    Columns are a (dataset, [mz_rank, pct_unmatched]) MultiIndex, dataset level ordered
+    5ng -> 1ng -> 250pg -> 125pg (decreasing input amount).
+    """
+    dirs = {
+        _extract_amount(d.name): d
+        for d in benchmark_dir.iterdir()
+        if d.name.startswith("Ultra_nanoflow")
+    }
+    per_condition = {
+        amount: _precursor_match_status(dirs[amount], percolator_subdir)
+        for amount in _X_ORDER
+    }
+    df = pd.concat(per_condition, axis=1, join="inner")
+    return df[_X_ORDER]
+
+
+def increasing_unmatched_precursors(
+    benchmark_dir: Path = BENCHMARK_DIR,
+    percolator_subdir: str = PERCOLATOR_SUBDIR,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Overlapped precursors (quantified across the full dilution series) whose % unmatched
+    rises monotonically as input amount decreases (5ng -> 1ng -> 250pg -> 125pg).
+
+    Includes each dataset's mz_rank alongside its pct_unmatched.
+    """
+    df = unmatched_pct_by_dilution(benchmark_dir, percolator_subdir)
+    pct = df.xs("pct_unmatched", axis=1, level=1)[_X_ORDER]
+    vals = pct.to_numpy()
+    non_decreasing = (vals[:, 1:] >= vals[:, :-1]).all(axis=1)
+    has_increase = (vals[:, 1:] > vals[:, :-1]).any(axis=1)
+    trend = non_decreasing & has_increase
+    return (
+        df.loc[trend].sort_values((_X_ORDER[-1], "pct_unmatched"), ascending=False),
+        df,
+    )
+
+
+def render_precursor_match_figures(
+    df: pd.DataFrame,
+    indices,
+    fig_dir: str | Path,
+    benchmark_dir: Path = BENCHMARK_DIR,
+    match_decoy: bool = False,
+) -> None:
+    """Render one match-features consensus figure per dilution condition for selected precursors.
+
+    *df* must carry the (dataset, [mz_rank, pct_unmatched]) MultiIndex-column layout
+    returned by `unmatched_pct_by_dilution` / `increasing_unmatched_precursors`, row-indexed
+    by (Modified sequence, Charge). For each (Modified sequence, Charge) label in *indices*,
+    looks up that precursor's mz_rank per condition and writes the consensus
+    alignment/segmentation figure to fig_dir/<sequence>_<charge>/<amount>.png.
+    """
+    from swaps.postprocessing.match_features import match_features_batch
+    from swaps.utils.config import get_cfg_defaults
+    from swaps.utils.singleton_swaps_optimization import swaps_optimization_cfg
+
+    fig_dir = Path(fig_dir)
+    dirs = {
+        _extract_amount(d.name): d
+        for d in benchmark_dir.iterdir()
+        if d.name.startswith("Ultra_nanoflow")
+    }
+
+    for idx in indices:
+        sequence, charge = idx
+        row = df.loc[idx]
+        subdir = fig_dir / f"{sequence}_{charge}"
+        subdir.mkdir(parents=True, exist_ok=True)
+
+        for amount in _X_ORDER:
+            mz_rank = int(row[(amount, "mz_rank")])
+            d = dirs[amount]
+
+            dict_ref = pd.read_pickle(d / "dict_ref_with_activation.pkl")
+            cfg = get_cfg_defaults(swaps_optimization_cfg)
+            cfg.merge_from_file(d / "quantification" / "effective_config.yaml")
+            raw_file_list = [
+                f for f in os.listdir(cfg.RESULT_PATH) if f.startswith(amount)
+            ]
+            processing_kwargs = yaml.safe_load(cfg.MATCH_FEATURES_KWARGS.dump())
+
+            match_features_batch(
+                dict_ref=dict_ref,
+                raw_file_list=raw_file_list,
+                result_dir=cfg.RESULT_PATH,
+                batch=[mz_rank],
+                processing_kwargs=processing_kwargs,
+                match_decoy=match_decoy,
+                visualize_dir=str(subdir),
+            )
+            generated = subdir / f"mz{mz_rank}_consensus.png"
+            if generated.exists():
+                generated.replace(subdir / f"{amount}.png")
+
+
 def print_summary(auc_df: pd.DataFrame, ids_series: pd.Series) -> None:
     auc_range = (auc_df.max(axis=1) - auc_df.min(axis=1)).sort_values()
     print("\n=== Feature AUC ===")
@@ -387,7 +522,9 @@ def main() -> None:
     parser.add_argument(
         "--out_dir",
         type=Path,
-        default=Path("/cmnfs/proj/ORIGINS/data/SWAPS_FFM_timsTOF_benchmark/feature_strength"),
+        default=Path(
+            "/cmnfs/proj/ORIGINS/data/SWAPS_FFM_timsTOF_benchmark/dilution_series"
+        ),
         help="Directory for output figures",
     )
     args = parser.parse_args()
