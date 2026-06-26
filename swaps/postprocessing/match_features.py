@@ -1288,7 +1288,7 @@ def segment_consensus_from_aligned(
         if consensus_image_indices is not None
         else alignment_state.aligned_images
     )
-    consensus = np.stack(_imgs_for_consensus, axis=0).mean(axis=0)
+    consensus = np.stack(_imgs_for_consensus, axis=0).sum(axis=0)
     consensus_denoised = smooth_and_denoise_image(consensus, **(denoise_kwargs or {}))
     rows, cols = alignment_state.target_shape
     non_none_indices = [
