@@ -7,6 +7,7 @@ from matplotlib.gridspec import GridSpec
 import numpy as np
 from typing import Optional
 import seaborn as sns
+from statsmodels.nonparametric.smoothers_lowess import lowess
 
 Logger = logging.getLogger(__name__)
 ALLOWED_ORGANISMS = ("HUMAN", "YEAST", "ECOLI")
@@ -181,6 +182,7 @@ def _prepare_qdf_from_combined_protein(
     id_cols: list[str] = ["Protein ID", "Organism"],
     cond_A_keyword: str = "HYE124_A",
     cond_B_keyword: str = "HYE124_B",
+    min_valid_per_cond: int = 2,
 ) -> tuple[pd.DataFrame, int]:
     """
     Prepare a long-form quantification table with columns:
@@ -229,8 +231,12 @@ def _prepare_qdf_from_combined_protein(
     cond_B_values = (
         qdf[cond_B_cols].apply(pd.to_numeric, errors="coerce").replace(0, np.nan)
     )
-    median_A = cond_A_values.median(axis=1, skipna=True)
-    median_B = cond_B_values.median(axis=1, skipna=True)
+    valid_A = cond_A_values.notna().sum(axis=1) >= min_valid_per_cond
+    valid_B = cond_B_values.notna().sum(axis=1) >= min_valid_per_cond
+    valid_mask = valid_A & valid_B
+
+    median_A = cond_A_values.median(axis=1, skipna=True).where(valid_mask)
+    median_B = cond_B_values.median(axis=1, skipna=True).where(valid_mask)
 
     qdf["log2_Intensity_ref"] = np.log2((median_A + median_B) / 2.0)
     qdf["ratio"] = np.log2(median_B / median_A)
@@ -253,6 +259,7 @@ def plot_protein_quant(
     id_cols: list[str] = ["Protein ID", "Organism"],
     cond_A_keyword: str = "HYE124_A",
     cond_B_keyword: str = "HYE124_B",
+    min_valid_per_cond: int = 2,
 ):
     plt.rcParams.update({"font.size": annot_fontsize})
     qdf, n_total_proteins = _prepare_qdf_from_combined_protein(
@@ -262,6 +269,7 @@ def plot_protein_quant(
         id_cols=id_cols,
         cond_A_keyword=cond_A_keyword,
         cond_B_keyword=cond_B_keyword,
+        min_valid_per_cond=min_valid_per_cond,
     )
 
     if label_map is None:
@@ -307,11 +315,28 @@ def plot_protein_quant(
         palette=color_map,
         hue_order=organisms_present,
         alpha=0.2,
+        s=4,
         legend=False,
         ax=ax_scatter,
     )
     for artist in ax_scatter.collections:
         artist.set_rasterized(True)
+
+    # for org in organisms_present:
+    #     sub = qdf[qdf["Organism"] == org].dropna(subset=["log2_Intensity_ref", "ratio"])
+    #     if len(sub) < 10:
+    #         continue
+    #     smoothed = lowess(
+    #         sub["ratio"].values, sub["log2_Intensity_ref"].values, frac=0.3
+    #     )
+    #     ax_scatter.plot(
+    #         smoothed[:, 0],
+    #         smoothed[:, 1],
+    #         color="black",
+    #         linewidth=1.5,
+    #         linestyle="--",
+    #         zorder=3,
+    #     )
 
     stats = qdf.groupby("Organism")["ratio"].agg(
         count="count",
@@ -324,7 +349,7 @@ def plot_protein_quant(
     for i, (org, row) in enumerate(stats.iterrows()):
         c = color_map[org] if org in color_map else "black"
         display_org = label_map.get(org, org)
-        ax_scatter.axhline(row["median"], linestyle="-", linewidth=1.2, color=c)
+        # ax_scatter.axhline(row["median"], linestyle="-", linewidth=1.2, color=c)
         ax_scatter.axhline(row["q1"], linestyle="--", linewidth=1, color=c)
         ax_scatter.axhline(row["q3"], linestyle="--", linewidth=1, color=c)
         text = (
@@ -397,6 +422,7 @@ def plot_protein_quant_rolling_quantiles(
     ref_y_line: Optional[list] = None,
     cond_A_keyword: str = "HYE124_A",
     cond_B_keyword: str = "HYE124_B",
+    min_valid_per_cond: int = 2,
 ):
     """Plot rolling window quantiles of log2 ratio vs log2 intensity per organism."""
     plt.rcParams.update({"font.size": annot_fontsize})
@@ -407,6 +433,7 @@ def plot_protein_quant_rolling_quantiles(
         id_cols=id_cols,
         cond_A_keyword=cond_A_keyword,
         cond_B_keyword=cond_B_keyword,
+        min_valid_per_cond=min_valid_per_cond,
     )
 
     if label_map is None:
