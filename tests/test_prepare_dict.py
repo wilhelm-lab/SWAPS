@@ -42,6 +42,7 @@ def confound_df():
                 "RT_search_right": 2.0,
                 "IM_search_left": 0.5,
                 "IM_search_right": 0.7,
+                "Charge": 2,
             },
             {
                 "mz_bin": 500.00,
@@ -49,6 +50,7 @@ def confound_df():
                 "RT_search_right": 2.5,
                 "IM_search_left": 0.6,
                 "IM_search_right": 0.8,
+                "Charge": 2,
             },
             {
                 "mz_bin": 500.00,
@@ -56,6 +58,7 @@ def confound_df():
                 "RT_search_right": 2.5,
                 "IM_search_left": 0.9,
                 "IM_search_right": 1.1,
+                "Charge": 2,
             },
             {
                 "mz_bin": 500.01,
@@ -63,6 +66,7 @@ def confound_df():
                 "RT_search_right": 2.0,
                 "IM_search_left": 0.5,
                 "IM_search_right": 0.7,
+                "Charge": 2,
             },
             {
                 "mz_bin": 500.02,
@@ -70,6 +74,7 @@ def confound_df():
                 "RT_search_right": 2.0,
                 "IM_search_left": 0.5,
                 "IM_search_right": 0.7,
+                "Charge": 2,
             },
         ]
     )
@@ -141,3 +146,14 @@ def test_input_df_not_mutated(confound_df):
     dict_add_confounding_groups(confound_df)
     assert list(confound_df.columns) == original_cols
     assert "confounders" not in confound_df.columns
+
+
+def test_charge_mismatch_excluded(confound_df):
+    # give row 1 (mz_rank=2) a different charge than row 0 (mz_rank=1);
+    # they otherwise overlap in mz_bin/RT/IM and would be confounders
+    confound_df.loc[confound_df["mz_rank"] == 2, "Charge"] = 3
+    result = dict_add_confounding_groups(confound_df)
+    row0_conf = set(result.loc[result["mz_rank"] == 1, "confounders"].iloc[0])
+    row1_conf = set(result.loc[result["mz_rank"] == 2, "confounders"].iloc[0])
+    assert 2 not in row0_conf
+    assert 1 not in row1_conf

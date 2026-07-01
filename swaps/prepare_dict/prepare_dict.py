@@ -605,9 +605,10 @@ def dict_add_confounding_groups(
 ) -> pd.DataFrame:
     """
     For each candidate find all others within |Δmz_bin| ≤ 10^-mz_bin_digits
-    that also overlap in both RT and IM search windows. Adds column
-    'confounders' — a numpy int array of confounding mz_rank values per row.
-    Used downstream to constrain decoy mz sampling away from occupied regions.
+    that also share the same charge state and overlap in both RT and IM
+    search windows. Adds column 'confounders' — a numpy int array of
+    confounding mz_rank values per row. Used downstream to constrain decoy
+    mz sampling away from occupied regions.
     """
     mz_tol = 10.0 ** (-mz_bin_digits) + 1e-9
 
@@ -620,6 +621,7 @@ def dict_add_confounding_groups(
     im_left = sorted_df["IM_search_left"].to_numpy(dtype=float)
     im_right = sorted_df["IM_search_right"].to_numpy(dtype=float)
     mz_ranks = sorted_df["mz_rank"].to_numpy(dtype=int)
+    charges = sorted_df["Charge"].to_numpy()
 
     n = len(sorted_df)
     confounders = np.empty(n, dtype=object)
@@ -634,9 +636,10 @@ def dict_add_confounding_groups(
             confounders[i] = np.empty(0, dtype=int)
             continue
 
+        charge_match = charges[ni] == charges[i]
         rt_overlap = (rt_left[ni] <= rt_right[i]) & (rt_left[i] <= rt_right[ni])
         im_overlap = (im_left[ni] <= im_right[i]) & (im_left[i] <= im_right[ni])
-        confounders[i] = mz_ranks[ni[rt_overlap & im_overlap]]
+        confounders[i] = mz_ranks[ni[charge_match & rt_overlap & im_overlap]]
 
     result = maxquant_dict_df.copy()
     result["confounders"] = pd.Series(confounders, index=orig_index)
