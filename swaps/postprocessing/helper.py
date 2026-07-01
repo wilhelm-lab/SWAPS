@@ -1,17 +1,56 @@
 import os
+import re
 import sparse
 import pyarrow as pa
 import pyarrow.parquet as pq
 import numpy as np
 import pandas as pd
 import duckdb
-from typing import Optional, List
+from typing import Optional, List, Dict
 import logging
 
 Logger = logging.getLogger(__name__)
 
 _SORTED_ACTIVATION_FILENAME = "activation_sorted_by_mz.parquet"
 _SORTED_ROW_GROUP_SIZE = 100_000
+
+# Brain-region sample-tag convention shared by FragPipe combined_ion.tsv run
+# columns and SWAPS run names, e.g. "..._P064051_Fresh2_5ug_..._4921[_1]".
+SAMPLE_TAG_PATTERN = re.compile(r"P\d{6}_(?P<tag>.+?)_5ug")
+REGION_REPLICATE_PATTERN = re.compile(r"^(?P<region>[A-Za-z]+)(?P<replicate>\d+)")
+
+MSSTATS_COLUMNS = [
+    "ProteinName",
+    "PeptideSequence",
+    "PrecursorCharge",
+    "FragmentIon",
+    "ProductCharge",
+    "IsotopeLabelType",
+    "Condition",
+    "BioReplicate",
+    "Run",
+    "Intensity",
+]
+
+
+def parse_condition_bioreplicate(run_name: str) -> tuple[str, int]:
+    """Extract (Condition, BioReplicate) from a run/column name.
+
+    Expects the brain-region sample-tag convention ``P{6 digits}_<region><replicate>_5ug``
+    (e.g. ``ssDDA_P064051_Fresh2_5ug_R1_BD6_1_4921``), shared by the FragPipe
+    ``combined_ion.tsv`` run columns and the SWAPS run/column names.
+    """
+    tag_match = SAMPLE_TAG_PATTERN.search(run_name)
+    if tag_match is None:
+        raise ValueError(
+            f"Could not find a 'P######_<tag>_5ug' sample tag in: {run_name!r}"
+        )
+    region_match = REGION_REPLICATE_PATTERN.match(tag_match.group("tag"))
+    if region_match is None:
+        raise ValueError(
+            f"Could not parse region/replicate from tag: {tag_match.group('tag')!r}"
+        )
+    return region_match.group("region"), int(region_match.group("replicate"))
 
 
 def build_mz_sorted_activation(
@@ -288,3 +327,153 @@ def build_pivot(pp_all, dict_ref):
             pivot[col] = pivot[col].fillna("unmatched")
 
     return pivot.reset_index()
+
+
+def _wide_intensity_to_msstats_long(
+    df: pd.DataFrame,
+    intensity_cols: List[str],
+    id_cols: Dict[str, str],
+    intensity_suffix: str = " Intensity",
+    drop_missing: bool = True,
+    zero_as_missing: bool = False,
+) -> pd.DataFrame:
+    """Melt a wide per-run-intensity table into MSstats long format.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Wide table with one row per ion and one ``<run><intensity_suffix>``
+        column per run, plus the identity columns named in `id_cols`.
+    intensity_cols : list of str
+        Columns in `df` holding per-run intensities.
+    id_cols : dict
+        Maps MSstats column name -> source column name, for
+        ``{"ProteinName": ..., "PeptideSequence": ..., "PrecursorCharge": ...}``.
+    intensity_suffix : str
+        Suffix stripped from `intensity_cols` to recover the run name, which
+        is then parsed with :func:`parse_condition_bioreplicate`.
+    drop_missing : bool
+        Drop rows with a missing intensity, i.e. ions not observed in that run.
+    zero_as_missing : bool
+        Treat an intensity of exactly 0.0 as missing (NaN) before dropping.
+        FragPipe's ``combined_ion.tsv`` encodes "not observed" as 0.0 rather
+        than NaN, unlike the SWAPS pivot table.
+
+    Returns
+    -------
+    pd.DataFrame
+        Long-format table with the standard MSstats columns
+        (see `MSSTATS_COLUMNS`).
+    """
+    run_names = sorted({col[: -len(intensity_suffix)] for col in intensity_cols})
+    run_meta = {
+        name: (*parse_condition_bioreplicate(name), run_id)
+        for run_id, name in enumerate(run_names, start=1)
+    }
+    condition_map = {name: meta[0] for name, meta in run_meta.items()}
+    bioreplicate_map = {name: meta[1] for name, meta in run_meta.items()}
+    run_id_map = {name: meta[2] for name, meta in run_meta.items()}
+
+    long_df = df.melt(
+        id_vars=list(id_cols.values()),
+        value_vars=intensity_cols,
+        var_name="_run_col",
+        value_name="Intensity",
+    )
+    if zero_as_missing:
+        long_df["Intensity"] = long_df["Intensity"].replace(0.0, np.nan)
+    if drop_missing:
+        long_df = long_df.dropna(subset=["Intensity"])
+
+    run_name = long_df.pop("_run_col").str[: -len(intensity_suffix)]
+    long_df["Condition"] = run_name.map(condition_map)
+    long_df["BioReplicate"] = run_name.map(bioreplicate_map)
+    long_df["Run"] = run_name.map(run_id_map)
+    long_df["IsotopeLabelType"] = "L"
+    long_df["FragmentIon"] = np.nan
+    long_df["ProductCharge"] = np.nan
+
+    long_df = long_df.rename(columns={src: dst for dst, src in id_cols.items()})
+    return long_df[MSSTATS_COLUMNS].reset_index(drop=True)
+
+
+def combined_ion_to_msstats(
+    combined_ion: pd.DataFrame,
+    protein_col: str = "Protein ID",
+    peptide_col: str = "Modified Sequence",
+    charge_col: str = "Charge",
+    intensity_suffix: str = " Intensity",
+    drop_missing: bool = True,
+) -> pd.DataFrame:
+    """Convert a FragPipe ``combined_ion.tsv`` wide table to MSstats long format.
+
+    Each ``<run>{intensity_suffix}`` column becomes one set of rows; Condition
+    and BioReplicate are parsed from the run name (see
+    :func:`parse_condition_bioreplicate`), Run is a consecutive integer per
+    unique run, and IsotopeLabelType is always ``"L"`` (no isotope labeling).
+    FragmentIon/ProductCharge are NA since this is precursor (ion)-level, not
+    fragment-level, data. FragPipe encodes "not observed in this run" as an
+    intensity of 0.0 (rather than NaN), so those rows are treated as missing
+    too.
+    """
+    intensity_cols = [
+        c for c in combined_ion.columns if c.endswith(intensity_suffix)
+    ]
+    if not intensity_cols:
+        raise ValueError(
+            f"No columns ending in {intensity_suffix!r} found in combined_ion."
+        )
+    id_cols = {
+        "ProteinName": protein_col,
+        "PeptideSequence": peptide_col,
+        "PrecursorCharge": charge_col,
+    }
+    return _wide_intensity_to_msstats_long(
+        combined_ion,
+        intensity_cols,
+        id_cols,
+        intensity_suffix,
+        drop_missing,
+        zero_as_missing=True,
+    )
+
+
+def swaps_combined_ions_to_msstats(
+    combined_ions: pd.DataFrame,
+    dict_ref: pd.DataFrame,
+    protein_col: str = "Proteins",
+    peptide_col: str = "Modified sequence",
+    charge_col: str = "Charge",
+    ion_id_col: str = "mz_rank",
+    intensity_suffix: str = " Intensity",
+    drop_missing: bool = True,
+) -> pd.DataFrame:
+    """Convert a SWAPS ``swaps_combined_ions.parquet`` wide table to MSstats long format.
+
+    `combined_ions` is the ``mz_rank`` + per-run ``"<run> Match Type"`` /
+    ``"<run> Intensity"`` table produced by :func:`build_pivot`. Peptide
+    identity (sequence/charge/protein) isn't carried in that table and is
+    joined in from `dict_ref` (the pipeline's ``dict_ref.pkl``) on
+    `ion_id_col`. Rows with no match in a given run have NaN intensity and
+    are dropped, same as for `combined_ion_to_msstats`.
+    """
+    intensity_cols = [
+        c for c in combined_ions.columns if c.endswith(intensity_suffix)
+    ]
+    if not intensity_cols:
+        raise ValueError(
+            f"No columns ending in {intensity_suffix!r} found in combined_ions."
+        )
+    merged = combined_ions[[ion_id_col] + intensity_cols].merge(
+        dict_ref[[ion_id_col, protein_col, peptide_col, charge_col]],
+        on=ion_id_col,
+        how="left",
+    )
+    id_cols = {
+        "ProteinName": protein_col,
+        "PeptideSequence": peptide_col,
+        "PrecursorCharge": charge_col,
+    }
+    return _wide_intensity_to_msstats_long(
+        merged, intensity_cols, id_cols, intensity_suffix, drop_missing
+    )
