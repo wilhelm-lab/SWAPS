@@ -2693,24 +2693,46 @@ def plot_intensity_coverage_by_species(
 
 def plot_dict_ref_search_windows(
     dict_ref: pd.DataFrame,
-    mz_bin: float,
-    tolerance: float,
+    mz_bin: Optional[float] = None,
+    tolerance: Optional[float] = None,
+    mz_rank: Optional[int] = None,
     figsize_windows: tuple = (8, 6),
     iso_row_height: float = 2.0,
     save_dir: Optional[str] = None,
 ) -> tuple[Figure, Figure]:
     """
-    Two-panel diagnostic for dict_ref entries near a given mz_bin.
+    Two-panel diagnostic for dict_ref entries near a given mz_bin, or for a
+    single mz_rank and its confounder group.
 
     Plot 1 – RT/IM search windows: one rectangle per row, colored by mz_bin,
     annotated with mz_rank.  X-axis = 1/K0, Y-axis = RT (min).
 
     Plot 2 – Isotope spike plots: one row of stacked subplots (shared x-axis)
     per dict_ref entry; X = IsoMZ, Y = IsoAbundance.
+
+    Either pass `mz_bin`/`tolerance` to select entries by proximity in m/z, or
+    pass `mz_rank` to select that entry together with the mz_ranks listed in
+    its "confounders" column.
     """
-    filtered = dict_ref[np.abs(dict_ref["mz_bin"] - mz_bin) <= tolerance].copy()
-    if filtered.empty:
-        raise ValueError(f"No entries within tolerance {tolerance} of mz_bin {mz_bin}")
+    if mz_rank is not None:
+        row = dict_ref.loc[dict_ref["mz_rank"] == mz_rank]
+        if row.empty:
+            raise ValueError(f"mz_rank {mz_rank} not found in dict_ref")
+        confounder_ranks = np.asarray(row["confounders"].iloc[0])
+        selected_ranks = np.union1d(confounder_ranks, [mz_rank])
+        filtered = dict_ref[dict_ref["mz_rank"].isin(selected_ranks)].copy()
+        title_suffix = f"mz_rank={mz_rank} + confounders"
+        file_suffix = f"mzrank{mz_rank}"
+    else:
+        if mz_bin is None or tolerance is None:
+            raise ValueError(
+                "Either mz_rank, or both mz_bin and tolerance, must be provided"
+            )
+        filtered = dict_ref[np.abs(dict_ref["mz_bin"] - mz_bin) <= tolerance].copy()
+        if filtered.empty:
+            raise ValueError(f"No entries within tolerance {tolerance} of mz_bin {mz_bin}")
+        title_suffix = f"mz_bin≈{mz_bin}  tol={tolerance}"
+        file_suffix = f"{mz_bin}_{tolerance}"
     filtered = filtered.sort_values("mz_rank")
     Logger.info(
         "Filtered dict_ref: %s",
@@ -2762,7 +2784,7 @@ def plot_dict_ref_search_windows(
     ax1.autoscale_view()
     ax1.set_xlabel("1/K0 (ion mobility)")
     ax1.set_ylabel("RT (min)")
-    ax1.set_title(f"RT/IM Search Windows  mz_bin≈{mz_bin}  tol={tolerance}")
+    ax1.set_title(f"RT/IM Search Windows  {title_suffix}")
     fig1.tight_layout()
 
     # ── Plot 2: Isotope spike subplots ────────────────────────────────────────
@@ -2793,7 +2815,7 @@ def plot_dict_ref_search_windows(
         )
 
     axes[-1].set_xlabel("m/z")
-    fig2.suptitle(f"Isotope Patterns  mz_bin≈{mz_bin}  tol={tolerance}")
+    fig2.suptitle(f"Isotope Patterns  {title_suffix}")
     fig2.tight_layout()
 
     if save_dir is not None:
@@ -2802,7 +2824,7 @@ def plot_dict_ref_search_windows(
             fig1.savefig(
                 os.path.join(
                     save_dir,
-                    f"DictRefWindows_{mz_bin}_{tolerance}.{fmt}",
+                    f"DictRefWindows_{file_suffix}.{fmt}",
                 ),
                 dpi=300,
                 bbox_inches="tight",
@@ -2810,7 +2832,7 @@ def plot_dict_ref_search_windows(
             fig2.savefig(
                 os.path.join(
                     save_dir,
-                    f"DictRefIsoPatterns_{mz_bin}_{tolerance}.{fmt}",
+                    f"DictRefIsoPatterns_{file_suffix}.{fmt}",
                 ),
                 dpi=300,
                 bbox_inches="tight",
