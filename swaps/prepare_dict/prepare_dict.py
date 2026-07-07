@@ -691,6 +691,42 @@ def dict_add_mass_mono(maxquant_dict_df: pd.DataFrame):
     return maxquant_dict_df
 
 
+def _modpept_atom_composition(modpept: str, charge: int, mod_CAM: bool = True):
+    """Build the elemental composition of a (possibly modified) peptide.
+
+    Counts modifications on the raw string, then strips ALL modification tokens
+    -- parenthesised spellings, bracket nominal-mass tokens ([43] acetyl, [147]
+    ox-Met), and lowercase terminal markers (the n/c in n[43]... N-/C-term
+    encoding) -- before iso.ParseFASTA. Stripping the lowercase markers is
+    essential: ParseFASTA otherwise reads a leading 'n' as an Asparagine
+    residue (+114.0429 Da). Extra atoms for water, charge protons, N-term
+    acetyl, ox-Met and carbamidomethyl (CAM) are then added back.
+
+    Shared by calculate_modpept_isopattern and calculate_modpept_mz.
+    """
+    n_H = 2 + charge  # 2 from water and others from charge (proton)
+    n_Mox = (
+        modpept.count("M(ox)") + modpept.count("Oxidation (M)") + modpept.count("[147]")
+    )
+    n_acetylN = (
+        modpept.count("(ac)")
+        + modpept.count("(Acetyl (Protein N-term))")
+        + modpept.count("[43]")
+    )
+
+    seq = re.sub(r"\([^)]*\)", "", modpept)  # drop (ox)/(Acetyl (Protein N-term))
+    seq = re.sub(r"\[[^\]]*\]", "", seq)  # drop [43]/[147] nominal-mass tokens
+    seq = re.sub(r"[a-z]", "", seq)  # drop lowercase n/c terminal markers
+
+    n_C = seq.count("C") if mod_CAM else 0
+    atom_composition = iso.ParseFASTA(seq)
+    atom_composition["H"] += 3 * n_C + n_H + 2 * n_acetylN
+    atom_composition["C"] += 2 * n_C + 2 * n_acetylN
+    atom_composition["N"] += 1 * n_C
+    atom_composition["O"] += 1 * n_C + 1 + n_acetylN + 1 * n_Mox
+    return atom_composition
+
+
 def calculate_modpept_isopattern(
     modpept: str, charge: int, ab_thres: float = 0.005, mod_CAM: bool = True
 ):
@@ -706,35 +742,7 @@ def calculate_modpept_isopattern(
 
     return: two list
     """
-
-    # account for extra atoms from modification and water
-    # count extra atoms
-    n_H = 2 + charge  # 2 from water and others from charge (proton)
-    n_Mox = (
-        modpept.count("M(ox)") + modpept.count("Oxidation (M)") + modpept.count("[147]")
-    )
-    modpept = modpept.replace("(ox)", "")
-    modpept = modpept.replace("(Oxidation (M))", "")
-    n_acetylN = (
-        modpept.count("(ac)")
-        + modpept.count("(Acetyl (Protein N-term))")
-        + modpept.count("[43]")
-    )
-    modpept = modpept.replace("(Acetyl (Protein N-term))", "")
-    modpept = modpept.replace("(ac)", "")
-
-    if mod_CAM:
-        n_C = modpept.count("C")
-    else:
-        n_C = 0
-    # addition of extra atoms
-    atom_composition = iso.ParseFASTA(modpept)
-    atom_composition["H"] += 3 * n_C + n_H + 2 * n_acetylN
-    atom_composition["C"] += 2 * n_C + 2 * n_acetylN
-    atom_composition["N"] += 1 * n_C
-    atom_composition["O"] += 1 * n_C + 1 + n_acetylN + 1 * n_Mox
-
-    # Isotope calculation
+    atom_composition = _modpept_atom_composition(modpept, charge, mod_CAM=mod_CAM)
     formula = "".join([f"{key}{value}" for key, value in atom_composition.items()])
     iso_distr = iso.IsoThreshold(formula=formula, threshold=ab_thres, absolute=True)
     iso_distr.sort_by_mass()
@@ -753,29 +761,7 @@ def calculate_modpept_mz(modpept: str, charge: int, mod_CAM: bool = True):
     :mod_CAM: bool, whether to consider CAM modification
     return: two list
     """
-
-    # account for extra atoms from modification and water
-    # count extra atoms
-    n_H = 2 + charge  # 2 from water and others from charge (proton)
-    n_Mox = modpept.count("M(ox)") + modpept.count("Oxidation (M)")
-    modpept = modpept.replace("(ox)", "")
-    modpept = modpept.replace("(Oxidation (M))", "")
-    n_acetylN = modpept.count("(ac)") + modpept.count("(Acetyl (Protein N-term))")
-    modpept = modpept.replace("(Acetyl (Protein N-term))", "")
-    modpept = modpept.replace("(ac)", "")
-
-    if mod_CAM:
-        n_C = modpept.count("C")
-    else:
-        n_C = 0
-    # addition of extra atoms
-    atom_composition = iso.ParseFASTA(modpept)
-    atom_composition["H"] += 3 * n_C + n_H + 2 * n_acetylN
-    atom_composition["C"] += 2 * n_C + 2 * n_acetylN
-    atom_composition["N"] += 1 * n_C
-    atom_composition["O"] += 1 * n_C + 1 + n_acetylN + 1 * n_Mox
-
-    # Isotope calculation
+    atom_composition = _modpept_atom_composition(modpept, charge, mod_CAM=mod_CAM)
     formula = "".join([f"{key}{value}" for key, value in atom_composition.items()])
     iso_distr = iso.IsoThreshold(formula=formula, threshold=0.1, absolute=True)
     iso_distr.sort_by_prob()

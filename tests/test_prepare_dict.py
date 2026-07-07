@@ -2,7 +2,10 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from swaps.prepare_dict.prepare_dict import dict_add_confounding_groups
+from swaps.prepare_dict.prepare_dict import (
+    calculate_modpept_isopattern,
+    dict_add_confounding_groups,
+)
 
 
 def _make_df(rows):
@@ -157,3 +160,22 @@ def test_charge_mismatch_excluded(confound_df):
     row1_conf = set(result.loc[result["mz_rank"] == 2, "confounders"].iloc[0])
     assert 2 not in row0_conf
     assert 1 not in row1_conf
+
+
+# --- calculate_modpept_isopattern (modification token handling) ---
+
+
+def test_isopattern_nterm_acetyl_token_stripped():
+    # 'n[43]' N-term acetyl: the leading lowercase 'n' must be stripped before
+    # ParseFASTA, else it is misread as an Asparagine residue (+114.0429 Da).
+    # Recorded precursor m/z for this peptide (charge 2) is 620.8236.
+    mz, _ = calculate_modpept_isopattern("n[43]AAAAAAAAAAGAAGGR", 2)
+    assert abs(float(mz[0]) - 620.8236) < 0.01
+
+
+def test_isopattern_oxmet_token_adds_one_oxygen():
+    # '[147]' ox-Met stays correct: exactly one oxygen (~15.9949 Da) heavier
+    # than the unmodified peptide (regression for the shared token stripper).
+    base, _ = calculate_modpept_isopattern("MPEPTIDEK", 1)
+    ox, _ = calculate_modpept_isopattern("M[147]PEPTIDEK", 1)
+    assert abs((float(ox[0]) - float(base[0])) - 15.9949) < 0.01
