@@ -279,6 +279,7 @@ def process_one_frame_ims(
     return_res_coo_dict: bool = False,
     parquet_file: Optional[str] = None,
     writer=None,
+    merge_confounders: bool = False,
     # zarr_path: Optional[str] = None,
     # zarr_shape: Optional[tuple] = None,
     # zarr_chunks: tuple = (256, 128, 1),
@@ -331,6 +332,13 @@ def process_one_frame_ims(
             candidate_precursor_by_rt = candidate_precursor_by_rt.sort_values(
                 "mz_rank", ascending=True
             )
+            if merge_confounders:
+                candidate_precursor_by_rt = collapse_candidates_by_confounder_group(
+                    candidate_precursor_by_rt
+                )
+                candidate_precursor_by_rt = candidate_precursor_by_rt.sort_values(
+                    "mz_rank", ascending=True
+                )
             all_frame_pept_idx = candidate_precursor_by_rt.mz_rank.values
             (
                 frame_array,
@@ -1093,6 +1101,47 @@ def match_frame_to_anchors(frame_mz, anchors, ppm_tol: float = 10):
     # matched_anchor_idx = matched_anchor_idx[match_mask]
 
     return match_mask, matched_anchor_idx
+
+
+def collapse_candidates_by_confounder_group(
+    candidate_precursor_by_rt: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Collapse multi-member confounder groups present in this frame's candidate
+    set into a single representative row keyed by confounder_group_id, using
+    the group's precomputed merged isotope pattern (GroupIsoMZ/
+    GroupIsoAbundance from dict_add_merged_confounder_pattern). This removes
+    the collinear/competing rows a confounder group would otherwise produce
+    in the per-frame SWA candidate matrix -- one activation trace is solved
+    for the whole group instead.
+
+    Solo candidates (confounder_group_id == -1, or the column absent) pass
+    through unchanged, keyed by their own mz_rank. The returned "mz_rank"
+    column is therefore a mix of real mz_ranks (solo) and group ids (merged
+    groups) -- used as the row-key for _prepare_sparse_matrices. Caller must
+    re-sort by "mz_rank" after calling this (group ids, being far larger than
+    real mz_ranks, sort to the end -- harmless for _prepare_sparse_matrices,
+    which only needs candidate_precursor_by_rt.mz_rank sorted ascending and
+    self-consistent).
+    """
+    if "confounder_group_id" not in candidate_precursor_by_rt.columns:
+        return candidate_precursor_by_rt
+    grouped_mask = candidate_precursor_by_rt["confounder_group_id"] != -1
+    if not grouped_mask.any():
+        return candidate_precursor_by_rt
+
+    solo = candidate_precursor_by_rt.loc[~grouped_mask]
+    grouped = candidate_precursor_by_rt.loc[grouped_mask]
+    representatives = grouped.drop_duplicates(
+        subset="confounder_group_id", keep="first"
+    ).copy()
+    representatives["mz_rank"] = representatives["confounder_group_id"]
+    representatives["IsoMZ"] = representatives["GroupIsoMZ"]
+    representatives["IsoAbundance"] = representatives["GroupIsoAbundance"]
+    representatives["mz_length"] = representatives["GroupMzLength"]
+    representatives["RT_search_left"] = representatives["GroupRT_search_left"]
+    representatives["RT_search_right"] = representatives["GroupRT_search_right"]
+    return pd.concat([solo, representatives], ignore_index=True)
 
 
 def _prepare_sparse_matrices(

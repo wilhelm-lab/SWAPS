@@ -18,7 +18,10 @@ from utils.ims_utils import (
 )
 from utils.config import get_cfg_defaults, merge_cfg_from_file
 from utils.singleton_swaps_optimization import swaps_optimization_cfg
-from optimization.inference import process_frames_parallel, generate_id_partitions
+from optimization.inference import (
+    process_frames_parallel,
+    generate_id_partitions,
+)
 from prepare_dict.prepare_dict import (
     construct_dict_from_search_pivoted,
     dict_add_index_to_raw_file,
@@ -53,6 +56,29 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
+
+def _quant_dir(cfg) -> str:
+    """RESULT_PATH/MATCH_FEATURES_KWARGS.dir_name, with a "_no_fdr" suffix
+    when FDR control is disabled so the two output types never collide and
+    it's obvious from the directory name alone which mode produced it."""
+    dir_name = cfg.MATCH_FEATURES_KWARGS.dir_name
+    if not cfg.FDR.ENABLED:
+        dir_name += "_no_fdr"
+    return os.path.join(cfg.RESULT_PATH, dir_name)
+
+
+def _to_parquet_safe(df: pd.DataFrame, path: str, **kwargs):
+    """df.to_parquet, coercing undistinguishable_group_id to a single dtype.
+
+    The column mixes the int default -1 (no coSWA collision) with str tags
+    like "10000030_0" (collision group); pyarrow's Table.from_pandas can't
+    infer one Arrow type for that object column and raises ArrowInvalid.
+    """
+    if "undistinguishable_group_id" in df.columns:
+        df = df.copy()
+        df["undistinguishable_group_id"] = df["undistinguishable_group_id"].astype(str)
+    df.to_parquet(path, **kwargs)
 
 
 def _save_effective_cfg(cfg, processing_kwargs: dict, result_path: str):
@@ -214,6 +240,30 @@ def opt_scan_by_scan(config_path: str):
                     ms1scans,
                     idx_suffix=f"_ref_{dir_wo_extension}",
                 )
+                # coSWA: group-window frame/IM indices for confounder-group
+                # members, so match_features crops the representative image to
+                # the merged (union) window the SWA solve actually spans, not
+                # the representative's own narrower individual window. Guard on
+                # GroupIM_search_left (this block's first-consumed column) so a
+                # stale dict_ref.pkl predating these columns is skipped rather
+                # than crashing -- regenerate dict_ref.pkl to pick up the fix.
+                if "GroupIM_search_left" in dict_ref.columns:
+                    dict_ref = dict_add_im_index(
+                        dict_ref,
+                        mobility_values_df,
+                        "GroupIM_search_left",
+                        "GroupIM_search_center",
+                        "GroupIM_search_right",
+                        idx_suffix=f"_group_ref_{dir_wo_extension}",
+                    )
+                    dict_ref = dict_add_rt_index(
+                        dict_ref,
+                        ms1scans,
+                        mq_rt_left_col="GroupRT_search_left",
+                        mq_rt_center_col=None,
+                        mq_rt_right_col="GroupRT_search_right",
+                        idx_suffix=f"_group_ref_{dir_wo_extension}",
+                    )
                 # added_im_and_rt_index = True
 
                 # Save the updated dict_ref with added activation info to the result directory for downstream processing
@@ -261,6 +311,7 @@ def opt_scan_by_scan(config_path: str):
                 use_ims=cfg.USE_IMS,
                 return_res_coo_dict=False,
                 max_mz_rank=max_mz_rank,
+                merge_confounders=cfg.PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED,
             )
     else:
         logging.info(
@@ -341,7 +392,7 @@ def opt_scan_by_scan(config_path: str):
 
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = [
-            ex.submit(df.to_parquet, os.path.join(quant_dir, fn), index=False)
+            ex.submit(_to_parquet_safe, df, os.path.join(quant_dir, fn), index=False)
             for fn, df in dfs_to_save.items()
         ]
         for f in futs:
@@ -514,7 +565,8 @@ def run_fdr_control_onwards(
     with ThreadPoolExecutor(max_workers=2) as ex:
         futs = [
             ex.submit(
-                pp_all.to_parquet,
+                _to_parquet_safe,
+                pp_all,
                 os.path.join(
                     quant_dir,
                     percolator_dir_name,
@@ -523,7 +575,8 @@ def run_fdr_control_onwards(
                 index=False,
             ),
             ex.submit(
-                pivot.to_parquet,
+                _to_parquet_safe,
+                pivot,
                 os.path.join(
                     quant_dir, percolator_dir_name, "swaps_combined_ions.parquet"
                 ),

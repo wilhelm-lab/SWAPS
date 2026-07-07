@@ -28,6 +28,7 @@ def detect_2d_peak_with_watershed(
     seed_radius: int = 0,
     use_competing_peaks: bool = True,  # new: enable/disable the feature
     # min_distance_to_true_seed: int = 15,  # new: minimum distance from competing peaks to the true seed
+    compactness: float = 0.001,
     visualize: bool = False,
 ):
     """
@@ -43,6 +44,11 @@ def detect_2d_peak_with_watershed(
         of the signal above its surrounding saddle.
     - norm_percentile: int
         Percentile of in-mask intensity used to normalise the image before h-maxima.
+    - compactness: float
+        Watershed compactness. Near zero (default) grows basins by steepest-descent
+        on intensity alone, so a weak peak next to a much taller one can lose most of
+        its basin to the neighbor. Larger values regularise growth towards equal-area
+        (Voronoi-like) splits, giving weak peaks a fairer geometric share.
     - visualize: bool
         If True, show a step-by-step matplotlib figure of each stage.
     Returns:
@@ -169,7 +175,7 @@ def detect_2d_peak_with_watershed(
                     -image,
                     candidate_markers,
                     mask=component_mask,
-                    compactness=0.001,
+                    compactness=compactness,
                 )
                 true_seed_label = candidate_labels[tuple(true_seed)]
 
@@ -232,7 +238,7 @@ def detect_2d_peak_with_watershed(
         markers = np.where(dist <= seed_radius, markers[ri, ci], 0)
 
     labels_multi_markers = watershed(
-        -image, markers, mask=mask_signal, compactness=0.001
+        -image, markers, mask=mask_signal, compactness=compactness
     )
 
     # --- new: when competing peaks were used, only return true seed's region ---

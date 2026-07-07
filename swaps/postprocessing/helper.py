@@ -114,10 +114,58 @@ def build_mz_sorted_activation(
     return out_path
 
 
+def expand_group_ids_to_members(
+    coord_frame_indices,
+    coord_im_indices,
+    coord_pept_indices,
+    data,
+    group_to_members: dict,
+):
+    """
+    Duplicate rows whose coord_pept_indices entry is a confounder group id
+    (a key in group_to_members) out to every member's real mz_rank. Used by
+    load_peptide_batch_df_from_partquet to lazily re-expand a coSWA group's
+    single stored activation trace, in memory, only for the batch currently
+    being read -- the SWA write path stores exactly one row-set per group
+    (see optimization.inference.collapse_candidates_by_confounder_group),
+    never duplicated to disk. Rows whose coord_pept_indices entry is not a
+    group id pass through unchanged.
+    """
+    coord_pept_indices = np.asarray(coord_pept_indices)
+    if len(coord_pept_indices) == 0 or not group_to_members:
+        return coord_frame_indices, coord_im_indices, coord_pept_indices, data
+    is_group = np.isin(coord_pept_indices, list(group_to_members.keys()))
+    if not is_group.any():
+        return coord_frame_indices, coord_im_indices, coord_pept_indices, data
+
+    solo_idx = np.flatnonzero(~is_group)
+    group_idx = np.flatnonzero(is_group)
+    rep_counts = np.array(
+        [len(group_to_members[coord_pept_indices[i]]) for i in group_idx]
+    )
+    expanded_pept = np.concatenate(
+        [coord_pept_indices[solo_idx]]
+        + [group_to_members[coord_pept_indices[i]] for i in group_idx]
+    )
+
+    def _expand(arr):
+        arr = np.asarray(arr)
+        return np.concatenate([arr[solo_idx], np.repeat(arr[group_idx], rep_counts)])
+
+    return (
+        _expand(coord_frame_indices),
+        _expand(coord_im_indices),
+        expanded_pept,
+        _expand(data),
+    )
+
+
 def load_peptide_batch_df_from_partquet(
     activation_dir: str,
     pept_indicies,  # list of int or np.ndarray
+    group_to_members: Optional[dict] = None,
     con: duckdb.DuckDBPyConnection | None = None,
+    expand_to_members: bool = True,
 ) -> pd.DataFrame:
     """Load activation rows for a contiguous mz_rank slice from the sorted parquet.
 
@@ -132,9 +180,30 @@ def load_peptide_batch_df_from_partquet(
     pept_indicies:
         Sequence of mz_rank values for this batch.  Should be a contiguous
         range so the BETWEEN predicate matches exactly the needed row groups.
+    group_to_members:
+        Optional {confounder_group_id: [real mz_ranks present in THIS batch]}
+        mapping (batch-scoped -- see match_features._group_members_in_batch).
+        coSWA groups are stored on disk as a single row-set keyed by their
+        group id, which is always > every real mz_rank (see
+        prepare_dict.dict_add_confounder_group_id) and therefore never falls
+        inside the BETWEEN range above. When provided, each group's row-set
+        is fetched via an extra IN(...) scan and, if `expand_to_members` is
+        True, duplicated in memory to every member key -- lazily
+        reconstructing, per batch, the same per-member view the SWA write
+        path used to persist to disk (before that duplication was found to
+        blow up build_mz_sorted_activation's memory footprint by up to ~20x
+        on real datasets).
     con:
         Optional existing DuckDB connection.  A new one is created (and closed)
         when *None*.
+    expand_to_members:
+        When True (default), duplicate each group's row-set to every member's
+        own mz_rank as described above. When False, group rows are returned
+        as-is, still keyed by their confounder_group_id -- for callers that
+        resolve a member's own mz_rank to its group id at lookup time instead
+        (see match_features._act_lookup_key), avoiding both the duplication
+        cost and the larger, more-duplicate-heavy mz_rank index that later
+        per-candidate lookups would otherwise run against.
     """
     sorted_path = os.path.join(activation_dir, _SORTED_ACTIVATION_FILENAME)
     own_connection = con is None
@@ -143,12 +212,42 @@ def load_peptide_batch_df_from_partquet(
         con.execute("SET enable_progress_bar = false")
     mz_min = int(min(pept_indicies))
     mz_max = int(max(pept_indicies))
-    df = con.execute(
-        f"SELECT * FROM parquet_scan('{sorted_path}') "
-        f"WHERE mz_rank BETWEEN {mz_min} AND {mz_max}"
-    ).df()
+    if group_to_members:
+        group_ids_sql = ",".join(str(int(g)) for g in group_to_members.keys())
+        # UNION ALL of two single-predicate scans, rather than one
+        # OR-combined predicate, so DuckDB's row-group min/max pruning stays
+        # effective on both halves independently.
+        query = (
+            f"SELECT * FROM parquet_scan('{sorted_path}') "
+            f"WHERE mz_rank BETWEEN {mz_min} AND {mz_max} "
+            f"UNION ALL "
+            f"SELECT * FROM parquet_scan('{sorted_path}') "
+            f"WHERE mz_rank IN ({group_ids_sql})"
+        )
+    else:
+        query = (
+            f"SELECT * FROM parquet_scan('{sorted_path}') "
+            f"WHERE mz_rank BETWEEN {mz_min} AND {mz_max}"
+        )
+    df = con.execute(query).df()
     if own_connection:
         con.close()
+    if group_to_members and expand_to_members:
+        frame_idx, im_idx, mz_rank, data = expand_group_ids_to_members(
+            df["frame_idx"].to_numpy(),
+            df["im_idx"].to_numpy(),
+            df["mz_rank"].to_numpy(),
+            df["activation"].to_numpy(),
+            group_to_members,
+        )
+        df = pd.DataFrame(
+            {
+                "frame_idx": frame_idx,
+                "im_idx": im_idx,
+                "mz_rank": mz_rank,
+                "activation": data,
+            }
+        )
     return df
 
 
@@ -159,16 +258,28 @@ def get_pept_act_from_parquet(
     run_name,
     shape: Optional[tuple] = None,
     return_offset: bool = False,
+    use_group_window: bool = False,
 ):
     # Support both a pre-indexed DataFrame (index == "mz_rank") and a plain one.
     if dict_ref.index.name == "mz_rank":
         row = dict_ref.loc[[pept_idx]]
     else:
         row = dict_ref.loc[dict_ref["mz_rank"] == pept_idx, :]
-    rt_start = row[f"MS1_frame_idx_left_ref_{run_name}"].values[0]
-    rt_end = row[f"MS1_frame_idx_right_ref_{run_name}"].values[0]
-    im_start = row[f"mobility_values_index_left_ref_{run_name}"].values[0]
-    im_end = row[f"mobility_values_index_right_ref_{run_name}"].values[0]
+    # coSWA: confounder-group members crop to the merged (union) RT/IM window
+    # the shared SWA solve spans, not each member's own narrower individual
+    # window. Falls back to the individual window when group columns are absent
+    # (solo candidates, or runs built without confounder merging).
+    _group_rt_left = f"MS1_frame_idx_left_group_ref_{run_name}"
+    if use_group_window and _group_rt_left in row.columns:
+        rt_start = row[_group_rt_left].values[0]
+        rt_end = row[f"MS1_frame_idx_right_group_ref_{run_name}"].values[0]
+        im_start = row[f"mobility_values_index_left_group_ref_{run_name}"].values[0]
+        im_end = row[f"mobility_values_index_right_group_ref_{run_name}"].values[0]
+    else:
+        rt_start = row[f"MS1_frame_idx_left_ref_{run_name}"].values[0]
+        rt_end = row[f"MS1_frame_idx_right_ref_{run_name}"].values[0]
+        im_start = row[f"mobility_values_index_left_ref_{run_name}"].values[0]
+        im_end = row[f"mobility_values_index_right_ref_{run_name}"].values[0]
     # rt_exp_start = row["MS1_frame_idx_left_exp"].values[0] - rt_start
     rt_exp_center = (
         (row[f"{run_name}_MS1_frame_idx_exp"].values[0] - rt_start)
@@ -416,9 +527,7 @@ def combined_ion_to_msstats(
     intensity of 0.0 (rather than NaN), so those rows are treated as missing
     too.
     """
-    intensity_cols = [
-        c for c in combined_ion.columns if c.endswith(intensity_suffix)
-    ]
+    intensity_cols = [c for c in combined_ion.columns if c.endswith(intensity_suffix)]
     if not intensity_cols:
         raise ValueError(
             f"No columns ending in {intensity_suffix!r} found in combined_ion."
@@ -457,9 +566,7 @@ def swaps_combined_ions_to_msstats(
     `ion_id_col`. Rows with no match in a given run have NaN intensity and
     are dropped, same as for `combined_ion_to_msstats`.
     """
-    intensity_cols = [
-        c for c in combined_ions.columns if c.endswith(intensity_suffix)
-    ]
+    intensity_cols = [c for c in combined_ions.columns if c.endswith(intensity_suffix)]
     if not intensity_cols:
         raise ValueError(
             f"No columns ending in {intensity_suffix!r} found in combined_ions."

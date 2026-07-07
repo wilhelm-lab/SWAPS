@@ -2696,6 +2696,7 @@ def plot_dict_ref_search_windows(
     mz_bin: Optional[float] = None,
     tolerance: Optional[float] = None,
     mz_rank: Optional[int] = None,
+    group_id: Optional[int] = None,
     figsize_windows: tuple = (8, 6),
     iso_row_height: float = 2.0,
     save_dir: Optional[str] = None,
@@ -2723,6 +2724,13 @@ def plot_dict_ref_search_windows(
         filtered = dict_ref[dict_ref["mz_rank"].isin(selected_ranks)].copy()
         title_suffix = f"mz_rank={mz_rank} + confounders"
         file_suffix = f"mzrank{mz_rank}"
+    if group_id is not None:
+        filtered = dict_ref.loc[dict_ref["confounder_group_id"] == group_id]
+        if filtered.empty:
+            raise ValueError(f"group_id {group_id} not found in dict_ref")
+        # filtered = np.asarray(row["mz_rank"])
+        title_suffix = f"group_id={group_id}"
+        file_suffix = f"groupid{group_id}"
     else:
         if mz_bin is None or tolerance is None:
             raise ValueError(
@@ -2730,7 +2738,9 @@ def plot_dict_ref_search_windows(
             )
         filtered = dict_ref[np.abs(dict_ref["mz_bin"] - mz_bin) <= tolerance].copy()
         if filtered.empty:
-            raise ValueError(f"No entries within tolerance {tolerance} of mz_bin {mz_bin}")
+            raise ValueError(
+                f"No entries within tolerance {tolerance} of mz_bin {mz_bin}"
+            )
         title_suffix = f"mz_bin≈{mz_bin}  tol={tolerance}"
         file_suffix = f"{mz_bin}_{tolerance}"
     filtered = filtered.sort_values("mz_rank")

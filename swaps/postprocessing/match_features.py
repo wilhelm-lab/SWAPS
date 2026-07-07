@@ -1,7 +1,7 @@
 import logging
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable
 import numpy as np
 import pandas as pd
@@ -63,6 +63,10 @@ class ConsensusSegmentationState:
     label_to_snap: dict[int, tuple[int, int]]
     non_none_indices: list[int]
     apply_seg: bool
+    # Watershed peak coordinates (Nx2, row/col), reused by coSWA to snap
+    # other confounder-group members' own anchors against this same
+    # segmentation without recomputing it. Empty when bbox fallback was used.
+    all_peaks: np.ndarray = field(default_factory=lambda: np.empty((0, 2), dtype=int))
 
 
 @dataclass
@@ -259,6 +263,30 @@ def _confounder_pool(
     return in_batch[in_batch != pept_idx].astype(batch_np.dtype)
 
 
+def _group_members_in_batch(
+    dict_ref_by_mz: pd.DataFrame, batch_np: np.ndarray
+) -> dict[int, list[int]]:
+    """Map each confounder_group_id with >=1 member present in `batch_np` to
+    ITS OWN batch-present real mz_ranks. Deliberately batch-scoped, not a
+    filtered view of a run-wide mapping -- computing a run-wide grouping once
+    per batch/worker would redo an O(N) groupby per batch, reintroducing a
+    smaller version of the exact blow-up removed from the SWA write path
+    (see helper.load_peptide_batch_df_from_partquet). A group split across
+    batches needs no cross-batch coordination: each batch independently sees
+    only its own present member(s), fetches the group's one stored parquet
+    row via IN(group_id), and expands it only to those members.
+    """
+    if "confounder_group_id" not in dict_ref_by_mz.columns:
+        return {}
+    members_by_group: dict[int, list[int]] = {}
+    for p in batch_np:
+        p = int(p)
+        gid = int(dict_ref_by_mz.at[p, "confounder_group_id"])
+        if gid != -1:
+            members_by_group.setdefault(gid, []).append(p)
+    return members_by_group
+
+
 def _parse_seg_mask_thres(val, default: tuple[int, int] = (3, 3)) -> tuple[int, int]:
     if isinstance(val, dict):
         return (int(val.get("rt", default[0])), int(val.get("im", default[1])))
@@ -317,8 +345,14 @@ def _annotate_peak_properties(
     source_run: str,
     source_type: str,
     decoy_mz_rank: int | None = None,
+    undistinguishable_group_id: str | int = -1,
 ) -> pd.DataFrame | None:
-    """Add anchor-aware metadata columns to a quantified peak-properties row."""
+    """Add anchor-aware metadata columns to a quantified peak-properties row.
+
+    undistinguishable_group_id flags coSWA confounder-group members whose
+    anchors snapped to the identical watershed peak (see match_features_batch)
+    -- -1 (the default) means not part of such a collision.
+    """
 
     if peak_properties is None:
         return None
@@ -331,6 +365,7 @@ def _annotate_peak_properties(
     peak_properties["own_feature_instance_id"] = own_feature_instance_id
     peak_properties["source_run"] = source_run
     peak_properties["source_type"] = source_type
+    peak_properties["undistinguishable_group_id"] = undistinguishable_group_id
     if decoy_mz_rank is not None:
         peak_properties["decoy_mz_rank"] = decoy_mz_rank
     return peak_properties
@@ -368,40 +403,335 @@ def match_features_batch(
     full_denoise_kwargs = _denoise_kwargs_all(denoise_cfg)
     _align_images = bool((processing_kwargs or {}).get("align_images", True))
 
+    # coSWA groups are stored on disk as a single row-set keyed by their
+    # confounder_group_id (never duplicated to every member's mz_rank -- see
+    # helper.load_peptide_batch_df_from_partquet). Compute this batch's own
+    # group membership once and reuse it both to fetch+expand each group's
+    # row below and to drive the shared-segmentation pre-pass further down.
+    _group_to_members = _group_members_in_batch(dict_ref_by_mz, batch_np)
+
     # Load activation data for this mz_rank batch from the pre-built sorted parquet.
     # DuckDB skips row groups outside [min(batch_np), max(batch_np)], so I/O scales
     # with batch_size / N_total.  Requires build_mz_sorted_activation() to have been
     # run for each raw_file activation directory beforehand.
     con = duckdb.connect()
     con.execute("SET enable_progress_bar = false")
-    act_dfs = {
+    # expand_to_members=False: keep each in-batch group's row-set keyed by its
+    # own confounder_group_id rather than duplicated out to every member's own
+    # mz_rank. Group members' activation lookups are instead redirected to the
+    # group id at query time (see _act_lookup_key below) -- same data, without
+    # the O(members) duplication cost or the correspondingly larger, more
+    # duplicate-heavy mz_rank index that per-candidate lookups would otherwise
+    # run against for every candidate sharing this batch, group or solo.
+    _act_dfs_raw = {
         raw_file: load_peptide_batch_df_from_partquet(
             os.path.join(result_dir, raw_file, "activation"),
             batch_np,
+            group_to_members=_group_to_members or None,
             con=con,
-        ).set_index("mz_rank", drop=False)
+            expand_to_members=False,
+        )
         for raw_file in raw_file_list
     }
     con.close()
 
-    def _select_mz(df_indexed: pd.DataFrame, mz_rank: int) -> pd.DataFrame:
-        try:
-            return df_indexed.loc[[mz_rank]]
-        except KeyError:
-            return df_indexed.iloc[0:0]
+    # Per-raw-file {mz_rank: sub-dataframe} map, built once so each candidate's
+    # activation fetch is an O(1) dict lookup instead of pandas' non-unique-
+    # index .loc[[key]] resolution (get_indexer_non_unique), which does not
+    # amortize to O(1) on repeated calls against the same index the way a
+    # unique index's hash lookup does.
+    act_dfs: dict[str, dict[int, pd.DataFrame]] = {
+        raw_file: {int(mz): sub for mz, sub in df.groupby("mz_rank", sort=False)}
+        for raw_file, df in _act_dfs_raw.items()
+    }
+    _empty_act_df = {raw_file: df.iloc[0:0] for raw_file, df in _act_dfs_raw.items()}
+
+    def _select_mz(raw_file: str, mz_rank: int) -> pd.DataFrame:
+        return act_dfs[raw_file].get(mz_rank, _empty_act_df[raw_file])
+
+    _has_group_col = "confounder_group_id" in dict_ref_by_mz.columns
+
+    def _act_lookup_key(pept_idx: int) -> int:
+        """Map a candidate's own mz_rank to the key its activation is stored
+        under in act_dfs: its confounder_group_id when it belongs to an
+        in-batch group (act_dfs keeps one un-duplicated row-set per group --
+        see expand_to_members=False above), else its own mz_rank unchanged."""
+        if not _has_group_col:
+            return pept_idx
+        gid = int(dict_ref_by_mz.at[pept_idx, "confounder_group_id"])
+        return gid if gid != -1 else pept_idx
+
+    def _load_pept_act(pept_idx: int, raw_file: str) -> tuple[np.ndarray, int, int]:
+        """Uncached single-shot load, used only by the coSWA group pre-pass
+        below (each (pept_idx, raw_file) pair is touched at most once there,
+        so the per-iteration caches used inside the main loop aren't needed).
+        Always crops to the group's merged window -- every caller here is a
+        confounder-group member (see pre-pass)."""
+        return get_pept_act_from_parquet(  # pyright: ignore[reportArgumentType]
+            _select_mz(raw_file, _act_lookup_key(int(pept_idx))),
+            int(pept_idx),
+            dict_ref_by_mz,
+            raw_file,
+            use_group_window=True,
+        )
+
+    def _load_raw_denoised_pept_act(pept_idx: int, raw_file: str) -> np.ndarray:
+        return smooth_and_denoise_image(
+            _load_pept_act(pept_idx, raw_file)[0], **raw_denoise_kwargs
+        )
+
+    def _positional_anchors(stack, ref_rf, quant_set, loader):
+        """Per-run anchor list over `stack`: this candidate's own reference /
+        quant_only runs get its (frame, scan) apex; all other runs get None."""
+        anchors: list[tuple[int, int] | None] = []
+        for rf in stack:
+            if rf == ref_rf or rf in quant_set:
+                t = loader(rf)
+                anchors.append((int(t[1]), int(t[2])))
+            else:
+                anchors.append(None)
+        return anchors
+
+    def _reference_match_quant_files(pept_idx: int):
+        row_series = dict_ref_by_mz.loc[pept_idx, :]
+        str_values = row_series[row_series.map(lambda x: isinstance(x, str))]
+        reference_raw_file = str(str_values.index[(str_values == "Reference")][0])
+        quant_only_raw_files = str_values.index[str_values == "Quant_Only"].tolist()
+        match_raw_files = str_values.index[
+            (str_values.str.contains("Match", regex=False))
+            | (str_values == "Quant_Only")
+        ].tolist()
+        return reference_raw_file, quant_only_raw_files, match_raw_files
+
+    # --- coSWA: pre-pass for confounder groups present in this batch ---
+    # For each multi-member confounder group (mz_ranks sharing
+    # confounder_group_id, from dict_add_confounder_group_id -- only present
+    # when PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED was set at dict-build time),
+    # build ONE representative's full alignment + watershed segmentation here
+    # and cache it; every other member reuses it (build_consensus_feature_
+    # bundle(reuse_from=...)) instead of recomputing SIFT-based alignment and
+    # h-maxima watershed per candidate -- their raw per-run activation images
+    # are identical by construction (coSWA merges the SWA solve for the whole
+    # group into one shared activation trace, stored on disk as a single
+    # row-set and lazily re-expanded to every member's own mz_rank when this
+    # batch's activation is loaded above -- see inference.collapse_
+    # candidates_by_confounder_group / helper.expand_group_ids_to_members).
+    #
+    # Collision is determined once per group, from each member's OWN
+    # reference-run anchor snapped against this one shared segmentation (not
+    # per-run: the segmentation itself is already shared across every run, so
+    # whether two members collide is a property of their position in that one
+    # map, not something that varies per run). Members whose reference-run
+    # anchor lands on the same watershed label as another member's are
+    # tagged with a shared undistinguishable_group_id, applied to all of
+    # their per-run quantification rows below.
+    #
+    # Deliberately out of scope here: decoy generation (_confounder_pool /
+    # peptide_swap sampling) is left completely untouched -- grouped
+    # candidates still go through the exact same per-candidate decoy code as
+    # solo candidates, each with its own reference_raw_file role assignment
+    # reused from the group representative (a documented simplification: a
+    # member's own per-run Reference/Match/Quant_Only identification status
+    # could in principle differ from the representative's).
+    _group_bundle_cache: dict[int, tuple[Any, ...]] = {}
+    _undistinguishable_tag: dict[int, str | int] = {}
+    # Per-member (own alignment, own watershed snap, own anchors), keyed by
+    # mz_rank -- populated below for every member of every multi-member
+    # group in this batch, and reused directly by the main loop instead of
+    # recomputing the same alignment-reuse + snap + anchor-image-load work
+    # a second time per candidate.
+    _member_prepass_cache: dict[
+        int, tuple[ConsensusAlignmentState, ConsensusSegmentationState, list]
+    ] = {}
+    if "confounder_group_id" in dict_ref_by_mz.columns:
+        _members_by_group = {
+            g: m for g, m in _group_to_members.items() if len(m) >= 2
+        }
+
+        _apply_seg = bool((processing_kwargs or {}).get("apply_seg", True))
+        _seg_mask_thres = _parse_seg_mask_thres(
+            (processing_kwargs or {}).get("seg_mask_thres")
+        )
+        _jump_dist_thres = _parse_jump_dist_thres(
+            (processing_kwargs or {}).get("jump_dist_thres")
+        )
+        _peak_consensus_kwargs = dict(
+            (processing_kwargs or {}).get("peak_consensus_kwargs", {})
+        )
+
+        for _gid, _members in _members_by_group.items():
+            _representative = min(_members)
+            # Per-member OWN roles -- confounder members can be identified in
+            # different runs than the representative, so role/anchor assignment
+            # must be per-member (only the alignment + watershed are shared).
+            _member_roles = {_m: _reference_match_quant_files(_m) for _m in _members}
+            _ref_raw_file, _quant_only_rf, _match_rf = _member_roles[_representative]
+            # Shared run stack for the whole group: representative's reference
+            # first (== alignment reference_idx 0), then every other run any
+            # member is identified/matched in. Built as an explicit union
+            # rather than relying on "Not_Match".contains("Match"), and
+            # guaranteed to contain every member's own reference + quant_only
+            # runs so per-member anchors can be placed positionally on it below.
+            _rep_consensus_raw_files = [_ref_raw_file] + list(_match_rf)
+            _stack_seen = set(_rep_consensus_raw_files)
+            for _m in _members:
+                _m_ref, _m_q, _m_match = _member_roles[_m]
+                for _rf in [_m_ref] + _m_q + _m_match:
+                    if _rf not in _stack_seen:
+                        _rep_consensus_raw_files.append(_rf)
+                        _stack_seen.add(_rf)
+            _stack_index = {rf: i for i, rf in enumerate(_rep_consensus_raw_files)}
+            _rep_quant_only_set = set(_quant_only_rf)
+            _rep_consensus_anchors: list[tuple[int, int] | None] = [
+                (
+                    (
+                        int(_load_pept_act(_representative, rf)[1]),
+                        int(_load_pept_act(_representative, rf)[2]),
+                    )
+                    if rf in _rep_quant_only_set or rf == _ref_raw_file
+                    else None
+                )
+                for rf in _rep_consensus_raw_files
+            ]
+            # Consensus image = mean over every run where ANY member is anchored
+            # (own reference or quant_only), so the shared segmentation reflects
+            # the whole group, not just the representative.
+            _group_consensus_indices = sorted(
+                {
+                    _stack_index[_rf]
+                    for _m in _members
+                    for _m_ref, _m_q, _ in (_member_roles[_m],)
+                    for _rf in [_m_ref] + _m_q
+                }
+            )
+            _rep_raw_images = [
+                _load_pept_act(_representative, rf)[0] for rf in _rep_consensus_raw_files
+            ]
+            _source_shapes = [img.shape for img in _rep_raw_images]
+            # Every member's own per-run anchors, computed up front (needed
+            # both to widen the shared template below and, per member, to
+            # reuse the representative's alignment further down) -- members
+            # share the representative's image origin/shape (use_group_window),
+            # so these anchors are already positionally valid against
+            # _rep_consensus_raw_files / _source_shapes.
+            _all_member_anchors: dict[int, list[tuple[int, int] | None]] = {
+                _m: _positional_anchors(
+                    _rep_consensus_raw_files,
+                    _member_roles[_m][0],
+                    set(_member_roles[_m][1]),
+                    lambda rf, _m=_m: _load_pept_act(_m, rf),
+                )
+                for _m in _members
+            }
+            _rep_bundle = build_consensus_feature_bundle(
+                images=[
+                    _load_raw_denoised_pept_act(_representative, rf)
+                    for rf in _rep_consensus_raw_files
+                ],
+                reference_idx=0,
+                template_frac=0.3,
+                anchors=_rep_consensus_anchors,
+                additional_anchors=list(_all_member_anchors.values()),
+                denoise_cfg=denoise_cfg,
+                watershed_kwargs=_peak_consensus_kwargs,
+                raw_images=_rep_raw_images,
+                labels=_rep_consensus_raw_files,
+                apply_seg=_apply_seg,
+                seg_mask_thres=_seg_mask_thres,
+                jump_dist_thres=_jump_dist_thres,
+                consensus_image_indices=_group_consensus_indices,
+                align_images=_align_images,
+            )
+            _group_bundle_cache[_gid] = (
+                _rep_bundle,
+                _ref_raw_file,
+                _rep_consensus_raw_files,
+                _rep_quant_only_set,
+                _rep_raw_images,
+            )
+
+            # Compute and cache each member's own alignment + watershed snap
+            # ONCE here (unconditionally -- every member's snap is needed
+            # below for collision detection, and is IDENTICAL to what the
+            # main loop would otherwise recompute per candidate via
+            # build_consensus_feature_bundle(reuse_from=_rep_bundle, ...):
+            # same _rep_bundle, same own anchors, same collapse args). The
+            # main loop looks this up via precomputed_states instead of
+            # rebuilding it, and reuses these same anchors as its own
+            # _consensus_anchors instead of reloading each anchor run's
+            # activation image a second time.
+            _label_members: dict[int, list[int]] = {}
+            for _m in _members:
+                _m_anchors = _all_member_anchors[_m]
+                _m_align = _reuse_alignment_with_new_anchors(
+                    _rep_bundle.alignment, _m_anchors, _source_shapes
+                )
+                _m_seg = _snap_all_anchors_to_watershed(
+                    _m_align,
+                    _rep_bundle.segmentation.consensus,
+                    _rep_bundle.segmentation.consensus_denoised,
+                    _rep_bundle.segmentation.watershed_labels,
+                    _rep_bundle.segmentation.all_peaks,
+                    _apply_seg,
+                    _seg_mask_thres,
+                    _jump_dist_thres,
+                    collapse_to_single_label=True,
+                    priority_anchor_index=_stack_index[_member_roles[_m][0]],
+                )
+                _member_prepass_cache[_m] = (_m_align, _m_seg, _m_anchors)
+                if (
+                    _rep_bundle.segmentation.apply_seg
+                    and _rep_bundle.segmentation.watershed_labels.max() > 0
+                    and _m_seg.target_label_ids
+                ):
+                    # Group members by the SAME single-segment assignment the
+                    # main loop uses (each member's full own-anchor set
+                    # snapped + majority-vote collapsed against the shared
+                    # segmentation), so the collision tag is consistent with
+                    # where each member is actually quantified.
+                    _label_members.setdefault(
+                        _m_seg.target_label_ids[0], []
+                    ).append(_m)
+            _collision_counter = 0
+            for _label_id, _m_list in _label_members.items():
+                if len(_m_list) >= 2:
+                    _tag = f"{_gid}_{_collision_counter}"
+                    _collision_counter += 1
+                    for _m in _m_list:
+                        _undistinguishable_tag[_m] = _tag
 
     for pept_idx in batch_np:
         pept_act_cache: dict[str, tuple[np.ndarray, int, int]] = {}
         pept_act_raw_denoised_cache: dict[str, np.ndarray] = {}
 
+        # coSWA: if pept_idx belongs to a multi-member confounder group
+        # present in this batch, reuse the group's cached representative
+        # role-assignment (reference/match/quant_only raw files) and,
+        # for non-representative members, its alignment + watershed
+        # segmentation too (see pre-pass above) -- own anchors are still
+        # this candidate's own, computed below as usual. Members also crop to
+        # the group's merged window (use_group_window), so every member's
+        # image shares the representative's origin/shape -- required for the
+        # anchor projection/snapping to be valid.
+        _group_id = (
+            int(dict_ref_by_mz.at[pept_idx, "confounder_group_id"])
+            if "confounder_group_id" in dict_ref_by_mz.columns
+            else -1
+        )
+        _cached_group = _group_bundle_cache.get(_group_id) if _group_id != -1 else None
+        _use_group_window = _cached_group is not None
+
+        _act_key = _group_id if _group_id != -1 else int(pept_idx)
+
         def _get_pept_act_tuple(raw_file: str) -> tuple[np.ndarray, int, int]:
             if raw_file not in pept_act_cache:
                 pept_act_cache[raw_file] = (
                     get_pept_act_from_parquet(  # pyright: ignore[reportArgumentType]
-                        _select_mz(act_dfs[raw_file], int(pept_idx)),
+                        _select_mz(raw_file, _act_key),
                         int(pept_idx),
                         dict_ref_by_mz,
                         raw_file,
+                        use_group_window=_use_group_window,
                     )
                 )
             return pept_act_cache[raw_file]
@@ -413,6 +743,10 @@ def match_features_batch(
                 )
             return pept_act_raw_denoised_cache[raw_file]
 
+        _undistinguishable_group_id = _undistinguishable_tag.get(int(pept_idx), -1)
+
+        # Roles are ALWAYS this candidate's OWN (fixes the coSWA bug where
+        # group members reused the representative's per-run role assignment).
         row_series = dict_ref_by_mz.loc[pept_idx, :]
         str_values = row_series[row_series.map(lambda x: isinstance(x, str))]
         reference_raw_file = str(str_values.index[(str_values == "Reference")][0])
@@ -421,47 +755,65 @@ def match_features_batch(
             (str_values.str.contains("Match", regex=False))
             | (str_values == "Quant_Only")
         ].tolist()
+        _quant_only_set = set(quant_only_raw_files)
+
+        if _cached_group is not None:
+            # Reuse the group's shared run-stack ORDERING + alignment +
+            # watershed; anchors and role labels are this member's own. Both
+            # the anchors and the alignment/watershed snap were already
+            # computed once for this exact member in the pre-pass above
+            # (identical inputs to what recomputing them here would produce
+            # -- same _rep_bundle, same own reference/quant_only runs, same
+            # collapse args) -- reuse them directly instead of reloading each
+            # anchor run's activation image and resnapping a second time.
+            (_rep_bundle, _, _consensus_raw_files, _, _rep_raw_images) = _cached_group
+            _m_align, _m_seg, _consensus_anchors = _member_prepass_cache[int(pept_idx)]
+        else:
+            _consensus_raw_files = [reference_raw_file] + match_raw_files
+            _consensus_anchors = _positional_anchors(
+                _consensus_raw_files,
+                reference_raw_file,
+                _quant_only_set,
+                _get_pept_act_tuple,
+            )
 
         own_anchor_id = 0
         feature_instance_id = _feature_instance_id(pept_idx, own_anchor_id)
 
-        _consensus_raw_files = [reference_raw_file] + match_raw_files
-        _quant_only_set = set(quant_only_raw_files)
-        _consensus_anchors: list[tuple[int, int] | None] = [
-            (
-                (int(_get_pept_act_tuple(rf)[1]), int(_get_pept_act_tuple(rf)[2]))
-                if rf in _quant_only_set or rf == reference_raw_file
-                else None
-            )
-            for rf in _consensus_raw_files
-        ]
         # Only files with known anchors contribute to the consensus average;
         # files without anchors are still aligned and quantified from the labels.
         _anchor_image_indices = [
             i for i, a in enumerate(_consensus_anchors) if a is not None
         ]
-        _consensus_bundle = build_consensus_feature_bundle(
-            images=[_get_raw_denoised_pept_act(rf) for rf in _consensus_raw_files],
-            reference_idx=0,
-            template_anchor=_get_pept_act_tuple(reference_raw_file)[1:3],
-            template_frac=0.3,
-            anchors=_consensus_anchors,
-            denoise_cfg=denoise_cfg,
-            watershed_kwargs=dict(
-                (processing_kwargs or {}).get("peak_consensus_kwargs", {})
-            ),
-            raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
-            labels=_consensus_raw_files,
-            apply_seg=bool((processing_kwargs or {}).get("apply_seg", True)),
-            seg_mask_thres=_parse_seg_mask_thres(
-                (processing_kwargs or {}).get("seg_mask_thres")
-            ),
-            jump_dist_thres=_parse_jump_dist_thres(
-                (processing_kwargs or {}).get("jump_dist_thres")
-            ),
-            consensus_image_indices=_anchor_image_indices,
-            align_images=_align_images,
-        )
+        if _cached_group is not None:
+            _consensus_bundle = build_consensus_feature_bundle(
+                images=[],
+                raw_images=_rep_raw_images,
+                labels=_consensus_raw_files,
+                precomputed_states=(_m_align, _m_seg),
+            )
+        else:
+            _consensus_bundle = build_consensus_feature_bundle(
+                images=[_get_raw_denoised_pept_act(rf) for rf in _consensus_raw_files],
+                reference_idx=0,
+                template_frac=0.3,
+                anchors=_consensus_anchors,
+                denoise_cfg=denoise_cfg,
+                watershed_kwargs=dict(
+                    (processing_kwargs or {}).get("peak_consensus_kwargs", {})
+                ),
+                raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
+                labels=_consensus_raw_files,
+                apply_seg=bool((processing_kwargs or {}).get("apply_seg", True)),
+                seg_mask_thres=_parse_seg_mask_thres(
+                    (processing_kwargs or {}).get("seg_mask_thres")
+                ),
+                jump_dist_thres=_parse_jump_dist_thres(
+                    (processing_kwargs or {}).get("jump_dist_thres")
+                ),
+                consensus_image_indices=_anchor_image_indices,
+                align_images=_align_images,
+            )
         if visualize_dir is not None:
             _visualize_consensus_bundle(
                 _consensus_bundle.alignment,
@@ -550,7 +902,7 @@ def match_features_batch(
                         else _batch_exclude
                     )
                     _decoy_mz = int(np.random.choice(_decoy_pool))
-                    _decoy_act_df = _select_mz(act_dfs[_plot_rf], _decoy_mz)
+                    _decoy_act_df = _select_mz(_plot_rf, _act_lookup_key(_decoy_mz))
                     _decoy_raw, _, _ = get_pept_act_from_parquet(
                         _decoy_act_df,
                         _decoy_mz,
@@ -577,7 +929,6 @@ def match_features_batch(
                     _decoy_bundle = build_consensus_feature_bundle(
                         images=_plot_raw_denoised_images,
                         reference_idx=0,
-                        template_anchor=_get_pept_act_tuple(reference_raw_file)[1:3],
                         template_frac=0.3,
                         anchors=_plot_anchors,
                         denoise_cfg=denoise_cfg,
@@ -697,6 +1048,7 @@ def match_features_batch(
                     own_feature_instance_id=feature_instance_id,
                     source_run="consensus",
                     source_type="Consensus",
+                    undistinguishable_group_id=_undistinguishable_group_id,
                 )
                 if _annotated_pp is None:
                     continue
@@ -710,6 +1062,7 @@ def match_features_batch(
                 _match_t["assimilated_to_anchor_id"] = own_anchor_id
                 _match_t["source_run"] = "consensus"
                 _match_t["source_type"] = "Consensus"
+                _match_t["undistinguishable_group_id"] = _undistinguishable_group_id
                 results_target.append(_match_t)
                 pp_match_target_list.append(_annotated_pp)
 
@@ -1161,9 +1514,20 @@ def align_images_to_reference(
     template_anchor: tuple[int, int] | None = None,
     template_frac: float = 0.3,
     anchors: list[tuple[int, int] | None] | None = None,
+    additional_anchors: list[list[tuple[int, int] | None]] | None = None,
     align_images: bool = True,
 ) -> ConsensusAlignmentState:
-    """Resize and align images to a reference template for consensus scoring."""
+    """Resize and align images to a reference template for consensus scoring.
+
+    If `template_anchor` is not given, it defaults to the centroid of all
+    anchor points -- `anchors` plus every list in `additional_anchors` (e.g.
+    one per confounder-group member, scaled into the reference frame) -- so
+    the template is centred on the whole group rather than pinned to a
+    single candidate's own anchor; falls back to the reference image's peak
+    if no anchors are provided. `template_frac` is likewise widened (never
+    narrowed) to the smallest fraction that still covers every anchor point
+    around the resolved template anchor, capped at 0.5.
+    """
 
     if not images:
         raise ValueError("images must contain at least one image.")
@@ -1176,6 +1540,13 @@ def align_images_to_reference(
             "anchors must have the same length as images "
             f"(got {len(anchors)}, expected {len(images)})."
         )
+    if additional_anchors is not None:
+        for _extra in additional_anchors:
+            if len(_extra) != len(images):
+                raise ValueError(
+                    "each list in additional_anchors must have the same length "
+                    f"as images (got {len(_extra)}, expected {len(images)})."
+                )
     if not (0 < template_frac <= 0.5):
         raise ValueError(f"template_frac must be in (0, 0.5], got {template_frac}.")
 
@@ -1196,11 +1567,40 @@ def align_images_to_reference(
         )
         for i in range(len(images))
     ]
+    _template_anchor_pool = list(scaled_anchors)
+    for _extra in additional_anchors or []:
+        _template_anchor_pool.extend(
+            _scale_anchor_to_target_shape(
+                _extra[i], images[i].shape, resolved_target_shape
+            )
+            for i in range(len(images))
+        )
+    _valid_template_anchors = [a for a in _template_anchor_pool if a is not None]
     reference_resized = resized_images[reference_idx]
+    resolved_template_anchor = template_anchor
+    if resolved_template_anchor is None and _valid_template_anchors:
+        resolved_template_anchor = (
+            float(np.mean([a[0] for a in _valid_template_anchors])),
+            float(np.mean([a[1] for a in _valid_template_anchors])),
+        )
+    resolved_template_frac = template_frac
+    if resolved_template_anchor is not None and _valid_template_anchors:
+        _rows, _cols = reference_resized.shape
+        _needed_frac = max(
+            (
+                max(
+                    abs(a[0] - resolved_template_anchor[0]) / _rows,
+                    abs(a[1] - resolved_template_anchor[1]) / _cols,
+                )
+                for a in _valid_template_anchors
+            ),
+            default=0.0,
+        )
+        resolved_template_frac = min(max(template_frac, _needed_frac), 0.5)
     anchor_row, anchor_col, template_bounds, template = _build_reference_template(
         reference_resized,
-        template_anchor,
-        template_frac,
+        resolved_template_anchor,
+        resolved_template_frac,
     )
 
     aligned_images: list[np.ndarray] = []
@@ -1270,26 +1670,144 @@ def align_images_to_reference(
     )
 
 
-def segment_consensus_from_aligned(
-    alignment_state: ConsensusAlignmentState,
-    denoise_kwargs: dict | None = None,
-    watershed_kwargs: dict | None = None,
-    apply_seg: bool = True,
-    seg_mask_thres: tuple[int, int] = (2, 5),
-    jump_dist_thres: tuple[int, int] = (0, 0),
-    consensus_image_indices: list[int] | None = None,
-) -> ConsensusSegmentationState:
-    """Segment a consensus image and track which labels belong to target anchors."""
+def _snap_anchor_to_watershed_label(
+    r: int,
+    c: int,
+    watershed_labels: np.ndarray,
+    all_peaks: np.ndarray,
+    labeled_coords: np.ndarray,
+    jump_dist_thres: tuple[int, int],
+) -> tuple[tuple[int, int] | None, int | None, dict[str, Any] | None]:
+    """
+    Snap a single (r, c) anchor onto the nearest peak within its watershed
+    label. Pure decision logic shared by the main per-run anchor loop in
+    segment_consensus_from_aligned and by coSWA's per-confounder-group-member
+    snapping (which reuses one group's already-computed watershed_labels/
+    all_peaks instead of resegmenting per candidate).
 
-    seg_mask_thres = _parse_seg_mask_thres(seg_mask_thres)
-    jump_dist_thres = _parse_jump_dist_thres(jump_dist_thres)
-    _imgs_for_consensus = (
-        [alignment_state.aligned_images[i] for i in consensus_image_indices]
-        if consensus_image_indices is not None
-        else alignment_state.aligned_images
+    Returns (snapped_rc, label_id, jump_info):
+      - Anchor inside a labeled region: snaps to the nearest peak within that
+        label. jump_info is None.
+      - Anchor in background: jumps to the nearest labeled pixel, then snaps
+        to that label's nearest peak. jump_info carries the jump details
+        (nearest_labeled_pixel, rt_dist, im_dist, dist_to_label[,
+        jumped_label, snapped_peak]) for the caller to log.
+      - Discarded (background jump distance exceeds jump_dist_thres, or no
+        labeled pixels exist at all): snapped_rc and label_id are None.
+    """
+    anchor_ws = int(watershed_labels[r, c])
+    if anchor_ws > 0:
+        # Anchor is inside a labeled region — snap to nearest peak in that label.
+        # The watershed invariant guarantees every label has at least one peak.
+        same_ws_peaks = all_peaks[
+            watershed_labels[all_peaks[:, 0], all_peaks[:, 1]] == anchor_ws
+        ]
+        dists = np.hypot(same_ws_peaks[:, 0] - r, same_ws_peaks[:, 1] - c)
+        nearest = same_ws_peaks[int(np.argmin(dists))]
+        snapped_rc = (int(nearest[0]), int(nearest[1]))
+        return snapped_rc, anchor_ws, None
+
+    if labeled_coords.shape[0] == 0:
+        return None, None, None
+
+    # Anchor is in background — jump to the nearest labeled region.
+    dists = np.hypot(labeled_coords[:, 0] - r, labeled_coords[:, 1] - c)
+    nearest_idx = int(np.argmin(dists))
+    nearest_labeled_rc = labeled_coords[nearest_idx]
+    rt_dist = abs(r - int(nearest_labeled_rc[0]))
+    im_dist = abs(c - int(nearest_labeled_rc[1]))
+    jump_info: dict[str, Any] = {
+        "nearest_labeled_pixel": (
+            int(nearest_labeled_rc[0]),
+            int(nearest_labeled_rc[1]),
+        ),
+        "rt_dist": rt_dist,
+        "im_dist": im_dist,
+        "dist_to_label": float(dists[nearest_idx]),
+    }
+    if (jump_dist_thres[0] > 0 and rt_dist > jump_dist_thres[0]) or (
+        jump_dist_thres[1] > 0 and im_dist > jump_dist_thres[1]
+    ):
+        return None, None, jump_info
+
+    jump_ws = int(watershed_labels[nearest_labeled_rc[0], nearest_labeled_rc[1]])
+    same_ws_peaks = all_peaks[
+        watershed_labels[all_peaks[:, 0], all_peaks[:, 1]] == jump_ws
+    ]
+    dists_peak = np.hypot(same_ws_peaks[:, 0] - r, same_ws_peaks[:, 1] - c)
+    nearest_peak = same_ws_peaks[int(np.argmin(dists_peak))]
+    snapped_rc = (int(nearest_peak[0]), int(nearest_peak[1]))
+    jump_info["jumped_label"] = jump_ws
+    jump_info["snapped_peak"] = snapped_rc
+    return snapped_rc, jump_ws, jump_info
+
+
+def _project_anchor_into_aligned_space(
+    anchor: tuple[int, int] | None,
+    source_shape: tuple[int, int],
+    alignment_state: "ConsensusAlignmentState",
+    run_position_i: int,
+) -> tuple[float, float] | None:
+    """
+    Project a raw (row, col) anchor for run `run_position_i` into the same
+    aligned pixel space as alignment_state.aligned_anchors, by applying the
+    identical scale-then-shift transform align_images_to_reference already
+    computed for that run (alignment_state.shifts[run_position_i] is (0, 0)
+    for the reference run and whenever align_images=False, so this formula
+    is valid uniformly).
+
+    Used by coSWA to re-project OTHER confounder-group members' own anchors
+    into a representative member's already-computed alignment, without
+    recomputing image resize/registration for every member.
+    """
+    scaled = _scale_anchor_to_target_shape(
+        anchor, source_shape, alignment_state.target_shape
     )
-    consensus = np.stack(_imgs_for_consensus, axis=0).mean(axis=0)
-    consensus_denoised = smooth_and_denoise_image(consensus, **(denoise_kwargs or {}))
+    if scaled is None:
+        return None
+    shift = alignment_state.shifts[run_position_i]
+    return (scaled[0] + shift[0], scaled[1] + shift[1])
+
+
+def _snap_all_anchors_to_watershed(
+    alignment_state: ConsensusAlignmentState,
+    consensus: np.ndarray,
+    consensus_denoised: np.ndarray,
+    watershed_labels: np.ndarray,
+    all_peaks: np.ndarray,
+    apply_seg: bool,
+    seg_mask_thres: tuple[int, int],
+    jump_dist_thres: tuple[int, int],
+    collapse_to_single_label: bool = False,
+    priority_anchor_index: int | None = None,
+) -> ConsensusSegmentationState:
+    """
+    Snap every non-None anchor in alignment_state onto the given watershed
+    segmentation (watershed_labels/all_peaks, already computed over
+    consensus_denoised), with bbox-fallback if segmentation is unusable or
+    yields too small a target-label span.
+
+    collapse_to_single_label (coSWA per-member assignment): when True and the
+    candidate's anchors snap to more than one watershed label, keep only ONE
+    label -- the majority vote over the per-anchor snapped labels, tie-broken
+    by the label of priority_anchor_index (the candidate's reference-run
+    anchor). Anchors on the losing labels are moved to discard_record so the
+    snap overlay still renders them (as discarded 'x'). This is the sole quant
+    differentiator between confounder-group members, which share one activation
+    trace and hence one intensity per segment.
+
+    Factored out of segment_consensus_from_aligned so coSWA can reuse one
+    confounder group's already-computed watershed_labels/all_peaks/consensus/
+    consensus_denoised to cheaply snap OTHER group members' own anchors
+    (fresh alignment_state, same underlying merged-activation image and
+    segmentation) without recomputing the expensive watershed detection.
+
+    watershed_labels may be a shared/cached array reused across multiple
+    calls (one per confounder-group member) -- the bbox-fallback branch
+    below mutates it via slice assignment, so copy defensively rather than
+    risk corrupting a caller's cached segmentation.
+    """
+    watershed_labels = watershed_labels.copy()
     rows, cols = alignment_state.target_shape
     non_none_indices = [
         i for i, aa in enumerate(alignment_state.aligned_anchors) if aa is not None
@@ -1297,7 +1815,6 @@ def segment_consensus_from_aligned(
     snapped_per_anchor: list[tuple[int, int] | None] = [None] * len(
         alignment_state.aligned_anchors
     )
-    watershed_labels: np.ndarray = np.zeros(consensus_denoised.shape, dtype=int)
     snap_log: dict[str, Any] = {
         "snap_record": {},
         "discard_record": {},
@@ -1307,25 +1824,12 @@ def segment_consensus_from_aligned(
     target_label_ids: list[int] = []
     seen_label_ids: set[int] = set()
     label_to_snap: dict[int, tuple[int, int]] = {}
+    anchor_to_label: dict[int, int] = {}
     use_bbox_fallback = not apply_seg
     if non_none_indices:
-        if apply_seg:
-            _wkwargs = dict(watershed_kwargs or {})
-            _int_threshold = _wkwargs.get("int_threshold", 0.5)
-            _h_rel = _wkwargs.get("h_rel", 0.15)
-            _norm_percentile = _wkwargs.get("norm_percentile", 95)
-            all_peaks, _unused_labels, _, watershed_labels, _ = (
-                detect_2d_peak_with_watershed(
-                    consensus_denoised,
-                    int_threshold=_int_threshold,
-                    h_rel=_h_rel,
-                    norm_percentile=_norm_percentile,
-                )
-            )
-        else:
-            all_peaks = np.empty((0, 2), dtype=int)
-
-        use_bbox_fallback = all_peaks.shape[0] == 0 or watershed_labels.max() == 0
+        use_bbox_fallback = (
+            (not apply_seg) or all_peaks.shape[0] == 0 or watershed_labels.max() == 0
+        )
 
         if not use_bbox_fallback:
             # Normal case: peaks and watershed labels detected successfully.
@@ -1336,70 +1840,52 @@ def segment_consensus_from_aligned(
                 assert aa is not None
                 r = int(np.clip(round(aa[0]), 0, rows - 1))
                 c = int(np.clip(round(aa[1]), 0, cols - 1))
-                anchor_ws = int(watershed_labels[r, c])
-                if anchor_ws > 0:
-                    # Anchor is inside a labeled region — snap to nearest peak in that label.
-                    # The watershed invariant guarantees every label has at least one peak.
-                    same_ws_peaks = all_peaks[
-                        watershed_labels[all_peaks[:, 0], all_peaks[:, 1]] == anchor_ws
-                    ]
-                    dists = np.hypot(same_ws_peaks[:, 0] - r, same_ws_peaks[:, 1] - c)
-                    nearest = same_ws_peaks[int(np.argmin(dists))]
-                    snapped_rc = (int(nearest[0]), int(nearest[1]))
-                    snapped_per_anchor[i] = snapped_rc
+                snapped_rc, label_id, jump_info = _snap_anchor_to_watershed_label(
+                    r, c, watershed_labels, all_peaks, labeled_coords, jump_dist_thres
+                )
+                if label_id is None:
+                    if jump_info is not None:
+                        snap_log["discard_record"][i] = {"anchor": (r, c), **jump_info}
+                    continue
+                snapped_per_anchor[i] = snapped_rc
+                anchor_to_label[i] = label_id
+                if jump_info is None:
                     snap_log["snap_record"][i] = ((r, c), snapped_rc)
-                    if anchor_ws not in seen_label_ids:
-                        target_label_ids.append(anchor_ws)
-                        seen_label_ids.add(anchor_ws)
-                        label_to_snap[anchor_ws] = snapped_rc
                 else:
-                    # Anchor is in background — jump to the nearest labeled region.
-                    dists = np.hypot(labeled_coords[:, 0] - r, labeled_coords[:, 1] - c)
-                    nearest_idx = int(np.argmin(dists))
-                    nearest_labeled_rc = labeled_coords[nearest_idx]
-                    rt_dist = abs(r - int(nearest_labeled_rc[0]))
-                    im_dist = abs(c - int(nearest_labeled_rc[1]))
-                    if (jump_dist_thres[0] > 0 and rt_dist > jump_dist_thres[0]) or (
-                        jump_dist_thres[1] > 0 and im_dist > jump_dist_thres[1]
-                    ):
-                        snap_log["discard_record"][i] = {
-                            "anchor": (r, c),
-                            "nearest_labeled_pixel": (
-                                int(nearest_labeled_rc[0]),
-                                int(nearest_labeled_rc[1]),
-                            ),
-                            "rt_dist": rt_dist,
-                            "im_dist": im_dist,
-                            "dist_to_label": float(dists[nearest_idx]),
-                        }
-                        continue
-                    jump_ws = int(
-                        watershed_labels[nearest_labeled_rc[0], nearest_labeled_rc[1]]
-                    )
-                    same_ws_peaks = all_peaks[
-                        watershed_labels[all_peaks[:, 0], all_peaks[:, 1]] == jump_ws
-                    ]
-                    dists_peak = np.hypot(
-                        same_ws_peaks[:, 0] - r, same_ws_peaks[:, 1] - c
-                    )
-                    nearest_peak = same_ws_peaks[int(np.argmin(dists_peak))]
-                    snapped_rc = (int(nearest_peak[0]), int(nearest_peak[1]))
-                    snapped_per_anchor[i] = snapped_rc
-                    snap_log["jump_anchor_log"][i] = {
-                        "anchor": (r, c),
-                        "nearest_labeled_pixel": (
-                            int(nearest_labeled_rc[0]),
-                            int(nearest_labeled_rc[1]),
-                        ),
-                        "jumped_label": jump_ws,
-                        "snapped_peak": snapped_rc,
-                        "dist_to_label": float(dists[nearest_idx]),
-                    }
+                    snap_log["jump_anchor_log"][i] = {"anchor": (r, c), **jump_info}
                     snap_log["snap_record"][i] = ((r, c), snapped_rc)
-                    if jump_ws not in seen_label_ids:
-                        target_label_ids.append(jump_ws)
-                        seen_label_ids.add(jump_ws)
-                        label_to_snap[jump_ws] = snapped_rc
+                if label_id not in seen_label_ids:
+                    target_label_ids.append(label_id)
+                    seen_label_ids.add(label_id)
+                    label_to_snap[label_id] = snapped_rc
+
+            # coSWA: collapse a member's multi-label snap to ONE segment
+            # (majority vote, tie-broken by the reference-run anchor).
+            if collapse_to_single_label and len(target_label_ids) > 1:
+                _counts: dict[int, int] = {}
+                for _lid in anchor_to_label.values():
+                    _counts[_lid] = _counts.get(_lid, 0) + 1
+                _max_count = max(_counts.values())
+                _top = [_lid for _lid, _c in _counts.items() if _c == _max_count]
+                _winner = None
+                if priority_anchor_index is not None:
+                    _prio = anchor_to_label.get(priority_anchor_index)
+                    if _prio in _top:
+                        _winner = _prio
+                if _winner is None:
+                    _winner = min(_top)
+                for _i, _lid in list(anchor_to_label.items()):
+                    if _lid != _winner:
+                        snapped_per_anchor[_i] = None
+                        _rec = snap_log["snap_record"].pop(_i, None)
+                        snap_log["jump_anchor_log"].pop(_i, None)
+                        snap_log["discard_record"][_i] = {
+                            "anchor": _rec[0] if _rec is not None else None,
+                            "collapsed_to_label": _winner,
+                        }
+                target_label_ids = [_winner]
+                seen_label_ids = {_winner}
+                label_to_snap = {_winner: label_to_snap[_winner]}
 
             # Roll back to bbox if target-label span is below (rt, im) thresholds.
             if any(t > 0 for t in seg_mask_thres) and target_label_ids:
@@ -1409,6 +1895,7 @@ def segment_consensus_from_aligned(
                 if _rt_span < seg_mask_thres[0] or _im_span < seg_mask_thres[1]:
                     use_bbox_fallback = True
                     watershed_labels = np.zeros(consensus_denoised.shape, dtype=int)
+                    all_peaks = np.empty((0, 2), dtype=int)
                     snapped_per_anchor = [None] * len(alignment_state.aligned_anchors)
                     snap_log = {
                         "snap_record": {},
@@ -1465,6 +1952,53 @@ def segment_consensus_from_aligned(
         label_to_snap=label_to_snap,
         non_none_indices=non_none_indices,
         apply_seg=not use_bbox_fallback,
+        all_peaks=all_peaks,
+    )
+
+
+def segment_consensus_from_aligned(
+    alignment_state: ConsensusAlignmentState,
+    denoise_kwargs: dict | None = None,
+    watershed_kwargs: dict | None = None,
+    apply_seg: bool = True,
+    seg_mask_thres: tuple[int, int] = (2, 5),
+    jump_dist_thres: tuple[int, int] = (0, 0),
+    consensus_image_indices: list[int] | None = None,
+) -> ConsensusSegmentationState:
+    """Segment a consensus image and track which labels belong to target anchors."""
+
+    seg_mask_thres = _parse_seg_mask_thres(seg_mask_thres)
+    jump_dist_thres = _parse_jump_dist_thres(jump_dist_thres)
+    _imgs_for_consensus = (
+        [alignment_state.aligned_images[i] for i in consensus_image_indices]
+        if consensus_image_indices is not None
+        else alignment_state.aligned_images
+    )
+    consensus = np.stack(_imgs_for_consensus, axis=0).mean(axis=0)
+    consensus_denoised = smooth_and_denoise_image(consensus, **(denoise_kwargs or {}))
+    watershed_labels: np.ndarray = np.zeros(consensus_denoised.shape, dtype=int)
+    all_peaks: np.ndarray = np.empty((0, 2), dtype=int)
+    non_none_indices = [
+        i for i, aa in enumerate(alignment_state.aligned_anchors) if aa is not None
+    ]
+    if non_none_indices and apply_seg:
+        _wkwargs = dict(watershed_kwargs or {})
+        all_peaks, _unused_labels, _, watershed_labels, _ = detect_2d_peak_with_watershed(
+            consensus_denoised,
+            int_threshold=_wkwargs.get("int_threshold", 0.5),
+            h_rel=_wkwargs.get("h_rel", 0.15),
+            norm_percentile=_wkwargs.get("norm_percentile", 95),
+            compactness=_wkwargs.get("compactness", 0.001),
+        )
+    return _snap_all_anchors_to_watershed(
+        alignment_state,
+        consensus,
+        consensus_denoised,
+        watershed_labels,
+        all_peaks,
+        apply_seg,
+        seg_mask_thres,
+        jump_dist_thres,
     )
 
 
@@ -1622,6 +2156,42 @@ def extract_peak_properties_from_consensus_labels(
     )
 
 
+def _reuse_alignment_with_new_anchors(
+    cached: ConsensusAlignmentState,
+    anchors: list[tuple[int, int] | None],
+    source_shapes: list[tuple[int, int]],
+) -> ConsensusAlignmentState:
+    """
+    Build a new ConsensusAlignmentState that reuses a cached alignment's
+    expensive fields (resized/aligned images, per-run shifts, template match
+    scores) verbatim, only recomputing aligned_anchors/scaled_anchors for a
+    NEW set of raw anchors.
+
+    Valid whenever the underlying raw images are the same as the ones the
+    cached alignment was built from (true for coSWA confounder-group members,
+    whose per-run activation images are identical by construction -- see
+    inference.collapse_candidates_by_confounder_group /
+    helper.expand_group_ids_to_members) -- the optimal image-to-image
+    registration (shifts) doesn't depend on which candidate's anchor is
+    being projected, only on the images themselves.
+    """
+    n = len(cached.aligned_images)
+    assert len(anchors) == n and len(source_shapes) == n
+    scaled_anchors = [
+        _scale_anchor_to_target_shape(anchors[i], source_shapes[i], cached.target_shape)
+        for i in range(n)
+    ]
+    aligned_anchors = [
+        (
+            (scaled_anchors[i][0] + cached.shifts[i][0], scaled_anchors[i][1] + cached.shifts[i][1])
+            if scaled_anchors[i] is not None
+            else None
+        )
+        for i in range(n)
+    ]
+    return replace(cached, aligned_anchors=aligned_anchors, scaled_anchors=scaled_anchors)
+
+
 def build_consensus_feature_bundle(
     images: list[np.ndarray],
     reference_idx: int = 0,
@@ -1629,6 +2199,7 @@ def build_consensus_feature_bundle(
     template_anchor: tuple[int, int] | None = None,
     template_frac: float = 0.3,
     anchors: list[tuple[int, int] | None] | None = None,
+    additional_anchors: list[list[tuple[int, int] | None]] | None = None,
     denoise_cfg: dict | None = None,
     watershed_kwargs: dict | None = None,
     labels: list[str] | None = None,
@@ -1638,35 +2209,90 @@ def build_consensus_feature_bundle(
     jump_dist_thres: tuple[int, int] = (0, 0),
     consensus_image_indices: list[int] | None = None,
     align_images: bool = True,
+    reuse_from: ConsensusFeatureBundle | None = None,
+    collapse_to_single_label: bool = False,
+    priority_anchor_index: int | None = None,
+    precomputed_states: (
+        tuple[ConsensusAlignmentState, ConsensusSegmentationState] | None
+    ) = None,
 ) -> ConsensusFeatureBundle:
-    """Build alignment, segmentation, and feature tables for consensus scoring."""
+    """Build alignment, segmentation, and feature tables for consensus scoring.
 
-    if labels is not None and len(labels) != len(images):
+    If reuse_from is given (a bundle already built for another candidate that
+    shares identical per-run raw images -- a coSWA confounder-group
+    representative), skip the expensive image alignment (SIFT/template
+    matching) and watershed segmentation entirely and reuse them, only
+    recomputing the cheap per-anchor snap + peak-property extraction for this
+    candidate's own `anchors`. `images` is ignored in that case (the
+    representative's own aligned_images are reused); `raw_images` is still
+    required as usual (identical content to the representative's, but still
+    passed explicitly to keep this function's contract uniform).
+
+    `additional_anchors` (e.g. every other confounder-group member's own
+    per-run anchor list) only widens the template placement -- its centroid
+    and required coverage radius -- and is otherwise ignored; it does not
+    affect `anchors`, which remains this call's own per-run anchor points.
+
+    If precomputed_states is given instead (a coSWA group member's own
+    alignment + segmentation, already produced by an earlier reuse_from-style
+    call for this exact candidate -- see match_features_batch's confounder-
+    group pre-pass), skip straight to peak-property extraction: `images`,
+    `anchors`, `reuse_from`, and every alignment/segmentation kwarg are
+    ignored. `raw_images` is still required as usual.
+    """
+
+    _n_runs = (
+        len(images)
+        if reuse_from is None and precomputed_states is None
+        else len(raw_images or [])
+    )
+    if labels is not None and len(labels) != _n_runs:
         raise ValueError(
             "labels must have the same length as images "
-            f"(got {len(labels)}, expected {len(images)})."
+            f"(got {len(labels)}, expected {_n_runs})."
         )
     _denoise_cfg = denoise_cfg or {}
     _consensus_denoise_kwargs = _denoise_kwargs_for_stage(_denoise_cfg, "consensus")
     _full_denoise_kwargs = _denoise_kwargs_all(_denoise_cfg)
-    alignment_state = align_images_to_reference(
-        images=images,
-        reference_idx=reference_idx,
-        target_shape=target_shape,
-        template_anchor=template_anchor,
-        template_frac=template_frac,
-        anchors=anchors,
-        align_images=align_images,
-    )
-    segmentation_state = segment_consensus_from_aligned(
-        alignment_state,
-        denoise_kwargs=_consensus_denoise_kwargs,
-        watershed_kwargs=watershed_kwargs,
-        apply_seg=apply_seg,
-        seg_mask_thres=seg_mask_thres,
-        jump_dist_thres=jump_dist_thres,
-        consensus_image_indices=consensus_image_indices,
-    )
+    if precomputed_states is not None:
+        alignment_state, segmentation_state = precomputed_states
+    elif reuse_from is None:
+        alignment_state = align_images_to_reference(
+            images=images,
+            reference_idx=reference_idx,
+            target_shape=target_shape,
+            template_anchor=template_anchor,
+            template_frac=template_frac,
+            anchors=anchors,
+            additional_anchors=additional_anchors,
+            align_images=align_images,
+        )
+        segmentation_state = segment_consensus_from_aligned(
+            alignment_state,
+            denoise_kwargs=_consensus_denoise_kwargs,
+            watershed_kwargs=watershed_kwargs,
+            apply_seg=apply_seg,
+            seg_mask_thres=seg_mask_thres,
+            jump_dist_thres=jump_dist_thres,
+            consensus_image_indices=consensus_image_indices,
+        )
+    else:
+        source_shapes = [img.shape for img in (raw_images or [])]
+        alignment_state = _reuse_alignment_with_new_anchors(
+            reuse_from.alignment, anchors or [], source_shapes
+        )
+        segmentation_state = _snap_all_anchors_to_watershed(
+            alignment_state,
+            reuse_from.segmentation.consensus,
+            reuse_from.segmentation.consensus_denoised,
+            reuse_from.segmentation.watershed_labels,
+            reuse_from.segmentation.all_peaks,
+            apply_seg,
+            _parse_seg_mask_thres(seg_mask_thres),
+            _parse_jump_dist_thres(jump_dist_thres),
+            collapse_to_single_label=collapse_to_single_label,
+            priority_anchor_index=priority_anchor_index,
+        )
     (
         consensus_pp,
         individual_pps,
