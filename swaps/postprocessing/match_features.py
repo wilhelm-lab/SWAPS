@@ -91,6 +91,7 @@ def match_features_batches_parallel(
     batch_size_max: int = 1500,
     max_workers: int = 4,
     processing_kwargs: dict | None = None,
+    match_decoy: bool = True,
 ):
     if peptide_indicies is None:
         peptide_indicies = dict_ref["mz_rank"].values
@@ -145,6 +146,7 @@ def match_features_batches_parallel(
             raw_file_list,
             result_dir,
             processing_kwargs,
+            match_decoy,
         ),
     ) as executor:
         futures = [
@@ -214,13 +216,16 @@ def match_features_batches_parallel(
     )
 
 
-def _init_match_features_worker(dict_ref, raw_file_list, result_dir, processing_kwargs):
+def _init_match_features_worker(
+    dict_ref, raw_file_list, result_dir, processing_kwargs, match_decoy: bool = True
+):
     """Store immutable batch context once per worker process."""
 
     _WORKER_CONTEXT["dict_ref"] = dict_ref
     _WORKER_CONTEXT["raw_file_list"] = raw_file_list
     _WORKER_CONTEXT["result_dir"] = result_dir
     _WORKER_CONTEXT["processing_kwargs"] = processing_kwargs
+    _WORKER_CONTEXT["match_decoy"] = match_decoy
     _WORKER_CONTEXT["dict_ref_by_mz"] = (
         dict_ref.set_index("mz_rank")
         if dict_ref["mz_rank"].is_unique
@@ -235,6 +240,7 @@ def _match_features_batch_worker(batch):
         result_dir=_WORKER_CONTEXT["result_dir"],
         batch=batch,
         processing_kwargs=_WORKER_CONTEXT["processing_kwargs"],
+        match_decoy=_WORKER_CONTEXT.get("match_decoy", True),
     )
 
 

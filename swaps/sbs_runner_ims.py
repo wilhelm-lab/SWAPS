@@ -377,8 +377,11 @@ def opt_scan_by_scan(config_path: str):
         batch_size_max=1500,
         max_workers=cfg.N_CPU,
         processing_kwargs=processing_kwargs,
+        # Decoys only exist to feed Mokapot/percolator FDR control below —
+        # skip generating them entirely when FDR is disabled.
+        match_decoy=cfg.FDR.ENABLED,
     )
-    quant_dir = os.path.join(cfg.RESULT_PATH, cfg.MATCH_FEATURES_KWARGS.dir_name)
+    quant_dir = _quant_dir(cfg)
     os.makedirs(quant_dir, exist_ok=True)
     dfs_to_save = {
         "no_quant_log.parquet": df_no_quant,
@@ -441,118 +444,158 @@ def run_fdr_control_onwards(
         pp_match_target, pp_match_target_msms, pp_match_decoy = (
             split_pp_by_match_status(dict_ref, pp_match_target, pp_match_decoy)
         )
-        _valid_t = pd.MultiIndex.from_frame(
-            pp_match_target[["feature_instance_id", "Run_name"]].drop_duplicates()
+        if cfg.FDR.ENABLED:
+            _valid_t = pd.MultiIndex.from_frame(
+                pp_match_target[["feature_instance_id", "Run_name"]].drop_duplicates()
+            )
+            _valid_d = pd.MultiIndex.from_frame(
+                pp_match_decoy[["feature_instance_id", "Run_name"]].drop_duplicates()
+            )
+            matches_target = matches_target[
+                pd.MultiIndex.from_arrays(
+                    [
+                        matches_target["feature_instance_id"],
+                        matches_target["matched_run"],
+                    ]
+                ).isin(_valid_t)
+            ]
+            matches_decoy = matches_decoy[
+                pd.MultiIndex.from_arrays(
+                    [matches_decoy["feature_instance_id"], matches_decoy["matched_run"]]
+                ).isin(_valid_d)
+            ]
+            logging.info(
+                "only_score_match: %d target, %d decoy matches after removing MS/MS-identified entries",
+                len(matches_target),
+                len(matches_decoy),
+            )
+
+    if cfg.FDR.ENABLED:
+        if cfg.FDR.INT_THRES > 0:
+            pp_target_passing = pp_match_target.loc[
+                pp_match_target["intensity_sum"] >= cfg.FDR.INT_THRES,
+                ["feature_instance_id", "Run_name"],
+            ].drop_duplicates()
+            pp_decoy_passing = pp_match_decoy.loc[
+                pp_match_decoy["intensity_sum"] >= cfg.FDR.INT_THRES,
+                ["feature_instance_id", "Run_name"],
+            ].drop_duplicates()
+            valid_target = pd.MultiIndex.from_frame(pp_target_passing)
+            valid_decoy = pd.MultiIndex.from_frame(pp_decoy_passing)
+            matches_target = matches_target[
+                pd.MultiIndex.from_arrays(
+                    [
+                        matches_target["feature_instance_id"],
+                        matches_target["matched_run"],
+                    ]
+                ).isin(valid_target)
+            ]
+            matches_decoy = matches_decoy[
+                pd.MultiIndex.from_arrays(
+                    [matches_decoy["feature_instance_id"], matches_decoy["matched_run"]]
+                ).isin(valid_decoy)
+            ]
+            logging.info(
+                "After intensity filtering (>= %s): %d target, %d decoy matches",
+                cfg.FDR.INT_THRES,
+                len(matches_target),
+                len(matches_decoy),
+            )
+
+        matches_target_normalized, matches_decoy_normalized = normalize_shift_by_runs(
+            matches_target, matches_decoy
         )
-        _valid_d = pd.MultiIndex.from_frame(
-            pp_match_decoy[["feature_instance_id", "Run_name"]].drop_duplicates()
+        tdc_df = combine_matches_target_decoy(
+            matches_target_normalized, matches_decoy_normalized, dict_ref
         )
-        matches_target = matches_target[
-            pd.MultiIndex.from_arrays(
-                [matches_target["feature_instance_id"], matches_target["matched_run"]]
-            ).isin(_valid_t)
+        tdc_df = tdc_df.merge(
+            dict_ref[["mz_rank", "count_confounders"]], on="mz_rank", how="left"
+        )
+        _align_images = bool(processing_kwargs.get("align_images", True))
+        _alignment_feature_cols = [
+            "im_shift_abs_scaled",
+            "rt_shift_abs_scaled",
+            "rt_shift",
+            "im_shift",
+            "template_matching_score",
         ]
-        matches_decoy = matches_decoy[
-            pd.MultiIndex.from_arrays(
-                [matches_decoy["feature_instance_id"], matches_decoy["matched_run"]]
-            ).isin(_valid_d)
+        _base_feature_cols = [
+            # "im_shift_scaled",
+            # "rt_shift_scaled",
+            "sift_similarities",
+            "zernike_similarities",
+            "sift_distance",
+            "zernike_distance",
+            "count_confounders",
         ]
+        _feature_cols = (
+            _alignment_feature_cols + _base_feature_cols
+            if _align_images
+            else _base_feature_cols
+        )
+        percolator_dir_name = "percolator_postprocessing_tdc"
+        psms, peptide, all_psms = brew_with_percolator(
+            tdc_df,
+            feature_cols=_feature_cols,
+            # train_fdr=cfg.FDR.TRAIN,
+            # test_fdr=cfg.FDR.TEST,
+            work_dir=os.path.join(quant_dir, percolator_dir_name),
+            decoy_col="Decoy",
+            filename_col="matched_run",
+            peptide_col="Sequence",
+            protein_col="Proteins",
+        )
+        # Filter for the columns passed the makopot filter
+        psms["mz_rank"] = psms["PSMId"].str.split("_").str[0].astype(int)
+
+        # Filter for the columns passed the makopot filter
+        psms_filtered = psms.loc[(psms["q-value"] < 0.01)]
+        pp_match_target_filtered = pp_match_target.merge(
+            psms_filtered[["filename", "mz_rank"]],
+            left_on=["mz_rank", "Run_name"],
+            right_on=["mz_rank", "filename"],
+            how="inner",
+        )
+        os.makedirs(os.path.join(quant_dir, percolator_dir_name), exist_ok=True)
+        _to_parquet_safe(
+            pp_match_target_filtered,
+            os.path.join(
+                quant_dir, percolator_dir_name, "pp_match_target_filtered.parquet"
+            ),
+            index=False,
+        )
+        _mbr_df = pp_match_target_filtered.drop(columns=["filename"])
+    else:
         logging.info(
-            "only_score_match: %d target, %d decoy matches after removing MS/MS-identified entries",
-            len(matches_target),
-            len(matches_decoy),
+            "cfg.FDR.ENABLED is False — skipping Mokapot/percolator FDR control; "
+            "pp_match_target_filtered is pp_match_target with only intensity "
+            "filtering (FDR.INT_THRES) applied."
         )
-
-    if cfg.FDR.INT_THRES > 0:
-        pp_target_passing = pp_match_target.loc[
-            pp_match_target["intensity_sum"] >= cfg.FDR.INT_THRES,
-            ["feature_instance_id", "Run_name"],
-        ].drop_duplicates()
-        pp_decoy_passing = pp_match_decoy.loc[
-            pp_match_decoy["intensity_sum"] >= cfg.FDR.INT_THRES,
-            ["feature_instance_id", "Run_name"],
-        ].drop_duplicates()
-        valid_target = pd.MultiIndex.from_frame(pp_target_passing)
-        valid_decoy = pd.MultiIndex.from_frame(pp_decoy_passing)
-        matches_target = matches_target[
-            pd.MultiIndex.from_arrays(
-                [matches_target["feature_instance_id"], matches_target["matched_run"]]
-            ).isin(valid_target)
-        ]
-        matches_decoy = matches_decoy[
-            pd.MultiIndex.from_arrays(
-                [matches_decoy["feature_instance_id"], matches_decoy["matched_run"]]
-            ).isin(valid_decoy)
-        ]
-        logging.info(
-            "After intensity filtering (>= %s): %d target, %d decoy matches",
-            cfg.FDR.INT_THRES,
-            len(matches_target),
-            len(matches_decoy),
+        if cfg.FDR.INT_THRES > 0:
+            pp_match_target_filtered = pp_match_target.loc[
+                pp_match_target["intensity_sum"] >= cfg.FDR.INT_THRES
+            ].copy()
+            logging.info(
+                "After intensity filtering (>= %s): %d of %d pp_match_target rows kept",
+                cfg.FDR.INT_THRES,
+                len(pp_match_target_filtered),
+                len(pp_match_target),
+            )
+        else:
+            pp_match_target_filtered = pp_match_target.copy()
+        percolator_dir_name = "intensity_filtered_postprocessing"
+        os.makedirs(os.path.join(quant_dir, percolator_dir_name), exist_ok=True)
+        _to_parquet_safe(
+            pp_match_target_filtered,
+            os.path.join(
+                quant_dir, percolator_dir_name, "pp_match_target_filtered.parquet"
+            ),
+            index=False,
         )
+        _mbr_df = pp_match_target_filtered
 
-    matches_target_normalized, matches_decoy_normalized = normalize_shift_by_runs(
-        matches_target, matches_decoy
-    )
-    tdc_df = combine_matches_target_decoy(
-        matches_target_normalized, matches_decoy_normalized, dict_ref
-    )
-    tdc_df = tdc_df.merge(
-        dict_ref[["mz_rank", "count_confounders"]], on="mz_rank", how="left"
-    )
-    _align_images = bool(processing_kwargs.get("align_images", True))
-    _alignment_feature_cols = [
-        "im_shift_abs_scaled",
-        "rt_shift_abs_scaled",
-        "rt_shift",
-        "im_shift",
-        "template_matching_score",
-    ]
-    _base_feature_cols = [
-        # "im_shift_scaled",
-        # "rt_shift_scaled",
-        "sift_similarities",
-        "zernike_similarities",
-        "sift_distance",
-        "zernike_distance",
-        "count_confounders",
-    ]
-    _feature_cols = (
-        _alignment_feature_cols + _base_feature_cols
-        if _align_images
-        else _base_feature_cols
-    )
-    percolator_dir_name = "percolator_postprocessing_tdc"
-    psms, peptide, all_psms = brew_with_percolator(
-        tdc_df,
-        feature_cols=_feature_cols,
-        # train_fdr=cfg.FDR.TRAIN,
-        # test_fdr=cfg.FDR.TEST,
-        work_dir=os.path.join(quant_dir, percolator_dir_name),
-        decoy_col="Decoy",
-        filename_col="matched_run",
-        peptide_col="Sequence",
-        protein_col="Proteins",
-    )
-    # Filter for the columns passed the makopot filter
-    psms["mz_rank"] = psms["PSMId"].str.split("_").str[0].astype(int)
-
-    # Filter for the columns passed the makopot filter
-    psms_filtered = psms.loc[(psms["q-value"] < 0.01)]
-    pp_match_target_filtered = pp_match_target.merge(
-        psms_filtered[["filename", "mz_rank"]],
-        left_on=["mz_rank", "Run_name"],
-        right_on=["mz_rank", "filename"],
-        how="inner",
-    )
-    pp_match_target_filtered.to_parquet(
-        os.path.join(
-            quant_dir, percolator_dir_name, "pp_match_target_filtered.parquet"
-        ),
-        index=False,
-    )
     dfs_to_concat = {
-        "MBR": pp_match_target_filtered.drop(columns=["filename"]),
+        "MBR": _mbr_df,
         "MS/MS Ref": pp_reference,
     }
     if pp_match_target_msms is not None:
@@ -678,7 +721,7 @@ def run_from_fdr_control(config_path: str):
     dict_ref = pd.read_pickle(dict_ref_path)
     logging.info("Loaded dict_ref from %s with %s entries", dict_ref_path, len(dict_ref))
 
-    quant_dir = os.path.join(cfg.RESULT_PATH, cfg.MATCH_FEATURES_KWARGS.dir_name)
+    quant_dir = _quant_dir(cfg)
     logging.info("Resuming from FDR control using quant_dir: %s", quant_dir)
     matches_target = pd.read_parquet(os.path.join(quant_dir, "matches_target.parquet"))
     matches_decoy = pd.read_parquet(os.path.join(quant_dir, "matches_decoy.parquet"))
