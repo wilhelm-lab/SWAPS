@@ -412,9 +412,11 @@ def build_pivot(pp_all, dict_ref):
     pd.DataFrame
         Pivoted dataframe with '{Run} Match Type' and '{Run} Intensity' columns.
     """
-    pp_all_undistinguishable_group_id = pp_all.groupby("mz_rank").agg(
-        {"undistinguishable_group_id": "first"}
-    )
+    _has_undistinguishable_group_id = "undistinguishable_group_id" in pp_all.columns
+    if _has_undistinguishable_group_id:
+        pp_all_undistinguishable_group_id = pp_all.groupby("mz_rank").agg(
+            {"undistinguishable_group_id": "first"}
+        )
     pivot = pp_all.pivot_table(
         index="mz_rank",
         columns="Run_name",
@@ -433,13 +435,14 @@ def build_pivot(pp_all, dict_ref):
 
     # Ensure all mz_rank from dict_ref exist
     pivot = pivot.reindex(dict_ref["mz_rank"])
-    pivot = pd.merge(
-        pivot,
-        pp_all_undistinguishable_group_id,
-        left_index=True,
-        right_index=True,
-        how="left",
-    )
+    if _has_undistinguishable_group_id:
+        pivot = pd.merge(
+            pivot,
+            pp_all_undistinguishable_group_id,
+            left_index=True,
+            right_index=True,
+            how="left",
+        )
     # Fill missing Match Type again after reindexing
     for col in pivot.columns:
         if "Match Type" in col:
