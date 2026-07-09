@@ -80,8 +80,12 @@ __C.PREPARE_DICT.OK.FDR = 0.01  # FDR threshold for Oktoberfest rescoring
 
 __C.PREPARE_DICT.MERGE_CONFOUNDERS = ConfigurationNode()
 __C.PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED = False  # merge confounder groups (coSWA) into one SWA candidate row; off by default for backward compatibility
-__C.PREPARE_DICT.MERGE_CONFOUNDERS.GROUP_ID_OFFSET = -1  # id offset added to a group's min mz_rank to form confounder_group_id; -1 = auto-derive from max mz_rank
-__C.PREPARE_DICT.MERGE_CONFOUNDERS.EXCLUDE_CROSS_TARGET_DECOY = True  # never merge a target with a decoy into the same confounder group
+__C.PREPARE_DICT.MERGE_CONFOUNDERS.GROUP_ID_OFFSET = (
+    -1
+)  # id offset added to a group's min mz_rank to form confounder_group_id; -1 = auto-derive from max mz_rank
+__C.PREPARE_DICT.MERGE_CONFOUNDERS.EXCLUDE_CROSS_TARGET_DECOY = (
+    True  # never merge a target with a decoy into the same confounder group
+)
 
 # optimization
 __C.OPTIMIZATION = ConfigurationNode()
@@ -125,8 +129,8 @@ __C.MATCH_FEATURES_KWARGS.denoise.log_transform = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.denoise.log_transform.at = "raw"
 __C.MATCH_FEATURES_KWARGS.denoise.log_transform.enabled = True
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.int_threshold = 2
-__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.h_rel = 0.15
+__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.int_threshold = 1
+__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.h_rel = 0.01
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.norm_percentile = 95
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.compactness = 0.001
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs = ConfigurationNode()

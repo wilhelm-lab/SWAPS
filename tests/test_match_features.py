@@ -404,7 +404,8 @@ class TestBuildConsensusFeatureBundleReuse:
 
 # ---------------------------------------------------------------------------
 # match_features_batch end-to-end: coSWA confounder-group orchestration
-# (one shared watershed segmentation per group, direct collision flagging)
+# (each member independently aligned + segmented; overlap between members'
+# own assigned segments is flagged post-hoc via undistinguishable_group_id)
 # ---------------------------------------------------------------------------
 
 _RT_RANGE = (100, 139)  # 40 frames
@@ -514,9 +515,11 @@ def _run_group_scenario(tmp_path, group_blobs, a_anchor_offset, b_anchor_offset)
 
 class TestMatchFeaturesBatchConfounderGroups:
     def test_bimodal_signal_separates_group_members_no_collision(self, tmp_path):
-        """Two distinguishable sub-peaks within the shared merged image ->
-        A and B's own anchors snap to DIFFERENT watershed labels -> both
-        correctly quantified independently, no undistinguishable flag."""
+        """Two distinguishable sub-peaks within the shared merged image -> A
+        and B each independently align + segment their own image, and each
+        one's own assigned segment lands on a different, non-overlapping
+        region -> both correctly quantified independently, no
+        undistinguishable flag."""
         (
             results_target,
             results_decoy,
@@ -546,10 +549,14 @@ class TestMatchFeaturesBatchConfounderGroups:
         assert by_rank_ref.loc[1, "area"] != by_rank_ref.loc[2, "area"]
 
     def test_unimodal_signal_flags_group_members_as_undistinguishable(self, tmp_path):
-        """A single peak in the shared merged image -> A and B's own
-        (different) anchors both jump/snap to the SAME watershed label ->
-        flagged with a shared undistinguishable_group_id and given
-        IDENTICAL quantification, exactly as approved in the coSWA plan."""
+        """A single peak in the shared merged image -> A and B each
+        independently align + segment their own image, and each one's own
+        assigned segment (there's only one label to land on) overlaps the
+        other's -> flagged with a shared undistinguishable_group_id. Their
+        quantification is no longer forced identical by construction (each
+        is computed fully independently) -- it happens to match here only
+        because both use identical anchors/runs/windows, not because that's
+        a guaranteed invariant of the new design."""
         (
             results_target,
             results_decoy,
@@ -578,10 +585,9 @@ class TestMatchFeaturesBatchConfounderGroups:
         assert tag_match != -1
         assert by_rank_match.loc[2, "undistinguishable_group_id"] == tag_match
 
-        # identical quantification for the colliding pair, by construction
-        assert by_rank_ref.loc[1, "area"] == by_rank_ref.loc[2, "area"]
-        assert by_rank_ref.loc[1, "intensity_sum"] == by_rank_ref.loc[2, "intensity_sum"]
-        assert by_rank_match.loc[1, "area"] == by_rank_match.loc[2, "area"]
+        # both are still genuinely quantified (not dropped just for overlapping)
+        assert by_rank_ref.loc[1, "area"] > 0
+        assert by_rank_ref.loc[2, "area"] > 0
 
     def test_solo_candidate_unaffected_by_group_presence(self, tmp_path):
         """C's own quantification and -1 tag hold regardless of whether the

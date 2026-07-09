@@ -374,7 +374,7 @@ def opt_scan_by_scan(config_path: str):
         raw_file_list=raw_file_list,
         result_dir=cfg.RESULT_PATH,
         peptide_indicies=dict_ref["mz_rank"].values,  # type: ignore
-        batch_size_max=1500,
+        batch_size_max=500,
         max_workers=cfg.N_CPU,
         processing_kwargs=processing_kwargs,
         # Decoys only exist to feed Mokapot/percolator FDR control below —
@@ -719,7 +719,9 @@ def run_from_fdr_control(config_path: str):
     if not os.path.exists(dict_ref_path):
         dict_ref_path = os.path.join(cfg.RESULT_PATH, "dict_ref.pkl")
     dict_ref = pd.read_pickle(dict_ref_path)
-    logging.info("Loaded dict_ref from %s with %s entries", dict_ref_path, len(dict_ref))
+    logging.info(
+        "Loaded dict_ref from %s with %s entries", dict_ref_path, len(dict_ref)
+    )
 
     quant_dir = _quant_dir(cfg)
     logging.info("Resuming from FDR control using quant_dir: %s", quant_dir)
