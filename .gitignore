@@ -32,3 +32,4 @@ swaps/feature_match_consensus_workflow.md
 .claude/*
 swaps/rerun_swa_failed_runs.py
 swaps/utils/feature_strength.py
+writing/*
