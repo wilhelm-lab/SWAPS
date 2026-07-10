@@ -83,6 +83,89 @@ class ConsensusFeatureBundle:
     raw_consensus_denoised: np.ndarray | None = None
 
 
+def _split_contiguous_into_batches(
+    sorted_arr: np.ndarray, batch_size_max: int, max_workers: int
+) -> list[np.ndarray]:
+    """Split a sorted mz_rank array into contiguous-range batches.
+
+    Contiguity lets DuckDB skip row groups in the mz-sorted parquet (produced
+    by build_mz_sorted_activation). At least 2×max_workers batches are used
+    for load balancing, so no worker idles at the tail.
+    """
+    n_total = len(sorted_arr)
+    if n_total == 0:
+        return []
+    n_batches = max(max_workers * 2, int(np.ceil(n_total / batch_size_max)))
+    return [b for b in np.array_split(sorted_arr, n_batches) if len(b)]
+
+
+def _pack_confounder_groups_into_batches(
+    mz_ranks: np.ndarray, group_ids: np.ndarray, batch_size_max: int
+) -> list[np.ndarray]:
+    """Greedily pack whole confounder groups into batches of ≤batch_size_max.
+
+    Members of the same confounder_group_id must land in the same batch (see
+    _group_members_in_batch): coSWA merging needs every group member present
+    in one worker's batch to fetch/expand the group's single stored parquet
+    row. Contiguity of mz_ranks within a batch is not required here.
+    """
+    if len(mz_ranks) == 0:
+        return []
+    order = np.argsort(group_ids, kind="stable")
+    sorted_gid = group_ids[order]
+    sorted_mz = mz_ranks[order]
+    change_points = np.flatnonzero(np.diff(sorted_gid)) + 1
+    member_groups = np.split(sorted_mz, change_points)
+
+    batches: list[np.ndarray] = []
+    current: list[np.ndarray] = []
+    current_size = 0
+    for grp in member_groups:
+        if current and current_size + len(grp) > batch_size_max:
+            batches.append(np.concatenate(current))
+            current, current_size = [], 0
+        current.append(grp)
+        current_size += len(grp)
+    if current:
+        batches.append(np.concatenate(current))
+    return batches
+
+
+def _build_peptide_batches(
+    dict_ref: pd.DataFrame,
+    peptide_indicies: np.ndarray,
+    batch_size_max: int,
+    max_workers: int,
+) -> list[np.ndarray]:
+    """Split peptide_indicies (mz_ranks) into worker batches.
+
+    Solo peptides (confounder_group_id == -1, or the column absent) are
+    batched separately from grouped ones, so solo batches can stay contiguous
+    mz_rank ranges (for DuckDB row-group skipping) while grouped peptides are
+    packed by whole confounder group -- never splitting a group's members
+    across two batches, since coSWA merging needs all of a group's members
+    together in one worker.
+    """
+    if "confounder_group_id" in dict_ref.columns:
+        group_map = dict_ref.drop_duplicates("mz_rank").set_index("mz_rank")[
+            "confounder_group_id"
+        ]
+        group_ids = group_map.reindex(peptide_indicies).fillna(-1).to_numpy(dtype=int)
+    else:
+        group_ids = np.full(len(peptide_indicies), -1, dtype=int)
+
+    solo_mask = group_ids == -1
+    solo_mz = np.sort(peptide_indicies[solo_mask])
+    grouped_mz = peptide_indicies[~solo_mask]
+    grouped_gid = group_ids[~solo_mask]
+
+    solo_batches = _split_contiguous_into_batches(solo_mz, batch_size_max, max_workers)
+    grouped_batches = _pack_confounder_groups_into_batches(
+        grouped_mz, grouped_gid, batch_size_max
+    )
+    return solo_batches + grouped_batches
+
+
 def match_features_batches_parallel(
     dict_ref,
     raw_file_list,
@@ -102,33 +185,16 @@ def match_features_batches_parallel(
             "Using provided peptide indices. Total count: %d", len(peptide_indicies)
         )
 
-    # Sort mz_ranks so each batch is a contiguous range — this lets DuckDB skip
-    # row groups in the mz-sorted parquet (produced by build_mz_sorted_activation).
-    sorted_mz = np.sort(
-        peptide_indicies
-    )  # pyright: ignore[reportArgumentType, reportCallIssue]
-    n_total = len(sorted_mz)
-
-    # Number of batches: enough so every batch ≤ batch_size_max, AND enough for
-    # good load balancing (≥ 2× max_workers so no worker idles at the tail).
-    n_batches = max(
-        max_workers * 2,
-        int(np.ceil(n_total / batch_size_max)),
+    peptide_indicies = np.asarray(peptide_indicies)
+    n_total = len(peptide_indicies)
+    peptide_batches = _build_peptide_batches(
+        dict_ref, peptide_indicies, batch_size_max, max_workers
     )
-    Logger.info(
-        "Total peptides: %d, Batch size max: %d, Max workers: %d → Using %d batches",
-        n_total,
-        batch_size_max,
-        max_workers,
-        n_batches,
-    )
-    peptide_batches = np.array_split(sorted_mz, n_batches)
-    actual_batch_size = len(peptide_batches[0])
     Logger.info(
         "Batching: %d peptides → %d batches of ≤%d (batch_size_max=%d, max_workers=%d)",
         n_total,
         len(peptide_batches),
-        actual_batch_size,
+        max((len(b) for b in peptide_batches), default=0),
         batch_size_max,
         max_workers,
     )
