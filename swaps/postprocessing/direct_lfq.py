@@ -18,6 +18,53 @@ ORGANISM_NAME_MAP = {
 }
 
 
+def undistinguishable_excl_output_name(output_name: str) -> str:
+    """DirectLFQ input filename for the version that excludes ions flagged as
+    belonging to a spatially undistinguishable coSWA confounder group (see
+    reformat_swaps_combined_for_directlfq). Only actually written when at
+    least one ion is flagged -- callers should check the path exists before
+    using it (e.g. before running DirectLFQ on it)."""
+    base_name, ext = os.path.splitext(output_name)
+    return f"{base_name}_excl_undistinguishable{ext}"
+
+
+def _log_and_write_undistinguishable_split(
+    reformatted_df: pd.DataFrame,
+    output_cols: list,
+    output_dir: str,
+    output_name: str,
+) -> None:
+    """Log the undistinguishable_group_id breakdown and, if any ion actually
+    belongs to a flagged coSWA confounder group (a value other than -1 or
+    NaN), additionally write a second DirectLFQ input with those ions
+    dropped entirely -- for comparing LFQ results with/without them.
+    """
+    gid = reformatted_df["undistinguishable_group_id"]
+    is_nan = gid.isna()
+    is_neg1 = ~is_nan & gid.astype(str).isin(["-1", "-1.0"])
+    is_other = ~is_nan & ~is_neg1
+    if not is_other.any():
+        return
+    Logger.info(
+        "undistinguishable_group_id breakdown among %d ions: -1=%d, NaN=%d, "
+        "other=%d (%d unique group id(s))",
+        len(gid),
+        int(is_neg1.sum()),
+        int(is_nan.sum()),
+        int(is_other.sum()),
+        int(gid[is_other].nunique()),
+    )
+    excl_name = undistinguishable_excl_output_name(output_name)
+    reformatted_df.loc[~is_other, output_cols].to_csv(
+        os.path.join(output_dir, excl_name), index=False, sep="\t"
+    )
+    Logger.info(
+        "Wrote DirectLFQ input excluding %d undistinguishable ion(s) to %s",
+        int(is_other.sum()),
+        excl_name,
+    )
+
+
 def reformat_swaps_combined_for_directlfq(
     combined_ion,
     dict_ref,
@@ -40,8 +87,13 @@ def reformat_swaps_combined_for_directlfq(
             ] = np.nan
     if keep_match_type_col:
         intensity_cols += [col for col in combined_ion.columns if col == "Match Type"]
+
+    has_group_id = "undistinguishable_group_id" in combined_ion.columns
+    merge_cols = intensity_cols + [ion_id_col]
+    if has_group_id:
+        merge_cols = merge_cols + ["undistinguishable_group_id"]
     reformatted_df = pd.merge(
-        combined_ion[intensity_cols + [ion_id_col]],
+        combined_ion[merge_cols],
         dict_ref[[ion_id_col, protein_id_col]],
         on=ion_id_col,
         how="left",
@@ -50,9 +102,14 @@ def reformat_swaps_combined_for_directlfq(
     intensity_cols_rename_map[protein_id_col] = "protein"
     intensity_cols_rename_map[ion_id_col] = "ion"
     reformatted_df = reformatted_df.rename(columns=intensity_cols_rename_map)
-    reformatted_df = reformatted_df[
-        ["protein", "ion"] + list(intensity_cols_rename_map.values())[:-2]
-    ]
+    output_cols = ["protein", "ion"] + list(intensity_cols_rename_map.values())[:-2]
+
+    if has_group_id:
+        _log_and_write_undistinguishable_split(
+            reformatted_df, output_cols, output_dir, output_name
+        )
+
+    reformatted_df = reformatted_df[output_cols]
     reformatted_df.to_csv(os.path.join(output_dir, output_name), index=False, sep="\t")
     return reformatted_df
 

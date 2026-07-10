@@ -47,6 +47,7 @@ from utils.plot import (
 from postprocessing.helper import build_pivot, build_mz_sorted_activation
 from postprocessing.direct_lfq import (
     reformat_swaps_combined_for_directlfq,
+    undistinguishable_excl_output_name,
 )
 
 # Clear existing logging handlers
@@ -640,6 +641,17 @@ def run_fdr_control_onwards(
     lfq_manager.run_lfq(
         input_file=os.path.join(quant_dir, percolator_dir_name, "swaps.aq_reformat.tsv")
     )
+    excl_input_file = os.path.join(
+        quant_dir,
+        percolator_dir_name,
+        undistinguishable_excl_output_name("swaps.aq_reformat.tsv"),
+    )
+    if os.path.exists(excl_input_file):
+        logging.info(
+            "Running DirectLFQ again excluding undistinguishable coSWA ions: %s",
+            excl_input_file,
+        )
+        lfq_manager.run_lfq(input_file=excl_input_file)
 
     logging.info("=================Result Analysis==================")
     result_analysis_dir = os.path.join(
