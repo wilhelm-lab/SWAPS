@@ -29,6 +29,7 @@ def detect_2d_peak_with_watershed(
     use_competing_peaks: bool = True,  # new: enable/disable the feature
     # min_distance_to_true_seed: int = 15,  # new: minimum distance from competing peaks to the true seed
     compactness: float = 0.001,
+    normalize_before_hmaxima: bool = True,
     visualize: bool = False,
 ):
     """
@@ -49,6 +50,12 @@ def detect_2d_peak_with_watershed(
         on intensity alone, so a weak peak next to a much taller one can lose most of
         its basin to the neighbor. Larger values regularise growth towards equal-area
         (Voronoi-like) splits, giving weak peaks a fairer geometric share.
+    - normalize_before_hmaxima: bool
+        If True (default), h-maxima runs on the image divided by its own
+        norm_percentile, so h_rel is a fraction of each image's dynamic range.
+        If False, h-maxima runs on `image` directly and h_rel becomes an
+        absolute prominence threshold in the image's own units (e.g. log10
+        intensity), skipping the percentile normalisation step entirely.
     - visualize: bool
         If True, show a step-by-step matplotlib figure of each stage.
     Returns:
@@ -82,12 +89,18 @@ def detect_2d_peak_with_watershed(
         )
 
     # Normalise once; shared by both auto-detect and competing-peaks branches.
-    _pN = np.percentile(image[mask_signal], norm_percentile)
-    _norm_image = image / _pN if _pN > 0 else image
+    # Skipped when normalize_before_hmaxima=False, since h_maxima then runs
+    # directly on `image` and neither _pN nor _norm_image is needed.
+    if normalize_before_hmaxima:
+        _pN = np.percentile(image[mask_signal], norm_percentile)
+        _hmaxima_image = image / _pN if _pN > 0 else image
+    else:
+        _hmaxima_image = image
 
     if coordinates is None:
-        # Auto-detect mode: peaks must rise ≥ h_rel × p(norm_percentile) above saddle.
-        hmax = h_maxima(_norm_image, h=h_rel) & mask_signal
+        # Auto-detect mode: peaks must rise ≥ h_rel × p(norm_percentile) above saddle
+        # (or ≥ h_rel in the image's own units when normalize_before_hmaxima=False).
+        hmax = h_maxima(_hmaxima_image, h=h_rel) & mask_signal
         if hmax.any():
             peak_labels, n_peaks = ndi.label(hmax)
             coordinates = np.array(
@@ -130,7 +143,7 @@ def detect_2d_peak_with_watershed(
     if use_competing_peaks and coordinates.shape[0] == 1:
         # gradient = sobel(image)
 
-        _hmax_bg = h_maxima(_norm_image, h=h_rel) & mask_signal
+        _hmax_bg = h_maxima(_hmaxima_image, h=h_rel) & mask_signal
         if _hmax_bg.any():
             _lbl_bg, _n_bg = ndi.label(_hmax_bg)
             bg_peaks = np.array(

@@ -1925,6 +1925,7 @@ def segment_consensus_from_aligned(
             h_rel=_wkwargs.get("h_rel", 0.15),
             norm_percentile=_wkwargs.get("norm_percentile", 95),
             compactness=_wkwargs.get("compactness", 0.001),
+            normalize_before_hmaxima=_wkwargs.get("normalize_before_hmaxima", True),
         )
     return _snap_all_anchors_to_watershed(
         alignment_state,

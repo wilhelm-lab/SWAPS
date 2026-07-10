@@ -133,6 +133,7 @@ __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.int_threshold = 1
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.h_rel = 0.01
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.norm_percentile = 95
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.compactness = 0.001
+__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.normalize_before_hmaxima = False
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.strategies = [
     "peptide_swap",
