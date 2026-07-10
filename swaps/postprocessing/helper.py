@@ -411,9 +411,21 @@ def build_pivot(pp_all, dict_ref):
     -------
     pd.DataFrame
         Pivoted dataframe with '{Run} Match Type' and '{Run} Intensity' columns.
+        Rows whose "Match Type" is "MBR" but which belong to a coSWA
+        confounder group flagged as spatially undistinguishable (see
+        `undistinguishable_group_id`) are relabeled "MBR_undistinguished"
+        instead, since such MBR hits cannot be reliably attributed to one
+        specific group member and should not feed into downstream LFQ.
     """
     _has_undistinguishable_group_id = "undistinguishable_group_id" in pp_all.columns
     if _has_undistinguishable_group_id:
+        pp_all = pp_all.copy()
+        _is_undistinguishable = ~pp_all["undistinguishable_group_id"].astype(str).isin(
+            ["-1", "-1.0"]
+        )
+        pp_all.loc[
+            (pp_all["Match Type"] == "MBR") & _is_undistinguishable, "Match Type"
+        ] = "MBR_undistinguished"
         pp_all_undistinguishable_group_id = pp_all.groupby("mz_rank").agg(
             {"undistinguishable_group_id": "first"}
         )

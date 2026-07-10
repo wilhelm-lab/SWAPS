@@ -605,6 +605,68 @@ class TestMatchFeaturesBatchConfounderGroups:
             assert pp_match.loc[3, "undistinguishable_group_id"] == -1
             assert pp_ref.loc[3, "area"] > 0
 
+    def test_merge_confounders_disabled_ignores_stale_group_id_column(
+        self, tmp_path
+    ):
+        """Backward compatibility: dict_ref may still carry a confounder_group_id
+        column left over from a previous run with coSWA enabled (e.g. a
+        reused dict_ref.pkl), but if PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED
+        is now False for this run, every candidate must be treated as solo,
+        fetching its own individually-stored activation (mirroring
+        test_no_confounder_group_id_column_behaves_as_before, just with the
+        stale column present) -- undistinguishable_group_id stays -1 for
+        everyone and no candidate silently loses its data."""
+        raw_files = ["run1", "run2"]
+        img_a = _group_blob_image([(15, 12, 10.0, 2.0)])
+        img_b = _group_blob_image([(15, 12, 10.0, 2.0)])
+        img_c = _group_blob_image([(25, 25, 10.0, 2.0)])
+        for rf in raw_files:
+            _write_combined_activation_parquet(
+                os.path.join(tmp_path, rf, "activation"),
+                {1: img_a, 2: img_b, 3: img_c},
+            )
+
+        def _abs(offset):
+            return (_RT_RANGE[0] + offset[0], _IM_RANGE[0] + offset[1])
+
+        rows = []
+        for mz_rank, group_id, off in [
+            (1, 1001, (15, 12)),
+            (2, 1001, (15, 12)),
+            (3, -1, (25, 25)),
+        ]:
+            row = {"mz_rank": mz_rank, "confounder_group_id": group_id}
+            for i, rf in enumerate(raw_files):
+                row[rf] = "Reference" if i == 0 else "Match"
+                row[f"MS1_frame_idx_left_ref_{rf}"] = _RT_RANGE[0]
+                row[f"MS1_frame_idx_right_ref_{rf}"] = _RT_RANGE[1]
+                row[f"mobility_values_index_left_ref_{rf}"] = _IM_RANGE[0]
+                row[f"mobility_values_index_right_ref_{rf}"] = _IM_RANGE[1]
+                rt_c, im_c = _abs(off)
+                row[f"{rf}_MS1_frame_idx_exp"] = rt_c
+                row[f"{rf}_mobility_values_index_exp"] = im_c
+            rows.append(row)
+        dict_ref = pd.DataFrame(rows)
+
+        (_, _, pp_reference_list, pp_match_target_list, *_rest) = match_features_batch(
+            dict_ref=dict_ref,
+            raw_file_list=raw_files,
+            result_dir=str(tmp_path),
+            batch=[1, 2, 3],
+            processing_kwargs={"apply_seg": True},
+            match_decoy=False,
+            merge_confounders_enabled=False,
+        )
+        pp_ref = pd.concat(pp_reference_list).set_index("mz_rank")
+        pp_match = pd.concat(pp_match_target_list).set_index("mz_rank")
+
+        # all three candidates still got quantified -- none silently dropped
+        # for want of an activation lookup keyed by the stale group id.
+        assert set(pp_ref.index) == {1, 2, 3}
+        assert set(pp_match.index) == {1, 2, 3}
+        assert (pp_ref["undistinguishable_group_id"] == -1).all()
+        assert (pp_match["undistinguishable_group_id"] == -1).all()
+
     def test_no_confounder_group_id_column_behaves_as_before(self, tmp_path):
         """Backward compatibility: without confounder_group_id (merging
         disabled at dict-build time), every candidate is processed

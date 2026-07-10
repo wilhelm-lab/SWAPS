@@ -92,6 +92,7 @@ def match_features_batches_parallel(
     max_workers: int = 4,
     processing_kwargs: dict | None = None,
     match_decoy: bool = True,
+    merge_confounders_enabled: bool = True,
 ):
     if peptide_indicies is None:
         peptide_indicies = dict_ref["mz_rank"].values
@@ -147,6 +148,7 @@ def match_features_batches_parallel(
             result_dir,
             processing_kwargs,
             match_decoy,
+            merge_confounders_enabled,
         ),
     ) as executor:
         futures = [
@@ -217,7 +219,12 @@ def match_features_batches_parallel(
 
 
 def _init_match_features_worker(
-    dict_ref, raw_file_list, result_dir, processing_kwargs, match_decoy: bool = True
+    dict_ref,
+    raw_file_list,
+    result_dir,
+    processing_kwargs,
+    match_decoy: bool = True,
+    merge_confounders_enabled: bool = True,
 ):
     """Store immutable batch context once per worker process."""
 
@@ -226,6 +233,7 @@ def _init_match_features_worker(
     _WORKER_CONTEXT["result_dir"] = result_dir
     _WORKER_CONTEXT["processing_kwargs"] = processing_kwargs
     _WORKER_CONTEXT["match_decoy"] = match_decoy
+    _WORKER_CONTEXT["merge_confounders_enabled"] = merge_confounders_enabled
     _WORKER_CONTEXT["dict_ref_by_mz"] = (
         dict_ref.set_index("mz_rank")
         if dict_ref["mz_rank"].is_unique
@@ -241,6 +249,9 @@ def _match_features_batch_worker(batch):
         batch=batch,
         processing_kwargs=_WORKER_CONTEXT["processing_kwargs"],
         match_decoy=_WORKER_CONTEXT.get("match_decoy", True),
+        merge_confounders_enabled=_WORKER_CONTEXT.get(
+            "merge_confounders_enabled", True
+        ),
     )
 
 
@@ -270,7 +281,9 @@ def _confounder_pool(
 
 
 def _group_members_in_batch(
-    dict_ref_by_mz: pd.DataFrame, batch_np: np.ndarray
+    dict_ref_by_mz: pd.DataFrame,
+    batch_np: np.ndarray,
+    merge_confounders_enabled: bool = True,
 ) -> dict[int, list[int]]:
     """Map each confounder_group_id with >=1 member present in `batch_np` to
     ITS OWN batch-present real mz_ranks. Deliberately batch-scoped, not a
@@ -281,7 +294,15 @@ def _group_members_in_batch(
     batches needs no cross-batch coordination: each batch independently sees
     only its own present member(s), fetches the group's one stored parquet
     row via IN(group_id), and expands it only to those members.
+
+    merge_confounders_enabled=False forces no groups at all (all mz_ranks
+    treated as solo), even if dict_ref still carries a stale
+    confounder_group_id column from a previous run with coSWA enabled --
+    keeps disabling PREPARE_DICT.MERGE_CONFOUNDERS backward compatible
+    without requiring dict_ref to be rebuilt.
     """
+    if not merge_confounders_enabled:
+        return {}
     if "confounder_group_id" not in dict_ref_by_mz.columns:
         return {}
     members_by_group: dict[int, list[int]] = {}
@@ -389,6 +410,7 @@ def match_features_batch(
     visualize_dir: str | None = None,
     match_decoy: bool = True,
     illustration_dir: str | None = None,
+    merge_confounders_enabled: bool = True,
 ):
     """Process one peptide batch using the consensus image path."""
     results_target, results_decoy = [], []
@@ -421,7 +443,9 @@ def match_features_batch(
     # group membership once: used to fetch+expand each group's row below, and
     # to drive the post-hoc segment-overlap tagging pass after the main loop
     # (see _mark_overlapping_group_members).
-    _group_to_members = _group_members_in_batch(dict_ref_by_mz, batch_np)
+    _group_to_members = _group_members_in_batch(
+        dict_ref_by_mz, batch_np, merge_confounders_enabled=merge_confounders_enabled
+    )
     _members_by_group = {g: m for g, m in _group_to_members.items() if len(m) >= 2}
 
     # Load activation data for this mz_rank batch from the pre-built sorted parquet.
@@ -463,7 +487,13 @@ def match_features_batch(
     def _select_mz(raw_file: str, mz_rank: int) -> pd.DataFrame:
         return act_dfs[raw_file].get(mz_rank, _empty_act_df[raw_file])
 
-    _has_group_col = "confounder_group_id" in dict_ref_by_mz.columns
+    # Gated on merge_confounders_enabled too, not just column presence: with
+    # coSWA disabled for this run, act_dfs is keyed by each candidate's own
+    # mz_rank (group_to_members=None above), so looking activation up by a
+    # stale confounder_group_id here would silently miss it.
+    _has_group_col = (
+        merge_confounders_enabled and "confounder_group_id" in dict_ref_by_mz.columns
+    )
 
     def _act_lookup_key(pept_idx: int) -> int:
         """Map a candidate's own mz_rank to the key its activation is stored
@@ -527,7 +557,7 @@ def match_features_batch(
         # member is subsequently aligned/segmented here.
         _group_id = (
             int(dict_ref_by_mz.at[pept_idx, "confounder_group_id"])
-            if "confounder_group_id" in dict_ref_by_mz.columns
+            if _has_group_col
             else -1
         )
         _act_key = _group_id if _group_id != -1 else int(pept_idx)

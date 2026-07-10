@@ -380,6 +380,7 @@ def opt_scan_by_scan(config_path: str):
         # Decoys only exist to feed Mokapot/percolator FDR control below —
         # skip generating them entirely when FDR is disabled.
         match_decoy=cfg.FDR.ENABLED,
+        merge_confounders_enabled=cfg.PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED,
     )
     quant_dir = _quant_dir(cfg)
     os.makedirs(quant_dir, exist_ok=True)

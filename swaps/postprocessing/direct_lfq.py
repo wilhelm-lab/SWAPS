@@ -28,6 +28,16 @@ def reformat_swaps_combined_for_directlfq(
     output_name="swaps.aq_reformat.tsv",
 ):
     intensity_cols = [col for col in combined_ion.columns if col.endswith("Intensity")]
+    combined_ion = combined_ion.copy()
+    for intensity_col in intensity_cols:
+        match_type_col = intensity_col.replace("Intensity", "Match Type")
+        if match_type_col in combined_ion.columns:
+            # MBR hits inside a coSWA confounder group whose independently-
+            # computed segments overlap cannot be attributed to one specific
+            # member (see build_pivot) -- excluded from LFQ input entirely.
+            combined_ion.loc[
+                combined_ion[match_type_col] == "MBR_undistinguished", intensity_col
+            ] = np.nan
     if keep_match_type_col:
         intensity_cols += [col for col in combined_ion.columns if col == "Match Type"]
     reformatted_df = pd.merge(

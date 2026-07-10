@@ -116,6 +116,27 @@ class TestBuildPivot:
         match_cols = [c for c in result.columns if "run_A" in c and "Match Type" in c]
         assert result.loc[0, match_cols[0]] == "MBR"
 
+    def test_mbr_undistinguishable_group_relabeled(self):
+        """MBR rows tagged with a real (non "-1") undistinguishable_group_id
+        get relabeled "MBR_undistinguished" so they're excluded downstream."""
+        pp = _make_pp_all([0, 1], ["run_A", "run_A"], ["MBR", "MBR"], [500.0, 600.0])
+        pp["undistinguishable_group_id"] = ["10020915_0", -1]
+        dr = _make_dict_ref([0, 1])
+        result = build_pivot(pp, dr)
+        match_col = [c for c in result.columns if "run_A" in c and "Match Type" in c][0]
+        assert result.loc[0, match_col] == "MBR_undistinguished"
+        assert result.loc[1, match_col] == "MBR"
+
+    def test_non_mbr_rows_untouched_by_undistinguishable_tag(self):
+        """Only "MBR" match type rows are eligible for relabeling, not
+        MS/MS or MS/MS Ref rows even if flagged with a group id."""
+        pp = _make_pp_all([0], ["run_A"], ["MS/MS Ref"], [1000.0])
+        pp["undistinguishable_group_id"] = ["10020915_0"]
+        dr = _make_dict_ref([0])
+        result = build_pivot(pp, dr)
+        match_col = [c for c in result.columns if "run_A" in c and "Match Type" in c][0]
+        assert result.loc[0, match_col] == "MS/MS Ref"
+
     def test_empty_pp_all_raises_or_returns_empty(self):
         # build_pivot requires at least one row to infer run columns from
         # pivot_table — empty input produces no columns, which is acceptable
