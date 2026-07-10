@@ -204,7 +204,15 @@ def match_features_batches_parallel(
     no_quant_log = []
     no_match_log = []
     snap_log_collection: dict[int, dict] = {}
-
+    if merge_confounders_enabled:
+        processing_kwargs = dict(processing_kwargs or {})
+        processing_kwargs["consensus_decoy_kwargs"] = {
+            **processing_kwargs.get("consensus_decoy_kwargs", {}),
+            "use_confounder_sampling": False,
+        }
+        Logger.info(
+            "merge_confounders_enabled=True: disabling confounder sampling for decoys."
+        )
     with ProcessPoolExecutor(
         max_workers=max_workers,
         initializer=_init_match_features_worker,
@@ -1985,13 +1993,15 @@ def segment_consensus_from_aligned(
     ]
     if non_none_indices and apply_seg:
         _wkwargs = dict(watershed_kwargs or {})
-        all_peaks, _unused_labels, _, watershed_labels, _ = detect_2d_peak_with_watershed(
-            consensus_denoised,
-            int_threshold=_wkwargs.get("int_threshold", 0.5),
-            h_rel=_wkwargs.get("h_rel", 0.15),
-            norm_percentile=_wkwargs.get("norm_percentile", 95),
-            compactness=_wkwargs.get("compactness", 0.001),
-            normalize_before_hmaxima=_wkwargs.get("normalize_before_hmaxima", True),
+        all_peaks, _unused_labels, _, watershed_labels, _ = (
+            detect_2d_peak_with_watershed(
+                consensus_denoised,
+                int_threshold=_wkwargs.get("int_threshold", 0.5),
+                h_rel=_wkwargs.get("h_rel", 0.15),
+                norm_percentile=_wkwargs.get("norm_percentile", 95),
+                compactness=_wkwargs.get("compactness", 0.001),
+                normalize_before_hmaxima=_wkwargs.get("normalize_before_hmaxima", True),
+            )
         )
     return _snap_all_anchors_to_watershed(
         alignment_state,
@@ -2186,13 +2196,18 @@ def _reuse_alignment_with_new_anchors(
     ]
     aligned_anchors = [
         (
-            (scaled_anchors[i][0] + cached.shifts[i][0], scaled_anchors[i][1] + cached.shifts[i][1])
+            (
+                scaled_anchors[i][0] + cached.shifts[i][0],
+                scaled_anchors[i][1] + cached.shifts[i][1],
+            )
             if scaled_anchors[i] is not None
             else None
         )
         for i in range(n)
     ]
-    return replace(cached, aligned_anchors=aligned_anchors, scaled_anchors=scaled_anchors)
+    return replace(
+        cached, aligned_anchors=aligned_anchors, scaled_anchors=scaled_anchors
+    )
 
 
 def build_consensus_feature_bundle(
