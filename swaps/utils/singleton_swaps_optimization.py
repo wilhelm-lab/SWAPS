@@ -152,3 +152,4 @@ __C.FDR.TRAIN = 0.05
 __C.FDR.TEST = 0.01
 __C.FDR.INT_THRES = 100  # intensity threshold for FDR; 0 means no threshold
 __C.FDR.ONLY_SCORE_MATCH = True  # if True, exclude Reference/Quant_Only run-peptide pairs from rescoring and pass them directly as "MS/MS" in the output
+__C.FDR.PERCOLATOR_POST_PROCESSING = "tdc"  # "tdc" (-Y, target-decoy competition) or "mix-max" (-y); selects percolator's post-processing method and the percolator_dir_name suffix

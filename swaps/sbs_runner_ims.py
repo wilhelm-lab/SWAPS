@@ -535,13 +535,15 @@ def run_fdr_control_onwards(
             if _align_images
             else _base_feature_cols
         )
-        percolator_dir_name = "percolator_postprocessing_tdc"
+        percolator_post_processing = cfg.FDR.PERCOLATOR_POST_PROCESSING
+        percolator_dir_name = f"percolator_postprocessing_{percolator_post_processing}"
         psms, peptide, all_psms = brew_with_percolator(
             tdc_df,
             feature_cols=_feature_cols,
             # train_fdr=cfg.FDR.TRAIN,
             # test_fdr=cfg.FDR.TEST,
             work_dir=os.path.join(quant_dir, percolator_dir_name),
+            post_processing=percolator_post_processing,
             decoy_col="Decoy",
             filename_col="matched_run",
             peptide_col="Sequence",
