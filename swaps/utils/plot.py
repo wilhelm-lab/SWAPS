@@ -1986,8 +1986,9 @@ def plot_match_type_comparison(
             "MS/MS Quant": "#55A868",
             "MS/MS Ref": "#4C72B0",
             "MBR": "#C44E52",
+            "MBR_undistinguished": "#DD8452",
             "unmatched": "#BBBBBB",
-            "Zero Quant": "#DD8452",
+            "Zero Quant": "#BBBBBB",
             "Quantified": "#55A868",
             "Not Quantified": "#BBBBBB",
         }
@@ -2003,6 +2004,7 @@ def plot_match_type_comparison(
                 "MS/MS Quant",
                 "MS/MS Ref",
                 "MBR",
+                "MBR_undistinguished",
                 "unmatched",
                 "Zero Quant",
             ]
