@@ -106,10 +106,14 @@ __C.MATCH_FEATURES_KWARGS.seg_mask_thres.im = 5  # min IM span of target labels
 __C.MATCH_FEATURES_KWARGS.jump_dist_thres = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.jump_dist_thres.rt = 10  # max RT jump in pixels; 0 = disabled
 __C.MATCH_FEATURES_KWARGS.jump_dist_thres.im = 10  # max IM jump in pixels; 0 = disabled
-# denoise: three sequential ops applied across two pipeline stages.
+# denoise: three sequential ops applied across pipeline stages.
 #   smooth.at / clean.at / log_transform.at controls which stage each op executes.
 #   "raw"       → applied to raw images before SIFT template-matching alignment
 #   "consensus" → applied to the averaged consensus image before watershed segmentation
+#   "aligned"   → log_transform only: applied right after alignment/template matching,
+#                 to the already-aligned per-run images, before they are averaged into
+#                 the consensus. Lets alignment run on un-transformed (noise-amplification-
+#                 free) images while consensus averaging still happens in log space.
 #   At peak-property extraction, raw_aligned images are compensated by applying all ops.
 __C.MATCH_FEATURES_KWARGS.denoise = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.denoise.smooth = ConfigurationNode()

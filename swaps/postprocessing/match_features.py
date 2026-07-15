@@ -1437,6 +1437,7 @@ def align_images_to_reference(
     anchors: list[tuple[int, int] | None] | None = None,
     additional_anchors: list[list[tuple[int, int] | None]] | None = None,
     align_images: bool = True,
+    post_align_log_transform: bool = False,
 ) -> ConsensusAlignmentState:
     """Resize and align images to a reference template for consensus scoring.
 
@@ -1448,6 +1449,13 @@ def align_images_to_reference(
     if no anchors are provided. `template_frac` is likewise widened (never
     narrowed) to the smallest fraction that still covers every anchor point
     around the resolved template anchor, capped at 0.5.
+
+    `post_align_log_transform`, if set, applies log2(1+x) to every aligned
+    image right after shift-finding -- template matching itself still runs
+    on the un-transformed images (less sensitive to noise amplified near
+    zero by the log), while everything downstream (consensus averaging,
+    descriptors) sees log-space images, same as the "raw"-stage log_transform
+    does today.
     """
 
     if not images:
@@ -1570,6 +1578,9 @@ def align_images_to_reference(
         match_score_maps.append(match_score_map)
         match_score_peaks.append(match_score_peak)
         match_score_label_indices.append(i)
+
+    if post_align_log_transform:
+        aligned_images = [np.log2(1 + img) for img in aligned_images]
 
     return ConsensusAlignmentState(
         reference_idx=reference_idx,
@@ -2272,6 +2283,9 @@ def build_consensus_feature_bundle(
     _denoise_cfg = denoise_cfg or {}
     _consensus_denoise_kwargs = _denoise_kwargs_for_stage(_denoise_cfg, "consensus")
     _full_denoise_kwargs = _denoise_kwargs_all(_denoise_cfg)
+    _post_align_log_transform = bool(
+        _denoise_kwargs_for_stage(_denoise_cfg, "aligned").get("log_transform", False)
+    )
     if precomputed_states is not None:
         alignment_state, segmentation_state = precomputed_states
     elif reuse_from is None:
@@ -2284,6 +2298,7 @@ def build_consensus_feature_bundle(
             anchors=anchors,
             additional_anchors=additional_anchors,
             align_images=align_images,
+            post_align_log_transform=_post_align_log_transform,
         )
         segmentation_state = segment_consensus_from_aligned(
             alignment_state,
