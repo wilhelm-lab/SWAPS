@@ -685,7 +685,9 @@ def match_features_batch(
         _consensus_bundle = build_consensus_feature_bundle(
             images=[_get_raw_denoised_pept_act(rf) for rf in _consensus_raw_files],
             reference_idx=0,
-            template_frac=0.3,
+            template_frac=float(
+                (processing_kwargs or {}).get("template_frac", 0.3)
+            ),
             anchors=_consensus_anchors,
             denoise_cfg=denoise_cfg,
             watershed_kwargs=dict(
@@ -830,7 +832,9 @@ def match_features_batch(
                     _decoy_bundle = build_consensus_feature_bundle(
                         images=_plot_raw_denoised_images,
                         reference_idx=0,
-                        template_frac=0.3,
+                        template_frac=float(
+                            (processing_kwargs or {}).get("template_frac", 0.3)
+                        ),
                         anchors=_plot_anchors,
                         denoise_cfg=denoise_cfg,
                         watershed_kwargs=dict(

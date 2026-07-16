@@ -106,6 +106,7 @@ __C.MATCH_FEATURES_KWARGS.seg_mask_thres.im = 5  # min IM span of target labels
 __C.MATCH_FEATURES_KWARGS.jump_dist_thres = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.jump_dist_thres.rt = 10  # max RT jump in pixels; 0 = disabled
 __C.MATCH_FEATURES_KWARGS.jump_dist_thres.im = 10  # max IM jump in pixels; 0 = disabled
+__C.MATCH_FEATURES_KWARGS.template_frac = 0.3  # half-width (as a fraction of each dim) of the template patch used for SIFT/consensus template matching; must be in (0, 0.5]
 # denoise: three sequential ops applied across pipeline stages.
 #   smooth.at / clean.at / log_transform.at controls which stage each op executes.
 #   "raw"       → applied to raw images before SIFT template-matching alignment
