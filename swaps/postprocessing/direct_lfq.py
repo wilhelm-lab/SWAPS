@@ -323,6 +323,7 @@ def plot_protein_quant(
     label_map: Optional[dict] = None,
     int_col_keyword: str = "MaxLFQ Intensity",
     bar_ylim: tuple[float, float] = (0, 4500),
+    scatter_xlim: Optional[tuple[float, float]] = None,
     id_cols: list[str] = ["Protein ID", "Organism"],
     cond_A_keyword: str = "HYE124_A",
     cond_B_keyword: str = "HYE124_B",
@@ -389,21 +390,22 @@ def plot_protein_quant(
     for artist in ax_scatter.collections:
         artist.set_rasterized(True)
 
-    # for org in organisms_present:
-    #     sub = qdf[qdf["Organism"] == org].dropna(subset=["log2_Intensity_ref", "ratio"])
-    #     if len(sub) < 10:
-    #         continue
-    #     smoothed = lowess(
-    #         sub["ratio"].values, sub["log2_Intensity_ref"].values, frac=0.3
-    #     )
-    #     ax_scatter.plot(
-    #         smoothed[:, 0],
-    #         smoothed[:, 1],
-    #         color="black",
-    #         linewidth=1.5,
-    #         linestyle="--",
-    #         zorder=3,
-    #     )
+    for org in organisms_present:
+        sub = qdf[qdf["Organism"] == org].dropna(subset=["log2_Intensity_ref", "ratio"])
+        if len(sub) < 10:
+            continue
+        smoothed = lowess(
+            sub["ratio"].values, sub["log2_Intensity_ref"].values, frac=0.3
+        )
+        ax_scatter.plot(
+            smoothed[:, 0],
+            smoothed[:, 1],
+            color=color_map[org],
+            # color="black",
+            linewidth=1.5,
+            linestyle="-",
+            zorder=3,
+        )
 
     stats = qdf.groupby("Organism")["ratio"].agg(
         count="count",
@@ -417,8 +419,8 @@ def plot_protein_quant(
         c = color_map[org] if org in color_map else "black"
         display_org = label_map.get(org, org)
         # ax_scatter.axhline(row["median"], linestyle="-", linewidth=1.2, color=c)
-        ax_scatter.axhline(row["q1"], linestyle="--", linewidth=1, color=c)
-        ax_scatter.axhline(row["q3"], linestyle="--", linewidth=1, color=c)
+        # ax_scatter.axhline(row["q1"], linestyle="--", linewidth=1, color=c)
+        # ax_scatter.axhline(row["q3"], linestyle="--", linewidth=1, color=c)
         text = (
             f"{display_org}: n={int(row['count'])}, "
             f"Med={row['median']:.2f}, Q3-Q1={row['q3'] - row['q1']:.2f}"
@@ -434,10 +436,14 @@ def plot_protein_quant(
 
     ax_scatter.set_xlabel("log2 Intensity, Mean of MixA and MixB")
     ax_scatter.set_ylabel("log2 Ratio, MixB/MixA")
-    ax_scatter.set_ylim(-5, 5)
+    ax_scatter.set_ylim(-3, 4)
+    ax_scatter.set_xlim(scatter_xlim if scatter_xlim is not None else (6, 22))
     ax_scatter.set_title(
-        f"{dataset_name} | Total Protein IDs: {n_total_proteins}, Quantifiable: {len(qdf)}"
+        f"{dataset_name} | Total IDs: {n_total_proteins}, Quantifiable: {len(qdf)}"
     )
+    ax_scatter.axhline(0, color="black", linewidth=0.8, linestyle=":")
+    ax_scatter.axhline(-1, color="black", linewidth=0.8, linestyle=":")
+    ax_scatter.axhline(2, color="black", linewidth=0.8, linestyle=":")
 
     # Right: marginal ratio density per organism.
     for org in organisms_present:
@@ -454,11 +460,20 @@ def plot_protein_quant(
                 linewidth=1,
             )
         if org in stats.index:
+            ax_kde.axhline(
+                stats.loc[org, "q1"], color=color_map[org], linewidth=1, linestyle="--"
+            )
             ax_kde.axhline(stats.loc[org, "median"], color=color_map[org], linewidth=1)
+            ax_kde.axhline(
+                stats.loc[org, "q3"], color=color_map[org], linewidth=1, linestyle="--"
+            )
 
     ax_kde.set_xlabel("Density")
     ax_kde.set_ylabel("")
     ax_kde.tick_params(labelleft=False)
+    ax_kde.axhline(0, color="black", linewidth=0.8, linestyle=":")
+    ax_kde.axhline(-1, color="black", linewidth=0.8, linestyle=":")
+    ax_kde.axhline(2, color="black", linewidth=0.8, linestyle=":")
     plt.tight_layout()
 
     if fig_dir:

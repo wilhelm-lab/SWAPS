@@ -1988,7 +1988,7 @@ def plot_match_type_comparison(
             "MBR": "#C44E52",
             "MBR_undistinguished": "#DD8452",
             "unmatched": "#BBBBBB",
-            "Zero Quant": "#BBBBBB",
+            "Zero Quant": "#CCB974",
             "Quantified": "#55A868",
             "Not Quantified": "#BBBBBB",
         }
@@ -2003,10 +2003,10 @@ def plot_match_type_comparison(
                 "MS/MS",
                 "MS/MS Quant",
                 "MS/MS Ref",
+                "Zero Quant",
                 "MBR",
                 "MBR_undistinguished",
                 "unmatched",
-                "Zero Quant",
             ]
         if iq_stack_order is None:
             iq_stack_order = ["MS/MS", "Zero Quant", "MBR", "unmatched"]
@@ -2040,13 +2040,21 @@ def plot_match_type_comparison(
                     if int_col_keyword
                     else None
                 )
-                mt_series = df[col].replace("MS/MS Ref", "MS/MS")
+                # Any MS/MS variant (MS/MS, MS/MS Ref, MS/MS Quant, ...) counts as plain "MS/MS".
+                mt_series = df[col].mask(
+                    df[col].str.contains("MS/MS", na=False), "MS/MS"
+                )
                 if int_col and int_col in df.columns and int_col != col:
-                    mask_zero = (df[int_col] == 0) & (mt_series != "unmatched")
-                    vc = mt_series.loc[~mask_zero].value_counts(dropna=True)
-                    vc["Zero Quant"] = mask_zero.sum()
-                else:
-                    vc = mt_series.value_counts(dropna=True)
+                    missing_or_zero = df[int_col].isna() | (df[int_col] == 0)
+                    # MS/MS without usable intensity is "Zero Quant"; MBR without
+                    # usable intensity is indistinguishable from "unmatched".
+                    mt_series = mt_series.mask(
+                        (mt_series == "MS/MS") & missing_or_zero, "Zero Quant"
+                    )
+                    mt_series = mt_series.mask(
+                        (mt_series == "MBR") & missing_or_zero, "unmatched"
+                    )
+                vc = mt_series.value_counts(dropna=True)
                 counts_dict[label] = vc
         counts = pd.DataFrame(counts_dict).T.fillna(0)
         ordered = [c for c in stack_order if c in counts.columns]
@@ -2061,6 +2069,11 @@ def plot_match_type_comparison(
     sw_cats = [c for c in stack_order if c in counts_sw.columns]
     counts_iq = counts_iq.reindex(index=exp_ids, columns=iq_cats, fill_value=0)
     counts_sw = counts_sw.reindex(index=exp_ids, columns=sw_cats, fill_value=0)
+
+    Logger.info(
+        "plot_match_type_comparison IonQuant counts:\n%s", counts_iq.to_string()
+    )
+    Logger.info("plot_match_type_comparison SWAPS counts:\n%s", counts_sw.to_string())
 
     n = len(exp_ids)
     bar_w = 0.38
@@ -2094,7 +2107,7 @@ def plot_match_type_comparison(
                         str(int(v)),
                         ha="center",
                         va="center",
-                        fontsize=7,
+                        fontsize=10,
                     )
             bottoms += vals
 
@@ -2321,13 +2334,15 @@ def plot_feature_roc_curves(
 
     fig, ax = plt.subplots(figsize=(6, 6))
     palette = sns.color_palette("tab10", n_colors=len(features))
+    lines_with_auc = []
     for feat, color in zip(features, palette):
         score = percolator_input[feat]
         auc = roc_auc_score(y, score)
         if auc < 0.5:
             score, auc = -score, 1 - auc
         fpr, tpr, _ = roc_curve(y, score)
-        ax.plot(fpr, tpr, color=color, label=f"{feat} (AUC={auc:.3f})")
+        (line,) = ax.plot(fpr, tpr, color=color, label=f"{feat} (AUC={auc:.3f})")
+        lines_with_auc.append((auc, line))
 
     ax.plot([0, 1], [0, 1], color="gray", linestyle="--", linewidth=0.8, alpha=0.6)
     ax.set_xlabel("False positive rate")
@@ -2335,7 +2350,9 @@ def plot_feature_roc_curves(
     ax.set_title(
         f"Feature ROC curves{' (' + fig_name_suffix.strip('_') + ')' if fig_name_suffix else ''}"
     )
-    ax.legend(loc="lower right", fontsize=8)
+    lines_with_auc.sort(key=lambda x: x[0], reverse=True)
+    handles = [line for _, line in lines_with_auc]
+    ax.legend(handles=handles, labels=[h.get_label() for h in handles], loc="lower right", fontsize=8)
     fig.tight_layout()
 
     fig_name = f"feature_roc_curves{fig_name_suffix}"

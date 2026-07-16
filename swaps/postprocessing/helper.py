@@ -599,3 +599,66 @@ def swaps_combined_ions_to_msstats(
     return _wide_intensity_to_msstats_long(
         merged, intensity_cols, id_cols, intensity_suffix, drop_missing
     )
+
+
+def reassign_quant_only_as_msms(
+    swaps_combined_ions: pd.DataFrame,
+    dict_ref: pd.DataFrame,
+    ion_id_col: str = "mz_rank",
+    match_type_suffix: str = " Match Type",
+    intensity_suffix: str = " Intensity",
+    int_thres: Optional[float] = None,
+) -> pd.DataFrame:
+    """Relabel run-peptide pairs marked "Reference"/"Quant_Only" in `dict_ref` as "MS/MS".
+
+    `dict_ref` has one column per raw file name whose cells encode the
+    search-engine match status ("Reference", "Quant_Only", "Not_Match", ...,
+    see `prepare_dict.pivot_psm_by_mz_rank`). Both "Reference" (the run chosen
+    as that peptide's global identification anchor) and "Quant_Only" (every
+    other run where the search engine also directly identified it) mean the
+    run-peptide pair was identified from its own MS/MS, so the corresponding
+    `"<run>{match_type_suffix}"` cell in `swaps_combined_ions` (produced by
+    :func:`build_pivot`) should be reported as "MS/MS" rather than whatever
+    SWAPS assigned it (e.g. "MS/MS Ref", "MBR").
+
+    If `int_thres` is given, any "MS/MS" cell (including ones just relabeled
+    above) whose matching `"<run>{intensity_suffix}"` value is missing or
+    below `int_thres` is further relabeled "Zero Quant", since it was
+    identified but not usably quantified.
+
+    Matches rows on `ion_id_col` and returns a copy of `swaps_combined_ions`
+    with the affected cells updated.
+    """
+    combined = swaps_combined_ions.copy()
+    has_id_index = combined.index.name == ion_id_col
+    if not has_id_index:
+        combined = combined.set_index(ion_id_col)
+
+    dict_ref_by_id = dict_ref.set_index(ion_id_col)
+    run_cols = [
+        col
+        for col in dict_ref_by_id.columns
+        if f"{col}{match_type_suffix}" in combined.columns
+    ]
+    for run in run_cols:
+        msms_ids = dict_ref_by_id.index[
+            dict_ref_by_id[run].isin(["Reference", "Quant_Only"])
+        ]
+        idx = combined.index.intersection(msms_ids)
+        combined.loc[idx, f"{run}{match_type_suffix}"] = "MS/MS"
+
+    if int_thres is not None:
+        for run in run_cols:
+            match_type_col = f"{run}{match_type_suffix}"
+            intensity_col = f"{run}{intensity_suffix}"
+            if intensity_col not in combined.columns:
+                continue
+            is_msms = combined[match_type_col] == "MS/MS"
+            low_intensity = (
+                combined[intensity_col].isna() | (combined[intensity_col] < int_thres)
+            )
+            combined.loc[is_msms & low_intensity, match_type_col] = "Zero Quant"
+
+    if not has_id_index:
+        combined = combined.reset_index()
+    return combined
