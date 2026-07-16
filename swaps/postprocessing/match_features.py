@@ -48,6 +48,7 @@ class ConsensusAlignmentState:
     match_score_maps: list[np.ndarray] = field(default_factory=list)
     match_score_peaks: list[tuple[int, int]] = field(default_factory=list)
     match_score_label_indices: list[int] = field(default_factory=list)
+    use_shift_crop_pad: bool = False
 
 
 @dataclass
@@ -485,6 +486,7 @@ def match_features_batch(
     match_decoy: bool = True,
     illustration_dir: str | None = None,
     merge_confounders_enabled: bool = True,
+    illustration_log_transform_raw: bool = False,
 ):
     """Process one peptide batch using the consensus image path."""
     results_target, results_decoy = [], []
@@ -507,6 +509,9 @@ def match_features_batch(
     raw_denoise_kwargs = _denoise_kwargs_for_stage(denoise_cfg, "raw")
     full_denoise_kwargs = _denoise_kwargs_all(denoise_cfg)
     _align_images = bool((processing_kwargs or {}).get("align_images", True))
+    _use_shift_crop_pad = bool(
+        (processing_kwargs or {}).get("use_shift_crop_pad", False)
+    )
     _jump_dist_thres = _parse_jump_dist_thres(
         (processing_kwargs or {}).get("jump_dist_thres")
     )
@@ -685,9 +690,7 @@ def match_features_batch(
         _consensus_bundle = build_consensus_feature_bundle(
             images=[_get_raw_denoised_pept_act(rf) for rf in _consensus_raw_files],
             reference_idx=0,
-            template_frac=float(
-                (processing_kwargs or {}).get("template_frac", 0.3)
-            ),
+            template_frac=float((processing_kwargs or {}).get("template_frac", 0.3)),
             anchors=_consensus_anchors,
             denoise_cfg=denoise_cfg,
             watershed_kwargs=dict(
@@ -702,6 +705,7 @@ def match_features_batch(
             jump_dist_thres=_jump_dist_thres,
             consensus_image_indices=_anchor_image_indices,
             align_images=_align_images,
+            use_shift_crop_pad=_use_shift_crop_pad,
         )
         if _group_id in _members_by_group:
             # Stash what the post-hoc overlap pass needs -- this member's own
@@ -740,6 +744,7 @@ def match_features_batch(
                 _consensus_raw_files,
                 _batch_svg_dir,
                 raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
+                log_transform_raw=illustration_log_transform_raw,
             )
         consensus_pp = _consensus_bundle.consensus_pp
         individual_pps = _consensus_bundle.individual_pps
@@ -852,6 +857,7 @@ def match_features_batch(
                             (processing_kwargs or {}).get("jump_dist_thres")
                         ),
                         align_images=_align_images,
+                        use_shift_crop_pad=_use_shift_crop_pad,
                     )
                     if visualize_dir is not None:
                         _visualize_consensus_bundle(
@@ -871,6 +877,7 @@ def match_features_batch(
                             _batch_svg_dir,
                             raw_images=_plot_raw_images,
                             filename_prefix=f"decoy_peptide_swap_rep{_rep}_",
+                            log_transform_raw=illustration_log_transform_raw,
                         )
 
         _off_target_label_shifts: list[tuple[int, int] | None] = []
@@ -1349,13 +1356,107 @@ def _resize_image_to_shape(
     return resized.astype(np.float64)
 
 
+def _shift_and_fit(
+    image: np.ndarray, target_shape: tuple[int, int], shift: tuple[int, int]
+) -> np.ndarray:
+    """Place `image` into a `target_shape` canvas at `shift`, via exact slicing.
+
+    Same convention as scipy.ndimage.shift(image, shift, mode="constant"):
+    out[p] = image[p - shift], zero-filled where that's out of range. Unlike
+    nd_shift this tolerates image.shape != target_shape -- an axis smaller
+    than target pads, one larger crops -- but both are driven by the same
+    `shift`, so pad and crop stay registered to the same match instead of
+    padding being a separate, shift-agnostic centering step.
+    """
+    out = np.zeros(target_shape, dtype=image.dtype)
+    src_slices: list[slice] = []
+    dst_slices: list[slice] = []
+    for axis in range(2):
+        native = image.shape[axis]
+        target = int(target_shape[axis])
+        s = int(shift[axis])
+        dst_lo, dst_hi = max(0, s), min(target, s + native)
+        if dst_lo >= dst_hi:
+            return out  # shift moves the image entirely out of frame
+        dst_slices.append(slice(dst_lo, dst_hi))
+        src_slices.append(slice(dst_lo - s, dst_hi - s))
+    out[tuple(dst_slices)] = image[tuple(src_slices)]
+    return out
+
+
+def _find_shift_via_template_match(
+    search_image: np.ndarray,
+    template: np.ndarray,
+    template_bounds: tuple[int, int, int, int],
+) -> tuple[tuple[int, int], float, np.ndarray, tuple[int, int]]:
+    """Locate `template` in `search_image`; return the integer shift that
+    aligns the match to `template_bounds` (the convention scipy.ndimage.shift
+    expects), the match score, its full score map, and the matched top-left.
+    Pure shift-finding -- callers decide how the shift gets applied.
+    """
+    template_rt_start, template_im_start, _, _ = template_bounds
+    match_score = match_template(search_image, template)
+    match_rt_topleft, match_im_topleft = np.unravel_index(
+        np.argmax(match_score), match_score.shape
+    )
+    shift = (
+        int(template_rt_start - match_rt_topleft),
+        int(template_im_start - match_im_topleft),
+    )
+    return (
+        shift,
+        float(match_score.max()),
+        match_score,
+        (int(match_rt_topleft), int(match_im_topleft)),
+    )
+
+
+def _find_shift_native_image(
+    image: np.ndarray,
+    template: np.ndarray,
+    template_bounds: tuple[int, int, int, int],
+) -> tuple[tuple[int, int], float, np.ndarray, tuple[int, int]]:
+    """_find_shift_via_template_match, but tolerant of `image` being smaller
+    than `template` in a dimension -- possible in shift_crop_pad mode since
+    no resizing happens, so a run's native window can be narrower than the
+    template patch cut from the (larger, reference-shaped) template. Pads
+    just enough to satisfy match_template's image >= template requirement,
+    then corrects the returned shift back into `image`'s own coordinate frame.
+    """
+    pad_before = [0, 0]
+    pads = []
+    for axis in range(2):
+        deficit = template.shape[axis] - image.shape[axis]
+        if deficit > 0:
+            before = (deficit + 1) // 2
+            pad_before[axis] = before
+            pads.append((before, deficit - before))
+        else:
+            pads.append((0, 0))
+    search_image = (
+        image if pad_before == [0, 0] else np.pad(image, pads, mode="constant")
+    )
+    shift, max_score, match_score, match_topleft = _find_shift_via_template_match(
+        search_image, template, template_bounds
+    )
+    shift = (shift[0] + pad_before[0], shift[1] + pad_before[1])
+    return shift, max_score, match_score, match_topleft
+
+
 def _scale_anchor_to_target_shape(
     anchor: tuple[int, int] | None,
     source_shape: tuple[int, int],
     target_shape: tuple[int, int],
+    use_shift_crop_pad: bool = False,
 ) -> tuple[float, float] | None:
     if anchor is None:
         return None
+    if use_shift_crop_pad:
+        # No resizing happens in this mode, so a run's native anchor is
+        # already in the same coordinate units as the reference's; per-run
+        # registration is applied later via +shift, same as the ratio-scaled
+        # anchor below is in resize mode.
+        return (float(anchor[0]), float(anchor[1]))
     scale_r = int(target_shape[0]) / int(source_shape[0])
     scale_c = int(target_shape[1]) / int(source_shape[1])
     return (float(anchor[0]) * scale_r, float(anchor[1]) * scale_c)
@@ -1405,15 +1506,8 @@ def _align_resized_image_to_template(
 ]:
     from scipy.ndimage import shift as nd_shift
 
-    template_rt_start, template_im_start, template_rt_end, template_im_end = (
-        template_bounds
-    )
-    match_score = match_template(resized_image, template)
-    max_score_index = np.unravel_index(np.argmax(match_score), match_score.shape)
-    match_rt_topleft, match_im_topleft = max_score_index
-    shift = (
-        int(template_rt_start - match_rt_topleft),
-        int(template_im_start - match_im_topleft),
+    shift, max_score, match_score, match_topleft = _find_shift_via_template_match(
+        resized_image, template, template_bounds
     )
     aligned_image = nd_shift(resized_image, shift=shift, mode="constant", cval=0.0)
     aligned_anchor = (
@@ -1423,12 +1517,12 @@ def _align_resized_image_to_template(
     )
     return (
         aligned_image,
-        (template_rt_start, template_im_start, template_rt_end, template_im_end),
+        template_bounds,
         aligned_anchor,
         shift,
-        float(match_score.max()),
+        max_score,
         match_score,
-        (int(match_rt_topleft), int(match_im_topleft)),
+        match_topleft,
     )
 
 
@@ -1442,6 +1536,7 @@ def align_images_to_reference(
     additional_anchors: list[list[tuple[int, int] | None]] | None = None,
     align_images: bool = True,
     post_align_log_transform: bool = False,
+    use_shift_crop_pad: bool = False,
 ) -> ConsensusAlignmentState:
     """Resize and align images to a reference template for consensus scoring.
 
@@ -1460,6 +1555,13 @@ def align_images_to_reference(
     zero by the log), while everything downstream (consensus averaging,
     descriptors) sees log-space images, same as the "raw"-stage log_transform
     does today.
+
+    `use_shift_crop_pad`, if set, skips cv2.resize entirely: match_template
+    runs directly on each run's native-shaped image, and the found integer
+    shift is applied by exact slicing (_shift_and_fit) instead of
+    interpolation -- pad where a run's window is smaller than the
+    reference's, crop where larger, both driven by the same shift so the two
+    stay mutually registered.
     """
 
     if not images:
@@ -1487,13 +1589,20 @@ def align_images_to_reference(
     resolved_target_shape = (
         ref_image.shape if target_shape is None else tuple(map(int, target_shape))
     )
-    resized_images = [
-        _resize_image_to_shape(image, resolved_target_shape) for image in images
-    ]
+    if use_shift_crop_pad:
+        resized_images = list(images)
+        if tuple(ref_image.shape) != tuple(resolved_target_shape):
+            resized_images[reference_idx] = _shift_and_fit(
+                ref_image, resolved_target_shape, (0, 0)
+            )
+    else:
+        resized_images = [
+            _resize_image_to_shape(image, resolved_target_shape) for image in images
+        ]
     scaled_anchors = [
         (
             _scale_anchor_to_target_shape(
-                anchors[i], images[i].shape, resolved_target_shape
+                anchors[i], images[i].shape, resolved_target_shape, use_shift_crop_pad
             )
             if anchors is not None
             else None
@@ -1504,7 +1613,7 @@ def align_images_to_reference(
     for _extra in additional_anchors or []:
         _template_anchor_pool.extend(
             _scale_anchor_to_target_shape(
-                _extra[i], images[i].shape, resolved_target_shape
+                _extra[i], images[i].shape, resolved_target_shape, use_shift_crop_pad
             )
             for i in range(len(images))
         )
@@ -1554,26 +1663,43 @@ def align_images_to_reference(
             max_scores.append(1.0)
             continue
         if not align_images:
-            aligned_images.append(resized_image.copy())
+            aligned_images.append(
+                _shift_and_fit(images[i], resolved_target_shape, (0, 0))
+                if use_shift_crop_pad
+                else resized_image.copy()
+            )
             matched_boxes.append(template_bounds)
             aligned_anchors.append(scaled_anchors[i])
             shifts.append((0, 0))
             max_scores.append(0.0)
             continue
-        (
-            aligned_image,
-            matched_box,
-            aligned_anchor,
-            shift,
-            max_score,
-            match_score_map,
-            match_score_peak,
-        ) = _align_resized_image_to_template(
-            resized_image,
-            template,
-            template_bounds,
-            scaled_anchors[i],
-        )
+        if use_shift_crop_pad:
+            shift, max_score, match_score_map, match_score_peak = (
+                _find_shift_native_image(images[i], template, template_bounds)
+            )
+            aligned_image = _shift_and_fit(images[i], resolved_target_shape, shift)
+            matched_box = template_bounds
+            scaled_anchor = scaled_anchors[i]
+            aligned_anchor = (
+                (float(scaled_anchor[0] + shift[0]), float(scaled_anchor[1] + shift[1]))
+                if scaled_anchor is not None
+                else None
+            )
+        else:
+            (
+                aligned_image,
+                matched_box,
+                aligned_anchor,
+                shift,
+                max_score,
+                match_score_map,
+                match_score_peak,
+            ) = _align_resized_image_to_template(
+                resized_image,
+                template,
+                template_bounds,
+                scaled_anchors[i],
+            )
         aligned_images.append(aligned_image)
         matched_boxes.append(matched_box)
         aligned_anchors.append(aligned_anchor)
@@ -1603,6 +1729,7 @@ def align_images_to_reference(
         match_score_maps=match_score_maps,
         match_score_peaks=match_score_peaks,
         match_score_label_indices=match_score_label_indices,
+        use_shift_crop_pad=use_shift_crop_pad,
     )
 
 
@@ -1697,7 +1824,10 @@ def _project_anchor_into_aligned_space(
     recomputing image resize/registration for every member.
     """
     scaled = _scale_anchor_to_target_shape(
-        anchor, source_shape, alignment_state.target_shape
+        anchor,
+        source_shape,
+        alignment_state.target_shape,
+        alignment_state.use_shift_crop_pad,
     )
     if scaled is None:
         return None
@@ -2034,9 +2164,15 @@ def _align_raw_images_with_shifts(
     raw_images: list[np.ndarray],
     target_shape: tuple[int, int],
     shifts: list[tuple[int, int]],
+    use_shift_crop_pad: bool = False,
 ) -> list[np.ndarray]:
     from scipy.ndimage import shift as nd_shift
 
+    if use_shift_crop_pad:
+        return [
+            _shift_and_fit(raw_image, target_shape, shifts[i])
+            for i, raw_image in enumerate(raw_images)
+        ]
     raw_aligned: list[np.ndarray] = []
     for i, raw_image in enumerate(raw_images):
         raw_resized = _resize_image_to_shape(raw_image, target_shape)
@@ -2138,6 +2274,7 @@ def extract_peak_properties_from_consensus_labels(
         raw_images,
         alignment_state.target_shape,
         alignment_state.shifts,
+        alignment_state.use_shift_crop_pad,
     )  # no raw denoise kwargs
 
     raw_consensus = segmentation_state.consensus  # with raw denoise kwargs
@@ -2206,7 +2343,9 @@ def _reuse_alignment_with_new_anchors(
     n = len(cached.aligned_images)
     assert len(anchors) == n and len(source_shapes) == n
     scaled_anchors = [
-        _scale_anchor_to_target_shape(anchors[i], source_shapes[i], cached.target_shape)
+        _scale_anchor_to_target_shape(
+            anchors[i], source_shapes[i], cached.target_shape, cached.use_shift_crop_pad
+        )
         for i in range(n)
     ]
     aligned_anchors = [
@@ -2242,6 +2381,7 @@ def build_consensus_feature_bundle(
     jump_dist_thres: tuple[int, int] = (0, 0),
     consensus_image_indices: list[int] | None = None,
     align_images: bool = True,
+    use_shift_crop_pad: bool = False,
     reuse_from: ConsensusFeatureBundle | None = None,
     collapse_to_single_label: bool = False,
     priority_anchor_index: int | None = None,
@@ -2303,6 +2443,7 @@ def build_consensus_feature_bundle(
             additional_anchors=additional_anchors,
             align_images=align_images,
             post_align_log_transform=_post_align_log_transform,
+            use_shift_crop_pad=use_shift_crop_pad,
         )
         segmentation_state = segment_consensus_from_aligned(
             alignment_state,
@@ -2724,6 +2865,7 @@ def _save_illustration_svgs(
     filename_prefix: str = "",
     segmentation_override: "ConsensusSegmentationState | None" = None,
     skip_per_run: bool = False,
+    log_transform_raw: bool = False,
 ) -> None:
     """Save individual clean SVG images for one peptide: raw, aligned, consensus, watershed.
 
@@ -2733,6 +2875,8 @@ def _save_illustration_svgs(
     segmentation_override: if provided, use instead of bundle.segmentation for consensus panels.
     skip_per_run: if True, skip per-run raw/aligned panels (useful for off-target decoys where
                   per-run images are identical to the target).
+    log_transform_raw: if True, plot the per-run raw panel as log2(1 + x) instead of the raw
+                        linear intensity scale.
     """
     import matplotlib.pyplot as plt
 
@@ -2767,15 +2911,6 @@ def _save_illustration_svgs(
         )
         plt.close(fig)
 
-    # bundle.raw_aligned_images is only populated when watershed succeeds; fall
-    # back to aligning the raw images ourselves using the same shifts.
-    raw_aligned = bundle.raw_aligned_images
-    if not raw_aligned and raw_images is not None:
-        raw_aligned = _align_raw_images_with_shifts(
-            raw_images,
-            bundle.alignment.target_shape,
-            bundle.alignment.shifts,
-        )
     aligned_imgs = bundle.alignment.aligned_images
 
     def _range(imgs: list[np.ndarray]) -> tuple[float | None, float | None]:
@@ -2785,9 +2920,12 @@ def _save_illustration_svgs(
             max(img.max() for img in imgs)
         )
 
+    def _maybe_log_raw(img: np.ndarray) -> np.ndarray:
+        return np.log2(1 + img) if log_transform_raw else img
+
     # raw and denoised-aligned images live on different intensity scales — keep
     # them separate so neither set looks empty next to the other
-    raw_vmin, raw_vmax = _range([np.log2(1 + img) for img in raw_aligned])
+    raw_vmin, raw_vmax = _range([_maybe_log_raw(img) for img in (raw_images or [])])
     aligned_vmin, aligned_vmax = _range(aligned_imgs)
 
     # anchor colour map — same indexing as _visualize_consensus_bundle
@@ -2872,9 +3010,9 @@ def _save_illustration_svgs(
     if not skip_per_run:
         for i, label in enumerate(labels):
             safe = _sanitize(label)
-            if i < len(raw_aligned):
+            if raw_images is not None and i < len(raw_images):
                 fig, ax = _make_ax(
-                    np.log2(1 + raw_aligned[i]), vmin=raw_vmin, vmax=raw_vmax
+                    _maybe_log_raw(raw_images[i]), vmin=raw_vmin, vmax=raw_vmax
                 )
                 _overlay_run_anchor(ax, i, aligned=False)
                 _save_fig(fig, f"mz{pept_idx}_raw_{i:02d}_{safe}.svg")
@@ -3016,31 +3154,37 @@ def _build_consensus_peptide_swap_decoy(
     decoy_raw_logged = smooth_and_denoise_image(
         decoy_raw_image, **(raw_denoise_kwargs or {})
     )
-    decoy_raw_logged_resized = _resize_image_to_shape(
-        decoy_raw_logged, bundle.alignment.target_shape
-    )
-    (
-        _aligned_denoised,
-        _matched_box,
-        _aligned_anchor,
-        shift,
-        max_score,
-        _match_score_map,
-        _match_score_peak,
-    ) = _align_resized_image_to_template(
-        decoy_raw_logged_resized,
-        bundle.alignment.template,
-        bundle.alignment.template_bounds,
-        None,
-    )
-    decoy_raw_resized = _resize_image_to_shape(
-        decoy_raw_image, bundle.alignment.target_shape
-    )
-    from scipy.ndimage import shift as nd_shift
+    target_shape = bundle.alignment.target_shape
+    if bundle.alignment.use_shift_crop_pad:
+        shift, max_score, _match_score_map, _match_score_peak = (
+            _find_shift_native_image(
+                decoy_raw_logged, bundle.alignment.template, bundle.alignment.template_bounds
+            )
+        )
+        decoy_raw_logged_resized = _shift_and_fit(decoy_raw_logged, target_shape, shift)
+        decoy_raw_aligned = _shift_and_fit(decoy_raw_image, target_shape, shift)
+    else:
+        decoy_raw_logged_resized = _resize_image_to_shape(decoy_raw_logged, target_shape)
+        (
+            _aligned_denoised,
+            _matched_box,
+            _aligned_anchor,
+            shift,
+            max_score,
+            _match_score_map,
+            _match_score_peak,
+        ) = _align_resized_image_to_template(
+            decoy_raw_logged_resized,
+            bundle.alignment.template,
+            bundle.alignment.template_bounds,
+            None,
+        )
+        decoy_raw_resized = _resize_image_to_shape(decoy_raw_image, target_shape)
+        from scipy.ndimage import shift as nd_shift
 
-    decoy_raw_aligned = nd_shift(
-        decoy_raw_resized, shift=shift, mode="constant", cval=0.0
-    )
+        decoy_raw_aligned = nd_shift(
+            decoy_raw_resized, shift=shift, mode="constant", cval=0.0
+        )
 
     decoy_pp = _extract_feature_rows_for_label_ids(
         bundle.segmentation.target_label_ids,
@@ -3126,6 +3270,7 @@ def generate_consensus_image(
     filename: str = "consensus_image.png",
     apply_seg: bool = True,
     seg_mask_thres: tuple[int, int] = (3, 3),
+    use_shift_crop_pad: bool = False,
 ) -> tuple[
     np.ndarray,
     list[np.ndarray],
@@ -3198,6 +3343,7 @@ def generate_consensus_image(
         raw_images=raw_images,
         apply_seg=apply_seg,
         seg_mask_thres=seg_mask_thres,
+        use_shift_crop_pad=use_shift_crop_pad,
     )
     alignment = bundle.alignment
     segmentation = bundle.segmentation

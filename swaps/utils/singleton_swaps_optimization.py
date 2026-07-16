@@ -99,6 +99,7 @@ __C.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH = 4  # width for IM peak extraction; o
 __C.MATCH_FEATURES_KWARGS = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.apply_seg = True
 __C.MATCH_FEATURES_KWARGS.align_images = True  # set False to skip template-matching alignment; rt/im shift and template_matching_score will be 0
+__C.MATCH_FEATURES_KWARGS.use_shift_crop_pad = False  # False (default): resize every image to the reference's shape via cv2.resize before template matching. True: skip resizing -- match_template runs directly on each run's native-shaped image, and the found integer shift is applied by exact slicing (pad where the image is smaller than the reference, crop where larger) instead of interpolation.
 __C.MATCH_FEATURES_KWARGS.dir_name = "quantification"
 __C.MATCH_FEATURES_KWARGS.seg_mask_thres = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.seg_mask_thres.rt = 2  # min RT span of target labels
