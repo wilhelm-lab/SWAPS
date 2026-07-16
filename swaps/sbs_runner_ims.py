@@ -537,6 +537,8 @@ def run_fdr_control_onwards(
         )
         percolator_post_processing = cfg.FDR.PERCOLATOR_POST_PROCESSING
         percolator_dir_name = f"percolator_postprocessing_{percolator_post_processing}"
+        if not cfg.FDR.ONLY_SCORE_MATCH:
+            percolator_dir_name += "_only_score_match_False"
         psms, peptide, all_psms = brew_with_percolator(
             tdc_df,
             feature_cols=_feature_cols,
