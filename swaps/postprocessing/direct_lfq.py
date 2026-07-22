@@ -114,6 +114,56 @@ def reformat_swaps_combined_for_directlfq(
     return reformatted_df
 
 
+def reformat_fragpipe_combined_ion_for_directlfq(
+    combined_ion,
+    output_dir,
+    protein_col="Protein",
+    seq_col="Modified Sequence",
+    charge_col="Charge",
+    intensity_suffix=" Intensity",
+    output_name="combined_ion.tsv.charge_aware.aq_reformat.tsv",
+):
+    """DirectLFQ's built-in "fragpipe_precursors" input config keys the ion
+    identity on `Modified Sequence` alone (see directlfq's
+    configs/intable_config.yaml), silently merging different charge states of
+    the same modified peptide into one "ion" -- `import_data`'s
+    `drop_duplicates(subset="ion")` then keeps only one charge state and
+    drops the rest. This reformats FragPipe's combined_ion.tsv into a
+    directLFQ-ready table with a charge-aware ion id (Modified Sequence +
+    Charge) instead, so every precursor survives.
+
+    The output filename must contain "aq_reformat" so that
+    directlfq.lfq_manager.run_lfq (via `import_data`) treats it as
+    already-formatted and skips its own (buggy) reformatting step -- pass
+    the returned path directly as `input_file`.
+    """
+    if isinstance(combined_ion, str):
+        combined_ion = pd.read_csv(combined_ion, sep="\t")
+
+    intensity_cols = [
+        col for col in combined_ion.columns if col.endswith(intensity_suffix)
+    ]
+    reformatted_df = combined_ion[
+        [protein_col, seq_col, charge_col] + intensity_cols
+    ].copy()
+    reformatted_df["ion"] = (
+        reformatted_df[seq_col].astype(str)
+        + "_"
+        + reformatted_df[charge_col].astype(str)
+    )
+    reformatted_df = reformatted_df.rename(columns={protein_col: "protein"})
+    intensity_cols_rename_map = {
+        col: col[: -len(intensity_suffix)] for col in intensity_cols
+    }
+    reformatted_df = reformatted_df.rename(columns=intensity_cols_rename_map)
+    output_cols = ["protein", "ion"] + list(intensity_cols_rename_map.values())
+
+    reformatted_df = reformatted_df[output_cols]
+    output_path = os.path.join(output_dir, output_name)
+    reformatted_df.to_csv(output_path, index=False, sep="\t")
+    return reformatted_df, output_path
+
+
 def extract_organism_from_protein_id(protein_id: object) -> str:
     """Extract organism code from the last '_' token in a protein id."""
     if not isinstance(protein_id, str) or not protein_id:
@@ -394,8 +444,15 @@ def plot_protein_quant(
         sub = qdf[qdf["Organism"] == org].dropna(subset=["log2_Intensity_ref", "ratio"])
         if len(sub) < 10:
             continue
+        x = sub["log2_Intensity_ref"].values
+        # delta lets lowess linearly interpolate between nearby x points
+        # instead of fitting a local regression at every one; it=0 skips
+        # the (unneeded here) robustifying iterations. Both are
+        # statsmodels-recommended for large n and cut runtime drastically
+        # on ~1e5-point groups with no visible change to the fitted line.
+        delta = 0.01 * (x.max() - x.min())
         smoothed = lowess(
-            sub["ratio"].values, sub["log2_Intensity_ref"].values, frac=0.3
+            sub["ratio"].values, x, frac=0.3, it=0, delta=delta
         )
         ax_scatter.plot(
             smoothed[:, 0],

@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 
 from postprocessing.direct_lfq import (
+    reformat_fragpipe_combined_ion_for_directlfq,
     reformat_swaps_combined_for_directlfq,
     undistinguishable_excl_output_name,
 )
@@ -92,3 +93,42 @@ class TestReformatUndistinguishableGroupIdSplit:
             tmp_path, undistinguishable_excl_output_name(output_name)
         )
         assert os.path.exists(excl_path)
+
+
+class TestReformatFragpipeCombinedIonChargeAware:
+    def _combined_ion(self):
+        # Same Modified Sequence at two charge states -- directLFQ's stock
+        # "fragpipe_precursors" config keys "ion" on Modified Sequence alone,
+        # so these would otherwise collapse into a single duplicated ion.
+        return pd.DataFrame(
+            {
+                "Protein": ["P1", "P1", "P2"],
+                "Modified Sequence": ["PEPTIDEK", "PEPTIDEK", "OTHERK"],
+                "Charge": [2, 3, 2],
+                "run_A Intensity": [100.0, 200.0, 300.0],
+            }
+        )
+
+    def test_ion_id_is_charge_aware_and_no_rows_dropped(self, tmp_path):
+        result, out_path = reformat_fragpipe_combined_ion_for_directlfq(
+            self._combined_ion(), output_dir=str(tmp_path)
+        )
+        assert len(result) == 3
+        assert result["ion"].is_unique
+        assert set(result["ion"]) == {"PEPTIDEK_2", "PEPTIDEK_3", "OTHERK_2"}
+        assert os.path.exists(out_path)
+        assert "aq_reformat" in os.path.basename(out_path)
+
+    def test_intensity_suffix_stripped_and_no_run_prefix(self, tmp_path):
+        result, _ = reformat_fragpipe_combined_ion_for_directlfq(
+            self._combined_ion(), output_dir=str(tmp_path)
+        )
+        assert list(result.columns) == ["protein", "ion", "run_A"]
+
+    def test_accepts_path_to_tsv(self, tmp_path):
+        combined_ion_path = os.path.join(tmp_path, "combined_ion.tsv")
+        self._combined_ion().to_csv(combined_ion_path, sep="\t", index=False)
+        result, _ = reformat_fragpipe_combined_ion_for_directlfq(
+            combined_ion_path, output_dir=str(tmp_path)
+        )
+        assert len(result) == 3
