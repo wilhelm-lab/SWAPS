@@ -835,6 +835,72 @@ def plot_fold_change_null_distribution(threshold: FoldChangeThreshold, ax=None):
     return ax
 
 
+def pairwise_replicate_correlation(
+    df: pd.DataFrame,
+    int_col_keyword: str = "Intensity",
+    label_fn=lambda col: col.split("_")[2],
+) -> dict[str, tuple[pd.DataFrame, pd.DataFrame]]:
+    """
+    Within-dataset replicate Pearson correlation (log2 intensity), grouped by
+    sample base name (e.g. columns tagged ``"C1"``/``"C2"``/``"C3"`` all
+    belong to base ``"C"``).
+
+    ``label_fn`` extracts a sample tag from each intensity column (default:
+    3rd underscore-separated field, e.g. ``"ssDDA_P064051_Fresh2_5ug_..."``
+    -> ``"Fresh2"``, matching the SWAPS/IonQuant run-name convention used
+    elsewhere in this module). Tags are grouped by base name with
+    :data:`swaps.postprocessing.helper.REGION_REPLICATE_PATTERN` (strips the
+    trailing replicate number); tags that don't match are skipped with a
+    warning. A square Pearson-correlation matrix is then computed pairwise
+    (on log2 intensity) within each base group that has >= 2 replicates.
+
+    Parameters
+    ----------
+    df : pd.DataFrame
+        Ion/peptide-level table with one or more intensity columns per
+        sample (rows = ions/peptides).
+    int_col_keyword : str
+        Substring identifying intensity columns.
+    label_fn : callable
+        ``(col_name: str) -> str`` sample tag extractor.
+
+    Returns
+    -------
+    dict mapping base name -> (corr, n_used), each a replicate x replicate
+    DataFrame indexed/columned by sample tag, suitable for
+    :func:`plot_paired_correlation_heatmap`.
+    """
+    int_cols = [c for c in df.columns if int_col_keyword in c]
+    if not int_cols:
+        raise ValueError(f"No columns containing {int_col_keyword!r} found in df")
+
+    tags = {col: label_fn(col) for col in int_cols}
+    groups: dict[str, list[str]] = {}
+    for col, tag in tags.items():
+        region_match = _REGION_REPLICATE_PATTERN.match(tag)
+        if region_match is None:
+            Logger.warning(
+                "Could not parse a base sample name from tag %r (column %r); skipping",
+                tag,
+                col,
+            )
+            continue
+        groups.setdefault(region_match.group("region"), []).append(col)
+
+    log_df = log2_transform(df[int_cols].replace(0.0, np.nan))
+
+    result = {}
+    for base, cols in groups.items():
+        if len(cols) < 2:
+            continue
+        sub = log_df[cols].rename(columns=tags)
+        corr = sub.corr()
+        valid = sub.notna().astype(int)
+        n_used = valid.T.dot(valid)
+        result[base] = (corr, n_used)
+    return result
+
+
 def paired_pearson_correlation(
     df_a: pd.DataFrame, df_b: pd.DataFrame
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
