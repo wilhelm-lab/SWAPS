@@ -642,8 +642,9 @@ def smooth_and_denoise_image(
         r_kw = dict(clean.get("remove_kwargs") or {})
         if "min_size" not in r_kw:
             r_kw["min_size"] = 5
-        cleaned_mask = remove_small_objects(result >= threshold, **r_kw)
-        result = result * cleaned_mask
+        cleaned_mask = remove_small_objects(result > 0, **r_kw, connectivity=2)
+        threshold_mask = result >= threshold
+        result = cleaned_mask * threshold_mask * result
     if log_transform:
         result = np.log2(1 + result)
     return result
