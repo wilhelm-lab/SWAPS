@@ -108,6 +108,11 @@ __C.MATCH_FEATURES_KWARGS.jump_dist_thres = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.jump_dist_thres.rt = 10  # max RT jump in pixels; 0 = disabled
 __C.MATCH_FEATURES_KWARGS.jump_dist_thres.im = 10  # max IM jump in pixels; 0 = disabled
 __C.MATCH_FEATURES_KWARGS.template_frac = 0.3  # half-width (as a fraction of each dim) of the template patch used for SIFT/consensus template matching; must be in (0, 0.5]
+__C.MATCH_FEATURES_KWARGS.segmentation_method = "watershed"  # one of ["watershed", "cnn"]; see match_features.segment_consensus_from_aligned
+__C.MATCH_FEATURES_KWARGS.cnn_kwargs = ConfigurationNode()
+__C.MATCH_FEATURES_KWARGS.cnn_kwargs.checkpoint_path = ""  # required when segmentation_method == "cnn"; a peak_detection_2d UNET checkpoint (train.py/EarlyStopping output)
+__C.MATCH_FEATURES_KWARGS.cnn_kwargs.device = "auto"  # "auto" (cuda if available else cpu), "cuda", or "cpu"
+__C.MATCH_FEATURES_KWARGS.cnn_kwargs.threshold = None  # sigmoid probability threshold for binarizing the predicted mask; None -> use peak_detection_cfg.MODEL.EVALUATION.THRESHOLD
 # denoise: three sequential ops applied across pipeline stages.
 #   smooth.at / clean.at / log_transform.at controls which stage each op executes.
 #   "raw"       → applied to raw images before SIFT template-matching alignment

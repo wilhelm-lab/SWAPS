@@ -622,6 +622,10 @@ def match_features_batch(
     _jump_dist_thres = _parse_jump_dist_thres(
         (processing_kwargs or {}).get("jump_dist_thres")
     )
+    _segmentation_method = str(
+        (processing_kwargs or {}).get("segmentation_method", "watershed")
+    )
+    _cnn_kwargs = dict((processing_kwargs or {}).get("cnn_kwargs", {}))
 
     # coSWA groups are stored on disk as a single row-set keyed by their
     # confounder_group_id (never duplicated to every member's mz_rank -- see
@@ -667,6 +671,33 @@ def match_features_batch(
     # candidates, operating on whichever ConsensusFeatureBundle this loop
     # built for them.
     _member_overlap_cache: dict[int, dict] = {}
+
+    # CNN pre-pass: resolve every candidate's own alignment first, then run
+    # ONE batched CNN forward pass across the whole batch instead of one
+    # forward pass per candidate inside the loop below (see
+    # _precompute_cnn_segmentation_states / _segment_consensus_batch_with_cnn
+    # / _cnn_batching_enabled for why this is GPU-only). The watershed path
+    # is untouched either way -- it still segments per-candidate inside the
+    # loop, same as before this existed.
+    _precomputed_cnn_states: dict[
+        int, tuple[ConsensusAlignmentState, ConsensusSegmentationState]
+    ] = (
+        _precompute_cnn_segmentation_states(
+            dict_ref_by_mz,
+            batch_np,
+            _select_mz,
+            _act_lookup_key,
+            raw_denoise_kwargs,
+            denoise_cfg,
+            float((processing_kwargs or {}).get("template_frac", 0.3)),
+            bool((processing_kwargs or {}).get("apply_seg", True)),
+            _cnn_kwargs,
+            _align_images,
+            _use_shift_crop_pad,
+        )
+        if _segmentation_method == "cnn" and _cnn_batching_enabled(_cnn_kwargs)
+        else {}
+    )
 
     for pept_idx in batch_np:
         pept_act_cache: dict[str, tuple[np.ndarray, int, int, tuple[int, int]]] = {}
@@ -733,26 +764,40 @@ def match_features_batch(
         _anchor_image_indices = [
             i for i, a in enumerate(_consensus_anchors) if a is not None
         ]
-        _consensus_bundle = build_consensus_feature_bundle(
-            images=[_get_raw_denoised_pept_act(rf) for rf in _consensus_raw_files],
-            reference_idx=0,
-            template_frac=float((processing_kwargs or {}).get("template_frac", 0.3)),
-            anchors=_consensus_anchors,
-            denoise_cfg=denoise_cfg,
-            watershed_kwargs=dict(
-                (processing_kwargs or {}).get("peak_consensus_kwargs", {})
-            ),
-            raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
-            labels=_consensus_raw_files,
-            apply_seg=bool((processing_kwargs or {}).get("apply_seg", True)),
-            seg_mask_thres=_parse_seg_mask_thres(
-                (processing_kwargs or {}).get("seg_mask_thres")
-            ),
-            jump_dist_thres=_jump_dist_thres,
-            consensus_image_indices=_anchor_image_indices,
-            align_images=_align_images,
-            use_shift_crop_pad=_use_shift_crop_pad,
-        )
+        if pept_idx in _precomputed_cnn_states:
+            # CNN pre-pass already computed this candidate's own alignment +
+            # segmentation as part of the whole-batch forward pass above --
+            # reuse it verbatim instead of recomputing (which would also
+            # re-run a redundant single-item CNN forward pass).
+            _consensus_bundle = build_consensus_feature_bundle(
+                images=[],
+                raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
+                labels=_consensus_raw_files,
+                precomputed_states=_precomputed_cnn_states[pept_idx],
+            )
+        else:
+            _consensus_bundle = build_consensus_feature_bundle(
+                images=[_get_raw_denoised_pept_act(rf) for rf in _consensus_raw_files],
+                reference_idx=0,
+                template_frac=float((processing_kwargs or {}).get("template_frac", 0.3)),
+                anchors=_consensus_anchors,
+                denoise_cfg=denoise_cfg,
+                watershed_kwargs=dict(
+                    (processing_kwargs or {}).get("peak_consensus_kwargs", {})
+                ),
+                raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
+                labels=_consensus_raw_files,
+                apply_seg=bool((processing_kwargs or {}).get("apply_seg", True)),
+                seg_mask_thres=_parse_seg_mask_thres(
+                    (processing_kwargs or {}).get("seg_mask_thres")
+                ),
+                jump_dist_thres=_jump_dist_thres,
+                consensus_image_indices=_anchor_image_indices,
+                align_images=_align_images,
+                use_shift_crop_pad=_use_shift_crop_pad,
+                segmentation_method=_segmentation_method,
+                cnn_kwargs=_cnn_kwargs,
+            )
         if _group_id in _members_by_group:
             # Stash what the post-hoc overlap pass needs -- this member's own
             # alignment/segmentation state, run stack, and per-run absolute
@@ -904,6 +949,8 @@ def match_features_batch(
                         ),
                         align_images=_align_images,
                         use_shift_crop_pad=_use_shift_crop_pad,
+                        segmentation_method=_segmentation_method,
+                        cnn_kwargs=_cnn_kwargs,
                     )
                     if visualize_dir is not None:
                         _visualize_consensus_bundle(
@@ -2157,6 +2204,427 @@ def _mark_overlapping_group_members(
     return tags
 
 
+_CNN_MODEL_CACHE: dict[tuple[str, str], Any] = {}
+
+
+def _resolve_cnn_device(device: str) -> str:
+    if device == "auto":
+        import torch
+
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return device
+
+
+def _cnn_batching_enabled(cnn_kwargs: dict) -> bool:
+    """Whether match_features_batch's CNN pre-pass should batch every
+    candidate into one forward pass (_precompute_cnn_segmentation_states)
+    instead of one forward pass per candidate.
+
+    GPU-only: measured on CPU (16 torch intra-op threads), batching is
+    ~1.5x *slower* than one call per candidate -- a single (1, 3, H, W)
+    image already saturates the CPU thread pool for this model size, so a
+    bigger batch just adds more serialized FLOPs with worse cache locality,
+    no extra parallelism. Batching only pays off where a lone image
+    otherwise underutilizes the device and kernel-launch overhead
+    dominates, i.e. GPU.
+    """
+    return _resolve_cnn_device(str(cnn_kwargs.get("device", "auto"))) == "cuda"
+
+
+def _get_cnn_segmentation_model(checkpoint_path: str, device: str):
+    """Lazily build+load the UNET checkpoint used for CNN consensus
+    segmentation, cached per (checkpoint_path, device) so each worker
+    process (see _WORKER_CONTEXT) only pays the load cost once.
+
+    Imports torch/peak_detection_2d lazily so the default watershed-only
+    path (still most runs) never pays their import cost, and to avoid a
+    module-load-time circular import with peak_detection_2d.dataset.
+    prepare_dataset, which itself imports from this module.
+    """
+    key = (checkpoint_path, device)
+    if key not in _CNN_MODEL_CACHE:
+        import torch
+        from peak_detection_2d.config.singleton_peak_detection import (
+            peak_detection_cfg,
+        )
+        from peak_detection_2d.model.build_model import build_model
+
+        model = build_model(peak_detection_cfg.MODEL).to(device)
+        state = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(state["model_state_dict"])
+        model.eval()
+        _CNN_MODEL_CACHE[key] = model
+    return _CNN_MODEL_CACHE[key]
+
+
+def _cnn_model_input_channels(
+    consensus_denoised: np.ndarray,
+    aligned_anchors: list[tuple[float, float] | None],
+    non_none_indices: list[int],
+    model_shape: tuple[int, int],
+) -> np.ndarray:
+    """Build one candidate's [raw, log1p(raw), hint] model-space input array
+    (C, H, W) at model_shape -- shared by the single-item and batched CNN
+    segmentation paths so resize/channel-construction logic exists once.
+
+    Builds the input exactly like
+    peak_detection_2d.dataset.torch_dataset.PeakSegmentationDataset does at
+    training time -- hint channel marks every non-None anchor positive.
+    """
+    from peak_detection_2d.config.singleton_peak_detection import peak_detection_cfg
+    from peak_detection_2d.dataset.prepare_dataset import (
+        _rescale_hint_points,
+        pad_or_rescale_to_shape,
+    )
+
+    native_shape = consensus_denoised.shape
+    rows, cols = native_shape
+    hint_native = np.zeros(native_shape, dtype=np.float32)
+    for i in non_none_indices:
+        aa = aligned_anchors[i]
+        if aa is None:
+            continue
+        r = int(np.clip(round(aa[0]), 0, rows - 1))
+        c = int(np.clip(round(aa[1]), 0, cols - 1))
+        hint_native[r, c] = 1
+
+    image_model, _ = pad_or_rescale_to_shape(
+        consensus_denoised.astype(np.float32), model_shape
+    )
+    hint_model = _rescale_hint_points(hint_native, model_shape)
+    channels = [image_model]
+    if peak_detection_cfg.MODEL.PARAMS.IN_CHANNELS == 3:
+        channels.append(np.log1p(image_model))
+    channels.append(hint_model)
+    return np.stack(channels, axis=0)
+
+
+def _segment_consensus_with_cnn(
+    consensus_denoised: np.ndarray,
+    aligned_anchors: list[tuple[float, float] | None],
+    non_none_indices: list[int],
+    model,
+    device: str,
+    threshold: float,
+    model_shape: tuple[int, int],
+) -> np.ndarray:
+    """Run the CNN segmentation model on a single consensus image, returning
+    a binary 0/1 mask at consensus_denoised's own native shape.
+
+    The model's fixed training input shape (model_shape) is purely an
+    internal resize detail: the image/hint are resized up to it
+    (_cnn_model_input_channels) and the predicted mask is resized back down
+    with invert_pad_or_rescale_to_shape, so callers never see model_shape.
+
+    One image per forward pass -- see _segment_consensus_batch_with_cnn for
+    the batched equivalent used by match_features_batch's CNN pre-pass,
+    which is substantially faster for more than a handful of candidates.
+    """
+    import torch
+    from peak_detection_2d.dataset.prepare_dataset import (
+        invert_pad_or_rescale_to_shape,
+    )
+
+    native_shape = consensus_denoised.shape
+    channels = _cnn_model_input_channels(
+        consensus_denoised, aligned_anchors, non_none_indices, model_shape
+    )
+    x = torch.from_numpy(channels).float().unsqueeze(0).to(device)
+    with torch.no_grad():
+        prob = torch.sigmoid(model(x))[0, 0].detach().cpu().numpy()
+    mask_model = (prob >= threshold).astype(np.float32)
+    mask_native = invert_pad_or_rescale_to_shape(mask_model, native_shape, model_shape)
+    return (mask_native > 0.5).astype(int)
+
+
+def _segment_consensus_batch_with_cnn(
+    items: list[
+        tuple[np.ndarray, list[tuple[float, float] | None], list[int]]
+    ],
+    model,
+    device: str,
+    threshold: float,
+    model_shape: tuple[int, int],
+    max_batch_size: int = 64,
+) -> list[np.ndarray]:
+    """Batched sibling of _segment_consensus_with_cnn: `items` is a list of
+    (consensus_denoised, aligned_anchors, non_none_indices) tuples, one per
+    candidate. Every candidate's model-space input already has the same
+    shape (model_shape, see _cnn_model_input_channels) regardless of its own
+    native consensus-image shape, so the whole batch can be stacked into one
+    [N, C, H, W] tensor and run through the model in a single forward pass
+    (chunked at max_batch_size to bound peak memory for very large batches)
+    instead of one forward pass per candidate.
+
+    Returns one binary 0/1 mask per item, each resized back to that item's
+    own native consensus_denoised shape -- same contract as calling
+    _segment_consensus_with_cnn once per item, just faster.
+    """
+    import torch
+    from peak_detection_2d.dataset.prepare_dataset import (
+        invert_pad_or_rescale_to_shape,
+    )
+
+    if not items:
+        return []
+
+    native_shapes = [consensus.shape for consensus, _, _ in items]
+    all_channels = np.stack(
+        [
+            _cnn_model_input_channels(consensus, anchors, non_none, model_shape)
+            for consensus, anchors, non_none in items
+        ],
+        axis=0,
+    )
+
+    probs = np.empty((len(items),) + tuple(model_shape), dtype=np.float32)
+    with torch.no_grad():
+        for start in range(0, len(items), max_batch_size):
+            end = min(start + max_batch_size, len(items))
+            x = torch.from_numpy(all_channels[start:end]).float().to(device)
+            probs[start:end] = torch.sigmoid(model(x))[:, 0].detach().cpu().numpy()
+
+    masks_model = (probs >= threshold).astype(np.float32)
+    return [
+        (
+            invert_pad_or_rescale_to_shape(
+                masks_model[i], native_shapes[i], model_shape
+            )
+            > 0.5
+        ).astype(int)
+        for i in range(len(items))
+    ]
+
+
+def _snap_all_anchors_to_cnn_mask(
+    alignment_state: ConsensusAlignmentState,
+    consensus: np.ndarray,
+    consensus_denoised: np.ndarray,
+    mask: np.ndarray,
+    apply_seg: bool,
+) -> ConsensusSegmentationState:
+    """CNN counterpart to _snap_all_anchors_to_watershed: `mask` is the CNN's
+    single binary foreground/background segmentation (see
+    _segment_consensus_with_cnn), stored as watershed_labels with a single
+    target_label_ids=[1] -- there is no per-anchor label disambiguation, so
+    every coSWA group member sharing this consensus image gets the identical
+    mask/quant (a deliberate v1 scope simplification; see plan notes on
+    _mark_overlapping_group_members).
+
+    Per-anchor snap point: the anchor's own position when it already falls
+    inside the mask, otherwise the mask's centroid -- there is no watershed-
+    style "nearest peak within the label" concept for a single binary blob.
+    """
+    rows, cols = alignment_state.target_shape
+    non_none_indices = [
+        i for i, aa in enumerate(alignment_state.aligned_anchors) if aa is not None
+    ]
+    snapped_per_anchor: list[tuple[int, int] | None] = [None] * len(
+        alignment_state.aligned_anchors
+    )
+    snap_log: dict[str, Any] = {
+        "snap_record": {},
+        "discard_record": {},
+        "no_seg_log": None,
+        "jump_anchor_log": {},
+    }
+    has_mask = apply_seg and mask.max() > 0
+    target_label_ids: list[int] = [1] if has_mask else []
+    label_to_snap: dict[int, tuple[int, int]] = {}
+    if has_mask and non_none_indices:
+        mask_rows, mask_cols = np.nonzero(mask)
+        centroid = (int(round(mask_rows.mean())), int(round(mask_cols.mean())))
+        label_to_snap[1] = centroid
+        for i in non_none_indices:
+            aa = alignment_state.aligned_anchors[i]
+            assert aa is not None
+            r = int(np.clip(round(aa[0]), 0, rows - 1))
+            c = int(np.clip(round(aa[1]), 0, cols - 1))
+            snapped_rc = (r, c) if mask[r, c] > 0 else centroid
+            snapped_per_anchor[i] = snapped_rc
+            snap_log["snap_record"][i] = ((r, c), snapped_rc)
+    watershed_labels = (
+        mask.astype(int) if has_mask else np.zeros(mask.shape, dtype=int)
+    )
+    return ConsensusSegmentationState(
+        consensus=consensus,
+        consensus_denoised=consensus_denoised,
+        snapped_per_anchor=snapped_per_anchor,
+        watershed_labels=watershed_labels,
+        snap_log=snap_log,
+        target_label_ids=target_label_ids,
+        label_to_snap=label_to_snap,
+        non_none_indices=non_none_indices,
+        apply_seg=apply_seg,
+        all_peaks=np.empty((0, 2), dtype=int),
+    )
+
+
+def _build_consensus_and_denoise(
+    alignment_state: ConsensusAlignmentState,
+    denoise_kwargs: dict | None,
+    consensus_image_indices: list[int] | None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Average the (selected) aligned images into a consensus image and
+    denoise it -- the shared first step of both the watershed and CNN
+    segmentation paths, and of the CNN batch pre-pass
+    (_precompute_cnn_segmentation_states) which needs it ahead of the main
+    per-candidate loop in match_features_batch."""
+    _imgs_for_consensus = (
+        [alignment_state.aligned_images[i] for i in consensus_image_indices]
+        if consensus_image_indices is not None
+        else alignment_state.aligned_images
+    )
+    consensus = np.stack(_imgs_for_consensus, axis=0).mean(axis=0)
+    consensus_denoised = smooth_and_denoise_image(consensus, **(denoise_kwargs or {}))
+    return consensus, consensus_denoised
+
+
+def _resolve_cnn_run_params(
+    cnn_kwargs: dict | None,
+) -> tuple[Any, str, float, tuple[int, int]]:
+    """Resolve (model, device, threshold, model_shape) from cnn_kwargs --
+    shared by the single-candidate (segment_consensus_from_aligned) and
+    batched (_precompute_cnn_segmentation_states) CNN segmentation paths."""
+    _ckwargs = dict(cnn_kwargs or {})
+    device = _resolve_cnn_device(str(_ckwargs.get("device", "auto")))
+    model = _get_cnn_segmentation_model(_ckwargs["checkpoint_path"], device)
+    from peak_detection_2d.config.singleton_peak_detection import peak_detection_cfg
+
+    _threshold = _ckwargs.get("threshold")
+    threshold = float(
+        _threshold
+        if _threshold is not None
+        else peak_detection_cfg.MODEL.EVALUATION.THRESHOLD
+    )
+    model_shape = tuple(int(v) for v in peak_detection_cfg.DATASET.TARGET_SHAPE)
+    return model, device, threshold, model_shape
+
+
+def _precompute_cnn_segmentation_states(
+    dict_ref_by_mz: pd.DataFrame,
+    batch_np: np.ndarray,
+    select_mz: Callable[[str, int], pd.DataFrame],
+    act_lookup_key: Callable[[int], int],
+    raw_denoise_kwargs: dict,
+    denoise_cfg: dict,
+    template_frac: float,
+    apply_seg: bool,
+    cnn_kwargs: dict,
+    align_images: bool,
+    use_shift_crop_pad: bool,
+) -> dict[int, tuple[ConsensusAlignmentState, ConsensusSegmentationState]]:
+    """CNN pre-pass for match_features_batch: resolves every candidate's own
+    alignment (same per-candidate role/anchor resolution the main loop uses
+    -- _reference_match_quant_files/_positional_anchors, own reference run,
+    own anchors, never a coSWA representative's -- via the same
+    select_mz/act_lookup_key closures the main loop itself uses), then runs
+    ONE batched CNN forward pass across the whole batch's consensus images
+    instead of one forward pass per candidate (see
+    _segment_consensus_batch_with_cnn).
+
+    Returns {pept_idx: (alignment_state, segmentation_state)} for every
+    candidate with at least one non-None anchor. Candidates with no anchors
+    at all are omitted -- match_features_batch's main loop falls back to its
+    normal (cheap, no CNN call) build_consensus_feature_bundle call for
+    those, matching what segment_consensus_from_aligned would have done
+    anyway (mask stays all-zero when non_none_indices is empty).
+    """
+    _consensus_denoise_kwargs = _denoise_kwargs_for_stage(denoise_cfg, "consensus")
+    _post_align_log_transform = bool(
+        _denoise_kwargs_for_stage(denoise_cfg, "aligned").get("log_transform", False)
+    )
+
+    pept_idx_order: list[int] = []
+    alignment_states: list[ConsensusAlignmentState] = []
+    consensus_pairs: list[tuple[np.ndarray, np.ndarray]] = []
+    cnn_items: list[tuple[np.ndarray, list[tuple[float, float] | None], list[int]]] = []
+    cnn_item_positions: list[int] = []
+
+    for pept_idx in batch_np:
+        pept_idx = int(pept_idx)
+        act_key = act_lookup_key(pept_idx)
+
+        def _loader(raw_file: str, _act_key=act_key, _pept_idx=pept_idx):
+            return get_pept_act_from_parquet(
+                select_mz(raw_file, _act_key),
+                _pept_idx,
+                dict_ref_by_mz,
+                raw_file,
+                return_offset=True,
+            )
+
+        reference_raw_file, quant_only_raw_files, match_raw_files = (
+            _reference_match_quant_files(dict_ref_by_mz, pept_idx)
+        )
+        quant_only_set = set(quant_only_raw_files)
+        consensus_raw_files = [reference_raw_file] + match_raw_files
+        consensus_anchors = _positional_anchors(
+            consensus_raw_files, reference_raw_file, quant_only_set, _loader
+        )
+        anchor_image_indices = [
+            i for i, a in enumerate(consensus_anchors) if a is not None
+        ]
+        if not anchor_image_indices or not apply_seg:
+            continue
+
+        denoised_images = [
+            smooth_and_denoise_image(_loader(rf)[0], **raw_denoise_kwargs)
+            for rf in consensus_raw_files
+        ]
+        alignment_state = align_images_to_reference(
+            images=denoised_images,
+            reference_idx=0,
+            template_frac=template_frac,
+            anchors=consensus_anchors,
+            align_images=align_images,
+            post_align_log_transform=_post_align_log_transform,
+            use_shift_crop_pad=use_shift_crop_pad,
+        )
+        consensus, consensus_denoised = _build_consensus_and_denoise(
+            alignment_state, _consensus_denoise_kwargs, anchor_image_indices
+        )
+        non_none_indices = [
+            i for i, aa in enumerate(alignment_state.aligned_anchors) if aa is not None
+        ]
+
+        pept_idx_order.append(pept_idx)
+        alignment_states.append(alignment_state)
+        consensus_pairs.append((consensus, consensus_denoised))
+        if non_none_indices:
+            cnn_item_positions.append(len(pept_idx_order) - 1)
+            cnn_items.append(
+                (consensus_denoised, alignment_state.aligned_anchors, non_none_indices)
+            )
+
+    if not pept_idx_order:
+        return {}
+
+    masks: list[np.ndarray] = [None] * len(pept_idx_order)  # type: ignore[list-item]
+    if cnn_items:
+        model, device, threshold, model_shape = _resolve_cnn_run_params(cnn_kwargs)
+        cnn_masks = _segment_consensus_batch_with_cnn(
+            cnn_items, model, device, threshold, model_shape
+        )
+        for pos, mask in zip(cnn_item_positions, cnn_masks):
+            masks[pos] = mask
+
+    result: dict[int, tuple[ConsensusAlignmentState, ConsensusSegmentationState]] = {}
+    for i, pept_idx in enumerate(pept_idx_order):
+        alignment_state = alignment_states[i]
+        consensus, consensus_denoised = consensus_pairs[i]
+        mask = (
+            masks[i]
+            if masks[i] is not None
+            else np.zeros(consensus_denoised.shape, dtype=int)
+        )
+        segmentation_state = _snap_all_anchors_to_cnn_mask(
+            alignment_state, consensus, consensus_denoised, mask, apply_seg
+        )
+        result[pept_idx] = (alignment_state, segmentation_state)
+    return result
+
+
 def segment_consensus_from_aligned(
     alignment_state: ConsensusAlignmentState,
     denoise_kwargs: dict | None = None,
@@ -2165,23 +2633,52 @@ def segment_consensus_from_aligned(
     seg_mask_thres: tuple[int, int] = (2, 5),
     jump_dist_thres: tuple[int, int] = (0, 0),
     consensus_image_indices: list[int] | None = None,
+    segmentation_method: str = "watershed",
+    cnn_kwargs: dict | None = None,
 ) -> ConsensusSegmentationState:
-    """Segment a consensus image and track which labels belong to target anchors."""
+    """Segment a consensus image and track which labels belong to target anchors.
+
+    segmentation_method selects between the default watershed pipeline and
+    the CNN UNET (see _segment_consensus_with_cnn / _snap_all_anchors_to_cnn_mask);
+    cnn_kwargs (only used when segmentation_method == "cnn") holds
+    checkpoint_path/device/threshold, see MATCH_FEATURES_KWARGS.cnn_kwargs.
+
+    One candidate per call, one CNN forward pass per call -- when
+    processing a whole batch of candidates, match_features_batch instead
+    uses _precompute_cnn_segmentation_states to batch all of them into a
+    single forward pass, which is substantially faster; this function
+    remains the single-candidate path (decoy plotting, ad-hoc/debug calls,
+    tests).
+    """
 
     seg_mask_thres = _parse_seg_mask_thres(seg_mask_thres)
     jump_dist_thres = _parse_jump_dist_thres(jump_dist_thres)
-    _imgs_for_consensus = (
-        [alignment_state.aligned_images[i] for i in consensus_image_indices]
-        if consensus_image_indices is not None
-        else alignment_state.aligned_images
+    consensus, consensus_denoised = _build_consensus_and_denoise(
+        alignment_state, denoise_kwargs, consensus_image_indices
     )
-    consensus = np.stack(_imgs_for_consensus, axis=0).mean(axis=0)
-    consensus_denoised = smooth_and_denoise_image(consensus, **(denoise_kwargs or {}))
-    watershed_labels: np.ndarray = np.zeros(consensus_denoised.shape, dtype=int)
-    all_peaks: np.ndarray = np.empty((0, 2), dtype=int)
     non_none_indices = [
         i for i, aa in enumerate(alignment_state.aligned_anchors) if aa is not None
     ]
+
+    if segmentation_method == "cnn":
+        mask = np.zeros(consensus_denoised.shape, dtype=int)
+        if non_none_indices and apply_seg:
+            model, device, threshold, model_shape = _resolve_cnn_run_params(cnn_kwargs)
+            mask = _segment_consensus_with_cnn(
+                consensus_denoised,
+                alignment_state.aligned_anchors,
+                non_none_indices,
+                model,
+                device,
+                threshold,
+                model_shape,
+            )
+        return _snap_all_anchors_to_cnn_mask(
+            alignment_state, consensus, consensus_denoised, mask, apply_seg
+        )
+
+    watershed_labels: np.ndarray = np.zeros(consensus_denoised.shape, dtype=int)
+    all_peaks: np.ndarray = np.empty((0, 2), dtype=int)
     if non_none_indices and apply_seg:
         _wkwargs = dict(watershed_kwargs or {})
         all_peaks, _unused_labels, _, watershed_labels, _ = (
@@ -2434,6 +2931,8 @@ def build_consensus_feature_bundle(
     precomputed_states: (
         tuple[ConsensusAlignmentState, ConsensusSegmentationState] | None
     ) = None,
+    segmentation_method: str = "watershed",
+    cnn_kwargs: dict | None = None,
 ) -> ConsensusFeatureBundle:
     """Build alignment, segmentation, and feature tables for consensus scoring.
 
@@ -2499,24 +2998,35 @@ def build_consensus_feature_bundle(
             seg_mask_thres=seg_mask_thres,
             jump_dist_thres=jump_dist_thres,
             consensus_image_indices=consensus_image_indices,
+            segmentation_method=segmentation_method,
+            cnn_kwargs=cnn_kwargs,
         )
     else:
         source_shapes = [img.shape for img in (raw_images or [])]
         alignment_state = _reuse_alignment_with_new_anchors(
             reuse_from.alignment, anchors or [], source_shapes
         )
-        segmentation_state = _snap_all_anchors_to_watershed(
-            alignment_state,
-            reuse_from.segmentation.consensus,
-            reuse_from.segmentation.consensus_denoised,
-            reuse_from.segmentation.watershed_labels,
-            reuse_from.segmentation.all_peaks,
-            apply_seg,
-            _parse_seg_mask_thres(seg_mask_thres),
-            _parse_jump_dist_thres(jump_dist_thres),
-            collapse_to_single_label=collapse_to_single_label,
-            priority_anchor_index=priority_anchor_index,
-        )
+        if segmentation_method == "cnn":
+            segmentation_state = _snap_all_anchors_to_cnn_mask(
+                alignment_state,
+                reuse_from.segmentation.consensus,
+                reuse_from.segmentation.consensus_denoised,
+                reuse_from.segmentation.watershed_labels,
+                apply_seg,
+            )
+        else:
+            segmentation_state = _snap_all_anchors_to_watershed(
+                alignment_state,
+                reuse_from.segmentation.consensus,
+                reuse_from.segmentation.consensus_denoised,
+                reuse_from.segmentation.watershed_labels,
+                reuse_from.segmentation.all_peaks,
+                apply_seg,
+                _parse_seg_mask_thres(seg_mask_thres),
+                _parse_jump_dist_thres(jump_dist_thres),
+                collapse_to_single_label=collapse_to_single_label,
+                priority_anchor_index=priority_anchor_index,
+            )
     (
         consensus_pp,
         individual_pps,
@@ -3317,6 +3827,8 @@ def generate_consensus_image(
     apply_seg: bool = True,
     seg_mask_thres: tuple[int, int] = (3, 3),
     use_shift_crop_pad: bool = False,
+    segmentation_method: str = "watershed",
+    cnn_kwargs: dict | None = None,
 ) -> tuple[
     np.ndarray,
     list[np.ndarray],
@@ -3390,6 +3902,8 @@ def generate_consensus_image(
         apply_seg=apply_seg,
         seg_mask_thres=seg_mask_thres,
         use_shift_crop_pad=use_shift_crop_pad,
+        segmentation_method=segmentation_method,
+        cnn_kwargs=cnn_kwargs,
     )
     alignment = bundle.alignment
     segmentation = bundle.segmentation

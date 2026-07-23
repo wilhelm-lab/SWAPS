@@ -11,6 +11,9 @@ from swaps.postprocessing.match_features import (
     align_images_to_reference,
     build_consensus_feature_bundle,
     match_features_batch,
+    segment_consensus_from_aligned,
+    _segment_consensus_with_cnn,
+    _snap_all_anchors_to_cnn_mask,
     _snap_anchor_to_watershed_label,
     _project_anchor_into_aligned_space,
     ConsensusAlignmentState,
@@ -710,3 +713,321 @@ class TestMatchFeaturesBatchConfounderGroups:
         )
         pp_ref = pd.concat(pp_reference_list)
         assert (pp_ref["undistinguishable_group_id"] == -1).all()
+
+
+# ---------------------------------------------------------------------------
+# CNN consensus segmentation (segmentation_method="cnn")
+# ---------------------------------------------------------------------------
+
+
+class TestSnapAllAnchorsToCnnMask:
+    """Per-anchor snap rule: keep the anchor's own position if it already
+    falls inside the mask, otherwise snap to the mask centroid -- there is
+    no watershed-style "nearest peak" concept for a single binary blob."""
+
+    def test_anchor_inside_mask_keeps_own_position(self):
+        mask = np.zeros((10, 10), dtype=int)
+        mask[6:9, 6:9] = 1  # centroid around (7, 7)
+        state = _minimal_alignment_state(target_shape=(10, 10), shifts=[(0, 0)])
+        state.aligned_anchors = [(6.0, 6.0)]  # inside the mask block
+        seg = _snap_all_anchors_to_cnn_mask(
+            state, consensus=mask.astype(float), consensus_denoised=mask.astype(float),
+            mask=mask, apply_seg=True,
+        )
+        assert seg.snapped_per_anchor[0] == (6, 6)
+        assert seg.target_label_ids == [1]
+
+    def test_anchor_outside_mask_snaps_to_centroid(self):
+        mask = np.zeros((10, 10), dtype=int)
+        mask[6:9, 6:9] = 1  # rows/cols 6,7,8 -> centroid (7, 7)
+        state = _minimal_alignment_state(target_shape=(10, 10), shifts=[(0, 0)])
+        state.aligned_anchors = [(0.0, 0.0)]  # far outside the mask
+        seg = _snap_all_anchors_to_cnn_mask(
+            state, consensus=mask.astype(float), consensus_denoised=mask.astype(float),
+            mask=mask, apply_seg=True,
+        )
+        assert seg.snapped_per_anchor[0] == (7, 7)
+        assert seg.label_to_snap[1] == (7, 7)
+
+    def test_multiple_anchors_get_own_or_centroid_independently(self):
+        mask = np.zeros((10, 10), dtype=int)
+        mask[6:9, 6:9] = 1
+        state = _minimal_alignment_state(
+            target_shape=(10, 10), shifts=[(0, 0), (0, 0)]
+        )
+        state.aligned_anchors = [(6.0, 7.0), (0.0, 0.0)]  # one inside, one outside
+        seg = _snap_all_anchors_to_cnn_mask(
+            state, consensus=mask.astype(float), consensus_denoised=mask.astype(float),
+            mask=mask, apply_seg=True,
+        )
+        assert seg.snapped_per_anchor[0] == (6, 7)  # own position, inside mask
+        assert seg.snapped_per_anchor[1] == (7, 7)  # centroid, outside mask
+
+    def test_empty_mask_yields_no_target_labels(self):
+        mask = np.zeros((10, 10), dtype=int)
+        state = _minimal_alignment_state(target_shape=(10, 10), shifts=[(0, 0)])
+        state.aligned_anchors = [(5.0, 5.0)]
+        seg = _snap_all_anchors_to_cnn_mask(
+            state, consensus=mask.astype(float), consensus_denoised=mask.astype(float),
+            mask=mask, apply_seg=True,
+        )
+        assert seg.target_label_ids == []
+        assert seg.snapped_per_anchor == [None]
+        assert seg.watershed_labels.max() == 0
+
+    def test_apply_seg_false_disables_segmentation_even_with_nonempty_mask(self):
+        mask = np.zeros((10, 10), dtype=int)
+        mask[6:9, 6:9] = 1
+        state = _minimal_alignment_state(target_shape=(10, 10), shifts=[(0, 0)])
+        state.aligned_anchors = [(6.0, 6.0)]
+        seg = _snap_all_anchors_to_cnn_mask(
+            state, consensus=mask.astype(float), consensus_denoised=mask.astype(float),
+            mask=mask, apply_seg=False,
+        )
+        assert seg.target_label_ids == []
+        assert seg.snapped_per_anchor == [None]
+
+
+class _FixedRegionLogitModel:
+    """Fake CNN: ignores the input entirely, returns a fixed logit map with a
+    known foreground rectangle covering the top-left `frac` of each axis --
+    lets _segment_consensus_with_cnn's resize/forward/inverse-resize/
+    threshold plumbing be tested without a real trained checkpoint. Uses a
+    fraction (not a fixed pixel count) so the foreground survives
+    downscaling regardless of the model's own configured input shape."""
+
+    def __init__(self, frac=0.5):
+        self.frac = frac
+
+    def eval(self):
+        pass
+
+    def to(self, device):
+        return self
+
+    def __call__(self, x):
+        import torch
+
+        b, c, h, w = x.shape
+        logits = torch.full((b, 1, h, w), -10.0)
+        logits[:, :, : int(h * self.frac), : int(w * self.frac)] = 10.0
+        return logits
+
+
+class TestSegmentConsensusWithCnn:
+    def test_output_mask_matches_native_consensus_shape(self):
+        consensus = np.random.default_rng(0).random((15, 40)).astype(np.float32)
+        model = _FixedRegionLogitModel(frac=0.5)
+        mask = _segment_consensus_with_cnn(
+            consensus,
+            aligned_anchors=[(2.0, 2.0)],
+            non_none_indices=[0],
+            model=model,
+            device="cpu",
+            threshold=0.5,
+            model_shape=(20, 20),
+        )
+        assert mask.shape == consensus.shape
+
+    def test_foreground_region_survives_resize_round_trip(self):
+        # Model input is smaller (target) than the native consensus image on
+        # both axes -> pad_or_rescale_to_shape rescales both axes down;
+        # inverting should still land the foreground back near the top-left,
+        # where _FixedRegionLogitModel marks it in model space.
+        consensus = np.zeros((40, 40), dtype=np.float32)
+        model = _FixedRegionLogitModel(frac=0.5)
+        mask = _segment_consensus_with_cnn(
+            consensus,
+            aligned_anchors=[(2.0, 2.0)],
+            non_none_indices=[0],
+            model=model,
+            device="cpu",
+            threshold=0.5,
+            model_shape=(20, 20),
+        )
+        assert mask.sum() > 0
+        # Foreground should be concentrated in the top-left quadrant.
+        top_left = mask[:20, :20].sum()
+        rest = mask.sum() - top_left
+        assert top_left > rest
+
+
+class TestSegmentConsensusFromAlignedCnnDispatch:
+    """End-to-end wiring test for segmentation_method="cnn": confirms
+    segment_consensus_from_aligned dispatches to the CNN path and returns a
+    ConsensusSegmentationState usable by the rest of the pipeline (same
+    shape as the watershed path), without needing a real checkpoint file."""
+
+    def test_dispatches_to_cnn_and_builds_valid_segmentation_state(
+        self, monkeypatch
+    ):
+        import swaps.postprocessing.match_features as mf
+
+        model = _FixedRegionLogitModel(frac=0.5)
+        monkeypatch.setattr(mf, "_get_cnn_segmentation_model", lambda ckpt, dev: model)
+        monkeypatch.setattr(mf, "_resolve_cnn_device", lambda dev: "cpu")
+
+        images = _make_test_images(1, shape=(20, 20))
+        alignment_state = align_images_to_reference(images, anchors=[(2, 2)])
+
+        seg = segment_consensus_from_aligned(
+            alignment_state,
+            segmentation_method="cnn",
+            cnn_kwargs={"checkpoint_path": "unused.pt", "device": "auto"},
+        )
+        assert seg.watershed_labels.shape == alignment_state.target_shape
+        assert seg.target_label_ids == [1]
+        assert seg.snapped_per_anchor[0] is not None
+
+    def test_full_bundle_computes_peak_properties_via_cnn_mask(self, monkeypatch):
+        """build_consensus_feature_bundle end-to-end with segmentation_method
+        "cnn": the CNN mask (at the model's own fixed shape) must round-trip
+        back to the native aligned-image shape for
+        calculate_peak_property_from_labels_and_image to produce a valid,
+        non-empty peak-property row -- this is the concern the mask-shape
+        round trip (invert_pad_or_rescale_to_shape) exists to satisfy."""
+        import swaps.postprocessing.match_features as mf
+
+        model = _FixedRegionLogitModel(frac=0.5)
+        monkeypatch.setattr(mf, "_get_cnn_segmentation_model", lambda ckpt, dev: model)
+        monkeypatch.setattr(mf, "_resolve_cnn_device", lambda dev: "cpu")
+
+        images = _make_test_images(2, shape=(20, 20))
+        bundle = build_consensus_feature_bundle(
+            images,
+            anchors=[(2, 2), (2, 2)],
+            raw_images=images,
+            labels=["run_a", "run_b"],
+            segmentation_method="cnn",
+            cnn_kwargs={"checkpoint_path": "unused.pt", "device": "auto"},
+        )
+        assert bundle.segmentation.watershed_labels.shape == bundle.alignment.target_shape
+        assert bundle.consensus_pp is not None
+        assert len(bundle.consensus_pp) == 1
+        assert bundle.consensus_pp["area"].iloc[0] > 0
+        assert all(pp is not None for pp in bundle.individual_pps)
+
+
+class TestMatchFeaturesBatchCnnBatchedPrePass:
+    """match_features_batch's CNN pre-pass (_precompute_cnn_segmentation_states)
+    batches every candidate's CNN forward pass into one call instead of one
+    per candidate. This must not change results -- only speed -- so these
+    tests run the same batch scenario with the pre-pass forced off (reverts
+    to one segment_consensus_from_aligned call per candidate, the pre-batching
+    behavior) and assert the outputs are identical."""
+
+    def _run(self, tmp_path, monkeypatch, model, disable_batching=False):
+        import swaps.postprocessing.match_features as mf
+
+        monkeypatch.setattr(mf, "_get_cnn_segmentation_model", lambda ckpt, dev: model)
+        # Actual tensor placement always resolves to "cpu" (no real CUDA
+        # here); _cnn_batching_enabled is monkeypatched separately below to
+        # force the pre-pass gate open/closed independent of that, since in
+        # production the gate itself is exactly "device == cuda" (batching
+        # is measured slower on CPU -- see _cnn_batching_enabled).
+        monkeypatch.setattr(mf, "_resolve_cnn_device", lambda dev: "cpu")
+        monkeypatch.setattr(
+            mf, "_cnn_batching_enabled", lambda cnn_kwargs: not disable_batching
+        )
+
+        raw_files = ["run1", "run2"]
+        group_img = _group_blob_image([(20, 20, 10.0, 3.0)])
+        solo_img = _group_blob_image([(25, 25, 10.0, 2.0)])
+        for rf in raw_files:
+            _write_combined_activation_parquet(
+                os.path.join(tmp_path, rf, "activation"),
+                {1001: group_img, 3: solo_img},
+            )
+
+        def _abs(offset):
+            return (_RT_RANGE[0] + offset[0], _IM_RANGE[0] + offset[1])
+
+        anchors = {
+            1: {rf: _abs((20, 20)) for rf in raw_files},
+            2: {rf: _abs((21, 21)) for rf in raw_files},
+            3: {rf: _abs((25, 25)) for rf in raw_files},
+        }
+        dict_ref = _build_group_dict_ref(raw_files, anchors)
+
+        return mf.match_features_batch(
+            dict_ref=dict_ref,
+            raw_file_list=raw_files,
+            result_dir=str(tmp_path),
+            batch=[1, 2, 3],
+            processing_kwargs={
+                "apply_seg": True,
+                "segmentation_method": "cnn",
+                "cnn_kwargs": {"checkpoint_path": "unused.pt", "device": "auto"},
+            },
+            match_decoy=False,
+        )
+
+    def test_batched_and_unbatched_prepass_agree(self, tmp_path, monkeypatch):
+        model = _FixedRegionLogitModel(frac=0.6)
+        (_, _, pp_ref_batched, pp_match_batched, *_r1) = self._run(
+            tmp_path / "batched", monkeypatch, model, disable_batching=False
+        )
+        (_, _, pp_ref_unbatched, pp_match_unbatched, *_r2) = self._run(
+            tmp_path / "unbatched", monkeypatch, model, disable_batching=True
+        )
+
+        cols = ["area", "snap_rt", "snap_im", "Run_name"]
+        ref_batched = pd.concat(pp_ref_batched)[cols].reset_index(drop=True)
+        ref_unbatched = pd.concat(pp_ref_unbatched)[cols].reset_index(drop=True)
+        pd.testing.assert_frame_equal(ref_batched, ref_unbatched)
+
+        match_batched = pd.concat(pp_match_batched)[cols].reset_index(drop=True)
+        match_unbatched = pd.concat(pp_match_unbatched)[cols].reset_index(drop=True)
+        pd.testing.assert_frame_equal(match_batched, match_unbatched)
+
+    def test_prepass_not_invoked_when_device_resolves_to_cpu(
+        self, tmp_path, monkeypatch
+    ):
+        """_cnn_batching_enabled gates the pre-pass on device == "cuda"
+        (measured slower on CPU, see its docstring) -- with no override, a
+        "device": "auto" run on this CPU-only box must not call the
+        batched pre-pass at all."""
+        import swaps.postprocessing.match_features as mf
+
+        def _fail_if_called(*args, **kwargs):
+            raise AssertionError(
+                "_precompute_cnn_segmentation_states should not run when "
+                "the resolved device is cpu"
+            )
+
+        monkeypatch.setattr(
+            mf, "_get_cnn_segmentation_model", lambda ckpt, dev: _FixedRegionLogitModel()
+        )
+        monkeypatch.setattr(mf, "_resolve_cnn_device", lambda dev: "cpu")
+        monkeypatch.setattr(
+            mf, "_precompute_cnn_segmentation_states", _fail_if_called
+        )
+
+        raw_files = ["run1", "run2"]
+        solo_img = _group_blob_image([(25, 25, 10.0, 2.0)])
+        for rf in raw_files:
+            _write_combined_activation_parquet(
+                os.path.join(tmp_path, rf, "activation"), {3: solo_img}
+            )
+        dict_ref = _build_group_dict_ref(
+            raw_files,
+            {
+                1: {rf: (0, 0) for rf in raw_files},
+                2: {rf: (0, 0) for rf in raw_files},
+                3: {rf: (125, 25) for rf in raw_files},
+            },
+        )
+        # Only mz_rank 3 has real activation data on disk; that's enough to
+        # confirm the pre-pass gate itself without needing the group rows.
+        mf.match_features_batch(
+            dict_ref=dict_ref,
+            raw_file_list=raw_files,
+            result_dir=str(tmp_path),
+            batch=[3],
+            processing_kwargs={
+                "apply_seg": True,
+                "segmentation_method": "cnn",
+                "cnn_kwargs": {"checkpoint_path": "unused.pt", "device": "auto"},
+            },
+            match_decoy=False,
+        )
