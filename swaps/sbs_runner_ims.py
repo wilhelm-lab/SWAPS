@@ -96,6 +96,70 @@ def _save_effective_cfg(cfg, processing_kwargs: dict, result_path: str):
     logging.info("Saved effective config to %s", save_path)
 
 
+def _augment_dict_ref_with_run_indices(
+    dict_ref: pd.DataFrame,
+    mobility_values_df: pd.DataFrame,
+    ms1scans: pd.DataFrame,
+    dir_wo_extension: str,
+) -> pd.DataFrame:
+    """Add one raw file's own RT/IM search-window index columns to dict_ref
+    (MS1_frame_idx_left/right_ref_<raw>, IM_search_left/right_ref_<raw>, and
+    the coSWA Group* variants when present) from its already-loaded
+    ms1scans/mobility_values_df tables.
+
+    Pure pandas merge_asof -- no raw .d file access and no scan-wise-
+    activation sparse-coding solve (see process_frames_parallel), so this
+    also works from already-exported ms1scans.csv/mobility_values.csv
+    without reloading the .d file at all. Reused by the main SWA loop below
+    and by swaps/rebuild_dict_ref_with_activation.py, a repair tool for
+    when dict_ref_with_activation.pkl has been lost/partially overwritten
+    (e.g. an interrupted SWA=True run -- dict_ref is saved after every raw
+    file, so a run killed partway through leaves only some raw files'
+    columns populated) but the per-run CSVs/activation parquets are intact.
+    """
+    dict_ref = dict_add_index_to_raw_file(
+        dict_ref, mobility_values_df, ms1scans, dir_wo_extension
+    )
+    dict_ref = dict_add_im_index(
+        dict_ref,
+        mobility_values_df,
+        "IM_search_left",
+        "IM_search_center",
+        "IM_search_right",
+        idx_suffix=f"_ref_{dir_wo_extension}",
+    )
+    dict_ref = dict_add_rt_index(
+        dict_ref,
+        ms1scans,
+        idx_suffix=f"_ref_{dir_wo_extension}",
+    )
+    # coSWA: group-window frame/IM indices for confounder-group members, so
+    # match_features crops the representative image to the merged (union)
+    # window the SWA solve actually spans, not the representative's own
+    # narrower individual window. Guard on GroupIM_search_left (this
+    # block's first-consumed column) so a stale dict_ref.pkl predating
+    # these columns is skipped rather than crashing -- regenerate
+    # dict_ref.pkl to pick up the fix.
+    if "GroupIM_search_left" in dict_ref.columns:
+        dict_ref = dict_add_im_index(
+            dict_ref,
+            mobility_values_df,
+            "GroupIM_search_left",
+            "GroupIM_search_center",
+            "GroupIM_search_right",
+            idx_suffix=f"_group_ref_{dir_wo_extension}",
+        )
+        dict_ref = dict_add_rt_index(
+            dict_ref,
+            ms1scans,
+            mq_rt_left_col="GroupRT_search_left",
+            mq_rt_center_col=None,
+            mq_rt_right_col="GroupRT_search_right",
+            idx_suffix=f"_group_ref_{dir_wo_extension}",
+        )
+    return dict_ref
+
+
 def opt_scan_by_scan(config_path: str):
     """Scan by scan optimization for joint identification and quantification."""
 
@@ -221,51 +285,9 @@ def opt_scan_by_scan(config_path: str):
                     data=data,  # type: ignore
                     swaps_result_dir=os.path.join(cfg.RESULT_PATH, dir_wo_extension),
                 )
-                dict_ref = dict_add_index_to_raw_file(
-                    dict_ref,
-                    mobility_values_df,
-                    ms1scans,
-                    dir_wo_extension,
+                dict_ref = _augment_dict_ref_with_run_indices(
+                    dict_ref, mobility_values_df, ms1scans, dir_wo_extension
                 )
-                # if not added_im_and_rt_index:
-                dict_ref = dict_add_im_index(
-                    dict_ref,
-                    mobility_values_df,
-                    "IM_search_left",
-                    "IM_search_center",
-                    "IM_search_right",
-                    idx_suffix=f"_ref_{dir_wo_extension}",
-                )
-                dict_ref = dict_add_rt_index(
-                    dict_ref,
-                    ms1scans,
-                    idx_suffix=f"_ref_{dir_wo_extension}",
-                )
-                # coSWA: group-window frame/IM indices for confounder-group
-                # members, so match_features crops the representative image to
-                # the merged (union) window the SWA solve actually spans, not
-                # the representative's own narrower individual window. Guard on
-                # GroupIM_search_left (this block's first-consumed column) so a
-                # stale dict_ref.pkl predating these columns is skipped rather
-                # than crashing -- regenerate dict_ref.pkl to pick up the fix.
-                if "GroupIM_search_left" in dict_ref.columns:
-                    dict_ref = dict_add_im_index(
-                        dict_ref,
-                        mobility_values_df,
-                        "GroupIM_search_left",
-                        "GroupIM_search_center",
-                        "GroupIM_search_right",
-                        idx_suffix=f"_group_ref_{dir_wo_extension}",
-                    )
-                    dict_ref = dict_add_rt_index(
-                        dict_ref,
-                        ms1scans,
-                        mq_rt_left_col="GroupRT_search_left",
-                        mq_rt_center_col=None,
-                        mq_rt_right_col="GroupRT_search_right",
-                        idx_suffix=f"_group_ref_{dir_wo_extension}",
-                    )
-                # added_im_and_rt_index = True
 
                 # Save the updated dict_ref with added activation info to the result directory for downstream processing
                 dict_ref.to_pickle(
