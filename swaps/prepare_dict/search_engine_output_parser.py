@@ -1,8 +1,11 @@
+import re
 import pandas as pd
 import logging
 import numpy as np
 
 Logger = logging.getLogger(__name__)
+
+_MAXQUANT_MOD_RE = re.compile(r"^(\d+)([A-Za-z])\(([-+0-9.]+)\)$")
 sage_rename_dict = {
     "psm_id": "id",
     "peptide": "Modified sequence",
@@ -168,5 +171,39 @@ def fragpipe_psm_parser(fragpipe_output: pd.DataFrame) -> pd.DataFrame:
         "Modifications"
     ].fillna("-")
     return fragpipe_output_copy
+
+
+def maxquant_mods_to_fragpipe_modseq(sequence: str, modifications: str) -> str | None:
+    """MaxQuant/SWAPS dict Sequence+Modifications -> FragPipe bracketed modified-
+    sequence string, e.g. ("AAAEVGAPFIEIHTGCYADAK", "16C(57.0215)") ->
+    "AAAEVGAPFIEIHTGC[57.0215]YADAK". Bridges dict_ref rows onto the same key
+    space as FragPipe's own "Modified Sequence" column (psm.tsv/combined_ion.tsv)
+    for joins that don't go through the search-engine parsers above. Returns
+    None if a modification token cannot be parsed, so callers can flag failures
+    instead of silently mis-mapping.
+    """
+    if modifications is None or modifications == "-" or pd.isna(modifications):
+        return sequence
+    nterm_mass = None
+    residue_mods = {}
+    for part in modifications.split(","):
+        part = part.strip()
+        if part.startswith("N-term"):
+            nterm_mass = part[part.index("(") + 1 : part.index(")")]
+            continue
+        m = _MAXQUANT_MOD_RE.match(part)
+        if not m:
+            return None
+        pos, mass = int(m.group(1)), m.group(3)
+        residue_mods[pos] = mass
+    chars = []
+    for i, ch in enumerate(sequence, start=1):
+        chars.append(ch)
+        if i in residue_mods:
+            chars.append(f"[{residue_mods[i]}]")
+    s = "".join(chars)
+    if nterm_mass is not None:
+        s = f"n[{nterm_mass}]" + s
+    return s
 
 
