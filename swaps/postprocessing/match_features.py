@@ -389,6 +389,113 @@ def _group_members_in_batch(
     return members_by_group
 
 
+def _load_batch_activation_dfs(
+    dict_ref_by_mz: pd.DataFrame,
+    raw_file_list: list[str],
+    result_dir: str,
+    batch_np: np.ndarray,
+    merge_confounders_enabled: bool = True,
+) -> tuple[dict[str, dict[int, pd.DataFrame]], dict[str, pd.DataFrame], dict[int, list[int]], bool]:
+    """Load one batch's per-run activation sub-dataframes from the mz-sorted
+    activation parquet, keyed by mz_rank for O(1) per-candidate lookup.
+
+    Shared by match_features_batch and CNN ground-truth dataset preparation
+    (swaps/peak_detection_2d/dataset/prepare_dataset.py) -- both need the same
+    per-run activation crops for a batch of candidates, just for different
+    downstream purposes (watershed segmentation vs. training-mask ground
+    truth). DuckDB skips row groups outside [min(batch_np), max(batch_np)], so
+    I/O scales with batch_size / N_total; requires build_mz_sorted_activation()
+    to have been run for each raw_file activation directory beforehand.
+
+    Returns (act_dfs, empty_act_df, group_to_members, has_group_col):
+      - act_dfs[raw_file][mz_rank] -> that candidate's activation sub-frame.
+      - empty_act_df[raw_file] -> empty frame with the right schema, for
+        candidates with no activation in that run.
+      - group_to_members: this batch's confounder_group_id -> member mz_ranks
+        (see _group_members_in_batch).
+      - has_group_col: whether candidates should be looked up by
+        confounder_group_id (act_lookup key) rather than their own mz_rank.
+    """
+    group_to_members = _group_members_in_batch(
+        dict_ref_by_mz, batch_np, merge_confounders_enabled=merge_confounders_enabled
+    )
+    # expand_to_members=False: keep each in-batch group's row-set keyed by its
+    # own confounder_group_id rather than duplicated out to every member's own
+    # mz_rank. Group members' activation lookups are instead redirected to the
+    # group id at query time (see _act_lookup_key) -- same data, without the
+    # O(members) duplication cost or the correspondingly larger, more
+    # duplicate-heavy mz_rank index that per-candidate lookups would otherwise
+    # run against for every candidate sharing this batch, group or solo.
+    con = duckdb.connect()
+    con.execute("SET enable_progress_bar = false")
+    _act_dfs_raw = {
+        raw_file: load_peptide_batch_df_from_partquet(
+            os.path.join(result_dir, raw_file, "activation"),
+            batch_np,
+            group_to_members=group_to_members or None,
+            con=con,
+            expand_to_members=False,
+        )
+        for raw_file in raw_file_list
+    }
+    con.close()
+
+    # Per-raw-file {mz_rank: sub-dataframe} map, built once so each candidate's
+    # activation fetch is an O(1) dict lookup instead of pandas' non-unique-
+    # index .loc[[key]] resolution (get_indexer_non_unique), which does not
+    # amortize to O(1) on repeated calls against the same index the way a
+    # unique index's hash lookup does.
+    act_dfs: dict[str, dict[int, pd.DataFrame]] = {
+        raw_file: {int(mz): sub for mz, sub in df.groupby("mz_rank", sort=False)}
+        for raw_file, df in _act_dfs_raw.items()
+    }
+    empty_act_df = {raw_file: df.iloc[0:0] for raw_file, df in _act_dfs_raw.items()}
+    # Gated on merge_confounders_enabled too, not just column presence: with
+    # coSWA disabled for a run, act_dfs is keyed by each candidate's own
+    # mz_rank (group_to_members=None above), so looking activation up by a
+    # stale confounder_group_id would silently miss it.
+    has_group_col = (
+        merge_confounders_enabled and "confounder_group_id" in dict_ref_by_mz.columns
+    )
+    return act_dfs, empty_act_df, group_to_members, has_group_col
+
+
+def _reference_match_quant_files(
+    dict_ref_by_mz: pd.DataFrame, pept_idx: int
+) -> tuple[str, list[str], list[str]]:
+    """Per-candidate run-role assignment: which raw file is this candidate's
+    own reference run, which runs are quant-only, and which participate in
+    matching (Match or Quant_Only roles). Roles are always the candidate's
+    OWN (never a coSWA group representative's -- see match_features_batch)."""
+    row_series = dict_ref_by_mz.loc[pept_idx, :]
+    str_values = row_series[row_series.map(lambda x: isinstance(x, str))]
+    reference_raw_file = str(str_values.index[(str_values == "Reference")][0])
+    quant_only_raw_files = str_values.index[str_values == "Quant_Only"].tolist()
+    match_raw_files = str_values.index[
+        (str_values.str.contains("Match", regex=False))
+        | (str_values == "Quant_Only")
+    ].tolist()
+    return reference_raw_file, quant_only_raw_files, match_raw_files
+
+
+def _positional_anchors(
+    stack: list[str],
+    ref_rf: str,
+    quant_set: set[str],
+    loader: Callable[[str], tuple[np.ndarray, int, int, tuple[int, int]]],
+) -> list[tuple[int, int] | None]:
+    """Per-run anchor list over `stack`: this candidate's own reference /
+    quant_only runs get its (frame, scan) apex; all other runs get None."""
+    anchors: list[tuple[int, int] | None] = []
+    for rf in stack:
+        if rf == ref_rf or rf in quant_set:
+            t = loader(rf)
+            anchors.append((int(t[1]), int(t[2])))
+        else:
+            anchors.append(None)
+    return anchors
+
+
 def _parse_seg_mask_thres(val, default: tuple[int, int] = (3, 3)) -> tuple[int, int]:
     if isinstance(val, dict):
         return (int(val.get("rt", default[0])), int(val.get("im", default[1])))
@@ -518,94 +625,33 @@ def match_features_batch(
 
     # coSWA groups are stored on disk as a single row-set keyed by their
     # confounder_group_id (never duplicated to every member's mz_rank -- see
-    # helper.load_peptide_batch_df_from_partquet). Compute this batch's own
-    # group membership once: used to fetch+expand each group's row below, and
-    # to drive the post-hoc segment-overlap tagging pass after the main loop
-    # (see _mark_overlapping_group_members).
-    _group_to_members = _group_members_in_batch(
-        dict_ref_by_mz, batch_np, merge_confounders_enabled=merge_confounders_enabled
+    # helper.load_peptide_batch_df_from_partquet). group_to_members drives the
+    # post-hoc segment-overlap tagging pass after the main loop (see
+    # _mark_overlapping_group_members).
+    act_dfs, _empty_act_df, _group_to_members, _has_group_col = (
+        _load_batch_activation_dfs(
+            dict_ref_by_mz,
+            raw_file_list,
+            result_dir,
+            batch_np,
+            merge_confounders_enabled=merge_confounders_enabled,
+        )
     )
     _members_by_group = {g: m for g, m in _group_to_members.items() if len(m) >= 2}
 
-    # Load activation data for this mz_rank batch from the pre-built sorted parquet.
-    # DuckDB skips row groups outside [min(batch_np), max(batch_np)], so I/O scales
-    # with batch_size / N_total.  Requires build_mz_sorted_activation() to have been
-    # run for each raw_file activation directory beforehand.
-    con = duckdb.connect()
-    con.execute("SET enable_progress_bar = false")
-    # expand_to_members=False: keep each in-batch group's row-set keyed by its
-    # own confounder_group_id rather than duplicated out to every member's own
-    # mz_rank. Group members' activation lookups are instead redirected to the
-    # group id at query time (see _act_lookup_key below) -- same data, without
-    # the O(members) duplication cost or the correspondingly larger, more
-    # duplicate-heavy mz_rank index that per-candidate lookups would otherwise
-    # run against for every candidate sharing this batch, group or solo.
-    _act_dfs_raw = {
-        raw_file: load_peptide_batch_df_from_partquet(
-            os.path.join(result_dir, raw_file, "activation"),
-            batch_np,
-            group_to_members=_group_to_members or None,
-            con=con,
-            expand_to_members=False,
-        )
-        for raw_file in raw_file_list
-    }
-    con.close()
-
-    # Per-raw-file {mz_rank: sub-dataframe} map, built once so each candidate's
-    # activation fetch is an O(1) dict lookup instead of pandas' non-unique-
-    # index .loc[[key]] resolution (get_indexer_non_unique), which does not
-    # amortize to O(1) on repeated calls against the same index the way a
-    # unique index's hash lookup does.
-    act_dfs: dict[str, dict[int, pd.DataFrame]] = {
-        raw_file: {int(mz): sub for mz, sub in df.groupby("mz_rank", sort=False)}
-        for raw_file, df in _act_dfs_raw.items()
-    }
-    _empty_act_df = {raw_file: df.iloc[0:0] for raw_file, df in _act_dfs_raw.items()}
-
     def _select_mz(raw_file: str, mz_rank: int) -> pd.DataFrame:
         return act_dfs[raw_file].get(mz_rank, _empty_act_df[raw_file])
-
-    # Gated on merge_confounders_enabled too, not just column presence: with
-    # coSWA disabled for this run, act_dfs is keyed by each candidate's own
-    # mz_rank (group_to_members=None above), so looking activation up by a
-    # stale confounder_group_id here would silently miss it.
-    _has_group_col = (
-        merge_confounders_enabled and "confounder_group_id" in dict_ref_by_mz.columns
-    )
 
     def _act_lookup_key(pept_idx: int) -> int:
         """Map a candidate's own mz_rank to the key its activation is stored
         under in act_dfs: its confounder_group_id when it belongs to an
         in-batch group (act_dfs keeps one un-duplicated row-set per group --
-        see expand_to_members=False above), else its own mz_rank unchanged."""
+        see expand_to_members=False in _load_batch_activation_dfs), else its
+        own mz_rank unchanged."""
         if not _has_group_col:
             return pept_idx
         gid = int(dict_ref_by_mz.at[pept_idx, "confounder_group_id"])
         return gid if gid != -1 else pept_idx
-
-    def _positional_anchors(stack, ref_rf, quant_set, loader):
-        """Per-run anchor list over `stack`: this candidate's own reference /
-        quant_only runs get its (frame, scan) apex; all other runs get None."""
-        anchors: list[tuple[int, int] | None] = []
-        for rf in stack:
-            if rf == ref_rf or rf in quant_set:
-                t = loader(rf)
-                anchors.append((int(t[1]), int(t[2])))
-            else:
-                anchors.append(None)
-        return anchors
-
-    def _reference_match_quant_files(pept_idx: int):
-        row_series = dict_ref_by_mz.loc[pept_idx, :]
-        str_values = row_series[row_series.map(lambda x: isinstance(x, str))]
-        reference_raw_file = str(str_values.index[(str_values == "Reference")][0])
-        quant_only_raw_files = str_values.index[str_values == "Quant_Only"].tolist()
-        match_raw_files = str_values.index[
-            (str_values.str.contains("Match", regex=False))
-            | (str_values == "Quant_Only")
-        ].tolist()
-        return reference_raw_file, quant_only_raw_files, match_raw_files
 
     # coSWA: every candidate -- group member or solo -- gets its own
     # independent alignment + watershed segmentation below (own roles, own
@@ -667,7 +713,7 @@ def match_features_batch(
         # group members used to reuse a representative's per-run role
         # assignment).
         reference_raw_file, quant_only_raw_files, match_raw_files = (
-            _reference_match_quant_files(pept_idx)
+            _reference_match_quant_files(dict_ref_by_mz, pept_idx)
         )
         _quant_only_set = set(quant_only_raw_files)
 
