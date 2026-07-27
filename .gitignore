@@ -30,3 +30,7 @@ profile.stats
 swaps/match_features_batches_parallel.md
 swaps/feature_match_consensus_workflow.md
 .claude/*
+swaps/rerun_swa_failed_runs.py
+swaps/utils/feature_strength.py
+writing/*
+swaps/utils/dilution_series_analysis.py

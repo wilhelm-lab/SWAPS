@@ -78,6 +78,15 @@ __C.PREPARE_DICT.OK.DIR = ""  # path to Oktoberfest rescoring output directory; 
 __C.PREPARE_DICT.OK.OUTPUT = "psms"  # one of ["psms", "peptides"]
 __C.PREPARE_DICT.OK.FDR = 0.01  # FDR threshold for Oktoberfest rescoring
 
+__C.PREPARE_DICT.MERGE_CONFOUNDERS = ConfigurationNode()
+__C.PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED = False  # merge confounder groups (coSWA) into one SWA candidate row; off by default for backward compatibility
+__C.PREPARE_DICT.MERGE_CONFOUNDERS.GROUP_ID_OFFSET = (
+    -1
+)  # id offset added to a group's min mz_rank to form confounder_group_id; -1 = auto-derive from max mz_rank
+__C.PREPARE_DICT.MERGE_CONFOUNDERS.EXCLUDE_CROSS_TARGET_DECOY = (
+    True  # never merge a target with a decoy into the same confounder group
+)
+
 # optimization
 __C.OPTIMIZATION = ConfigurationNode()
 __C.OPTIMIZATION.N_BATCH = (
@@ -89,6 +98,8 @@ __C.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH = 4  # width for IM peak extraction; o
 # match features kwargs (postprocessing peak detection/matching parameters)
 __C.MATCH_FEATURES_KWARGS = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.apply_seg = True
+__C.MATCH_FEATURES_KWARGS.align_images = True  # set False to skip template-matching alignment; rt/im shift and template_matching_score will be 0
+__C.MATCH_FEATURES_KWARGS.use_shift_crop_pad = False  # False (default): resize every image to the reference's shape via cv2.resize before template matching. True: skip resizing -- match_template runs directly on each run's native-shaped image, and the found integer shift is applied by exact slicing (pad where the image is smaller than the reference, crop where larger) instead of interpolation.
 __C.MATCH_FEATURES_KWARGS.dir_name = "quantification"
 __C.MATCH_FEATURES_KWARGS.seg_mask_thres = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.seg_mask_thres.rt = 2  # min RT span of target labels
@@ -96,10 +107,15 @@ __C.MATCH_FEATURES_KWARGS.seg_mask_thres.im = 5  # min IM span of target labels
 __C.MATCH_FEATURES_KWARGS.jump_dist_thres = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.jump_dist_thres.rt = 10  # max RT jump in pixels; 0 = disabled
 __C.MATCH_FEATURES_KWARGS.jump_dist_thres.im = 10  # max IM jump in pixels; 0 = disabled
-# denoise: three sequential ops applied across two pipeline stages.
+__C.MATCH_FEATURES_KWARGS.template_frac = 0.3  # half-width (as a fraction of each dim) of the template patch used for SIFT/consensus template matching; must be in (0, 0.5]
+# denoise: three sequential ops applied across pipeline stages.
 #   smooth.at / clean.at / log_transform.at controls which stage each op executes.
 #   "raw"       → applied to raw images before SIFT template-matching alignment
 #   "consensus" → applied to the averaged consensus image before watershed segmentation
+#   "aligned"   → log_transform only: applied right after alignment/template matching,
+#                 to the already-aligned per-run images, before they are averaged into
+#                 the consensus. Lets alignment run on un-transformed (noise-amplification-
+#                 free) images while consensus averaging still happens in log space.
 #   At peak-property extraction, raw_aligned images are compensated by applying all ops.
 __C.MATCH_FEATURES_KWARGS.denoise = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.denoise.smooth = ConfigurationNode()
@@ -119,9 +135,11 @@ __C.MATCH_FEATURES_KWARGS.denoise.log_transform = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.denoise.log_transform.at = "raw"
 __C.MATCH_FEATURES_KWARGS.denoise.log_transform.enabled = True
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.int_threshold = 2
-__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.h_rel = 0.15
+__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.int_threshold = 1
+__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.h_rel = 0.001
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.norm_percentile = 95
+__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.compactness = 0.001
+__C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.normalize_before_hmaxima = False
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.strategies = [
     "peptide_swap",
@@ -135,7 +153,9 @@ __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.off_target_max_overlap_fraction
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.use_confounder_sampling = True
 
 __C.FDR = ConfigurationNode()
+__C.FDR.ENABLED = True  # if False, skip Mokapot/percolator FDR control entirely; pp_match_target_filtered is pp_match_target with only intensity filtering (FDR.INT_THRES) applied
 __C.FDR.TRAIN = 0.05
 __C.FDR.TEST = 0.01
 __C.FDR.INT_THRES = 100  # intensity threshold for FDR; 0 means no threshold
 __C.FDR.ONLY_SCORE_MATCH = True  # if True, exclude Reference/Quant_Only run-peptide pairs from rescoring and pass them directly as "MS/MS" in the output
+__C.FDR.PERCOLATOR_POST_PROCESSING = "tdc"  # "tdc" (-Y, target-decoy competition) or "mix-max" (-y); selects percolator's post-processing method and the percolator_dir_name suffix

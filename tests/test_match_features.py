@@ -1,8 +1,30 @@
+import os
+
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
-from swaps.postprocessing.match_features import _confounder_pool
+from swaps.postprocessing.match_features import (
+    _confounder_pool,
+    align_images_to_reference,
+    build_consensus_feature_bundle,
+    match_features_batch,
+    _snap_anchor_to_watershed_label,
+    _project_anchor_into_aligned_space,
+    ConsensusAlignmentState,
+)
+
+
+def _two_blob_image(shape=(40, 40), centers=((10, 10), (10, 30)), amp=10.0, sigma=3.0):
+    """Two well-separated Gaussian blobs -> detect_2d_peak_with_watershed
+    resolves them as two distinct watershed labels/peaks."""
+    img = np.zeros(shape, dtype=np.float64)
+    yy, xx = np.mgrid[0 : shape[0], 0 : shape[1]]
+    for cy, cx in centers:
+        img += amp * np.exp(-(((yy - cy) ** 2 + (xx - cx) ** 2) / (2 * sigma**2)))
+    return img
 
 
 def _dict_ref_by_mz(rows):
@@ -54,3 +76,637 @@ def test_dtype_matches_batch():
     df = _dict_ref_by_mz([{"mz_rank": 1, "confounders": conf}])
     pool = _confounder_pool(1, batch, df)
     assert pool.dtype == batch.dtype
+
+
+# ---------------------------------------------------------------------------
+# align_images=False
+# ---------------------------------------------------------------------------
+
+
+def _make_test_images(n=3, shape=(20, 20), seed=42):
+    rng = np.random.default_rng(seed)
+    return [rng.uniform(0, 1, shape).astype(np.float32) for _ in range(n)]
+
+
+class TestAlignImagesDisabled:
+    def test_shifts_are_zero(self):
+        images = _make_test_images(3)
+        state = align_images_to_reference(images, align_images=False)
+        assert all(s == (0, 0) for s in state.shifts)
+
+    def test_non_reference_max_scores_are_zero(self):
+        images = _make_test_images(3)
+        state = align_images_to_reference(images, reference_idx=0, align_images=False)
+        assert state.max_scores[0] == 1.0  # reference unchanged
+        assert all(s == 0.0 for s in state.max_scores[1:])
+
+    def test_aligned_images_equal_resized(self):
+        images = _make_test_images(3)
+        state = align_images_to_reference(images, align_images=False)
+        for aligned, resized in zip(state.aligned_images, state.resized_images):
+            np.testing.assert_array_equal(aligned, resized)
+
+    def test_build_bundle_zero_shifts_via_processing_kwargs(self):
+        """build_consensus_feature_bundle propagates align_images=False correctly."""
+        images = _make_test_images(2, shape=(30, 30))
+        bundle = build_consensus_feature_bundle(images, align_images=False)
+        assert all(s == (0, 0) for s in bundle.alignment.shifts)
+        assert bundle.alignment.max_scores[1] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# _snap_anchor_to_watershed_label (extracted from segment_consensus_from_aligned,
+# reused by coSWA to snap other confounder-group members against one shared
+# watershed segmentation)
+# ---------------------------------------------------------------------------
+
+
+def _two_label_watershed():
+    """8x8 label map: label 1 occupies rows 0-2/cols 0-2, label 2 occupies
+    rows 5-7/cols 5-7, background (0) everywhere else. Peaks sit at the
+    corner of each label."""
+    labels = np.zeros((8, 8), dtype=int)
+    labels[0:3, 0:3] = 1
+    labels[5:8, 5:8] = 2
+    all_peaks = np.array([[1, 1], [6, 6]])
+    labeled_coords = np.argwhere(labels > 0)
+    return labels, all_peaks, labeled_coords
+
+
+class TestSnapAnchorToWatershedLabel:
+    def test_anchor_inside_label_snaps_to_nearest_peak(self):
+        labels, all_peaks, labeled_coords = _two_label_watershed()
+        snapped_rc, label_id, jump_info = _snap_anchor_to_watershed_label(
+            1, 1, labels, all_peaks, labeled_coords, jump_dist_thres=(0, 0)
+        )
+        assert snapped_rc == (1, 1)
+        assert label_id == 1
+        assert jump_info is None
+
+    def test_anchor_inside_label_but_off_peak_still_finds_same_label(self):
+        labels, all_peaks, labeled_coords = _two_label_watershed()
+        snapped_rc, label_id, jump_info = _snap_anchor_to_watershed_label(
+            2, 2, labels, all_peaks, labeled_coords, jump_dist_thres=(0, 0)
+        )
+        assert snapped_rc == (1, 1)  # nearest peak within label 1
+        assert label_id == 1
+        assert jump_info is None
+
+    def test_background_anchor_jumps_to_nearest_label_within_threshold(self):
+        labels, all_peaks, labeled_coords = _two_label_watershed()
+        # (3, 1) is background, one row below label 1's bottom edge (2, 1)
+        snapped_rc, label_id, jump_info = _snap_anchor_to_watershed_label(
+            3, 1, labels, all_peaks, labeled_coords, jump_dist_thres=(2, 2)
+        )
+        assert label_id == 1
+        assert snapped_rc == (1, 1)
+        assert jump_info is not None
+        assert jump_info["jumped_label"] == 1
+        assert jump_info["snapped_peak"] == (1, 1)
+
+    def test_background_anchor_beyond_threshold_is_discarded(self):
+        labels, all_peaks, labeled_coords = _two_label_watershed()
+        # (3, 1) is 1 pixel from label 1 -- a threshold of (0, 0) discards it
+        # ((0, 0) is treated as "no limit" by the rt/im > 0 gating, so use a
+        # threshold that's actually enforced: (1, 1) still allows dist=1, so
+        # push further away to guarantee a discard.
+        snapped_rc, label_id, jump_info = _snap_anchor_to_watershed_label(
+            0, 7, labels, all_peaks, labeled_coords, jump_dist_thres=(1, 1)
+        )
+        assert label_id is None
+        assert snapped_rc is None
+        assert jump_info is not None
+        assert "jumped_label" not in jump_info  # discarded before jumping
+
+    def test_no_labeled_pixels_returns_none(self):
+        labels = np.zeros((8, 8), dtype=int)
+        all_peaks = np.empty((0, 2), dtype=int)
+        labeled_coords = np.empty((0, 2), dtype=int)
+        snapped_rc, label_id, jump_info = _snap_anchor_to_watershed_label(
+            3, 3, labels, all_peaks, labeled_coords, jump_dist_thres=(0, 0)
+        )
+        assert (snapped_rc, label_id, jump_info) == (None, None, None)
+
+
+# ---------------------------------------------------------------------------
+# _project_anchor_into_aligned_space
+# ---------------------------------------------------------------------------
+
+
+def _minimal_alignment_state(target_shape, shifts):
+    """A ConsensusAlignmentState with only the fields _project_anchor_into_aligned_space reads populated."""
+    return ConsensusAlignmentState(
+        reference_idx=0,
+        target_shape=target_shape,
+        anchor_row=0,
+        anchor_col=0,
+        template_bounds=(0, 0, 0, 0),
+        template=np.zeros((1, 1)),
+        resized_images=[],
+        aligned_images=[],
+        matched_boxes=[],
+        aligned_anchors=[],
+        scaled_anchors=[],
+        shifts=shifts,
+        max_scores=[],
+    )
+
+
+class TestProjectAnchorIntoAlignedSpace:
+    def test_same_shape_no_shift_is_identity(self):
+        state = _minimal_alignment_state(target_shape=(20, 20), shifts=[(0, 0)])
+        result = _project_anchor_into_aligned_space((5, 7), (20, 20), state, 0)
+        assert result == (5.0, 7.0)
+
+    def test_applies_shift(self):
+        state = _minimal_alignment_state(target_shape=(20, 20), shifts=[(3, -2)])
+        result = _project_anchor_into_aligned_space((5, 7), (20, 20), state, 0)
+        assert result == (8.0, 5.0)
+
+    def test_scales_before_shifting(self):
+        # source image half the target size -> anchor coordinates double
+        state = _minimal_alignment_state(target_shape=(20, 20), shifts=[(1, 1)])
+        result = _project_anchor_into_aligned_space((5, 5), (10, 10), state, 0)
+        assert result == (11.0, 11.0)  # (5*2)+1, (5*2)+1
+
+    def test_none_anchor_returns_none(self):
+        state = _minimal_alignment_state(target_shape=(20, 20), shifts=[(0, 0)])
+        assert _project_anchor_into_aligned_space(None, (20, 20), state, 0) is None
+
+    def test_matches_representative_own_aligned_anchor(self):
+        """Sanity check against the real pipeline: projecting the SAME anchor
+        that align_images_to_reference already aligned should reproduce its
+        own aligned_anchors entry exactly."""
+        images = _make_test_images(2, shape=(20, 20))
+        anchors = [(5, 5), (8, 3)]
+        state = align_images_to_reference(images, anchors=anchors)
+        projected = _project_anchor_into_aligned_space(
+            anchors[1], images[1].shape, state, 1
+        )
+        assert projected == state.aligned_anchors[1]
+
+
+# ---------------------------------------------------------------------------
+# build_consensus_feature_bundle(reuse_from=...) -- coSWA confounder-group
+# member reuse: skip alignment/watershed, only re-snap + re-extract.
+# ---------------------------------------------------------------------------
+
+
+class TestBuildConsensusFeatureBundleReuse:
+    def test_reused_bundle_snaps_to_its_own_anchor_independently(self):
+        img = _two_blob_image()
+        representative = build_consensus_feature_bundle(
+            images=[img],
+            anchors=[(10, 10)],
+            raw_images=[img],
+            labels=["run1"],
+        )
+        assert representative.segmentation.snapped_per_anchor[0] == (10, 10)
+        assert representative.consensus_pp is not None
+
+        other_member = build_consensus_feature_bundle(
+            images=[img],  # ignored when reuse_from is set
+            anchors=[(10, 30)],  # this member's OWN, different, anchor
+            raw_images=[img],
+            labels=["run1"],
+            reuse_from=representative,
+        )
+        assert other_member.segmentation.snapped_per_anchor[0] == (10, 30)
+        assert other_member.consensus_pp is not None
+        # the two members land on DIFFERENT watershed labels (correctly
+        # told apart), even though they share the identical underlying image
+        assert (
+            representative.segmentation.target_label_ids
+            != other_member.segmentation.target_label_ids
+        )
+
+    def test_reused_bundle_shares_expensive_state_not_recomputed(self):
+        img = _two_blob_image()
+        representative = build_consensus_feature_bundle(
+            images=[img], anchors=[(10, 10)], raw_images=[img], labels=["run1"]
+        )
+        other_member = build_consensus_feature_bundle(
+            images=[img],
+            anchors=[(10, 30)],
+            raw_images=[img],
+            labels=["run1"],
+            reuse_from=representative,
+        )
+        # consensus/consensus_denoised/all_peaks/aligned_images are reused
+        # verbatim (same object), not recomputed -- watershed_labels is
+        # defensively copied (see _snap_all_anchors_to_watershed) but must
+        # still be content-equal.
+        assert other_member.segmentation.consensus is representative.segmentation.consensus
+        assert (
+            other_member.segmentation.consensus_denoised
+            is representative.segmentation.consensus_denoised
+        )
+        assert other_member.segmentation.all_peaks is representative.segmentation.all_peaks
+        assert other_member.alignment.aligned_images is representative.alignment.aligned_images
+        np.testing.assert_array_equal(
+            other_member.segmentation.watershed_labels,
+            representative.segmentation.watershed_labels,
+        )
+
+    def test_two_members_colliding_on_same_label_get_identical_quantification(self):
+        """If two confounder-group members' anchors happen to land on the
+        SAME watershed label, their extracted quantification comes out
+        identical by construction (same mask, same raw image) -- this is
+        the property the collision-flagging logic in match_features_batch
+        relies on."""
+        img = _two_blob_image()
+        representative = build_consensus_feature_bundle(
+            images=[img], anchors=[(10, 10)], raw_images=[img], labels=["run1"]
+        )
+        colliding_member = build_consensus_feature_bundle(
+            images=[img],
+            anchors=[(11, 11)],  # close enough to snap to the SAME label
+            raw_images=[img],
+            labels=["run1"],
+            reuse_from=representative,
+        )
+        assert (
+            representative.segmentation.target_label_ids
+            == colliding_member.segmentation.target_label_ids
+        )
+        pd.testing.assert_frame_equal(
+            representative.consensus_pp, colliding_member.consensus_pp
+        )
+
+    def test_collapse_to_single_label_tie_broken_by_priority_anchor(self):
+        """coSWA per-member assignment: a member whose anchors span BOTH blobs
+        (one each -> a tie) collapses to the single segment chosen by
+        priority_anchor_index (its reference-run anchor)."""
+        img = _two_blob_image()
+        rep = build_consensus_feature_bundle(
+            images=[img, img],
+            anchors=[(10, 10), (10, 10)],
+            raw_images=[img, img],
+            labels=["r1", "r2"],
+        )
+
+        def _reuse(anchors, **kw):
+            return build_consensus_feature_bundle(
+                images=[img, img],
+                anchors=anchors,
+                raw_images=[img, img],
+                labels=["r1", "r2"],
+                reuse_from=rep,
+                **kw,
+            )
+
+        label_a = _reuse([(10, 10), (10, 10)]).segmentation.target_label_ids
+        label_b = _reuse([(10, 30), (10, 30)]).segmentation.target_label_ids
+        assert label_a != label_b
+
+        # Without collapse, both blobs' labels are kept.
+        spanning = _reuse([(10, 10), (10, 30)])
+        assert len(spanning.segmentation.target_label_ids) == 2
+
+        # Tie -> priority anchor decides which single label survives.
+        prio0 = _reuse(
+            [(10, 10), (10, 30)],
+            collapse_to_single_label=True,
+            priority_anchor_index=0,
+        )
+        prio1 = _reuse(
+            [(10, 10), (10, 30)],
+            collapse_to_single_label=True,
+            priority_anchor_index=1,
+        )
+        assert prio0.segmentation.target_label_ids == label_a
+        assert prio1.segmentation.target_label_ids == label_b
+        # The discarded anchor is recorded (renders as 'x' in the overlay).
+        assert 1 in prio0.segmentation.snap_log["discard_record"]
+
+    def test_collapse_to_single_label_majority_over_priority(self):
+        """Majority vote wins even against the priority anchor: two anchors on
+        blob B, one (the priority) on blob A -> B survives."""
+        img = _two_blob_image()
+        rep = build_consensus_feature_bundle(
+            images=[img, img, img],
+            anchors=[(10, 30), (10, 30), (10, 30)],
+            raw_images=[img, img, img],
+            labels=["r1", "r2", "r3"],
+        )
+        label_b = rep.segmentation.target_label_ids
+        member = build_consensus_feature_bundle(
+            images=[img, img, img],
+            anchors=[(10, 10), (10, 30), (10, 30)],
+            raw_images=[img, img, img],
+            labels=["r1", "r2", "r3"],
+            reuse_from=rep,
+            collapse_to_single_label=True,
+            priority_anchor_index=0,  # points at the minority blob A
+        )
+        assert member.segmentation.target_label_ids == label_b
+
+
+# ---------------------------------------------------------------------------
+# match_features_batch end-to-end: coSWA confounder-group orchestration
+# (each member independently aligned + segmented; overlap between members'
+# own assigned segments is flagged post-hoc via undistinguishable_group_id)
+# ---------------------------------------------------------------------------
+
+_RT_RANGE = (100, 139)  # 40 frames
+_IM_RANGE = (0, 39)  # 40 im bins
+
+
+def _group_blob_image(blobs):
+    n_rt = _RT_RANGE[1] - _RT_RANGE[0] + 1
+    n_im = _IM_RANGE[1] - _IM_RANGE[0] + 1
+    yy, xx = np.mgrid[0:n_im, 0:n_rt]
+    img = np.zeros((n_im, n_rt))
+    for rt_c, im_c, amp, sigma in blobs:
+        img += amp * np.exp(-(((yy - im_c) ** 2 + (xx - rt_c) ** 2) / (2 * sigma**2)))
+    return img
+
+
+def _write_combined_activation_parquet(act_dir, images_by_mz_rank):
+    os.makedirs(act_dir, exist_ok=True)
+    rows = []
+    for mz_rank, img in images_by_mz_rank.items():
+        im_idx, rt_idx = np.nonzero(img > 0.5)
+        for i, r in zip(im_idx, rt_idx):
+            rows.append(
+                {
+                    "frame_idx": _RT_RANGE[0] + r,
+                    "im_idx": _IM_RANGE[0] + i,
+                    "mz_rank": mz_rank,
+                    "activation": float(img[i, r]),
+                }
+            )
+    df = pd.DataFrame(rows)
+    table = pa.Table.from_pandas(
+        df[["frame_idx", "im_idx", "mz_rank", "activation"]].astype(
+            {
+                "frame_idx": "uint16",
+                "im_idx": "uint16",
+                "mz_rank": "uint32",
+                "activation": "float32",
+            }
+        ),
+        preserve_index=False,
+    )
+    pq.write_table(table, os.path.join(act_dir, "activation_sorted_by_mz.parquet"))
+
+
+def _build_group_dict_ref(raw_files, anchors):
+    """anchors: dict[mz_rank] -> dict[run] -> (rt_center, im_center) absolute
+    frame/im index, mirroring each candidate's own individually-predicted
+    apex (independent of the shared merged activation image)."""
+    rows = []
+    for mz_rank, group_id in [(1, 1001), (2, 1001), (3, -1)]:
+        row = {"mz_rank": mz_rank, "confounder_group_id": group_id}
+        for i, rf in enumerate(raw_files):
+            row[rf] = "Reference" if i == 0 else "Match"
+            row[f"MS1_frame_idx_left_ref_{rf}"] = _RT_RANGE[0]
+            row[f"MS1_frame_idx_right_ref_{rf}"] = _RT_RANGE[1]
+            row[f"mobility_values_index_left_ref_{rf}"] = _IM_RANGE[0]
+            row[f"mobility_values_index_right_ref_{rf}"] = _IM_RANGE[1]
+            rt_c, im_c = anchors[mz_rank][rf]
+            row[f"{rf}_MS1_frame_idx_exp"] = rt_c
+            row[f"{rf}_mobility_values_index_exp"] = im_c
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _run_group_scenario(tmp_path, group_blobs, a_anchor_offset, b_anchor_offset):
+    """Two runs, three candidates: mz_rank 1 (A) and 2 (B) are a confounder
+    group sharing the IDENTICAL activation image `group_blobs` in every run
+    (as coSWA's SWA-level merge would produce -- see
+    helper.expand_group_ids_to_members); mz_rank 3 (C) is solo with its
+    own separate, well-clear activation. A and B's own individually
+    predicted anchors are placed at a_anchor_offset/b_anchor_offset within
+    that shared image."""
+    raw_files = ["run1", "run2"]
+    group_img = _group_blob_image(group_blobs)
+    solo_img = _group_blob_image([(25, 25, 10.0, 2.0)])
+    for rf in raw_files:
+        # On-disk format post-fix: the group is stored as ONE row-set keyed
+        # by its confounder_group_id (1001, matching _build_group_dict_ref's
+        # mz_rank 1 and 2 assignment) -- never duplicated to each member's
+        # own mz_rank. match_features_batch lazily re-expands it in memory
+        # for this batch via load_peptide_batch_df_from_partquet.
+        _write_combined_activation_parquet(
+            os.path.join(tmp_path, rf, "activation"),
+            {1001: group_img, 3: solo_img},
+        )
+
+    def _abs(offset):
+        return (_RT_RANGE[0] + offset[0], _IM_RANGE[0] + offset[1])
+
+    anchors = {
+        1: {rf: _abs(a_anchor_offset) for rf in raw_files},
+        2: {rf: _abs(b_anchor_offset) for rf in raw_files},
+        3: {rf: _abs((25, 25)) for rf in raw_files},
+    }
+    dict_ref = _build_group_dict_ref(raw_files, anchors)
+
+    return match_features_batch(
+        dict_ref=dict_ref,
+        raw_file_list=raw_files,
+        result_dir=str(tmp_path),
+        batch=[1, 2, 3],
+        processing_kwargs={"apply_seg": True},
+        match_decoy=False,
+    )
+
+
+class TestMatchFeaturesBatchConfounderGroups:
+    def test_bimodal_signal_separates_group_members_no_collision(self, tmp_path):
+        """Two distinguishable sub-peaks within the shared merged image -> A
+        and B each independently align + segment their own image, and each
+        one's own assigned segment lands on a different, non-overlapping
+        region -> both correctly quantified independently, no
+        undistinguishable flag."""
+        (
+            results_target,
+            results_decoy,
+            pp_reference_list,
+            pp_match_target_list,
+            pp_match_decoy_list,
+            no_quant_log,
+            no_match_log,
+            snap_log_collection,
+        ) = _run_group_scenario(
+            tmp_path,
+            group_blobs=[(15, 8, 10.0, 2.0), (15, 18, 10.0, 2.0)],
+            a_anchor_offset=(15, 8),
+            b_anchor_offset=(15, 18),
+        )
+        pp_ref = pd.concat(pp_reference_list)
+        pp_match = pd.concat(pp_match_target_list)
+        by_rank_ref = pp_ref.set_index("mz_rank")
+        by_rank_match = pp_match.set_index("mz_rank")
+
+        assert by_rank_ref.loc[1, "undistinguishable_group_id"] == -1
+        assert by_rank_ref.loc[2, "undistinguishable_group_id"] == -1
+        assert by_rank_ref.loc[3, "undistinguishable_group_id"] == -1
+        assert by_rank_match.loc[1, "undistinguishable_group_id"] == -1
+        assert by_rank_match.loc[2, "undistinguishable_group_id"] == -1
+        # correctly told apart: distinct quantification for A vs B
+        assert by_rank_ref.loc[1, "area"] != by_rank_ref.loc[2, "area"]
+
+    def test_unimodal_signal_flags_group_members_as_undistinguishable(self, tmp_path):
+        """A single peak in the shared merged image -> A and B each
+        independently align + segment their own image, and each one's own
+        assigned segment (there's only one label to land on) overlaps the
+        other's -> flagged with a shared undistinguishable_group_id. Their
+        quantification is no longer forced identical by construction (each
+        is computed fully independently) -- it happens to match here only
+        because both use identical anchors/runs/windows, not because that's
+        a guaranteed invariant of the new design."""
+        (
+            results_target,
+            results_decoy,
+            pp_reference_list,
+            pp_match_target_list,
+            pp_match_decoy_list,
+            no_quant_log,
+            no_match_log,
+            snap_log_collection,
+        ) = _run_group_scenario(
+            tmp_path,
+            group_blobs=[(15, 12, 10.0, 2.0)],
+            a_anchor_offset=(15, 12),
+            b_anchor_offset=(15, 12),
+        )
+        pp_ref = pd.concat(pp_reference_list)
+        pp_match = pd.concat(pp_match_target_list)
+        by_rank_ref = pp_ref.set_index("mz_rank")
+        by_rank_match = pp_match.set_index("mz_rank")
+
+        tag_ref = by_rank_ref.loc[1, "undistinguishable_group_id"]
+        assert tag_ref != -1
+        assert by_rank_ref.loc[2, "undistinguishable_group_id"] == tag_ref
+        assert by_rank_ref.loc[3, "undistinguishable_group_id"] == -1  # solo untouched
+        tag_match = by_rank_match.loc[1, "undistinguishable_group_id"]
+        assert tag_match != -1
+        assert by_rank_match.loc[2, "undistinguishable_group_id"] == tag_match
+
+        # both are still genuinely quantified (not dropped just for overlapping)
+        assert by_rank_ref.loc[1, "area"] > 0
+        assert by_rank_ref.loc[2, "area"] > 0
+
+    def test_solo_candidate_unaffected_by_group_presence(self, tmp_path):
+        """C's own quantification and -1 tag hold regardless of whether the
+        other group members' signal happens to be separable or not."""
+        for group_blobs, a_off, b_off in [
+            ([(15, 8, 10.0, 2.0), (15, 18, 10.0, 2.0)], (15, 8), (15, 18)),
+            ([(15, 12, 10.0, 2.0)], (15, 12), (15, 12)),
+        ]:
+            (_, _, pp_reference_list, pp_match_target_list, *_rest) = (
+                _run_group_scenario(tmp_path, group_blobs, a_off, b_off)
+            )
+            pp_ref = pd.concat(pp_reference_list).set_index("mz_rank")
+            pp_match = pd.concat(pp_match_target_list).set_index("mz_rank")
+            assert pp_ref.loc[3, "undistinguishable_group_id"] == -1
+            assert pp_match.loc[3, "undistinguishable_group_id"] == -1
+            assert pp_ref.loc[3, "area"] > 0
+
+    def test_merge_confounders_disabled_ignores_stale_group_id_column(
+        self, tmp_path
+    ):
+        """Backward compatibility: dict_ref may still carry a confounder_group_id
+        column left over from a previous run with coSWA enabled (e.g. a
+        reused dict_ref.pkl), but if PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED
+        is now False for this run, every candidate must be treated as solo,
+        fetching its own individually-stored activation (mirroring
+        test_no_confounder_group_id_column_behaves_as_before, just with the
+        stale column present) -- undistinguishable_group_id stays -1 for
+        everyone and no candidate silently loses its data."""
+        raw_files = ["run1", "run2"]
+        img_a = _group_blob_image([(15, 12, 10.0, 2.0)])
+        img_b = _group_blob_image([(15, 12, 10.0, 2.0)])
+        img_c = _group_blob_image([(25, 25, 10.0, 2.0)])
+        for rf in raw_files:
+            _write_combined_activation_parquet(
+                os.path.join(tmp_path, rf, "activation"),
+                {1: img_a, 2: img_b, 3: img_c},
+            )
+
+        def _abs(offset):
+            return (_RT_RANGE[0] + offset[0], _IM_RANGE[0] + offset[1])
+
+        rows = []
+        for mz_rank, group_id, off in [
+            (1, 1001, (15, 12)),
+            (2, 1001, (15, 12)),
+            (3, -1, (25, 25)),
+        ]:
+            row = {"mz_rank": mz_rank, "confounder_group_id": group_id}
+            for i, rf in enumerate(raw_files):
+                row[rf] = "Reference" if i == 0 else "Match"
+                row[f"MS1_frame_idx_left_ref_{rf}"] = _RT_RANGE[0]
+                row[f"MS1_frame_idx_right_ref_{rf}"] = _RT_RANGE[1]
+                row[f"mobility_values_index_left_ref_{rf}"] = _IM_RANGE[0]
+                row[f"mobility_values_index_right_ref_{rf}"] = _IM_RANGE[1]
+                rt_c, im_c = _abs(off)
+                row[f"{rf}_MS1_frame_idx_exp"] = rt_c
+                row[f"{rf}_mobility_values_index_exp"] = im_c
+            rows.append(row)
+        dict_ref = pd.DataFrame(rows)
+
+        (_, _, pp_reference_list, pp_match_target_list, *_rest) = match_features_batch(
+            dict_ref=dict_ref,
+            raw_file_list=raw_files,
+            result_dir=str(tmp_path),
+            batch=[1, 2, 3],
+            processing_kwargs={"apply_seg": True},
+            match_decoy=False,
+            merge_confounders_enabled=False,
+        )
+        pp_ref = pd.concat(pp_reference_list).set_index("mz_rank")
+        pp_match = pd.concat(pp_match_target_list).set_index("mz_rank")
+
+        # all three candidates still got quantified -- none silently dropped
+        # for want of an activation lookup keyed by the stale group id.
+        assert set(pp_ref.index) == {1, 2, 3}
+        assert set(pp_match.index) == {1, 2, 3}
+        assert (pp_ref["undistinguishable_group_id"] == -1).all()
+        assert (pp_match["undistinguishable_group_id"] == -1).all()
+
+    def test_no_confounder_group_id_column_behaves_as_before(self, tmp_path):
+        """Backward compatibility: without confounder_group_id (merging
+        disabled at dict-build time), every candidate is processed
+        independently as today, undistinguishable_group_id defaults to -1
+        for everyone."""
+        raw_files = ["run1", "run2"]
+        img_a = _group_blob_image([(15, 12, 10.0, 2.0)])
+        img_b = _group_blob_image([(15, 12, 10.0, 2.0)])
+        img_c = _group_blob_image([(25, 25, 10.0, 2.0)])
+        for rf in raw_files:
+            _write_combined_activation_parquet(
+                os.path.join(tmp_path, rf, "activation"),
+                {1: img_a, 2: img_b, 3: img_c},
+            )
+
+        def _abs(offset):
+            return (_RT_RANGE[0] + offset[0], _IM_RANGE[0] + offset[1])
+
+        rows = []
+        for mz_rank, off in [(1, (15, 12)), (2, (15, 12)), (3, (25, 25))]:
+            row = {"mz_rank": mz_rank}  # no confounder_group_id column at all
+            for i, rf in enumerate(raw_files):
+                row[rf] = "Reference" if i == 0 else "Match"
+                row[f"MS1_frame_idx_left_ref_{rf}"] = _RT_RANGE[0]
+                row[f"MS1_frame_idx_right_ref_{rf}"] = _RT_RANGE[1]
+                row[f"mobility_values_index_left_ref_{rf}"] = _IM_RANGE[0]
+                row[f"mobility_values_index_right_ref_{rf}"] = _IM_RANGE[1]
+                rt_c, im_c = _abs(off)
+                row[f"{rf}_MS1_frame_idx_exp"] = rt_c
+                row[f"{rf}_mobility_values_index_exp"] = im_c
+            rows.append(row)
+        dict_ref = pd.DataFrame(rows)
+
+        (_, _, pp_reference_list, pp_match_target_list, *_rest) = match_features_batch(
+            dict_ref=dict_ref,
+            raw_file_list=raw_files,
+            result_dir=str(tmp_path),
+            batch=[1, 2, 3],
+            processing_kwargs={"apply_seg": True},
+            match_decoy=False,
+        )
+        pp_ref = pd.concat(pp_reference_list)
+        assert (pp_ref["undistinguishable_group_id"] == -1).all()

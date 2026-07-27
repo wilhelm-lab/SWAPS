@@ -28,6 +28,8 @@ def detect_2d_peak_with_watershed(
     seed_radius: int = 0,
     use_competing_peaks: bool = True,  # new: enable/disable the feature
     # min_distance_to_true_seed: int = 15,  # new: minimum distance from competing peaks to the true seed
+    compactness: float = 0.001,
+    normalize_before_hmaxima: bool = True,
     visualize: bool = False,
 ):
     """
@@ -43,6 +45,17 @@ def detect_2d_peak_with_watershed(
         of the signal above its surrounding saddle.
     - norm_percentile: int
         Percentile of in-mask intensity used to normalise the image before h-maxima.
+    - compactness: float
+        Watershed compactness. Near zero (default) grows basins by steepest-descent
+        on intensity alone, so a weak peak next to a much taller one can lose most of
+        its basin to the neighbor. Larger values regularise growth towards equal-area
+        (Voronoi-like) splits, giving weak peaks a fairer geometric share.
+    - normalize_before_hmaxima: bool
+        If True (default), h-maxima runs on the image divided by its own
+        norm_percentile, so h_rel is a fraction of each image's dynamic range.
+        If False, h-maxima runs on `image` directly and h_rel becomes an
+        absolute prominence threshold in the image's own units (e.g. log10
+        intensity), skipping the percentile normalisation step entirely.
     - visualize: bool
         If True, show a step-by-step matplotlib figure of each stage.
     Returns:
@@ -76,12 +89,18 @@ def detect_2d_peak_with_watershed(
         )
 
     # Normalise once; shared by both auto-detect and competing-peaks branches.
-    _pN = np.percentile(image[mask_signal], norm_percentile)
-    _norm_image = image / _pN if _pN > 0 else image
+    # Skipped when normalize_before_hmaxima=False, since h_maxima then runs
+    # directly on `image` and neither _pN nor _norm_image is needed.
+    if normalize_before_hmaxima:
+        _pN = np.percentile(image[mask_signal], norm_percentile)
+        _hmaxima_image = image / _pN if _pN > 0 else image
+    else:
+        _hmaxima_image = image
 
     if coordinates is None:
-        # Auto-detect mode: peaks must rise ≥ h_rel × p(norm_percentile) above saddle.
-        hmax = h_maxima(_norm_image, h=h_rel) & mask_signal
+        # Auto-detect mode: peaks must rise ≥ h_rel × p(norm_percentile) above saddle
+        # (or ≥ h_rel in the image's own units when normalize_before_hmaxima=False).
+        hmax = h_maxima(_hmaxima_image, h=h_rel) & mask_signal
         if hmax.any():
             peak_labels, n_peaks = ndi.label(hmax)
             coordinates = np.array(
@@ -124,7 +143,7 @@ def detect_2d_peak_with_watershed(
     if use_competing_peaks and coordinates.shape[0] == 1:
         # gradient = sobel(image)
 
-        _hmax_bg = h_maxima(_norm_image, h=h_rel) & mask_signal
+        _hmax_bg = h_maxima(_hmaxima_image, h=h_rel) & mask_signal
         if _hmax_bg.any():
             _lbl_bg, _n_bg = ndi.label(_hmax_bg)
             bg_peaks = np.array(
@@ -169,7 +188,7 @@ def detect_2d_peak_with_watershed(
                     -image,
                     candidate_markers,
                     mask=component_mask,
-                    compactness=0.001,
+                    compactness=compactness,
                 )
                 true_seed_label = candidate_labels[tuple(true_seed)]
 
@@ -232,7 +251,7 @@ def detect_2d_peak_with_watershed(
         markers = np.where(dist <= seed_radius, markers[ri, ci], 0)
 
     labels_multi_markers = watershed(
-        -image, markers, mask=mask_signal, compactness=0.001
+        -image, markers, mask=mask_signal, compactness=compactness
     )
 
     # --- new: when competing peaks were used, only return true seed's region ---
@@ -623,8 +642,9 @@ def smooth_and_denoise_image(
         r_kw = dict(clean.get("remove_kwargs") or {})
         if "min_size" not in r_kw:
             r_kw["min_size"] = 5
-        cleaned_mask = remove_small_objects(result >= threshold, **r_kw)
-        result = result * cleaned_mask
+        cleaned_mask = remove_small_objects(result > 0, **r_kw, connectivity=2)
+        threshold_mask = result >= threshold
+        result = cleaned_mask * threshold_mask * result
     if log_transform:
         result = np.log2(1 + result)
     return result

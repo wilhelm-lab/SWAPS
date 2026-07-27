@@ -606,9 +606,10 @@ def dict_add_confounding_groups(
 ) -> pd.DataFrame:
     """
     For each candidate find all others within |Δmz_bin| ≤ 10^-mz_bin_digits
-    that also overlap in both RT and IM search windows. Adds column
-    'confounders' — a numpy int array of confounding mz_rank values per row.
-    Used downstream to constrain decoy mz sampling away from occupied regions.
+    that also share the same charge state and overlap in both RT and IM
+    search windows. Adds column 'confounders' — a numpy int array of
+    confounding mz_rank values per row. Used downstream to constrain decoy
+    mz sampling away from occupied regions.
     """
     mz_tol = 10.0 ** (-mz_bin_digits) + 1e-9
 
@@ -621,6 +622,7 @@ def dict_add_confounding_groups(
     im_left = sorted_df["IM_search_left"].to_numpy(dtype=float)
     im_right = sorted_df["IM_search_right"].to_numpy(dtype=float)
     mz_ranks = sorted_df["mz_rank"].to_numpy(dtype=int)
+    charges = sorted_df["Charge"].to_numpy()
 
     n = len(sorted_df)
     confounders = np.empty(n, dtype=object)
@@ -635,13 +637,221 @@ def dict_add_confounding_groups(
             confounders[i] = np.empty(0, dtype=int)
             continue
 
+        charge_match = charges[ni] == charges[i]
         rt_overlap = (rt_left[ni] <= rt_right[i]) & (rt_left[i] <= rt_right[ni])
         im_overlap = (im_left[ni] <= im_right[i]) & (im_left[i] <= im_right[ni])
-        confounders[i] = mz_ranks[ni[rt_overlap & im_overlap]]
+        confounders[i] = mz_ranks[ni[charge_match & rt_overlap & im_overlap]]
 
     result = maxquant_dict_df.copy()
     result["confounders"] = pd.Series(confounders, index=orig_index)
     result["count_confounders"] = result["confounders"].apply(len)
+    return result
+
+
+def _interval_overlap_frac(al: float, ar: float, bl: float, br: float) -> float:
+    """Fraction of the narrower [l, r] interval covered by the overlap of
+    [al, ar] and [bl, br]; 0.0 if disjoint. Used to score how well a
+    candidate co-elutes / co-mobilises with a confounder group."""
+    inter = min(ar, br) - max(al, bl)
+    if inter <= 0:
+        return 0.0
+    span = min(ar - al, br - bl)
+    return inter / span if span > 0 else 0.0
+
+
+def dict_add_confounder_group_id(
+    maxquant_dict_df: pd.DataFrame,
+    group_id_offset: int = -1,
+    exclude_cross_target_decoy: bool = True,
+) -> pd.DataFrame:
+    """
+    Partition the pairwise 'confounders' adjacency (dict_add_confounding_groups)
+    into "confounder groups", used by coSWA to merge a group's SWA candidate
+    rows into one during scan-wise activation.
+
+    Unlike connected components (single-linkage), this uses a greedy
+    complete-linkage (clique) partition: a candidate joins a group only if it
+    confounds EVERY current member, so every pair in a group mutually
+    confounds. This avoids the chaining where non-transitive m/z / RT / IM
+    overlaps collapse far-apart candidates into one huge group. Seeds are
+    processed in ascending-degree order (yields tight groups); ties for the
+    next member are broken by the largest RT x IM window-overlap fraction
+    against the group's running centroid window. Each candidate ends up in
+    exactly one group (a partition); a node out-competed out of every clique
+    stays solo (the safe, no-merge direction).
+
+    Adds 'confounder_group_id': group_id_offset + min(mz_rank) within each
+    group of size >= 2; -1 for solo candidates. group_id_offset places group
+    ids in a range disjoint from all real mz_rank values, so a group id can
+    never be mistaken for a real candidate's own mz_rank downstream. If
+    group_id_offset < 0, it is auto-derived as
+    10 ** (ceil(log10(max mz_rank)) + 1). Ids stay unique because the partition
+    is disjoint (each group's min mz_rank belongs to that group alone).
+
+    If exclude_cross_target_decoy is True and a 'Decoy' column is present,
+    edges between a target and a decoy are dropped first, so a target's SWA
+    activation can never be merged with an unrelated decoy's.
+
+    Requires 'confounders', 'mz_rank' and the RT/IM search-window columns
+    (run after dict_add_confounding_groups).
+    """
+    assert "confounders" in maxquant_dict_df.columns
+    assert "mz_rank" in maxquant_dict_df.columns
+
+    mz_ranks = maxquant_dict_df["mz_rank"].to_numpy(dtype=np.int64)
+    n = len(mz_ranks)
+    rank_to_pos = {int(r): i for i, r in enumerate(mz_ranks)}
+
+    rt_l = maxquant_dict_df["RT_search_left"].to_numpy(dtype=float)
+    rt_r = maxquant_dict_df["RT_search_right"].to_numpy(dtype=float)
+    im_l = maxquant_dict_df["IM_search_left"].to_numpy(dtype=float)
+    im_r = maxquant_dict_df["IM_search_right"].to_numpy(dtype=float)
+
+    decoy = (
+        maxquant_dict_df["Decoy"].to_numpy()
+        if exclude_cross_target_decoy and "Decoy" in maxquant_dict_df.columns
+        else None
+    )
+
+    # symmetric neighbour sets (positional) with optional target/decoy filtering
+    neigh = [set() for _ in range(n)]
+    for pos, conf in enumerate(maxquant_dict_df["confounders"].to_numpy()):
+        for c in conf:
+            other = rank_to_pos.get(int(c))
+            if other is None or other == pos:
+                continue
+            if decoy is not None and bool(decoy[pos]) != bool(decoy[other]):
+                continue
+            neigh[pos].add(other)
+            neigh[other].add(pos)
+
+    if group_id_offset is None or group_id_offset < 0:
+        max_mz_rank = int(mz_ranks.max()) if n > 0 else 0
+        group_id_offset = 10 ** (int(np.ceil(np.log10(max(max_mz_rank, 1) + 1))) + 1)
+    assert group_id_offset + int(mz_ranks.max() if n > 0 else 0) < np.iinfo(
+        np.uint32
+    ).max, "GROUP_ID_OFFSET too large: confounder_group_id would overflow uint32"
+
+    # greedy complete-linkage (clique) partition
+    assigned = np.full(n, -1, dtype=np.int64)  # -1 = unassigned / available
+    degree = np.fromiter((len(s) for s in neigh), dtype=np.int64, count=n)
+    cliques: List[list] = []
+    for seed in np.argsort(degree, kind="stable"):  # ascending degree
+        if assigned[seed] != -1:
+            continue
+        members = [seed]
+        crl, crr, cil, cir = rt_l[seed], rt_r[seed], im_l[seed], im_r[seed]
+        cand = {j for j in neigh[seed] if assigned[j] == -1}
+        while cand:
+            best, best_score = -1, -1.0
+            for j in cand:
+                score = _interval_overlap_frac(
+                    crl, crr, rt_l[j], rt_r[j]
+                ) * _interval_overlap_frac(cil, cir, im_l[j], im_r[j])
+                if score > best_score:
+                    best, best_score = j, score
+            members.append(best)
+            m = len(members)
+            crl += (rt_l[best] - crl) / m
+            crr += (rt_r[best] - crr) / m
+            cil += (im_l[best] - cil) / m
+            cir += (im_r[best] - cir) / m
+            # keep only candidates still adjacent to EVERY member (clique)
+            cand = {
+                j
+                for j in cand
+                if j != best and assigned[j] == -1 and j in neigh[best]
+            }
+        if len(members) >= 2:
+            cid = len(cliques)
+            for mm in members:
+                assigned[mm] = cid
+            cliques.append(members)
+
+    group_id = np.full(n, -1, dtype=np.int64)
+    for members in cliques:
+        idx = np.asarray(members)
+        group_id[idx] = group_id_offset + int(mz_ranks[idx].min())
+
+    result = maxquant_dict_df.copy()
+    result["confounder_group_id"] = group_id
+    return result
+
+
+def dict_add_merged_confounder_pattern(
+    maxquant_dict_df: pd.DataFrame, mz_bin_digits: int = 2
+) -> pd.DataFrame:
+    """
+    For each multi-member confounder group (confounder_group_id != -1),
+    compute one merged isotope pattern shared by the whole group: the union
+    of member IsoMZ (binned at mz_bin_digits), taking the max IsoAbundance at
+    each matched m/z bin, renormalized to sum to 1. RT and IM windows are the
+    union (min left, max right) of member windows. Stored as new
+    GroupIsoMZ/GroupIsoAbundance/GroupRT_search_left/GroupRT_search_right/
+    GroupIM_search_left/GroupIM_search_center/GroupIM_search_right/
+    GroupMzLength columns, populated for every row -- solo candidates
+    (confounder_group_id == -1) get their own IsoMZ/IsoAbundance/
+    RT_search_left/RT_search_right/IM_search_*/mz_length copied through
+    unchanged, so callers can always read the Group* columns regardless of
+    whether a candidate is grouped. GroupIM_search_center is derived as the
+    midpoint of the (union) IM window for every row -- used only as
+    dict_add_im_index's merge anchor; cropping reads only left/right.
+
+    Requires confounder_group_id (run after dict_add_confounder_group_id).
+    Does not require mz_length to already exist (may run before
+    dict_add_mz_len) -- GroupMzLength is derived from IsoMZ directly.
+    """
+    assert "confounder_group_id" in maxquant_dict_df.columns
+
+    result = maxquant_dict_df.copy()
+    result["GroupIsoMZ"] = result["IsoMZ"]
+    result["GroupIsoAbundance"] = result["IsoAbundance"]
+    result["GroupRT_search_left"] = result["RT_search_left"]
+    result["GroupRT_search_right"] = result["RT_search_right"]
+    result["GroupIM_search_left"] = result["IM_search_left"]
+    result["GroupIM_search_right"] = result["IM_search_right"]
+    result["GroupMzLength"] = result["IsoMZ"].apply(len)
+
+    grouped = result.loc[result["confounder_group_id"] != -1].groupby(
+        "confounder_group_id"
+    )
+    for group_id, members in grouped:
+        all_mz = np.concatenate(members["IsoMZ"].to_numpy())
+        all_ab = np.concatenate(members["IsoAbundance"].to_numpy())
+        mz_bins = np.round(all_mz, mz_bin_digits)
+        unique_bins, inverse = np.unique(mz_bins, return_inverse=True)
+
+        merged_ab = np.zeros(len(unique_bins))
+        np.maximum.at(merged_ab, inverse, all_ab)
+
+        merged_mz_sum = np.zeros(len(unique_bins))
+        np.add.at(merged_mz_sum, inverse, all_mz)
+        bin_counts = np.bincount(inverse, minlength=len(unique_bins))
+        merged_mz = merged_mz_sum / bin_counts
+
+        order = np.argsort(merged_mz)
+        merged_mz = merged_mz[order]
+        merged_ab = merged_ab[order] / merged_ab.sum()
+
+        idx = members.index
+        result.loc[idx, "GroupIsoMZ"] = pd.Series(
+            [merged_mz] * len(idx), index=idx
+        )
+        result.loc[idx, "GroupIsoAbundance"] = pd.Series(
+            [merged_ab] * len(idx), index=idx
+        )
+        result.loc[idx, "GroupRT_search_left"] = members["RT_search_left"].min()
+        result.loc[idx, "GroupRT_search_right"] = members["RT_search_right"].max()
+        result.loc[idx, "GroupIM_search_left"] = members["IM_search_left"].min()
+        result.loc[idx, "GroupIM_search_right"] = members["IM_search_right"].max()
+        result.loc[idx, "GroupMzLength"] = len(merged_mz)
+
+    # Midpoint of the (union) IM window -- only used as dict_add_im_index's
+    # merge anchor; cropping reads GroupIM_search_left/right.
+    result["GroupIM_search_center"] = (
+        result["GroupIM_search_left"] + result["GroupIM_search_right"]
+    ) / 2
+
     return result
 
 
@@ -689,6 +899,42 @@ def dict_add_mass_mono(maxquant_dict_df: pd.DataFrame):
     return maxquant_dict_df
 
 
+def _modpept_atom_composition(modpept: str, charge: int, mod_CAM: bool = True):
+    """Build the elemental composition of a (possibly modified) peptide.
+
+    Counts modifications on the raw string, then strips ALL modification tokens
+    -- parenthesised spellings, bracket nominal-mass tokens ([43] acetyl, [147]
+    ox-Met), and lowercase terminal markers (the n/c in n[43]... N-/C-term
+    encoding) -- before iso.ParseFASTA. Stripping the lowercase markers is
+    essential: ParseFASTA otherwise reads a leading 'n' as an Asparagine
+    residue (+114.0429 Da). Extra atoms for water, charge protons, N-term
+    acetyl, ox-Met and carbamidomethyl (CAM) are then added back.
+
+    Shared by calculate_modpept_isopattern and calculate_modpept_mz.
+    """
+    n_H = 2 + charge  # 2 from water and others from charge (proton)
+    n_Mox = (
+        modpept.count("M(ox)") + modpept.count("Oxidation (M)") + modpept.count("[147]")
+    )
+    n_acetylN = (
+        modpept.count("(ac)")
+        + modpept.count("(Acetyl (Protein N-term))")
+        + modpept.count("[43]")
+    )
+
+    seq = re.sub(r"\([^)]*\)", "", modpept)  # drop (ox)/(Acetyl (Protein N-term))
+    seq = re.sub(r"\[[^\]]*\]", "", seq)  # drop [43]/[147] nominal-mass tokens
+    seq = re.sub(r"[a-z]", "", seq)  # drop lowercase n/c terminal markers
+
+    n_C = seq.count("C") if mod_CAM else 0
+    atom_composition = iso.ParseFASTA(seq)
+    atom_composition["H"] += 3 * n_C + n_H + 2 * n_acetylN
+    atom_composition["C"] += 2 * n_C + 2 * n_acetylN
+    atom_composition["N"] += 1 * n_C
+    atom_composition["O"] += 1 * n_C + 1 + n_acetylN + 1 * n_Mox
+    return atom_composition
+
+
 def calculate_modpept_isopattern(
     modpept: str, charge: int, ab_thres: float = 0.005, mod_CAM: bool = True
 ):
@@ -704,35 +950,7 @@ def calculate_modpept_isopattern(
 
     return: two list
     """
-
-    # account for extra atoms from modification and water
-    # count extra atoms
-    n_H = 2 + charge  # 2 from water and others from charge (proton)
-    n_Mox = (
-        modpept.count("M(ox)") + modpept.count("Oxidation (M)") + modpept.count("[147]")
-    )
-    modpept = modpept.replace("(ox)", "")
-    modpept = modpept.replace("(Oxidation (M))", "")
-    n_acetylN = (
-        modpept.count("(ac)")
-        + modpept.count("(Acetyl (Protein N-term))")
-        + modpept.count("[43]")
-    )
-    modpept = modpept.replace("(Acetyl (Protein N-term))", "")
-    modpept = modpept.replace("(ac)", "")
-
-    if mod_CAM:
-        n_C = modpept.count("C")
-    else:
-        n_C = 0
-    # addition of extra atoms
-    atom_composition = iso.ParseFASTA(modpept)
-    atom_composition["H"] += 3 * n_C + n_H + 2 * n_acetylN
-    atom_composition["C"] += 2 * n_C + 2 * n_acetylN
-    atom_composition["N"] += 1 * n_C
-    atom_composition["O"] += 1 * n_C + 1 + n_acetylN + 1 * n_Mox
-
-    # Isotope calculation
+    atom_composition = _modpept_atom_composition(modpept, charge, mod_CAM=mod_CAM)
     formula = "".join([f"{key}{value}" for key, value in atom_composition.items()])
     iso_distr = iso.IsoThreshold(formula=formula, threshold=ab_thres, absolute=True)
     iso_distr.sort_by_mass()
@@ -751,29 +969,7 @@ def calculate_modpept_mz(modpept: str, charge: int, mod_CAM: bool = True):
     :mod_CAM: bool, whether to consider CAM modification
     return: two list
     """
-
-    # account for extra atoms from modification and water
-    # count extra atoms
-    n_H = 2 + charge  # 2 from water and others from charge (proton)
-    n_Mox = modpept.count("M(ox)") + modpept.count("Oxidation (M)")
-    modpept = modpept.replace("(ox)", "")
-    modpept = modpept.replace("(Oxidation (M))", "")
-    n_acetylN = modpept.count("(ac)") + modpept.count("(Acetyl (Protein N-term))")
-    modpept = modpept.replace("(Acetyl (Protein N-term))", "")
-    modpept = modpept.replace("(ac)", "")
-
-    if mod_CAM:
-        n_C = modpept.count("C")
-    else:
-        n_C = 0
-    # addition of extra atoms
-    atom_composition = iso.ParseFASTA(modpept)
-    atom_composition["H"] += 3 * n_C + n_H + 2 * n_acetylN
-    atom_composition["C"] += 2 * n_C + 2 * n_acetylN
-    atom_composition["N"] += 1 * n_C
-    atom_composition["O"] += 1 * n_C + 1 + n_acetylN + 1 * n_Mox
-
-    # Isotope calculation
+    atom_composition = _modpept_atom_composition(modpept, charge, mod_CAM=mod_CAM)
     formula = "".join([f"{key}{value}" for key, value in atom_composition.items()])
     iso_distr = iso.IsoThreshold(formula=formula, threshold=0.1, absolute=True)
     iso_distr.sort_by_prob()
@@ -1476,6 +1672,15 @@ def construct_dict_from_search_pivoted(
         maxquant_dict_df=evidence_group_summary,
         mz_bin_digits=cfg_prepare_dict.MZ_BIN_DIGITS,
     )
+    if cfg_prepare_dict.MERGE_CONFOUNDERS.ENABLED:
+        evidence_group_summary = dict_add_confounder_group_id(
+            evidence_group_summary,
+            group_id_offset=cfg_prepare_dict.MERGE_CONFOUNDERS.GROUP_ID_OFFSET,
+            exclude_cross_target_decoy=cfg_prepare_dict.MERGE_CONFOUNDERS.EXCLUDE_CROSS_TARGET_DECOY,
+        )
+        evidence_group_summary = dict_add_merged_confounder_pattern(
+            evidence_group_summary, mz_bin_digits=cfg_prepare_dict.MZ_BIN_DIGITS
+        )
 
     evidence_group_summary = dict_add_mz_len(maxquant_dict_df=evidence_group_summary)
 
@@ -1867,6 +2072,15 @@ def construct_dict(
         maxquant_dict_df=maxquant_dict,
         mz_bin_digits=cfg_prepare_dict.MZ_BIN_DIGITS,
     )
+    if cfg_prepare_dict.MERGE_CONFOUNDERS.ENABLED:
+        maxquant_dict = dict_add_confounder_group_id(
+            maxquant_dict,
+            group_id_offset=cfg_prepare_dict.MERGE_CONFOUNDERS.GROUP_ID_OFFSET,
+            exclude_cross_target_decoy=cfg_prepare_dict.MERGE_CONFOUNDERS.EXCLUDE_CROSS_TARGET_DECOY,
+        )
+        maxquant_dict = dict_add_merged_confounder_pattern(
+            maxquant_dict, mz_bin_digits=cfg_prepare_dict.MZ_BIN_DIGITS
+        )
     maxquant_dict = dict_add_mz_len(maxquant_dict_df=maxquant_dict)
 
     pept_batch_size = ceil(maxquant_dict.shape[0] / n_blocks_by_pept) + 1

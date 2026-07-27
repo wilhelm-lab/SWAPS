@@ -268,6 +268,37 @@ class TestTimestampLogic:
 
 
 # ---------------------------------------------------------------------------
+# _quant_dir FDR suffix (mirrors sbs_runner_ims.py logic)
+# ---------------------------------------------------------------------------
+
+
+class TestQuantDirFdrSuffix:
+    """Mirrors sbs_runner_ims._quant_dir: appends '_no_fdr' to the quant
+    output dir name when FDR control is disabled, so the two run modes never
+    collide and the directory name alone tells you which one produced it."""
+
+    def _quant_dir(self, cfg):
+        dir_name = cfg.MATCH_FEATURES_KWARGS.dir_name
+        if not cfg.FDR.ENABLED:
+            dir_name += "_no_fdr"
+        return os.path.join(cfg.RESULT_PATH, dir_name)
+
+    def test_no_suffix_when_fdr_enabled(self, cfg, tmp_path):
+        cfg.RESULT_PATH = str(tmp_path)
+        cfg.FDR.ENABLED = True
+        assert self._quant_dir(cfg) == os.path.join(
+            str(tmp_path), cfg.MATCH_FEATURES_KWARGS.dir_name
+        )
+
+    def test_no_fdr_suffix_when_fdr_disabled(self, cfg, tmp_path):
+        cfg.RESULT_PATH = str(tmp_path)
+        cfg.FDR.ENABLED = False
+        assert self._quant_dir(cfg) == os.path.join(
+            str(tmp_path), cfg.MATCH_FEATURES_KWARGS.dir_name + "_no_fdr"
+        )
+
+
+# ---------------------------------------------------------------------------
 # N_CPU / N_BATCH auto-detection (mirrors sbs_runner_ims.py logic)
 # ---------------------------------------------------------------------------
 

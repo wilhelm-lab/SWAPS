@@ -70,7 +70,10 @@ def prepare_percolator_input(
         inplace=True,
     )
     df_pin["peptide"] = "-." + df_pin["peptide"] + ".-"
-    df_pin = df_pin[["id", "label", "scannr"] + feature_cols + ["peptide", "proteins"]]
+    df_pin["filename"] = df_pin[filename_col]
+    df_pin = df_pin[
+        ["id", "label", "scannr", "filename"] + feature_cols + ["peptide", "proteins"]
+    ]
     return df_pin
 
 
@@ -286,9 +289,16 @@ def brew_with_mokapot(
     return result, model, psms
 
 
+_PERCOLATOR_POST_PROCESSING_FLAGS = {
+    "tdc": "-Y",
+    "mix-max": "-y",
+}
+
+
 def brew_with_percolator(
-    peptide_info_dataframe: pd.DataFrame,
+    peptide_info_dataframe: pd.DataFrame | None = None,
     work_dir: Optional[str] = None,
+    post_processing: str = "tdc",
     **kwargs,
 ):
     """
@@ -306,6 +316,10 @@ def brew_with_percolator(
         Unused — kept for API symmetry with brew_with_mokapot.
     work_dir : str, optional
         Directory to write input/output files (default: current working directory).
+    post_processing : str, optional
+        Percolator post-processing method for assigning q-values/PEPs: "tdc"
+        (target-decoy competition, passed as -Y) or "mix-max" (passed as -y).
+        Default: "tdc".
     **kwargs
         Forwarded to prepare_percolator_input (e.g. feature_cols, decoy_col, peptide_col).
 
@@ -317,6 +331,12 @@ def brew_with_percolator(
         concatenated with a "label" column (1 = target, -1 = decoy) — mirrors the
         mokapot return convention.
     """
+    if post_processing not in _PERCOLATOR_POST_PROCESSING_FLAGS:
+        raise ValueError(
+            f"post_processing must be one of {list(_PERCOLATOR_POST_PROCESSING_FLAGS)}, "
+            f"got {post_processing!r}"
+        )
+
     if work_dir is None:
         work_dir = os.getcwd()
     else:
@@ -354,7 +374,7 @@ def brew_with_percolator(
 
     cmd = [
         "percolator",
-        "-y",
+        _PERCOLATOR_POST_PROCESSING_FLAGS[post_processing],
         "--only-psms",
         "-I",
         "separate",

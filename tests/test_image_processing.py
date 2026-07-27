@@ -237,6 +237,7 @@ def _make_alignment_state(shape=(20, 20), anchor=(10, 10)) -> ConsensusAlignment
         aligned_images=[img],
         matched_boxes=[(r - 2, c - 2, r + 2, c + 2)],
         aligned_anchors=[(float(r), float(c))],
+        scaled_anchors=[(float(r), float(c))],
         shifts=[(0, 0)],
         max_scores=[1.0],
     )
@@ -312,6 +313,7 @@ class TestSegmentConsensusJumpDistThres:
             aligned_images=[img],
             matched_boxes=[(anchor[0] - 2, anchor[1] - 2, anchor[0] + 2, anchor[1] + 2)],
             aligned_anchors=[(float(anchor[0]), float(anchor[1]))],
+            scaled_anchors=[(float(anchor[0]), float(anchor[1]))],
             shifts=[(0, 0)],
             max_scores=[1.0],
         )
@@ -407,6 +409,7 @@ class TestSegmentConsensusJumpDistThres:
             aligned_images=[img, img],
             matched_boxes=[(18, 18, 22, 22), (18, 18, 22, 22)],
             aligned_anchors=[(5.0, 5.0), (20.0, 20.0)],
+            scaled_anchors=[(5.0, 5.0), (20.0, 20.0)],
             shifts=[(0, 0), (0, 0)],
             max_scores=[1.0, 1.0],
         )
@@ -453,6 +456,7 @@ class TestSegmentConsensusImageIndices:
             aligned_images=[img_signal, img_noise],
             matched_boxes=[(r - 2, c - 2, r + 2, c + 2)] * 2,
             aligned_anchors=[(float(r), float(c)), None],
+            scaled_anchors=[(float(r), float(c)), None],
             shifts=[(0, 0), (0, 0)],
             max_scores=[1.0, 0.5],
         )

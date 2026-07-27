@@ -7,6 +7,7 @@ from matplotlib.gridspec import GridSpec
 import numpy as np
 from typing import Optional
 import seaborn as sns
+from statsmodels.nonparametric.smoothers_lowess import lowess
 
 Logger = logging.getLogger(__name__)
 ALLOWED_ORGANISMS = ("HUMAN", "YEAST", "ECOLI")
@@ -17,17 +18,82 @@ ORGANISM_NAME_MAP = {
 }
 
 
+def undistinguishable_excl_output_name(output_name: str) -> str:
+    """DirectLFQ input filename for the version that excludes ions flagged as
+    belonging to a spatially undistinguishable coSWA confounder group (see
+    reformat_swaps_combined_for_directlfq). Only actually written when at
+    least one ion is flagged -- callers should check the path exists before
+    using it (e.g. before running DirectLFQ on it)."""
+    base_name, ext = os.path.splitext(output_name)
+    return f"{base_name}_excl_undistinguishable{ext}"
+
+
+def _log_and_write_undistinguishable_split(
+    reformatted_df: pd.DataFrame,
+    output_cols: list,
+    output_dir: str,
+    output_name: str,
+) -> None:
+    """Log the undistinguishable_group_id breakdown and, if any ion actually
+    belongs to a flagged coSWA confounder group (a value other than -1 or
+    NaN), additionally write a second DirectLFQ input with those ions
+    dropped entirely -- for comparing LFQ results with/without them.
+    """
+    gid = reformatted_df["undistinguishable_group_id"]
+    is_nan = gid.isna()
+    is_neg1 = ~is_nan & gid.astype(str).isin(["-1", "-1.0"])
+    is_other = ~is_nan & ~is_neg1
+    if not is_other.any():
+        return
+    Logger.info(
+        "undistinguishable_group_id breakdown among %d ions: -1=%d, NaN=%d, "
+        "other=%d (%d unique group id(s))",
+        len(gid),
+        int(is_neg1.sum()),
+        int(is_nan.sum()),
+        int(is_other.sum()),
+        int(gid[is_other].nunique()),
+    )
+    excl_name = undistinguishable_excl_output_name(output_name)
+    reformatted_df.loc[~is_other, output_cols].to_csv(
+        os.path.join(output_dir, excl_name), index=False, sep="\t"
+    )
+    Logger.info(
+        "Wrote DirectLFQ input excluding %d undistinguishable ion(s) to %s",
+        int(is_other.sum()),
+        excl_name,
+    )
+
+
 def reformat_swaps_combined_for_directlfq(
     combined_ion,
     dict_ref,
     output_dir,
+    keep_match_type_col: bool = False,
     ion_id_col="mz_rank",
     protein_id_col="Proteins",
     output_name="swaps.aq_reformat.tsv",
 ):
     intensity_cols = [col for col in combined_ion.columns if col.endswith("Intensity")]
+    combined_ion = combined_ion.copy()
+    for intensity_col in intensity_cols:
+        match_type_col = intensity_col.replace("Intensity", "Match Type")
+        if match_type_col in combined_ion.columns:
+            # MBR hits inside a coSWA confounder group whose independently-
+            # computed segments overlap cannot be attributed to one specific
+            # member (see build_pivot) -- excluded from LFQ input entirely.
+            combined_ion.loc[
+                combined_ion[match_type_col] == "MBR_undistinguished", intensity_col
+            ] = np.nan
+    if keep_match_type_col:
+        intensity_cols += [col for col in combined_ion.columns if col == "Match Type"]
+
+    has_group_id = "undistinguishable_group_id" in combined_ion.columns
+    merge_cols = intensity_cols + [ion_id_col]
+    if has_group_id:
+        merge_cols = merge_cols + ["undistinguishable_group_id"]
     reformatted_df = pd.merge(
-        combined_ion[intensity_cols + [ion_id_col]],
+        combined_ion[merge_cols],
         dict_ref[[ion_id_col, protein_id_col]],
         on=ion_id_col,
         how="left",
@@ -36,11 +102,66 @@ def reformat_swaps_combined_for_directlfq(
     intensity_cols_rename_map[protein_id_col] = "protein"
     intensity_cols_rename_map[ion_id_col] = "ion"
     reformatted_df = reformatted_df.rename(columns=intensity_cols_rename_map)
-    reformatted_df = reformatted_df[
-        ["protein", "ion"] + list(intensity_cols_rename_map.values())[:-2]
-    ]
+    output_cols = ["protein", "ion"] + list(intensity_cols_rename_map.values())[:-2]
+
+    if has_group_id:
+        _log_and_write_undistinguishable_split(
+            reformatted_df, output_cols, output_dir, output_name
+        )
+
+    reformatted_df = reformatted_df[output_cols]
     reformatted_df.to_csv(os.path.join(output_dir, output_name), index=False, sep="\t")
     return reformatted_df
+
+
+def reformat_fragpipe_combined_ion_for_directlfq(
+    combined_ion,
+    output_dir,
+    protein_col="Protein",
+    seq_col="Modified Sequence",
+    charge_col="Charge",
+    intensity_suffix=" Intensity",
+    output_name="combined_ion.tsv.charge_aware.aq_reformat.tsv",
+):
+    """DirectLFQ's built-in "fragpipe_precursors" input config keys the ion
+    identity on `Modified Sequence` alone (see directlfq's
+    configs/intable_config.yaml), silently merging different charge states of
+    the same modified peptide into one "ion" -- `import_data`'s
+    `drop_duplicates(subset="ion")` then keeps only one charge state and
+    drops the rest. This reformats FragPipe's combined_ion.tsv into a
+    directLFQ-ready table with a charge-aware ion id (Modified Sequence +
+    Charge) instead, so every precursor survives.
+
+    The output filename must contain "aq_reformat" so that
+    directlfq.lfq_manager.run_lfq (via `import_data`) treats it as
+    already-formatted and skips its own (buggy) reformatting step -- pass
+    the returned path directly as `input_file`.
+    """
+    if isinstance(combined_ion, str):
+        combined_ion = pd.read_csv(combined_ion, sep="\t")
+
+    intensity_cols = [
+        col for col in combined_ion.columns if col.endswith(intensity_suffix)
+    ]
+    reformatted_df = combined_ion[
+        [protein_col, seq_col, charge_col] + intensity_cols
+    ].copy()
+    reformatted_df["ion"] = (
+        reformatted_df[seq_col].astype(str)
+        + "_"
+        + reformatted_df[charge_col].astype(str)
+    )
+    reformatted_df = reformatted_df.rename(columns={protein_col: "protein"})
+    intensity_cols_rename_map = {
+        col: col[: -len(intensity_suffix)] for col in intensity_cols
+    }
+    reformatted_df = reformatted_df.rename(columns=intensity_cols_rename_map)
+    output_cols = ["protein", "ion"] + list(intensity_cols_rename_map.values())
+
+    reformatted_df = reformatted_df[output_cols]
+    output_path = os.path.join(output_dir, output_name)
+    reformatted_df.to_csv(output_path, index=False, sep="\t")
+    return reformatted_df, output_path
 
 
 def extract_organism_from_protein_id(protein_id: object) -> str:
@@ -178,6 +299,7 @@ def _prepare_qdf_from_combined_protein(
     id_cols: list[str] = ["Protein ID", "Organism"],
     cond_A_keyword: str = "HYE124_A",
     cond_B_keyword: str = "HYE124_B",
+    min_valid_per_cond: int = 2,
 ) -> tuple[pd.DataFrame, int]:
     """
     Prepare a long-form quantification table with columns:
@@ -226,8 +348,12 @@ def _prepare_qdf_from_combined_protein(
     cond_B_values = (
         qdf[cond_B_cols].apply(pd.to_numeric, errors="coerce").replace(0, np.nan)
     )
-    median_A = cond_A_values.median(axis=1, skipna=True)
-    median_B = cond_B_values.median(axis=1, skipna=True)
+    valid_A = cond_A_values.notna().sum(axis=1) >= min_valid_per_cond
+    valid_B = cond_B_values.notna().sum(axis=1) >= min_valid_per_cond
+    valid_mask = valid_A & valid_B
+
+    median_A = cond_A_values.median(axis=1, skipna=True).where(valid_mask)
+    median_B = cond_B_values.median(axis=1, skipna=True).where(valid_mask)
 
     qdf["log2_Intensity_ref"] = np.log2((median_A + median_B) / 2.0)
     qdf["ratio"] = np.log2(median_B / median_A)
@@ -247,9 +373,11 @@ def plot_protein_quant(
     label_map: Optional[dict] = None,
     int_col_keyword: str = "MaxLFQ Intensity",
     bar_ylim: tuple[float, float] = (0, 4500),
+    scatter_xlim: Optional[tuple[float, float]] = None,
     id_cols: list[str] = ["Protein ID", "Organism"],
     cond_A_keyword: str = "HYE124_A",
     cond_B_keyword: str = "HYE124_B",
+    min_valid_per_cond: int = 2,
 ):
     plt.rcParams.update({"font.size": annot_fontsize})
     qdf, n_total_proteins = _prepare_qdf_from_combined_protein(
@@ -259,6 +387,7 @@ def plot_protein_quant(
         id_cols=id_cols,
         cond_A_keyword=cond_A_keyword,
         cond_B_keyword=cond_B_keyword,
+        min_valid_per_cond=min_valid_per_cond,
     )
 
     if label_map is None:
@@ -304,11 +433,36 @@ def plot_protein_quant(
         palette=color_map,
         hue_order=organisms_present,
         alpha=0.2,
+        s=4,
         legend=False,
         ax=ax_scatter,
     )
     for artist in ax_scatter.collections:
         artist.set_rasterized(True)
+
+    for org in organisms_present:
+        sub = qdf[qdf["Organism"] == org].dropna(subset=["log2_Intensity_ref", "ratio"])
+        if len(sub) < 10:
+            continue
+        x = sub["log2_Intensity_ref"].values
+        # delta lets lowess linearly interpolate between nearby x points
+        # instead of fitting a local regression at every one; it=0 skips
+        # the (unneeded here) robustifying iterations. Both are
+        # statsmodels-recommended for large n and cut runtime drastically
+        # on ~1e5-point groups with no visible change to the fitted line.
+        delta = 0.01 * (x.max() - x.min())
+        smoothed = lowess(
+            sub["ratio"].values, x, frac=0.3, it=0, delta=delta
+        )
+        ax_scatter.plot(
+            smoothed[:, 0],
+            smoothed[:, 1],
+            color=color_map[org],
+            # color="black",
+            linewidth=1.5,
+            linestyle="-",
+            zorder=3,
+        )
 
     stats = qdf.groupby("Organism")["ratio"].agg(
         count="count",
@@ -321,9 +475,9 @@ def plot_protein_quant(
     for i, (org, row) in enumerate(stats.iterrows()):
         c = color_map[org] if org in color_map else "black"
         display_org = label_map.get(org, org)
-        ax_scatter.axhline(row["median"], linestyle="-", linewidth=1.2, color=c)
-        ax_scatter.axhline(row["q1"], linestyle="--", linewidth=1, color=c)
-        ax_scatter.axhline(row["q3"], linestyle="--", linewidth=1, color=c)
+        # ax_scatter.axhline(row["median"], linestyle="-", linewidth=1.2, color=c)
+        # ax_scatter.axhline(row["q1"], linestyle="--", linewidth=1, color=c)
+        # ax_scatter.axhline(row["q3"], linestyle="--", linewidth=1, color=c)
         text = (
             f"{display_org}: n={int(row['count'])}, "
             f"Med={row['median']:.2f}, Q3-Q1={row['q3'] - row['q1']:.2f}"
@@ -339,10 +493,14 @@ def plot_protein_quant(
 
     ax_scatter.set_xlabel("log2 Intensity, Mean of MixA and MixB")
     ax_scatter.set_ylabel("log2 Ratio, MixB/MixA")
-    ax_scatter.set_ylim(-5, 5)
+    ax_scatter.set_ylim(-3, 4)
+    ax_scatter.set_xlim(scatter_xlim if scatter_xlim is not None else (6, 22))
     ax_scatter.set_title(
-        f"{dataset_name} | Total Protein IDs: {n_total_proteins}, Quantifiable: {len(qdf)}"
+        f"{dataset_name} | Total IDs: {n_total_proteins}, Quantifiable: {len(qdf)}"
     )
+    ax_scatter.axhline(0, color="black", linewidth=0.8, linestyle=":")
+    ax_scatter.axhline(-1, color="black", linewidth=0.8, linestyle=":")
+    ax_scatter.axhline(2, color="black", linewidth=0.8, linestyle=":")
 
     # Right: marginal ratio density per organism.
     for org in organisms_present:
@@ -359,11 +517,20 @@ def plot_protein_quant(
                 linewidth=1,
             )
         if org in stats.index:
+            ax_kde.axhline(
+                stats.loc[org, "q1"], color=color_map[org], linewidth=1, linestyle="--"
+            )
             ax_kde.axhline(stats.loc[org, "median"], color=color_map[org], linewidth=1)
+            ax_kde.axhline(
+                stats.loc[org, "q3"], color=color_map[org], linewidth=1, linestyle="--"
+            )
 
     ax_kde.set_xlabel("Density")
     ax_kde.set_ylabel("")
     ax_kde.tick_params(labelleft=False)
+    ax_kde.axhline(0, color="black", linewidth=0.8, linestyle=":")
+    ax_kde.axhline(-1, color="black", linewidth=0.8, linestyle=":")
+    ax_kde.axhline(2, color="black", linewidth=0.8, linestyle=":")
     plt.tight_layout()
 
     if fig_dir:
@@ -394,6 +561,7 @@ def plot_protein_quant_rolling_quantiles(
     ref_y_line: Optional[list] = None,
     cond_A_keyword: str = "HYE124_A",
     cond_B_keyword: str = "HYE124_B",
+    min_valid_per_cond: int = 2,
 ):
     """Plot rolling window quantiles of log2 ratio vs log2 intensity per organism."""
     plt.rcParams.update({"font.size": annot_fontsize})
@@ -404,6 +572,7 @@ def plot_protein_quant_rolling_quantiles(
         id_cols=id_cols,
         cond_A_keyword=cond_A_keyword,
         cond_B_keyword=cond_B_keyword,
+        min_valid_per_cond=min_valid_per_cond,
     )
 
     if label_map is None:

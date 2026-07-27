@@ -19,7 +19,10 @@ from utils.ims_utils import (
 )
 from utils.config import get_cfg_defaults, merge_cfg_from_file
 from utils.singleton_swaps_optimization import swaps_optimization_cfg
-from .optimization.inference import process_frames_parallel, generate_id_partitions
+from optimization.inference import (
+    process_frames_parallel,
+    generate_id_partitions,
+)
 from prepare_dict.prepare_dict import (
     construct_dict_from_search_pivoted,
     dict_add_index_to_raw_file,
@@ -45,6 +48,7 @@ from utils.plot import (
 from postprocessing.helper import build_pivot, build_mz_sorted_activation
 from postprocessing.direct_lfq import (
     reformat_swaps_combined_for_directlfq,
+    undistinguishable_excl_output_name,
 )
 
 # Clear existing logging handlers
@@ -54,6 +58,29 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+
+
+def _quant_dir(cfg) -> str:
+    """RESULT_PATH/MATCH_FEATURES_KWARGS.dir_name, with a "_no_fdr" suffix
+    when FDR control is disabled so the two output types never collide and
+    it's obvious from the directory name alone which mode produced it."""
+    dir_name = cfg.MATCH_FEATURES_KWARGS.dir_name
+    if not cfg.FDR.ENABLED:
+        dir_name += "_no_fdr"
+    return os.path.join(cfg.RESULT_PATH, dir_name)
+
+
+def _to_parquet_safe(df: pd.DataFrame, path: str, **kwargs):
+    """df.to_parquet, coercing undistinguishable_group_id to a single dtype.
+
+    The column mixes the int default -1 (no coSWA collision) with str tags
+    like "10000030_0" (collision group); pyarrow's Table.from_pandas can't
+    infer one Arrow type for that object column and raises ArrowInvalid.
+    """
+    if "undistinguishable_group_id" in df.columns:
+        df = df.copy()
+        df["undistinguishable_group_id"] = df["undistinguishable_group_id"].astype(str)
+    df.to_parquet(path, **kwargs)
 
 
 def _save_effective_cfg(cfg, processing_kwargs: dict, result_path: str):
@@ -228,6 +255,30 @@ def opt_scan_by_scan(config_path: str):
                     ms1scans,
                     idx_suffix=f"_ref_{dir_wo_extension}",
                 )
+                # coSWA: group-window frame/IM indices for confounder-group
+                # members, so match_features crops the representative image to
+                # the merged (union) window the SWA solve actually spans, not
+                # the representative's own narrower individual window. Guard on
+                # GroupIM_search_left (this block's first-consumed column) so a
+                # stale dict_ref.pkl predating these columns is skipped rather
+                # than crashing -- regenerate dict_ref.pkl to pick up the fix.
+                if "GroupIM_search_left" in dict_ref.columns:
+                    dict_ref = dict_add_im_index(
+                        dict_ref,
+                        mobility_values_df,
+                        "GroupIM_search_left",
+                        "GroupIM_search_center",
+                        "GroupIM_search_right",
+                        idx_suffix=f"_group_ref_{dir_wo_extension}",
+                    )
+                    dict_ref = dict_add_rt_index(
+                        dict_ref,
+                        ms1scans,
+                        mq_rt_left_col="GroupRT_search_left",
+                        mq_rt_center_col=None,
+                        mq_rt_right_col="GroupRT_search_right",
+                        idx_suffix=f"_group_ref_{dir_wo_extension}",
+                    )
                 # added_im_and_rt_index = True
 
                 # Save the updated dict_ref with added activation info to the result directory for downstream processing
@@ -288,6 +339,7 @@ def opt_scan_by_scan(config_path: str):
                 use_ims=cfg.USE_IMS,
                 return_res_coo_dict=False,
                 max_mz_rank=max_mz_rank,
+                merge_confounders=cfg.PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED,
             )
     else:
         logging.info(
@@ -350,11 +402,15 @@ def opt_scan_by_scan(config_path: str):
         raw_file_list=raw_file_list,
         result_dir=cfg.RESULT_PATH,
         peptide_indicies=dict_ref["mz_rank"].values,  # type: ignore
-        batch_size_max=1500,
+        batch_size_max=500,
         max_workers=cfg.N_CPU,
         processing_kwargs=processing_kwargs,
+        # Decoys only exist to feed Mokapot/percolator FDR control below —
+        # skip generating them entirely when FDR is disabled.
+        match_decoy=cfg.FDR.ENABLED,
+        merge_confounders_enabled=cfg.PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED,
     )
-    quant_dir = os.path.join(cfg.RESULT_PATH, cfg.MATCH_FEATURES_KWARGS.dir_name)
+    quant_dir = _quant_dir(cfg)
     os.makedirs(quant_dir, exist_ok=True)
     dfs_to_save = {
         "no_quant_log.parquet": df_no_quant,
@@ -368,7 +424,7 @@ def opt_scan_by_scan(config_path: str):
 
     with ThreadPoolExecutor(max_workers=4) as ex:
         futs = [
-            ex.submit(df.to_parquet, os.path.join(quant_dir, fn), index=False)
+            ex.submit(_to_parquet_safe, df, os.path.join(quant_dir, fn), index=False)
             for fn, df in dfs_to_save.items()
         ]
         for f in futs:
@@ -379,6 +435,37 @@ def opt_scan_by_scan(config_path: str):
     if df_jump is not None:
         df_jump.to_csv(os.path.join(quant_dir, "jump_anchor_log.csv"), index=True)
     _save_effective_cfg(cfg, processing_kwargs, quant_dir)
+
+    run_fdr_control_onwards(
+        cfg,
+        processing_kwargs,
+        dict_ref,
+        quant_dir,
+        matches_target,
+        matches_decoy,
+        pp_reference,
+        pp_match_target,
+        pp_match_decoy,
+    )
+
+
+def run_fdr_control_onwards(
+    cfg,
+    processing_kwargs: dict,
+    dict_ref: pd.DataFrame,
+    quant_dir: str,
+    matches_target: pd.DataFrame,
+    matches_decoy: pd.DataFrame,
+    pp_reference: pd.DataFrame,
+    pp_match_target: pd.DataFrame,
+    pp_match_decoy: pd.DataFrame,
+):
+    """Run FDR control, DirectLFQ quantification, and result analysis.
+
+    Takes the feature-feature-match outputs (either freshly computed by
+    opt_scan_by_scan, or loaded from a prior run's quant_dir) and carries the
+    pipeline through to the final result analysis plots.
+    """
     logging.info("=================FDR control==================")
 
     pp_match_target_msms = None
@@ -386,106 +473,162 @@ def opt_scan_by_scan(config_path: str):
         pp_match_target, pp_match_target_msms, pp_match_decoy = (
             split_pp_by_match_status(dict_ref, pp_match_target, pp_match_decoy)
         )
-        _valid_t = pd.MultiIndex.from_frame(
-            pp_match_target[["feature_instance_id", "Run_name"]].drop_duplicates()
-        )
-        _valid_d = pd.MultiIndex.from_frame(
-            pp_match_decoy[["feature_instance_id", "Run_name"]].drop_duplicates()
-        )
-        matches_target = matches_target[
-            pd.MultiIndex.from_arrays(
-                [matches_target["feature_instance_id"], matches_target["matched_run"]]
-            ).isin(_valid_t)
-        ]
-        matches_decoy = matches_decoy[
-            pd.MultiIndex.from_arrays(
-                [matches_decoy["feature_instance_id"], matches_decoy["matched_run"]]
-            ).isin(_valid_d)
-        ]
-        logging.info(
-            "only_score_match: %d target, %d decoy matches after removing MS/MS-identified entries",
-            len(matches_target),
-            len(matches_decoy),
-        )
+        if cfg.FDR.ENABLED:
+            _valid_t = pd.MultiIndex.from_frame(
+                pp_match_target[["feature_instance_id", "Run_name"]].drop_duplicates()
+            )
+            _valid_d = pd.MultiIndex.from_frame(
+                pp_match_decoy[["feature_instance_id", "Run_name"]].drop_duplicates()
+            )
+            matches_target = matches_target[
+                pd.MultiIndex.from_arrays(
+                    [
+                        matches_target["feature_instance_id"],
+                        matches_target["matched_run"],
+                    ]
+                ).isin(_valid_t)
+            ]
+            matches_decoy = matches_decoy[
+                pd.MultiIndex.from_arrays(
+                    [matches_decoy["feature_instance_id"], matches_decoy["matched_run"]]
+                ).isin(_valid_d)
+            ]
+            logging.info(
+                "only_score_match: %d target, %d decoy matches after removing MS/MS-identified entries",
+                len(matches_target),
+                len(matches_decoy),
+            )
 
-    if cfg.FDR.INT_THRES > 0:
-        pp_target_passing = pp_match_target.loc[
-            pp_match_target["intensity_sum"] >= cfg.FDR.INT_THRES,
-            ["feature_instance_id", "Run_name"],
-        ].drop_duplicates()
-        pp_decoy_passing = pp_match_decoy.loc[
-            pp_match_decoy["intensity_sum"] >= cfg.FDR.INT_THRES,
-            ["feature_instance_id", "Run_name"],
-        ].drop_duplicates()
-        valid_target = pd.MultiIndex.from_frame(pp_target_passing)
-        valid_decoy = pd.MultiIndex.from_frame(pp_decoy_passing)
-        matches_target = matches_target[
-            pd.MultiIndex.from_arrays(
-                [matches_target["feature_instance_id"], matches_target["matched_run"]]
-            ).isin(valid_target)
-        ]
-        matches_decoy = matches_decoy[
-            pd.MultiIndex.from_arrays(
-                [matches_decoy["feature_instance_id"], matches_decoy["matched_run"]]
-            ).isin(valid_decoy)
-        ]
-        logging.info(
-            "After intensity filtering (>= %s): %d target, %d decoy matches",
-            cfg.FDR.INT_THRES,
-            len(matches_target),
-            len(matches_decoy),
-        )
+    if cfg.FDR.ENABLED:
+        if cfg.FDR.INT_THRES > 0:
+            pp_target_passing = pp_match_target.loc[
+                pp_match_target["intensity_sum"] >= cfg.FDR.INT_THRES,
+                ["feature_instance_id", "Run_name"],
+            ].drop_duplicates()
+            pp_decoy_passing = pp_match_decoy.loc[
+                pp_match_decoy["intensity_sum"] >= cfg.FDR.INT_THRES,
+                ["feature_instance_id", "Run_name"],
+            ].drop_duplicates()
+            valid_target = pd.MultiIndex.from_frame(pp_target_passing)
+            valid_decoy = pd.MultiIndex.from_frame(pp_decoy_passing)
+            matches_target = matches_target[
+                pd.MultiIndex.from_arrays(
+                    [
+                        matches_target["feature_instance_id"],
+                        matches_target["matched_run"],
+                    ]
+                ).isin(valid_target)
+            ]
+            matches_decoy = matches_decoy[
+                pd.MultiIndex.from_arrays(
+                    [matches_decoy["feature_instance_id"], matches_decoy["matched_run"]]
+                ).isin(valid_decoy)
+            ]
+            logging.info(
+                "After intensity filtering (>= %s): %d target, %d decoy matches",
+                cfg.FDR.INT_THRES,
+                len(matches_target),
+                len(matches_decoy),
+            )
 
-    matches_target_normalized, matches_decoy_normalized = normalize_shift_by_runs(
-        matches_target, matches_decoy
-    )
-    tdc_df = combine_matches_target_decoy(
-        matches_target_normalized, matches_decoy_normalized, dict_ref
-    )
-    tdc_df = tdc_df.merge(
-        dict_ref[["mz_rank", "count_confounders"]], on="mz_rank", how="left"
-    )
-    psms, peptide, all_psms = brew_with_percolator(
-        tdc_df,
-        feature_cols=[
+        matches_target_normalized, matches_decoy_normalized = normalize_shift_by_runs(
+            matches_target, matches_decoy
+        )
+        tdc_df = combine_matches_target_decoy(
+            matches_target_normalized, matches_decoy_normalized, dict_ref
+        )
+        tdc_df = tdc_df.merge(
+            dict_ref[["mz_rank", "count_confounders"]], on="mz_rank", how="left"
+        )
+        _align_images = bool(processing_kwargs.get("align_images", True))
+        _alignment_feature_cols = [
             "im_shift_abs_scaled",
             "rt_shift_abs_scaled",
             "rt_shift",
             "im_shift",
+            "template_matching_score",
+        ]
+        _base_feature_cols = [
             # "im_shift_scaled",
             # "rt_shift_scaled",
             "sift_similarities",
             "zernike_similarities",
             "sift_distance",
             "zernike_distance",
-            "template_matching_score",
             "count_confounders",
-        ],
-        # train_fdr=cfg.FDR.TRAIN,
-        # test_fdr=cfg.FDR.TEST,
-        work_dir=os.path.join(quant_dir, "tmp_percolator"),
-        decoy_col="Decoy",
-        filename_col="matched_run",
-        peptide_col="Sequence",
-        protein_col="Proteins",
-    )
-    # Filter for the columns passed the makopot filter
-    psms["filename"] = psms["PSMId"].str.split("_").apply(lambda x: "_".join(x[1:-1]))
-    psms["mz_rank"] = psms["PSMId"].str.split("_").str[0].astype(int)
+        ]
+        _feature_cols = (
+            _alignment_feature_cols + _base_feature_cols
+            if _align_images
+            else _base_feature_cols
+        )
+        percolator_post_processing = cfg.FDR.PERCOLATOR_POST_PROCESSING
+        percolator_dir_name = f"percolator_postprocessing_{percolator_post_processing}"
+        if not cfg.FDR.ONLY_SCORE_MATCH:
+            percolator_dir_name += "_only_score_match_False"
+        psms, peptide, all_psms = brew_with_percolator(
+            tdc_df,
+            feature_cols=_feature_cols,
+            # train_fdr=cfg.FDR.TRAIN,
+            # test_fdr=cfg.FDR.TEST,
+            work_dir=os.path.join(quant_dir, percolator_dir_name),
+            post_processing=percolator_post_processing,
+            decoy_col="Decoy",
+            filename_col="matched_run",
+            peptide_col="Sequence",
+            protein_col="Proteins",
+        )
+        # Filter for the columns passed the makopot filter
+        psms["mz_rank"] = psms["PSMId"].str.split("_").str[0].astype(int)
 
-    # Filter for the columns passed the makopot filter
-    psms_filtered = psms.loc[(psms["q-value"] < 0.01)]
-    pp_match_target_filtered = pp_match_target.merge(
-        psms_filtered[["filename", "mz_rank"]],
-        left_on=["mz_rank", "Run_name"],
-        right_on=["mz_rank", "filename"],
-        how="inner",
-    )
-    pp_match_target_filtered.to_parquet(
-        os.path.join(quant_dir, "pp_match_target_filtered.parquet"), index=False
-    )
+        # Filter for the columns passed the makopot filter
+        psms_filtered = psms.loc[(psms["q-value"] < 0.01)]
+        pp_match_target_filtered = pp_match_target.merge(
+            psms_filtered[["filename", "mz_rank"]],
+            left_on=["mz_rank", "Run_name"],
+            right_on=["mz_rank", "filename"],
+            how="inner",
+        )
+        os.makedirs(os.path.join(quant_dir, percolator_dir_name), exist_ok=True)
+        _to_parquet_safe(
+            pp_match_target_filtered,
+            os.path.join(
+                quant_dir, percolator_dir_name, "pp_match_target_filtered.parquet"
+            ),
+            index=False,
+        )
+        _mbr_df = pp_match_target_filtered.drop(columns=["filename"])
+    else:
+        logging.info(
+            "cfg.FDR.ENABLED is False — skipping Mokapot/percolator FDR control; "
+            "pp_match_target_filtered is pp_match_target with only intensity "
+            "filtering (FDR.INT_THRES) applied."
+        )
+        if cfg.FDR.INT_THRES > 0:
+            pp_match_target_filtered = pp_match_target.loc[
+                pp_match_target["intensity_sum"] >= cfg.FDR.INT_THRES
+            ].copy()
+            logging.info(
+                "After intensity filtering (>= %s): %d of %d pp_match_target rows kept",
+                cfg.FDR.INT_THRES,
+                len(pp_match_target_filtered),
+                len(pp_match_target),
+            )
+        else:
+            pp_match_target_filtered = pp_match_target.copy()
+        percolator_dir_name = "intensity_filtered_postprocessing"
+        os.makedirs(os.path.join(quant_dir, percolator_dir_name), exist_ok=True)
+        _to_parquet_safe(
+            pp_match_target_filtered,
+            os.path.join(
+                quant_dir, percolator_dir_name, "pp_match_target_filtered.parquet"
+            ),
+            index=False,
+        )
+        _mbr_df = pp_match_target_filtered
+
     dfs_to_concat = {
-        "MBR": pp_match_target_filtered.drop(columns=["filename"]),
+        "MBR": _mbr_df,
         "MS/MS Ref": pp_reference,
     }
     if pp_match_target_msms is not None:
@@ -498,14 +641,21 @@ def opt_scan_by_scan(config_path: str):
     with ThreadPoolExecutor(max_workers=2) as ex:
         futs = [
             ex.submit(
-                pp_all.to_parquet,
+                _to_parquet_safe,
+                pp_all,
                 os.path.join(
-                    quant_dir, "pp_reference_quant_only_match_target_filtered.parquet"
+                    quant_dir,
+                    percolator_dir_name,
+                    "pp_reference_quant_only_match_target_filtered.parquet",
                 ),
                 index=False,
             ),
             ex.submit(
-                pivot.to_parquet, os.path.join(quant_dir, "swaps_combined_ions.parquet")
+                _to_parquet_safe,
+                pivot,
+                os.path.join(
+                    quant_dir, percolator_dir_name, "swaps_combined_ions.parquet"
+                ),
             ),
         ]
         for f in futs:
@@ -515,19 +665,35 @@ def opt_scan_by_scan(config_path: str):
     _ = reformat_swaps_combined_for_directlfq(
         pivot,
         dict_ref,
-        output_dir=quant_dir,
+        output_dir=os.path.join(quant_dir, percolator_dir_name),
         ion_id_col="mz_rank",
         protein_id_col="Proteins",
     )
-    lfq_manager.run_lfq(input_file=os.path.join(quant_dir, "swaps.aq_reformat.tsv"))
+    lfq_manager.run_lfq(
+        input_file=os.path.join(quant_dir, percolator_dir_name, "swaps.aq_reformat.tsv")
+    )
+    excl_input_file = os.path.join(
+        quant_dir,
+        percolator_dir_name,
+        undistinguishable_excl_output_name("swaps.aq_reformat.tsv"),
+    )
+    if os.path.exists(excl_input_file):
+        logging.info(
+            "Running DirectLFQ again excluding undistinguishable coSWA ions: %s",
+            excl_input_file,
+        )
+        lfq_manager.run_lfq(input_file=excl_input_file)
 
     logging.info("=================Result Analysis==================")
+    result_analysis_dir = os.path.join(
+        quant_dir, percolator_dir_name, "result_analysis"
+    )
     calc_quant_corr(
         pp_reference,
         pp_match_target_filtered,
-        quant_dir,
+        result_analysis_dir,
     )
-    plot_match_type_from_combined(df=pivot, fig_dir=quant_dir)
+    plot_match_type_from_combined(df=pivot, fig_dir=result_analysis_dir)
     try:
         # compare with IonQuant results
         combined_ionquant = pd.read_csv(
@@ -535,7 +701,9 @@ def opt_scan_by_scan(config_path: str):
             sep="\t",
         )
         plot_match_type_from_combined(
-            df=combined_ionquant, fig_dir=quant_dir, fig_name_suffix="_ionquant"
+            df=combined_ionquant,
+            fig_dir=result_analysis_dir,
+            fig_name_suffix="_ionquant",
         )
     except FileNotFoundError:
         logging.info(
@@ -546,20 +714,27 @@ def opt_scan_by_scan(config_path: str):
         dataset_name="SWAPS_ions_raw",
         int_col_keyword="Intensity",
         label_char_range=(0, 10),
-        fig_dir=quant_dir,
+        fig_dir=result_analysis_dir,
     )
     lfq_swaps_ion = pd.read_csv(
-        os.path.join(quant_dir, "swaps.aq_reformat.tsv.ion_intensities.tsv"), sep="\t"
+        os.path.join(
+            quant_dir, percolator_dir_name, "swaps.aq_reformat.tsv.ion_intensities.tsv"
+        ),
+        sep="\t",
     )
     plot_quantification_by_run(
         lfq_swaps_ion,
         dataset_name="SWAPS_ions_directLFQ",
         label_char_range=(0, 14),
         id_cols=["protein", "ion"],
-        fig_dir=quant_dir,
+        fig_dir=result_analysis_dir,
     )
     lfq_swaps_protein = pd.read_csv(
-        os.path.join(quant_dir, "swaps.aq_reformat.tsv.protein_intensities.tsv"),
+        os.path.join(
+            quant_dir,
+            percolator_dir_name,
+            "swaps.aq_reformat.tsv.protein_intensities.tsv",
+        ),
         sep="\t",
     )
     plot_quantification_by_run(
@@ -567,7 +742,51 @@ def opt_scan_by_scan(config_path: str):
         dataset_name="SWAPS_proteins_directLFQ",
         label_char_range=(0, 14),
         id_cols=["protein", "Protein"],
-        fig_dir=quant_dir,
+        fig_dir=result_analysis_dir,
+    )
+
+
+def run_from_fdr_control(config_path: str):
+    """Resume the pipeline at FDR control, reusing a prior run's match outputs.
+
+    Loads dict_ref and the matches_target/decoy + pp_reference/pp_match_target/
+    pp_match_decoy parquets from quant_dir = RESULT_PATH/MATCH_FEATURES_KWARGS.dir_name
+    (as resolved from config_path) instead of recomputing them via
+    match_features_batches_parallel.
+    """
+    cfg = get_cfg_defaults(swaps_optimization_cfg)  # type: ignore
+    merge_cfg_from_file(cfg, config_path)
+    logging.info("merge with cfg file %s", config_path)
+    processing_kwargs = yaml.safe_load(cfg.MATCH_FEATURES_KWARGS.dump())
+
+    dict_ref_path = os.path.join(cfg.RESULT_PATH, "dict_ref_with_activation.pkl")
+    if not os.path.exists(dict_ref_path):
+        dict_ref_path = os.path.join(cfg.RESULT_PATH, "dict_ref.pkl")
+    dict_ref = pd.read_pickle(dict_ref_path)
+    logging.info(
+        "Loaded dict_ref from %s with %s entries", dict_ref_path, len(dict_ref)
+    )
+
+    quant_dir = _quant_dir(cfg)
+    logging.info("Resuming from FDR control using quant_dir: %s", quant_dir)
+    matches_target = pd.read_parquet(os.path.join(quant_dir, "matches_target.parquet"))
+    matches_decoy = pd.read_parquet(os.path.join(quant_dir, "matches_decoy.parquet"))
+    pp_reference = pd.read_parquet(os.path.join(quant_dir, "pp_reference.parquet"))
+    pp_match_target = pd.read_parquet(
+        os.path.join(quant_dir, "pp_match_target.parquet")
+    )
+    pp_match_decoy = pd.read_parquet(os.path.join(quant_dir, "pp_match_decoy.parquet"))
+
+    run_fdr_control_onwards(
+        cfg,
+        processing_kwargs,
+        dict_ref,
+        quant_dir,
+        matches_target,
+        matches_decoy,
+        pp_reference,
+        pp_match_target,
+        pp_match_decoy,
     )
 
 
@@ -580,10 +799,22 @@ def main():
     """
     parser = argparse.ArgumentParser(description="Run ScanByScan processing.")
     parser.add_argument("config_path", help="Path to the configuration YAML file")
+    parser.add_argument(
+        "--from-fdr",
+        action="store_true",
+        help=(
+            "Skip prepare-dict/SWA/feature-feature-matching and resume at FDR "
+            "control, reusing matches_target/decoy + pp_reference/pp_match_target/"
+            "pp_match_decoy parquets from RESULT_PATH/MATCH_FEATURES_KWARGS.dir_name."
+        ),
+    )
     args = parser.parse_args()
 
     # Call the actual function with the parsed argument
-    opt_scan_by_scan(args.config_path)
+    if args.from_fdr:
+        run_from_fdr_control(args.config_path)
+    else:
+        opt_scan_by_scan(args.config_path)
 
 
 if __name__ == "__main__":
