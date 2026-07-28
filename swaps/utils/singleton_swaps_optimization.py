@@ -151,6 +151,22 @@ __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.off_target_max_overlap_fraction
 # peptide_swap only: prefer near-isobaric co-eluting candidates (confounders column
 # in dict_ref) as decoy source; falls back to full batch if none are in-batch
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.use_confounder_sampling = True
+__C.MATCH_FEATURES_KWARGS.debug_limit_mz = 0  # 0 = disabled; otherwise limit to first N mz_rank values
+__C.MATCH_FEATURES_KWARGS.debug_limit_runs = 0  # 0 = disabled; otherwise limit to first N runs
+__C.MATCH_FEATURES_KWARGS.debug_timing = True  # log per-mz and per-batch timing information
+__C.MATCH_FEATURES_KWARGS.alignment_method = "xcorr"  # xcorr is the first-stage non-IMS lag estimate
+__C.MATCH_FEATURES_KWARGS.xcorr_max_lag = 20  # max allowed lag in frames for cross-correlation
+__C.MATCH_FEATURES_KWARGS.cowarp_auto_segment = False
+__C.MATCH_FEATURES_KWARGS.cowarp_num_intervals = None
+__C.MATCH_FEATURES_KWARGS.cowarp_segment_length = None
+__C.MATCH_FEATURES_KWARGS.cowarp_slack = None
+__C.MATCH_FEATURES_KWARGS.cowarp_segmentation_type = "stationary_points"
+__C.MATCH_FEATURES_KWARGS.cowarp_deformation_coeff = None
+__C.MATCH_FEATURES_KWARGS.cowarp_filter_func_code = "gaussian"
+__C.MATCH_FEATURES_KWARGS.cowarp_filter_func_params = 3
+__C.MATCH_FEATURES_KWARGS.cowarp_process_filtered_signals = False
+__C.MATCH_FEATURES_KWARGS.cowarp_min_interval_length = None
+__C.MATCH_FEATURES_KWARGS.cowarp_verbose = False
 
 __C.FDR = ConfigurationNode()
 __C.FDR.ENABLED = True  # if False, skip Mokapot/percolator FDR control entirely; pp_match_target_filtered is pp_match_target with only intensity filtering (FDR.INT_THRES) applied

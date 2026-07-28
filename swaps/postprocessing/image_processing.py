@@ -402,6 +402,240 @@ def detect_2d_peak_with_watershed(
     return peaks_out, labels, image, labels_multi_markers, snapped_seed
 
 
+def detect_1d_peak_with_watershed(
+    curve: np.ndarray,
+    int_threshold: float = 0.5,
+    h_rel: float = 0.15,
+    norm_percentile: int = 95,
+    min_basin_intensity_frac: float = 0.02,
+    smooth_sigma: float = 1.0,
+    coordinates: Optional[np.ndarray] = None,
+    use_competing_peaks: bool = True,
+    compactness: float = 0.0,
+    normalize_before_hmaxima: bool = True,
+    visualize: bool = False,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Optional[int]]:
+    """
+    Returns
+    -------
+    peaks_out : np.ndarray[int], shape (n_peaks,)
+        Frame indices of peaks (argmax of original curve within each basin).
+    labels : np.ndarray[int32], shape (len(curve),)
+        Per-frame basin label after noise-floor filtering; 0 = background.
+    curve_log : np.ndarray
+        Log10-transformed curve used for segmentation (analog of image in 2-D).
+    labels_multi_markers : np.ndarray[int32]
+        Full watershed with all markers before region selection / noise filtering.
+    snapped_seed : int or None
+        Snapped seed frame (guided mode) or first detected peak (auto-detect).
+    """
+    curve = np.asarray(curve, dtype=np.float64)
+    n = len(curve)
+    _empty_labels = np.zeros(n, dtype=np.int32)
+    _empty_peaks = np.empty(0, dtype=np.int32)
+
+    if n == 0:
+        return _empty_peaks, _empty_labels, np.zeros(n), _empty_labels, None
+
+    # 1D-specific: internal log10 transform
+    curve_log = np.where(curve > 0, np.log10(curve), 0.0)
+
+    mask_signal = curve_log >= int_threshold
+    if not mask_signal.any():
+        return _empty_peaks, _empty_labels, curve_log, _empty_labels, None
+
+    # 1D-specific: Gaussian smoothing before h-maxima and watershed
+    smoothed = (
+        gaussian_filter1d(curve_log, sigma=float(smooth_sigma), mode="nearest")
+        if smooth_sigma > 0
+        else curve_log.copy()
+    )
+
+    if normalize_before_hmaxima:
+        # percentile from smoothed[mask_signal]: same array and population as h_maxima/watershed
+        pN = float(np.percentile(smoothed[mask_signal], norm_percentile))
+        _hmaxima_curve = smoothed / pN if pN > 0 else smoothed
+    else:
+        _hmaxima_curve = smoothed
+
+    _coords_provided = coordinates is not None
+    snapped_seed: Optional[int] = int(coordinates[0]) if coordinates is not None else None
+
+    if coordinates is None:
+        hmax = h_maxima(_hmaxima_curve, h=h_rel) & mask_signal
+        if not hmax.any():
+            return _empty_peaks, _empty_labels, curve_log, _empty_labels, None
+        peak_label_arr, n_peaks = ndi.label(hmax)
+        coordinates = np.array(
+            [np.argmax(np.where(peak_label_arr == k, smoothed, -np.inf)) for k in range(1, n_peaks + 1)],
+            dtype=np.int32,
+        )
+        if coordinates.size > 0:
+            snapped_seed = int(coordinates[0])
+
+    if coordinates.size == 0:
+        return _empty_peaks, _empty_labels, curve_log, _empty_labels, snapped_seed
+
+    if snapped_seed is None:
+        snapped_seed = int(coordinates[0])
+
+    marker_arr = np.zeros(n, dtype=np.int32)
+    _viz: dict = {}
+
+    if use_competing_peaks and coordinates.shape[0] == 1:
+        hmax_bg = h_maxima(_hmaxima_curve, h=h_rel) & mask_signal
+        if hmax_bg.any():
+            _lbl_bg, _n_bg = ndi.label(hmax_bg)
+            bg_peaks = np.array(
+                [np.argmax(np.where(_lbl_bg == k, smoothed, -np.inf)) for k in range(1, _n_bg + 1)],
+                dtype=np.int32,
+            )
+        else:
+            bg_peaks = np.empty(0, dtype=np.int32)
+
+        if len(bg_peaks) > 0:
+            true_seed = int(coordinates[0])
+            # 1D connected components = contiguous signal segments
+            connected_components, _ = ndi.label(mask_signal)
+            true_seed_component = connected_components[true_seed]
+
+            same_component_mask = np.array(
+                [connected_components[p] == true_seed_component for p in bg_peaks]
+            )
+
+            if same_component_mask.any():
+                same_component_peaks = bg_peaks[same_component_mask]
+                component_mask = connected_components == true_seed_component
+
+                cand_markers = np.zeros(n, dtype=np.int32)
+                for i, p in enumerate(same_component_peaks):
+                    cand_markers[p] = i + 1
+                candidate_labels = watershed(
+                    -smoothed, cand_markers, mask=component_mask, compactness=compactness
+                ).astype(np.int32)
+                true_seed_label = candidate_labels[true_seed]
+
+                if true_seed_label > 0:
+                    snapped_peak_mask = np.array(
+                        [cand_markers[p] == true_seed_label for p in same_component_peaks]
+                    )
+                    snapped_seed = (
+                        int(same_component_peaks[np.flatnonzero(snapped_peak_mask)[0]])
+                        if snapped_peak_mask.any()
+                        else true_seed
+                    )
+                else:
+                    snapped_seed = true_seed
+
+                marker_arr[snapped_seed] = 1
+                next_id = 2
+                for p in same_component_peaks:
+                    if p == snapped_seed:
+                        continue
+                    marker_arr[p] = next_id
+                    next_id += 1
+            else:
+                same_component_peaks = np.empty(0, dtype=np.int32)
+                snapped_seed = int(coordinates[0])
+                # no markers set — mirrors 2D edge-case behavior
+
+            if visualize:
+                _viz["true_seed"] = true_seed
+                _viz["bg_peaks"] = bg_peaks
+                _viz["connected_components"] = connected_components
+                _viz["same_component_peaks"] = same_component_peaks
+                _viz["snapped_seed"] = snapped_seed
+                _viz["competitors"] = np.array([p for p in same_component_peaks if p != snapped_seed])
+    else:
+        for i, idx in enumerate(coordinates):
+            marker_arr[int(idx)] = i + 1
+
+    labels_multi_markers = watershed(
+        -smoothed, marker_arr, mask=mask_signal, compactness=compactness
+    ).astype(np.int32)
+
+    if use_competing_peaks and coordinates.shape[0] == 1:
+        true_marker = marker_arr[snapped_seed]
+        labels_ws = np.where(labels_multi_markers == true_marker, true_marker, 0).astype(np.int32)
+    else:
+        labels_ws = labels_multi_markers
+
+    # 1D-specific: noise-floor basin filter + contiguous relabelling
+    total_signal = float(curve[mask_signal].sum())
+    noise_floor = min_basin_intensity_frac * total_signal
+    surviving = [
+        lbl for lbl in range(1, labels_ws.max() + 1)
+        if (labels_ws == lbl).any() and float(curve[labels_ws == lbl].sum()) >= noise_floor
+    ]
+    new_labels = np.zeros(n, dtype=np.int32)
+    for new_id, old_lbl in enumerate(surviving, 1):
+        new_labels[labels_ws == old_lbl] = new_id
+    labels = new_labels
+
+    surviving_peaks = np.array(
+        [int(np.argmax(np.where(labels == new_id, curve, -np.inf))) for new_id in range(1, len(surviving) + 1)],
+        dtype=np.int32,
+    )
+
+    if _coords_provided:
+        peaks_out = np.array([snapped_seed], dtype=np.int32)
+    else:
+        peaks_out = surviving_peaks
+        if peaks_out.size > 0:
+            snapped_seed = int(peaks_out[0])
+
+    if visualize:
+        n_cols = 5
+        fig, axes = plt.subplots(1, n_cols, figsize=(4 * n_cols, 3))
+        x = np.arange(n)
+
+        def _vlines(ax, indices, color, lw=1.0, ls="-", label=None):
+            for i, idx in enumerate(np.atleast_1d(indices)):
+                ax.axvline(idx, color=color, lw=lw, ls=ls, label=label if i == 0 else None)
+
+        axes[0].plot(x, curve_log)
+        if _coords_provided:
+            _vlines(axes[0], int(coordinates[0]), "red", lw=1.5, label="input seed")
+        axes[0].set_title("1. log curve + input seed", fontsize=8)
+        axes[0].legend(fontsize=6)
+
+        axes[1].fill_between(x, 0, mask_signal.astype(float), alpha=0.3, color="cyan")
+        axes[1].plot(x, mask_signal.astype(float))
+        axes[1].set_title("2. Signal mask (>= threshold)", fontsize=8)
+
+        if _viz:
+            axes[2].plot(x, smoothed, label="smoothed")
+            _vlines(axes[2], _viz["bg_peaks"], "orange", lw=0.8, ls=":", label="bg peaks")
+            _vlines(axes[2], _viz["same_component_peaks"], "cyan", lw=1, ls="--", label="same segment")
+            axes[2].axvline(_viz["true_seed"], color="red", lw=1.5, label="true seed")
+            axes[2].axvline(_viz["snapped_seed"], color="lime", lw=1.5, label="snapped seed")
+        else:
+            axes[2].plot(x, smoothed)
+        axes[2].set_title("3. bg peaks (same segment)", fontsize=8)
+        axes[2].legend(fontsize=6)
+
+        axes[3].step(x, marker_arr, where="mid")
+        if snapped_seed is not None:
+            axes[3].axvline(snapped_seed, color="lime", lw=1.5, label="snapped seed")
+        axes[3].set_title("4. Markers for watershed", fontsize=8)
+        axes[3].legend(fontsize=6)
+
+        axes[4].step(x, labels, where="mid", label="labels")
+        _vlines(axes[4], surviving_peaks, "orange", lw=1.5, ls="--", label="peaks")
+        axes[4].set_title("5. Final labels + peaks", fontsize=8)
+        axes[4].legend(fontsize=6)
+
+        fig.suptitle(
+            f"detect_1d_peak_with_watershed  |  int_threshold={int_threshold}  "
+            f"h_rel={h_rel}  norm_percentile={norm_percentile}  smooth_sigma={smooth_sigma}",
+            fontsize=9,
+        )
+        fig.tight_layout()
+        plt.show()
+
+    return peaks_out, labels, curve_log, labels_multi_markers, snapped_seed
+
+
 def calculate_peak_property_from_labels_and_image(
     labels,
     image_2d,

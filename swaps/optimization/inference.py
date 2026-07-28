@@ -190,7 +190,7 @@ def process_one_frame(
     ppm_tol: int = 20,
     bin_frame_mz: bool = True,
     bin_width: float = 0.01,
-    debug: bool = False,
+    debug: bool = True,
     return_res_coo_dict: bool = False,
     **process_frame_kwargs,
 ):
@@ -600,7 +600,7 @@ def process_batch_frame(
                 ms1scans=ms1scans,
                 ms1_frame_idx=scan_idx,
                 maxquant_result_ref_with_im_index_sortmz=maxquant_result_ref_with_im_index_sortmz,
-                debug=False,
+                debug=True,
                 return_res_coo_dict=return_res_coo_dict,
                 **process_frame_kwargs,
             )
@@ -749,6 +749,11 @@ def process_batch_frame_save_parquet(
             "coord_pept_indices": [],
             "data": [],
         }
+        batch_rt_pept_res_coo_dict = {
+            "coord_frame_indices": [], 
+            "coord_pept_indices": [], 
+            "data": [],
+        }
     path_act = f"{parquet_file}_activation.parquet"
     path_res = f"{parquet_file}_residue.parquet"
     schema_act = init_parquet_scheme(data_col_name="activation")
@@ -858,7 +863,28 @@ def process_batch_frame_save_parquet(
                 writer_res.write_table(table_res)
             else:
                 os.remove(path_res)  # remove residue parquet if not return res coo dict
-
+        else:
+            table_act = pa.Table.from_pydict(
+                {
+                    "frame_idx": np.array(
+                        batch_rt_pept_act_coo_dict["coord_frame_indices"], 
+                        dtype=np.uint16,
+                    ),
+                    "im_idx": np.zeros(
+                        len(batch_rt_pept_act_coo_dict["coord_frame_indices"]), dtype=np.uint16,
+                    ),
+                    "mz_rank": np.array(batch_rt_pept_act_coo_dict["coord_pept_indices"], 
+                    dtype=np.uint32,
+                    ),
+                    "activation": np.array(batch_rt_pept_act_coo_dict["data"], dtype=np.float32
+                    ),
+                }
+            )
+            writer_act.write_table(table_act)
+                    
+                    
+                    # if not return_res_coo_dict and os.path.exists(path_res):
+                      #os.remove(path_res)
 
 def _match_candidate_mz_and_binned_frame_mz_by_ppm(
     candidate_mz,

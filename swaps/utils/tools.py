@@ -226,7 +226,7 @@ def load_mzml(msconvert_file: str, unify_format: bool = False) -> pd.DataFrame:
                 axis=1,
                 inplace=True,
             )
-            df_ms1["MS1_frame_idx"] = df_ms1["Id"]
+            df_ms1["MS1_frame_idx"] = range(len(df_ms1))
         Logger.info("Saving data to pickle file")
         df_ms1.to_pickle(msconvert_file[:-5] + ".pkl")
 

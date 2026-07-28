@@ -40,6 +40,7 @@ from postprocessing.rescore import (
 from postprocessing.match_features import (
     match_features_batches_parallel,
 )
+from postprocessing.match_features_non_ims import match_features_batches_parallel_non_ims
 from utils.plot import (
     calc_quant_corr,
     plot_match_type_from_combined,
@@ -192,25 +193,48 @@ def opt_scan_by_scan(config_path: str):
     # -------------Scan-Wise Activation for each .d dataset------------#
     # added_im_and_rt_index = False
     if cfg.SWA:
+        if not isinstance(cfg.DATA_PATH, list):
+            cfg.DATA_PATH = [cfg.DATA_PATH]
+        if cfg.EXCLUDE_DATASET_NAME and not isinstance(cfg.EXCLUDE_DATASET_NAME, list):
+            cfg.EXCLUDE_DATASET_NAME = [cfg.EXCLUDE_DATASET_NAME]
+
         logging.info(
             "Processing Scan-Wise Activation for each dataset in %s excluding %s",
             cfg.DATA_PATH,
             cfg.EXCLUDE_DATASET_NAME,
         )
-        
+
+        data_paths = []
         if cfg.USE_IMS:
-            # For IMS data, use .d 
-            data_paths = get_dot_d_paths(cfg.DATA_PATH, cfg.EXCLUDE_DATASET_NAME)
+            # For IMS data, use .d directories. Support DATA_PATH as list of root dirs.
+            for data_path in cfg.DATA_PATH:
+                data_paths.extend(get_dot_d_paths(data_path, cfg.EXCLUDE_DATASET_NAME))
         else:
-            all_files = os.listdir(cfg.DATA_PATH)
-            exclude_names = cfg.EXCLUDE_DATASET_NAME if isinstance(cfg.EXCLUDE_DATASET_NAME, list) else [cfg.EXCLUDE_DATASET_NAME]
-            data_paths = [
-                os.path.join(cfg.DATA_PATH, f)
-                for f in all_files
-                if f.endswith(".mzML") and not any(excl in f for excl in exclude_names)
-            ]
+            exclude_names = cfg.EXCLUDE_DATASET_NAME or []
+            for data_path in cfg.DATA_PATH:
+                if os.path.isdir(data_path):
+                    all_files = os.listdir(data_path)
+                    data_paths.extend(
+                        os.path.join(data_path, f)
+                        for f in all_files
+                        if f.endswith(".mzML")
+                        and not f.startswith("._")
+                        and not f.startswith(".")
+                        and not any(excl in f for excl in exclude_names)
+                    )
+                elif os.path.isfile(data_path) and data_path.endswith(".mzML"):
+                    basename = os.path.basename(data_path)
+                    if not basename.startswith("._") and not basename.startswith(".") and not any(
+                        excl in basename for excl in exclude_names
+                    ):
+                        data_paths.append(data_path)
+                else:
+                    raise ValueError(
+                        "DATA_PATH entries for non-IMS mode must be either .mzML files "
+                        "or directories containing .mzML files. Got: %s" % data_path
+                    )
             logging.info("Found %d mzML files to process", len(data_paths))
-        
+
         for data_path in data_paths:
             data_dir = os.path.basename(data_path)
             logging.info(
@@ -290,17 +314,44 @@ def opt_scan_by_scan(config_path: str):
                 # For non-IMS data, load mzML file
                 logging.info("Loading non-IMS mzML data from %s", data_path)
                 ms1scans = load_mzml(data_path, unify_format=True)
-                ms1scans.set_index("Id", inplace=True)
+                ms1scans.set_index("MS1_frame_idx", inplace=True, drop=False)
                 mobility_values_df = None
                 data = None
                 
-                # Add RT index if available
+                # Add RT index if available and create run-specific exp frame idx
                 if ms1scans is not None:
                     dict_ref = dict_add_rt_index(
                         dict_ref,
                         ms1scans,
                         idx_suffix=f"_ref_{dir_wo_extension}",
                     )
+                    try:
+                        rt_col = f"{dir_wo_extension}_RT"
+                        exp_col = f"{dir_wo_extension}_MS1_frame_idx_exp"
+                        valid_mask = dict_ref[rt_col] > 0
+                        tmp = dict_ref[valid_mask].sort_values(rt_col)
+                        mapped = pd.merge_asof(
+                            left=tmp,
+                            right=ms1scans[["Time_minute", "MS1_frame_idx"]],
+                            left_on=rt_col,
+                            right_on="Time_minute",
+                            direction="nearest",
+                        )
+                        mapped = mapped[["mz_rank", "MS1_frame_idx"]]
+                        dict_ref = dict_ref.merge(mapped, on="mz_rank", how="left")
+                        dict_ref.rename(columns={"MS1_frame_idx": exp_col}, inplace=True)
+                        n_valid = int(valid_mask.sum())
+                        logging.info(
+                            "Created %s: %d/%d identified, %d unidentified → NaN",
+                            exp_col, n_valid, len(dict_ref), len(dict_ref) - n_valid,
+                        )
+                    except Exception as e:
+                        logging.warning(
+                            "Failed to create %s: %s",
+                            f"{dir_wo_extension}_MS1_frame_idx_exp",
+                            e,
+                        )
+
                     dict_ref.to_pickle(
                         os.path.join(cfg.RESULT_PATH, "dict_ref_with_activation.pkl")
                     )
@@ -388,29 +439,46 @@ def opt_scan_by_scan(config_path: str):
             else:
                 logging.info("Done: %s", d)
 
-    (
-        matches_target,
-        matches_decoy,
-        pp_reference,
-        pp_match_target,
-        pp_match_decoy,
-        df_no_quant,
-        df_no_match,
-        snap_log_collection,
-    ) = match_features_batches_parallel(
-        dict_ref=dict_ref,
-        raw_file_list=raw_file_list,
-        result_dir=cfg.RESULT_PATH,
-        peptide_indicies=dict_ref["mz_rank"].values,  # type: ignore
-        batch_size_max=500,
-        max_workers=cfg.N_CPU,
-        processing_kwargs=processing_kwargs,
-        # Decoys only exist to feed Mokapot/percolator FDR control below —
-        # skip generating them entirely when FDR is disabled.
-        match_decoy=cfg.FDR.ENABLED,
-        merge_confounders_enabled=cfg.PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED,
-    )
-    quant_dir = _quant_dir(cfg)
+    if cfg.USE_IMS:
+        (
+            matches_target,
+            matches_decoy,
+            pp_reference,
+            pp_match_target,
+            pp_match_decoy,
+            df_no_quant,
+            df_no_match,
+            snap_log_collection,
+        ) = match_features_batches_parallel(
+            dict_ref=dict_ref,
+            raw_file_list=raw_file_list,
+            result_dir=cfg.RESULT_PATH,
+            peptide_indicies=dict_ref["mz_rank"].values,  # type: ignore
+            batch_size_max=1500,
+            max_workers=cfg.N_CPU,
+            processing_kwargs=processing_kwargs,
+        )
+    else:
+        # Non-IMS path
+        (
+            matches_target,
+            matches_decoy,
+            pp_reference,
+            pp_match_target,
+            pp_match_decoy,
+            df_no_quant,
+            df_no_match,
+            snap_log_collection,
+        ) = match_features_batches_parallel_non_ims(
+            dict_ref=dict_ref,
+            raw_file_list=raw_file_list,
+            result_dir=cfg.RESULT_PATH,
+            peptide_indicies=dict_ref["mz_rank"].values,  # type: ignore
+            batch_size_max=1500,
+            max_workers=cfg.N_CPU,
+            processing_kwargs=processing_kwargs,
+        )
+    quant_dir = os.path.join(cfg.RESULT_PATH, cfg.MATCH_FEATURES_KWARGS.dir_name)
     os.makedirs(quant_dir, exist_ok=True)
     dfs_to_save = {
         "no_quant_log.parquet": df_no_quant,
@@ -549,8 +617,6 @@ def run_fdr_control_onwards(
             "template_matching_score",
         ]
         _base_feature_cols = [
-            # "im_shift_scaled",
-            # "rt_shift_scaled",
             "sift_similarities",
             "zernike_similarities",
             "sift_distance",
@@ -580,8 +646,6 @@ def run_fdr_control_onwards(
         )
         # Filter for the columns passed the makopot filter
         psms["mz_rank"] = psms["PSMId"].str.split("_").str[0].astype(int)
-
-        # Filter for the columns passed the makopot filter
         psms_filtered = psms.loc[(psms["q-value"] < 0.01)]
         pp_match_target_filtered = pp_match_target.merge(
             psms_filtered[["filename", "mz_rank"]],

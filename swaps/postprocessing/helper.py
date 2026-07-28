@@ -88,7 +88,7 @@ def build_mz_sorted_activation(
     batch_files = sorted(
         os.path.join(activation_dir, f)
         for f in os.listdir(activation_dir)
-        if f.startswith("swa_frame_batch_") and f.endswith(".parquet")
+        if f.startswith("swa_frame_batch_") and f.endswith("_activation.parquet")
     )
     # Read one file at a time to avoid exhausting OS file descriptors when many
     # runs are processed concurrently (DuckDB glob opens all ~128 files per
@@ -242,6 +242,21 @@ def load_peptide_batch_df_from_partquet(
         )
     return df
 
+def get_rt_window(dict_ref_row: pd.Series, run_name: str) -> tuple[int, int, int]:
+    """Return (rt_start, rt_end, rt_exp_center) for run_name from a dict_ref row.
+
+    rt_exp_center is relative to rt_start; falls back to the window midpoint
+    when the expected frame index is missing or falls outside the window.
+    """
+    rt_start = int(dict_ref_row[f"MS1_frame_idx_left_ref_{run_name}"])
+    rt_end = int(dict_ref_row[f"MS1_frame_idx_right_ref_{run_name}"])
+    _raw_exp = dict_ref_row[f"{run_name}_MS1_frame_idx_exp"]
+    rt_exp_center = (
+        int(_raw_exp) - rt_start
+        if pd.notna(_raw_exp) and int(_raw_exp) > rt_start
+        else (rt_end - rt_start) // 2
+    )
+    return rt_start, rt_end, rt_exp_center
 
 def get_pept_act_from_parquet(
     act_df,
@@ -257,32 +272,42 @@ def get_pept_act_from_parquet(
         row = dict_ref.loc[[pept_idx]]
     else:
         row = dict_ref.loc[dict_ref["mz_rank"] == pept_idx, :]
-    # coSWA: confounder-group members crop to the merged (union) RT/IM window
-    # the shared SWA solve spans, not each member's own narrower individual
-    # window. Falls back to the individual window when group columns are absent
-    # (solo candidates, or runs built without confounder merging).
-    _group_rt_left = f"MS1_frame_idx_left_group_ref_{run_name}"
-    if use_group_window and _group_rt_left in row.columns:
-        rt_start = row[_group_rt_left].values[0]
-        rt_end = row[f"MS1_frame_idx_right_group_ref_{run_name}"].values[0]
-        im_start = row[f"mobility_values_index_left_group_ref_{run_name}"].values[0]
-        im_end = row[f"mobility_values_index_right_group_ref_{run_name}"].values[0]
+    rt_start = row[f"MS1_frame_idx_left_ref_{run_name}"].values[0]
+    rt_end = row[f"MS1_frame_idx_right_ref_{run_name}"].values[0]
+    im_left_col = f"mobility_values_index_left_ref_{run_name}"
+    im_right_col = f"mobility_values_index_right_ref_{run_name}"
+    im_exp_col = f"{run_name}_mobility_values_index_exp"
+
+    has_ims = (
+        im_left_col in row.columns
+        and im_right_col in row.columns
+        and im_exp_col in row.columns
+        and "im_idx" in act_df.columns
+    )
+
+    if has_ims:
+        im_start = row[im_left_col].values[0]
+        im_end = row[im_right_col].values[0]
     else:
-        rt_start = row[f"MS1_frame_idx_left_ref_{run_name}"].values[0]
-        rt_end = row[f"MS1_frame_idx_right_ref_{run_name}"].values[0]
-        im_start = row[f"mobility_values_index_left_ref_{run_name}"].values[0]
-        im_end = row[f"mobility_values_index_right_ref_{run_name}"].values[0]
+        if "im_idx" not in act_df.columns:
+            act_df = act_df.copy()
+            act_df["im_idx"] = 0
+        im_start = 0
+        im_end = 0
     # rt_exp_start = row["MS1_frame_idx_left_exp"].values[0] - rt_start
     rt_exp_center = (
         (row[f"{run_name}_MS1_frame_idx_exp"].values[0] - rt_start)
         if row[f"{run_name}_MS1_frame_idx_exp"].values[0] > rt_start
         else ((rt_start + rt_end) // 2 - rt_start)
     )
-    im_exp_center = (
-        (row[f"{run_name}_mobility_values_index_exp"].values[0] - im_start)
-        if row[f"{run_name}_mobility_values_index_exp"].values[0] > im_start
-        else ((im_start + im_end) // 2 - im_start)
-    )
+    if has_ims:
+        im_exp_center = (
+            (row[im_exp_col].values[0] - im_start)
+            if row[im_exp_col].values[0] > im_start
+            else ((im_start + im_end) // 2 - im_start)
+        )
+    else:
+        im_exp_center = 0
     pept_act = parquet_df_to_dense_frame(act_df, (rt_start, rt_end), (im_start, im_end))
 
     if shape is not None:
