@@ -7,7 +7,10 @@ import pyarrow.parquet as pq
 import pytest
 
 from swaps.postprocessing.match_features import (
+    _build_consensus_peptide_swap_decoy,
     _confounder_pool,
+    _find_shift_via_template_match,
+    _shift_and_fit,
     align_images_to_reference,
     build_consensus_feature_bundle,
     match_features_batch,
@@ -112,6 +115,200 @@ class TestAlignImagesDisabled:
         bundle = build_consensus_feature_bundle(images, align_images=False)
         assert all(s == (0, 0) for s in bundle.alignment.shifts)
         assert bundle.alignment.max_scores[1] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# broad_alignment: forced_shifts center (rather than replace) template-match
+# discovery on a small window around the given shift -- a real
+# (non-NaN) template_matching_score comes out either way, distinct from the
+# 0.0 sentinel align_images=False uses ("bounded search" vs "not attempted").
+# With no explicit max_deviation, the window collapses to the forced shift
+# itself (an exact rescore there), as long as that position is actually
+# reachable by valid-mode template matching -- template_anchor=(15, 15) below
+# keeps the template away from the image edge so it always is; see
+# TestFindShiftViaTemplateMatchConstrained for the near-edge/clamped case.
+# ---------------------------------------------------------------------------
+
+
+class TestBroadAlignmentForcedShift:
+    def test_resize_mode_applies_forced_shift(self):
+        images = _make_test_images(2, shape=(30, 30))
+        state = align_images_to_reference(
+            images, forced_shifts=[None, (2, -3)], template_anchor=(15, 15)
+        )
+        assert state.shifts[1] == (2, -3)
+        assert not np.isnan(state.max_scores[1])
+
+    def test_crop_pad_mode_applies_forced_shift(self):
+        images = _make_test_images(2, shape=(30, 30))
+        state = align_images_to_reference(
+            images,
+            forced_shifts=[None, (2, -3)],
+            use_shift_crop_pad=True,
+            template_anchor=(15, 15),
+        )
+        assert state.shifts[1] == (2, -3)
+        assert not np.isnan(state.max_scores[1])
+
+    def test_crop_pad_mode_forced_shift_matches_shift_and_fit(self):
+        images = _make_test_images(2, shape=(30, 30))
+        state = align_images_to_reference(
+            images,
+            forced_shifts=[None, (2, -3)],
+            use_shift_crop_pad=True,
+            template_anchor=(15, 15),
+        )
+        expected = _shift_and_fit(images[1], (30, 30), (2, -3))
+        np.testing.assert_array_equal(state.aligned_images[1], expected)
+
+    def test_reference_image_ignores_forced_shifts(self):
+        images = _make_test_images(2, shape=(30, 30))
+        state = align_images_to_reference(images, reference_idx=0, forced_shifts=[(9, 9), None])
+        assert state.shifts[0] == (0, 0)
+        assert state.max_scores[0] == 1.0
+
+    def test_none_entries_still_discover_normally(self):
+        images = _make_test_images(3, shape=(30, 30))
+        forced = align_images_to_reference(images, forced_shifts=[None, (2, -3), None])
+        discovered = align_images_to_reference(images)
+        assert forced.shifts[2] == discovered.shifts[2]
+        assert forced.max_scores[2] == discovered.max_scores[2]
+
+    def test_build_bundle_propagates_forced_shifts(self):
+        images = _make_test_images(2, shape=(30, 30))
+        bundle = build_consensus_feature_bundle(
+            images, forced_shifts=[None, (4, 1)], template_anchor=(15, 15)
+        )
+        assert bundle.alignment.shifts[1] == (4, 1)
+        assert not np.isnan(bundle.alignment.max_scores[1])
+
+    def test_bundle_forced_shift_ignores_broad_alignment_max_deviation_when_none(self):
+        # No max_deviation given at all (neither forced_shifts-adjacent kwarg) ->
+        # still defaults to an exact rescore (deviation 0), not an unconstrained
+        # search that would silently discard the forced shift.
+        images = _make_test_images(2, shape=(30, 30))
+        bundle = build_consensus_feature_bundle(
+            images,
+            forced_shifts=[None, (4, 1)],
+            template_anchor=(15, 15),
+            broad_alignment_max_deviation=None,
+        )
+        assert bundle.alignment.shifts[1] == (4, 1)
+
+    def test_peptide_swap_decoy_rescores_at_forced_shift(self):
+        # Real blobs (not random noise), plus anchors/raw_images/labels, so
+        # watershed finds a non-empty target_label_ids -- mirrors
+        # TestBuildConsensusFeatureBundleReuse's fixture requirements.
+        img = _two_blob_image()
+        bundle = build_consensus_feature_bundle(
+            images=[img, img],
+            anchors=[(10, 10), (10, 10)],
+            raw_images=[img, img],
+            labels=["R1", "R2"],
+        )
+        decoy_image = _two_blob_image(centers=((25, 5), (25, 25)))
+        # (-2, -2), not (5, -2): the target's own template touches the image's
+        # top/left edge (anchor (10, 10), template_frac 0.3 on a 40x40 image),
+        # so only non-positive rt shifts are reachable by valid-mode
+        # template matching without clamping -- see the module-level note
+        # above and TestFindShiftViaTemplateMatchConstrained for that clamp.
+        _decoy_pp, shift, max_score = _build_consensus_peptide_swap_decoy(
+            bundle, decoy_image, "R2", forced_shift=(-2, -2)
+        )
+        assert shift == (-2, -2)
+        assert not np.isnan(max_score)
+
+    def test_peptide_swap_decoy_constrained_search_stays_within_window(self):
+        img = _two_blob_image()
+        bundle = build_consensus_feature_bundle(
+            images=[img, img],
+            anchors=[(10, 10), (10, 10)],
+            raw_images=[img, img],
+            labels=["R1", "R2"],
+        )
+        decoy_image = _two_blob_image(centers=((25, 5), (25, 25)))
+        _decoy_pp, shift, _max_score = _build_consensus_peptide_swap_decoy(
+            bundle, decoy_image, "R2", forced_shift=(-2, -2), max_deviation=3
+        )
+        assert abs(shift[0] - (-2)) <= 3
+        assert abs(shift[1] - (-2)) <= 3
+
+
+# ---------------------------------------------------------------------------
+# _find_shift_via_template_match's search_center/max_deviation constraint --
+# the core mechanism broad_alignment uses to bound per-candidate discovery to
+# a small neighborhood of a precalibrated shift instead of either fixing it
+# outright (old behavior) or searching the whole image (the original
+# unconstrained per-candidate discovery, which is what let low-S/N peptides
+# lock onto a spurious, far-away, higher-scoring correlation peak).
+# ---------------------------------------------------------------------------
+
+
+def _bump(img, center, amp=5.0, sigma=1.5):
+    yy, xx = np.mgrid[0 : img.shape[0], 0 : img.shape[1]]
+    img += amp * np.exp(-(((yy - center[0]) ** 2 + (xx - center[1]) ** 2) / (2 * sigma**2)))
+    return img
+
+
+class TestFindShiftViaTemplateMatchConstrained:
+    """search_image has two bumps: a nearby, shape-mismatched one (imperfect
+    correlation) at the position search_center=(0, 0) implies, and a distant
+    one built from the exact same gaussian as the template (near-perfect
+    correlation) 9 pixels away in each axis -- so unconstrained discovery
+    reliably prefers the distant, better-scoring, but wrong bump."""
+
+    def _search_image_and_template(self):
+        search_image = np.random.default_rng(0).normal(0, 0.05, (20, 20))
+        _bump(search_image, (5, 5), amp=5.0, sigma=2.5)  # near, shape-mismatched
+        _bump(search_image, (14, 14), amp=3.0, sigma=1.5)  # far, shape-matched
+        template = _bump(np.zeros((5, 5)), (2, 2), amp=1.0, sigma=1.5)
+        template_bounds = (3, 3, 8, 8)
+        return search_image, template, template_bounds
+
+    def test_unconstrained_prefers_the_far_better_match(self):
+        search_image, template, template_bounds = self._search_image_and_template()
+        shift, score, _, _ = _find_shift_via_template_match(
+            search_image, template, template_bounds
+        )
+        assert shift == (-9, -9)
+        assert score > 0.99
+
+    def test_zero_deviation_forces_exact_center_even_if_worse(self):
+        search_image, template, template_bounds = self._search_image_and_template()
+        shift, score, _, _ = _find_shift_via_template_match(
+            search_image, template, template_bounds, search_center=(0, 0), max_deviation=0
+        )
+        assert shift == (0, 0)
+        assert score < 0.99  # the near bump's imperfect match, not the far one's
+
+    def test_small_deviation_window_excludes_the_far_optimum(self):
+        search_image, template, template_bounds = self._search_image_and_template()
+        shift, score, _, _ = _find_shift_via_template_match(
+            search_image, template, template_bounds, search_center=(0, 0), max_deviation=2
+        )
+        assert abs(shift[0]) <= 2 and abs(shift[1]) <= 2
+        assert shift != (-9, -9)
+
+    def test_large_enough_deviation_recovers_the_far_optimum(self):
+        search_image, template, template_bounds = self._search_image_and_template()
+        shift, score, _, _ = _find_shift_via_template_match(
+            search_image, template, template_bounds, search_center=(0, 0), max_deviation=9
+        )
+        assert shift == (-9, -9)
+        assert score > 0.99
+
+    def test_search_center_beyond_valid_range_is_clamped_not_erroring(self):
+        # template_bounds' top-left is (3, 3); a search_center that would
+        # imply a negative match_score index (e.g. (10, 10), far outside the
+        # image) must clamp into the valid range rather than raising/
+        # wrapping -- the exact returned shift isn't asserted, only that it
+        # stays finite and near the clamped boundary.
+        search_image, template, template_bounds = self._search_image_and_template()
+        shift, score, _, _ = _find_shift_via_template_match(
+            search_image, template, template_bounds, search_center=(10, 10), max_deviation=0
+        )
+        assert np.isfinite(score)
+        assert shift[0] <= 3 and shift[1] <= 3
 
 
 # ---------------------------------------------------------------------------

@@ -39,6 +39,7 @@ from postprocessing.rescore import (
 from postprocessing.match_features import (
     match_features_batches_parallel,
 )
+from postprocessing.broad_alignment import calibrate_broad_alignment
 from utils.plot import (
     calc_quant_corr,
     plot_match_type_from_combined,
@@ -361,6 +362,26 @@ def opt_scan_by_scan(config_path: str):
             else:
                 logging.info("Done: %s", d)
 
+    if cfg.MATCH_FEATURES_KWARGS.broad_alignment.enabled:
+        broad_alignment_table_path = os.path.join(
+            cfg.RESULT_PATH, "broad_alignment_shift_table.parquet"
+        )
+        if os.path.exists(broad_alignment_table_path):
+            logging.info(
+                "broad_alignment shift table already exists, skipping calibration: %s",
+                broad_alignment_table_path,
+            )
+        else:
+            logging.info("Calibrating broad_alignment shift table...")
+            calibrate_broad_alignment(
+                result_dir=cfg.RESULT_PATH,
+                raw_file_list=raw_file_list,
+                dict_ref_path=os.path.join(
+                    cfg.RESULT_PATH, "dict_ref_with_activation.pkl"
+                ),
+                output_path=broad_alignment_table_path,
+            )
+
     (
         matches_target,
         matches_decoy,
@@ -530,10 +551,16 @@ def run_fdr_control_onwards(
             "zernike_distance",
             "count_confounders",
         ]
+        # rt_shift/im_shift/template_matching_score are meaningless when
+        # align_images=False (alignment is skipped, so shift is always (0,0)
+        # and the score a fixed 0.0 sentinel), but stay genuine per-candidate
+        # values under broad_alignment (search is centered on, not fixed to,
+        # the calibrated shift -- see align_images_to_reference's
+        # broad_alignment_max_deviation), so they remain useful FDR features.
         _feature_cols = (
-            _alignment_feature_cols + _base_feature_cols
-            if _align_images
-            else _base_feature_cols
+            _base_feature_cols
+            if not _align_images
+            else _alignment_feature_cols + _base_feature_cols
         )
         percolator_post_processing = cfg.FDR.PERCOLATOR_POST_PROCESSING
         percolator_dir_name = f"percolator_postprocessing_{percolator_post_processing}"

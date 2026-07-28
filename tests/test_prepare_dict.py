@@ -7,6 +7,8 @@ from swaps.prepare_dict.prepare_dict import (
     dict_add_confounding_groups,
     dict_add_confounder_group_id,
     dict_add_merged_confounder_pattern,
+    get_rt_im_range,
+    pivot_psm_by_mz_rank,
 )
 
 
@@ -485,3 +487,55 @@ def test_merged_pattern_does_not_require_mz_length_column(iso_group_df):
     assert "mz_length" not in iso_group_df.columns
     result = dict_add_merged_confounder_pattern(iso_group_df, mz_bin_digits=2)
     assert result["GroupMzLength"].notna().all()
+
+
+@pytest.fixture
+def score_evidence_df():
+    """Two peptides: A has 2 MSMS + 1 MATCH row, B has 1 MSMS + 1 MATCH row."""
+    rows = [
+        # Peptide A
+        {"Sequence": "PEPTIDEA", "Modifications": "Unmodified", "Charge": 2,
+         "Modified sequence": "_PEPTIDEA_", "Raw file": "R1", "Type": "MSMS",
+         "Score": 50.0, "Intensity": 1000.0, "Retention time": 5.0,
+         "Retention length": 0.2, "1/K0": 0.80, "1/K0 length": 0.02, "m/z": 500.0},
+        {"Sequence": "PEPTIDEA", "Modifications": "Unmodified", "Charge": 2,
+         "Modified sequence": "_PEPTIDEA_", "Raw file": "R2", "Type": "MSMS",
+         "Score": 70.0, "Intensity": 1200.0, "Retention time": 5.1,
+         "Retention length": 0.2, "1/K0": 0.81, "1/K0 length": 0.02, "m/z": 500.0},
+        {"Sequence": "PEPTIDEA", "Modifications": "Unmodified", "Charge": 2,
+         "Modified sequence": "_PEPTIDEA_", "Raw file": "R3", "Type": "MULTI-MATCH",
+         "Score": np.nan, "Intensity": 800.0, "Retention time": 5.05,
+         "Retention length": 0.2, "1/K0": 0.805, "1/K0 length": 0.02, "m/z": 500.0},
+        # Peptide B
+        {"Sequence": "PEPTIDEB", "Modifications": "Unmodified", "Charge": 2,
+         "Modified sequence": "_PEPTIDEB_", "Raw file": "R1", "Type": "MSMS",
+         "Score": 40.0, "Intensity": 500.0, "Retention time": 3.0,
+         "Retention length": 0.15, "1/K0": 0.60, "1/K0 length": 0.02, "m/z": 501.0},
+        {"Sequence": "PEPTIDEB", "Modifications": "Unmodified", "Charge": 2,
+         "Modified sequence": "_PEPTIDEB_", "Raw file": "R2", "Type": "MULTI-MATCH",
+         "Score": np.nan, "Intensity": 300.0, "Retention time": 3.05,
+         "Retention length": 0.15, "1/K0": 0.605, "1/K0 length": 0.02, "m/z": 501.0},
+    ]
+    return pd.DataFrame(rows)
+
+
+def test_pivot_reference_score_is_best_msms_score(score_evidence_df):
+    result = pivot_psm_by_mz_rank(score_evidence_df).reset_index()
+    a = result.loc[result["Sequence"] == "PEPTIDEA"].iloc[0]
+    b = result.loc[result["Sequence"] == "PEPTIDEB"].iloc[0]
+    assert a["reference_score"] == 70.0
+    assert b["reference_score"] == 40.0
+
+
+def test_identification_stats_from_msms_only(score_evidence_df):
+    result = get_rt_im_range(score_evidence_df)
+    a = result.loc[result["Sequence"] == "PEPTIDEA"].iloc[0]
+    b = result.loc[result["Sequence"] == "PEPTIDEB"].iloc[0]
+    assert a["n_identifications"] == 2
+    assert a["score_median"] == 60.0
+    assert a["score_std"] == pytest.approx(np.std([50.0, 70.0], ddof=1))
+    assert b["n_identifications"] == 1
+    assert b["score_median"] == 40.0
+    # single-identification std is NaN before fill; filled with column mean
+    # (the only other value present, i.e. peptide A's own std).
+    assert b["score_std"] == pytest.approx(a["score_std"])

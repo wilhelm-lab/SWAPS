@@ -314,6 +314,13 @@ def _init_match_features_worker(
         if dict_ref["mz_rank"].is_unique
         else dict_ref.drop_duplicates("mz_rank").set_index("mz_rank")
     )
+    if bool((processing_kwargs or {}).get("broad_alignment", {}).get("enabled", False)):
+        from .broad_alignment import build_shift_lookup, load_shift_table
+
+        _table_path = os.path.join(result_dir, "broad_alignment_shift_table.parquet")
+        _WORKER_CONTEXT["broad_alignment_lookup"] = build_shift_lookup(
+            load_shift_table(_table_path)
+        )
 
 
 def _match_features_batch_worker(batch):
@@ -515,6 +522,31 @@ def match_features_batch(
     _jump_dist_thres = _parse_jump_dist_thres(
         (processing_kwargs or {}).get("jump_dist_thres")
     )
+    _broad_alignment_enabled = (
+        bool((processing_kwargs or {}).get("broad_alignment", {}).get("enabled", False))
+        and _align_images
+    )
+    if (
+        bool((processing_kwargs or {}).get("broad_alignment", {}).get("enabled", False))
+        and not _align_images
+    ):
+        Logger.warning(
+            "MATCH_FEATURES_KWARGS.broad_alignment.enabled=True is ignored "
+            "because align_images=False."
+        )
+    _shift_lookup = None
+    _broad_alignment_max_deviation = int(
+        (processing_kwargs or {}).get("broad_alignment", {}).get("max_deviation", 5)
+    )
+    if _broad_alignment_enabled:
+        _cached_lookup = _WORKER_CONTEXT.get("broad_alignment_lookup")
+        if _cached_lookup is not None:
+            _shift_lookup = _cached_lookup
+        else:
+            from .broad_alignment import build_shift_lookup, load_shift_table
+
+            _table_path = os.path.join(result_dir, "broad_alignment_shift_table.parquet")
+            _shift_lookup = build_shift_lookup(load_shift_table(_table_path))
 
     # coSWA groups are stored on disk as a single row-set keyed by their
     # confounder_group_id (never duplicated to every member's mz_rank -- see
@@ -687,6 +719,13 @@ def match_features_batch(
         _anchor_image_indices = [
             i for i, a in enumerate(_consensus_anchors) if a is not None
         ]
+        _forced_shifts = None
+        if _shift_lookup is not None:
+            _rt_pos = float(dict_ref_by_mz.at[pept_idx, "RT_search_center"])
+            _forced_shifts = [None] + [
+                _shift_lookup.lookup(reference_raw_file, rf, _rt_pos)
+                for rf in match_raw_files
+            ]
         _consensus_bundle = build_consensus_feature_bundle(
             images=[_get_raw_denoised_pept_act(rf) for rf in _consensus_raw_files],
             reference_idx=0,
@@ -706,6 +745,8 @@ def match_features_batch(
             consensus_image_indices=_anchor_image_indices,
             align_images=_align_images,
             use_shift_crop_pad=_use_shift_crop_pad,
+            forced_shifts=_forced_shifts,
+            broad_alignment_max_deviation=_broad_alignment_max_deviation,
         )
         if _group_id in _members_by_group:
             # Stash what the post-hoc overlap pass needs -- this member's own
@@ -997,6 +1038,16 @@ def match_features_batch(
                             decoy_act,
                             _rf,
                             raw_denoise_kwargs=raw_denoise_kwargs,
+                            forced_shift=(
+                                _consensus_bundle.alignment.shifts[_ci]
+                                if _broad_alignment_enabled
+                                else None
+                            ),
+                            max_deviation=(
+                                _broad_alignment_max_deviation
+                                if _broad_alignment_enabled
+                                else None
+                            ),
                         )
                         if decoy_pp_raw is None:
                             no_quant_log.append(
@@ -1388,24 +1439,48 @@ def _find_shift_via_template_match(
     search_image: np.ndarray,
     template: np.ndarray,
     template_bounds: tuple[int, int, int, int],
+    search_center: tuple[int, int] | None = None,
+    max_deviation: int | None = None,
 ) -> tuple[tuple[int, int], float, np.ndarray, tuple[int, int]]:
     """Locate `template` in `search_image`; return the integer shift that
     aligns the match to `template_bounds` (the convention scipy.ndimage.shift
     expects), the match score, its full score map, and the matched top-left.
     Pure shift-finding -- callers decide how the shift gets applied.
+
+    `search_center`/`max_deviation`, if both given, restrict the search to a
+    `(2*max_deviation+1)`-wide window of the correlation surface centered on
+    the top-left implied by the `search_center` shift, instead of the global
+    argmax -- used by broad_alignment to bound per-candidate discovery to a
+    small neighborhood around a precalibrated shift (max_deviation=0 collapses
+    the window to that exact position, i.e. "rescore at the forced shift").
     """
     template_rt_start, template_im_start, _, _ = template_bounds
     match_score = match_template(search_image, template)
-    match_rt_topleft, match_im_topleft = np.unravel_index(
-        np.argmax(match_score), match_score.shape
-    )
+    if search_center is not None and max_deviation is not None:
+        center_rt = int(
+            np.clip(template_rt_start - search_center[0], 0, match_score.shape[0] - 1)
+        )
+        center_im = int(
+            np.clip(template_im_start - search_center[1], 0, match_score.shape[1] - 1)
+        )
+        row_lo = max(0, center_rt - max_deviation)
+        row_hi = min(match_score.shape[0], center_rt + max_deviation + 1)
+        col_lo = max(0, center_im - max_deviation)
+        col_hi = min(match_score.shape[1], center_im + max_deviation + 1)
+        window = match_score[row_lo:row_hi, col_lo:col_hi]
+        local_rt, local_im = np.unravel_index(np.argmax(window), window.shape)
+        match_rt_topleft, match_im_topleft = local_rt + row_lo, local_im + col_lo
+    else:
+        match_rt_topleft, match_im_topleft = np.unravel_index(
+            np.argmax(match_score), match_score.shape
+        )
     shift = (
         int(template_rt_start - match_rt_topleft),
         int(template_im_start - match_im_topleft),
     )
     return (
         shift,
-        float(match_score.max()),
+        float(match_score[match_rt_topleft, match_im_topleft]),
         match_score,
         (int(match_rt_topleft), int(match_im_topleft)),
     )
@@ -1415,6 +1490,8 @@ def _find_shift_native_image(
     image: np.ndarray,
     template: np.ndarray,
     template_bounds: tuple[int, int, int, int],
+    search_center: tuple[int, int] | None = None,
+    max_deviation: int | None = None,
 ) -> tuple[tuple[int, int], float, np.ndarray, tuple[int, int]]:
     """_find_shift_via_template_match, but tolerant of `image` being smaller
     than `template` in a dimension -- possible in shift_crop_pad mode since
@@ -1422,6 +1499,10 @@ def _find_shift_native_image(
     template patch cut from the (larger, reference-shaped) template. Pads
     just enough to satisfy match_template's image >= template requirement,
     then corrects the returned shift back into `image`'s own coordinate frame.
+
+    `search_center` (given in `image`'s own, unpadded coordinate frame, same
+    as the returned shift) is translated into the padded frame before being
+    passed down to `_find_shift_via_template_match`.
     """
     pad_before = [0, 0]
     pads = []
@@ -1436,8 +1517,17 @@ def _find_shift_native_image(
     search_image = (
         image if pad_before == [0, 0] else np.pad(image, pads, mode="constant")
     )
+    padded_search_center = (
+        (search_center[0] - pad_before[0], search_center[1] - pad_before[1])
+        if search_center is not None
+        else None
+    )
     shift, max_score, match_score, match_topleft = _find_shift_via_template_match(
-        search_image, template, template_bounds
+        search_image,
+        template,
+        template_bounds,
+        search_center=padded_search_center,
+        max_deviation=max_deviation,
     )
     shift = (shift[0] + pad_before[0], shift[1] + pad_before[1])
     return shift, max_score, match_score, match_topleft
@@ -1495,6 +1585,8 @@ def _align_resized_image_to_template(
     template: np.ndarray,
     template_bounds: tuple[int, int, int, int],
     scaled_anchor: tuple[float, float] | None = None,
+    search_center: tuple[int, int] | None = None,
+    max_deviation: int | None = None,
 ) -> tuple[
     np.ndarray,
     tuple[int, int, int, int],
@@ -1507,7 +1599,11 @@ def _align_resized_image_to_template(
     from scipy.ndimage import shift as nd_shift
 
     shift, max_score, match_score, match_topleft = _find_shift_via_template_match(
-        resized_image, template, template_bounds
+        resized_image,
+        template,
+        template_bounds,
+        search_center=search_center,
+        max_deviation=max_deviation,
     )
     aligned_image = nd_shift(resized_image, shift=shift, mode="constant", cval=0.0)
     aligned_anchor = (
@@ -1537,8 +1633,22 @@ def align_images_to_reference(
     align_images: bool = True,
     post_align_log_transform: bool = False,
     use_shift_crop_pad: bool = False,
+    forced_shifts: list[tuple[int, int] | None] | None = None,
+    broad_alignment_max_deviation: int | None = None,
 ) -> ConsensusAlignmentState:
     """Resize and align images to a reference template for consensus scoring.
+
+    `forced_shifts`, if given, must have one entry per image (None for images
+    that should still go through unconstrained template-match discovery).
+    Where an entry is not None, that image still runs template-match
+    discovery, but the search is restricted to a
+    `(2*broad_alignment_max_deviation+1)`-wide window around the given (rt,
+    im) shift instead of the whole correlation surface -- used by
+    MATCH_FEATURES_KWARGS.broad_alignment to bound per-candidate discovery to
+    a small neighborhood around a precalibrated, RT-binned majority-vote
+    shift, for peptides too low-S/N for unconstrained template matching to
+    trust on its own. `broad_alignment_max_deviation=0` collapses the window
+    to the forced shift itself (rescoring there without any freedom to move).
 
     If `template_anchor` is not given, it defaults to the centroid of all
     anchor points -- `anchors` plus every list in `additional_anchors` (e.g.
@@ -1582,6 +1692,11 @@ def align_images_to_reference(
                     "each list in additional_anchors must have the same length "
                     f"as images (got {len(_extra)}, expected {len(images)})."
                 )
+    if forced_shifts is not None and len(forced_shifts) != len(images):
+        raise ValueError(
+            "forced_shifts must have the same length as images "
+            f"(got {len(forced_shifts)}, expected {len(images)})."
+        )
     if not (0 < template_frac <= 0.5):
         raise ValueError(f"template_frac must be in (0, 0.5], got {template_frac}.")
 
@@ -1673,9 +1788,28 @@ def align_images_to_reference(
             shifts.append((0, 0))
             max_scores.append(0.0)
             continue
+        _search_center = (
+            forced_shifts[i]
+            if forced_shifts is not None and forced_shifts[i] is not None
+            else None
+        )
+        # A forced_shifts entry with no explicit max_deviation defaults to an
+        # exact rescore (deviation 0) rather than silently falling back to an
+        # unconstrained search that would ignore the caller's forced shift.
+        _max_deviation = (
+            (broad_alignment_max_deviation if broad_alignment_max_deviation is not None else 0)
+            if _search_center is not None
+            else None
+        )
         if use_shift_crop_pad:
             shift, max_score, match_score_map, match_score_peak = (
-                _find_shift_native_image(images[i], template, template_bounds)
+                _find_shift_native_image(
+                    images[i],
+                    template,
+                    template_bounds,
+                    search_center=_search_center,
+                    max_deviation=_max_deviation,
+                )
             )
             aligned_image = _shift_and_fit(images[i], resolved_target_shape, shift)
             matched_box = template_bounds
@@ -1699,6 +1833,8 @@ def align_images_to_reference(
                 template,
                 template_bounds,
                 scaled_anchors[i],
+                search_center=_search_center,
+                max_deviation=_max_deviation,
             )
         aligned_images.append(aligned_image)
         matched_boxes.append(matched_box)
@@ -2388,8 +2524,18 @@ def build_consensus_feature_bundle(
     precomputed_states: (
         tuple[ConsensusAlignmentState, ConsensusSegmentationState] | None
     ) = None,
+    forced_shifts: list[tuple[int, int] | None] | None = None,
+    broad_alignment_max_deviation: int | None = None,
 ) -> ConsensusFeatureBundle:
     """Build alignment, segmentation, and feature tables for consensus scoring.
+
+    `forced_shifts`/`broad_alignment_max_deviation` are passed straight
+    through to align_images_to_reference (see its docstring) and are only
+    consulted when `reuse_from` and `precomputed_states` are both None --
+    both of those branches copy an already-resolved alignment (forced or
+    discovered) from elsewhere instead of discovering one here, so a coSWA
+    confounder-group member automatically inherits whatever shift its group
+    representative got.
 
     If reuse_from is given (a bundle already built for another candidate that
     shares identical per-run raw images -- a coSWA confounder-group
@@ -2444,6 +2590,8 @@ def build_consensus_feature_bundle(
             align_images=align_images,
             post_align_log_transform=_post_align_log_transform,
             use_shift_crop_pad=use_shift_crop_pad,
+            forced_shifts=forced_shifts,
+            broad_alignment_max_deviation=broad_alignment_max_deviation,
         )
         segmentation_state = segment_consensus_from_aligned(
             alignment_state,
@@ -3148,17 +3296,40 @@ def _build_consensus_peptide_swap_decoy(
     decoy_raw_image: np.ndarray,
     run_name: str,
     raw_denoise_kwargs: dict | None = None,
+    forced_shift: tuple[int, int] | None = None,
+    max_deviation: int | None = None,
 ) -> tuple[pd.DataFrame | None, tuple[int, int], float]:
-    """Align a wrong same-run peptide image and score it under target consensus labels."""
+    """Align a wrong same-run peptide image and score it under target consensus labels.
+
+    `forced_shift`/`max_deviation`, if given, restrict template-match
+    discovery on the decoy's own (wrong-peptide) image content to a small
+    window around the real target's already-resolved shift for this run
+    (rather than an unconstrained search) -- used when broad_alignment is
+    enabled, so the decoy gets a genuine template_matching_score of its own
+    (needed for valid target-decoy competition in Percolator) while staying
+    anchored near the same registered coordinate frame as the target it's
+    compared against.
+    """
 
     decoy_raw_logged = smooth_and_denoise_image(
         decoy_raw_image, **(raw_denoise_kwargs or {})
     )
     target_shape = bundle.alignment.target_shape
+    # A forced_shift with no explicit max_deviation defaults to an exact
+    # rescore (deviation 0), same convention as align_images_to_reference.
+    _max_deviation = (
+        (max_deviation if max_deviation is not None else 0)
+        if forced_shift is not None
+        else None
+    )
     if bundle.alignment.use_shift_crop_pad:
         shift, max_score, _match_score_map, _match_score_peak = (
             _find_shift_native_image(
-                decoy_raw_logged, bundle.alignment.template, bundle.alignment.template_bounds
+                decoy_raw_logged,
+                bundle.alignment.template,
+                bundle.alignment.template_bounds,
+                search_center=forced_shift,
+                max_deviation=_max_deviation,
             )
         )
         decoy_raw_logged_resized = _shift_and_fit(decoy_raw_logged, target_shape, shift)
@@ -3178,6 +3349,8 @@ def _build_consensus_peptide_swap_decoy(
             bundle.alignment.template,
             bundle.alignment.template_bounds,
             None,
+            search_center=forced_shift,
+            max_deviation=_max_deviation,
         )
         decoy_raw_resized = _resize_image_to_shape(decoy_raw_image, target_shape)
         from scipy.ndimage import shift as nd_shift

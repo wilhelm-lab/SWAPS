@@ -2197,6 +2197,16 @@ def get_rt_im_range(
     summarize_without_match: bool = False,
 ):
     # --- Step 7: Get rt and ion mobility experimental statistic
+    # Identification-quality stats, always computed from direct MS/MS rows
+    # only (mirrors pivot_psm_by_mz_rank's own msms_mask) regardless of
+    # summarize_without_match, which controls RT/IM range calc, not this.
+    msms_mask = ~evidence[match_col].str.contains("MATCH", na=False)
+    identification_stats = (
+        evidence[msms_mask]
+        .groupby(id_cols, dropna=False)["Score"]
+        .agg(n_identifications="count", score_median="median", score_std="std")
+        .reset_index()
+    )
     if summarize_without_match:
         evidence = evidence[
             ~evidence[match_col].str.contains("MATCH", na=False)
@@ -2237,6 +2247,12 @@ def get_rt_im_range(
     )
     evidence_group_summary = evidence_group_summary.rename(
         columns={"modified_sequence": "Modified sequence", "mz": "m/z"}
+    )
+    evidence_group_summary = evidence_group_summary.merge(
+        identification_stats, on=id_cols, how="left"
+    )
+    evidence_group_summary["score_std"] = evidence_group_summary["score_std"].fillna(
+        evidence_group_summary["score_std"].mean()
     )
     evidence_group_summary["rt_apex_std"] = evidence_group_summary[
         "rt_apex_std"
@@ -2419,9 +2435,20 @@ def pivot_psm_by_mz_rank(
     pivot_mobility.fillna(
         0, inplace=True
     )  # fill missing mobility with 0, can be changed to other value if needed
+
+    # reference_score: the is_global_best row's own Score -- exactly one such
+    # row per id_cols group (see Step 1 above), so this is a plain reindex.
+    reference_score = (
+        evidence[evidence["is_global_best"]]
+        .set_index(id_cols)[metric_col]
+        .rename("reference_score")
+    )
+
     # --- Step 5: Combine everything ---
     # join=inner ensures we keep only rows consistent across pivots
-    result_df = pd.concat([pivot_status, pivot_rt, pivot_mobility], axis=1)
+    result_df = pd.concat(
+        [pivot_status, pivot_rt, pivot_mobility, reference_score], axis=1
+    )
 
     # --- Step 6: Validation ---
     ref_counts = (pivot_status == "Reference").sum(axis=1)

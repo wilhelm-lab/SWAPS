@@ -321,3 +321,56 @@ class TestCpuAutoDetection:
         if cfg.OPTIMIZATION.N_BATCH < 0:
             cfg.OPTIMIZATION.N_BATCH = cfg.N_CPU
         assert cfg.OPTIMIZATION.N_BATCH == 8
+
+
+# ---------------------------------------------------------------------------
+# broad_alignment config (mirrors sbs_runner_ims.py's run_fdr_control_onwards
+# _feature_cols conditional)
+# ---------------------------------------------------------------------------
+
+
+class TestBroadAlignmentConfig:
+    def test_disabled_by_default(self, cfg):
+        assert cfg.MATCH_FEATURES_KWARGS.broad_alignment.enabled is False
+
+    def test_max_deviation_default(self, cfg):
+        assert cfg.MATCH_FEATURES_KWARGS.broad_alignment.max_deviation == 5
+
+    def _feature_cols(self, align_images):
+        alignment_feature_cols = [
+            "im_shift_abs_scaled",
+            "rt_shift_abs_scaled",
+            "rt_shift",
+            "im_shift",
+            "template_matching_score",
+        ]
+        base_feature_cols = [
+            "sift_similarities",
+            "zernike_similarities",
+            "sift_distance",
+            "zernike_distance",
+            "count_confounders",
+        ]
+        return (
+            base_feature_cols
+            if not align_images
+            else alignment_feature_cols + base_feature_cols
+        )
+
+    def test_alignment_cols_included_when_align_images(self):
+        cols = self._feature_cols(align_images=True)
+        assert "rt_shift" in cols
+        assert "template_matching_score" in cols
+
+    def test_alignment_cols_stay_when_broad_alignment_enabled(self):
+        # broad_alignment centers the search on (rather than fixing it to)
+        # the calibrated shift, so forced-shift candidates now get a genuine
+        # (bounded, non-NaN) template_matching_score -- these columns are no
+        # longer dropped from the FDR feature list.
+        cols = self._feature_cols(align_images=True)
+        assert "rt_shift" in cols
+        assert "template_matching_score" in cols
+
+    def test_alignment_cols_dropped_when_align_images_false(self):
+        cols = self._feature_cols(align_images=False)
+        assert "rt_shift" not in cols
