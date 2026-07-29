@@ -84,3 +84,4 @@ Top-level entry point. Loops over raw files, calls each stage in order, saves a 
 - Don't write long monolithic functions — extract repeated patterns into shared helpers.
 - Don't inline logic that already exists elsewhere in the codebase.
 - Don't add comments that just restate what the code does, only short hint
+- NEVER run `rm` (or any other deletion of files/directories) without first asking for explicit consent, even for files/directories generated earlier in the same session.
