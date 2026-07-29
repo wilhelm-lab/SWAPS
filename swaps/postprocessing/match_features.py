@@ -45,6 +45,8 @@ class ConsensusAlignmentState:
     scaled_anchors: list[tuple[float, float] | None]
     shifts: list[tuple[int, int]]
     max_scores: list[float]
+    free_shifts: list[tuple[int, int] | None] = field(default_factory=list)
+    free_max_scores: list[float | None] = field(default_factory=list)
     match_score_maps: list[np.ndarray] = field(default_factory=list)
     match_score_peaks: list[tuple[int, int]] = field(default_factory=list)
     match_score_label_indices: list[int] = field(default_factory=list)
@@ -1232,6 +1234,11 @@ def compare_peak_properties(peak_properties_a, peak_properties_b):
         "template_matching_score": peak_properties_b["template_matching_score"].values[
             0
         ],
+        "delta_shift_rt": peak_properties_b["delta_shift_rt"].values[0],
+        "delta_shift_im": peak_properties_b["delta_shift_im"].values[0],
+        "delta_template_matching_score": peak_properties_b[
+            "delta_template_matching_score"
+        ].values[0],
         "sift_similarities": compare_sift_descriptors_similarities(
             peak_properties_a["sift_des"].values[0],
             peak_properties_b["sift_des"].values[0],
@@ -1514,6 +1521,22 @@ def _find_shift_via_template_match(
     )
 
 
+def _global_best_from_score_map(
+    match_score: np.ndarray, template_bounds: tuple[int, int, int, int]
+) -> tuple[tuple[int, int], float]:
+    """Unconstrained best shift/score from an already-computed match_template
+    surface -- reuses the full correlation map broad_alignment's constrained
+    search already produced (see _find_shift_via_template_match), so this is
+    just an extra argmax on data already in memory, not a second match_template
+    call. Used to compare a max_deviation=0 forced rescore against what a free
+    search over the same surface would have found.
+    """
+    template_rt_start, template_im_start, _, _ = template_bounds
+    rt_topleft, im_topleft = np.unravel_index(np.argmax(match_score), match_score.shape)
+    shift = (int(template_rt_start - rt_topleft), int(template_im_start - im_topleft))
+    return shift, float(match_score[rt_topleft, im_topleft])
+
+
 def _find_shift_native_image(
     image: np.ndarray,
     template: np.ndarray,
@@ -1793,6 +1816,8 @@ def align_images_to_reference(
     aligned_anchors: list[tuple[float, float] | None] = []
     shifts: list[tuple[int, int]] = []
     max_scores: list[float] = []
+    free_shifts: list[tuple[int, int] | None] = []
+    free_max_scores: list[float | None] = []
     match_score_maps: list[np.ndarray] = []
     match_score_peaks: list[tuple[int, int]] = []
     match_score_label_indices: list[int] = []
@@ -1804,6 +1829,8 @@ def align_images_to_reference(
             aligned_anchors.append(scaled_anchors[i])
             shifts.append((0, 0))
             max_scores.append(1.0)
+            free_shifts.append(None)
+            free_max_scores.append(None)
             continue
         if not align_images:
             aligned_images.append(
@@ -1815,6 +1842,8 @@ def align_images_to_reference(
             aligned_anchors.append(scaled_anchors[i])
             shifts.append((0, 0))
             max_scores.append(0.0)
+            free_shifts.append(None)
+            free_max_scores.append(None)
             continue
         _search_center = (
             forced_shifts[i]
@@ -1869,6 +1898,14 @@ def align_images_to_reference(
         aligned_anchors.append(aligned_anchor)
         shifts.append(shift)
         max_scores.append(max_score)
+        if _search_center is not None and _max_deviation == 0:
+            free_shift, free_max_score = _global_best_from_score_map(
+                match_score_map, template_bounds
+            )
+        else:
+            free_shift, free_max_score = None, None
+        free_shifts.append(free_shift)
+        free_max_scores.append(free_max_score)
         match_score_maps.append(match_score_map)
         match_score_peaks.append(match_score_peak)
         match_score_label_indices.append(i)
@@ -1890,6 +1927,8 @@ def align_images_to_reference(
         scaled_anchors=scaled_anchors,
         shifts=shifts,
         max_scores=max_scores,
+        free_shifts=free_shifts,
+        free_max_scores=free_max_scores,
         match_score_maps=match_score_maps,
         match_score_peaks=match_score_peaks,
         match_score_label_indices=match_score_label_indices,
@@ -2359,6 +2398,8 @@ def _extract_feature_rows_for_label_ids(
     shift: tuple[int, int],
     template_matching_score: float,
     snap_resolver: Callable[[int], tuple[int, int] | None],
+    free_shift: tuple[int, int] | None = None,
+    free_max_score: float | None = None,
 ) -> pd.DataFrame | None:
     # Pick the dominant label by area in label_image (deterministic across runs
     # sharing the same segmentation).
@@ -2383,6 +2424,20 @@ def _extract_feature_rows_for_label_ids(
     peak_properties["shift_rt"] = int(shift[0])
     peak_properties["shift_im"] = int(shift[1])
     peak_properties["template_matching_score"] = float(template_matching_score)
+    # Only populated for a max_deviation=0 forced rescore (see
+    # _global_best_from_score_map) -- 0.0 sentinel elsewhere, same convention
+    # as the descriptor comparisons below for "not applicable".
+    peak_properties["delta_shift_rt"] = (
+        float(abs(free_shift[0] - shift[0])) if free_shift is not None else 0.0
+    )
+    peak_properties["delta_shift_im"] = (
+        float(abs(free_shift[1] - shift[1])) if free_shift is not None else 0.0
+    )
+    peak_properties["delta_template_matching_score"] = (
+        float(free_max_score - template_matching_score)
+        if free_max_score is not None
+        else 0.0
+    )
     peak_properties["sift_des"] = None
     peak_properties.at[0, "sift_des"] = get_sift_descriptor(
         denoised_image,
@@ -2472,6 +2527,12 @@ def extract_peak_properties_from_consensus_labels(
                 run_name=run_name,
                 shift=alignment_state.shifts[i],
                 template_matching_score=alignment_state.max_scores[i],
+                free_shift=alignment_state.free_shifts[i]
+                if i < len(alignment_state.free_shifts)
+                else None,
+                free_max_score=alignment_state.free_max_scores[i]
+                if i < len(alignment_state.free_max_scores)
+                else None,
                 snap_resolver=lambda label_id, i=i: (
                     segmentation_state.snapped_per_anchor[i]
                     if segmentation_state.snapped_per_anchor[i] is not None
@@ -3367,7 +3428,7 @@ def _build_consensus_peptide_swap_decoy(
         else None
     )
     if bundle.alignment.use_shift_crop_pad:
-        shift, max_score, _match_score_map, _match_score_peak = (
+        shift, max_score, match_score_map, _match_score_peak = (
             _find_shift_native_image(
                 decoy_raw_logged,
                 bundle.alignment.template,
@@ -3386,7 +3447,7 @@ def _build_consensus_peptide_swap_decoy(
             _aligned_anchor,
             shift,
             max_score,
-            _match_score_map,
+            match_score_map,
             _match_score_peak,
         ) = _align_resized_image_to_template(
             decoy_raw_logged_resized,
@@ -3403,6 +3464,13 @@ def _build_consensus_peptide_swap_decoy(
             decoy_raw_resized, shift=shift, mode="constant", cval=0.0
         )
 
+    if forced_shift is not None and _max_deviation == 0:
+        free_shift, free_max_score = _global_best_from_score_map(
+            match_score_map, bundle.alignment.template_bounds
+        )
+    else:
+        free_shift, free_max_score = None, None
+
     decoy_pp = _extract_feature_rows_for_label_ids(
         bundle.segmentation.target_label_ids,
         bundle.segmentation.watershed_labels,
@@ -3411,6 +3479,8 @@ def _build_consensus_peptide_swap_decoy(
         run_name=run_name,
         shift=shift,
         template_matching_score=max_score,
+        free_shift=free_shift,
+        free_max_score=free_max_score,
         snap_resolver=lambda label_id: bundle.segmentation.label_to_snap.get(label_id),
     )
     return decoy_pp, shift, max_score
@@ -3453,6 +3523,12 @@ def _build_consensus_off_target_decoy(
         run_name=run_name,
         shift=bundle.alignment.shifts[run_index],
         template_matching_score=bundle.alignment.max_scores[run_index],
+        free_shift=bundle.alignment.free_shifts[run_index]
+        if run_index < len(bundle.alignment.free_shifts)
+        else None,
+        free_max_score=bundle.alignment.free_max_scores[run_index]
+        if run_index < len(bundle.alignment.free_max_scores)
+        else None,
         snap_resolver=lambda label_id: _resolve_shifted_label_snap(
             shifted_labels,
             label_id,

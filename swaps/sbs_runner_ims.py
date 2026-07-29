@@ -564,6 +564,25 @@ def run_fdr_control_onwards(
             if not _align_images
             else _alignment_feature_cols + _base_feature_cols
         )
+        # delta_shift_rt/im and delta_template_matching_score compare a
+        # max_deviation=0 forced rescore against the unconstrained global
+        # optimum over the same match_template surface (see
+        # _global_best_from_score_map) -- 0.0 sentinel everywhere else, which
+        # would look like "free search agrees exactly" rather than "not
+        # applicable" for every row if max_deviation != 0, so only wire these
+        # in when the config guarantees every row actually has a genuine
+        # value.
+        _broad_alignment_cfg = processing_kwargs.get("broad_alignment", {})
+        if (
+            _align_images
+            and bool(_broad_alignment_cfg.get("enabled", False))
+            and int(_broad_alignment_cfg.get("max_deviation", 5)) == 0
+        ):
+            _feature_cols = _feature_cols + [
+                "delta_shift_rt",
+                "delta_shift_im",
+                "delta_template_matching_score",
+            ]
         percolator_post_processing = cfg.FDR.PERCOLATOR_POST_PROCESSING
         percolator_dir_name = f"percolator_postprocessing_{percolator_post_processing}"
         if not cfg.FDR.ONLY_SCORE_MATCH:
