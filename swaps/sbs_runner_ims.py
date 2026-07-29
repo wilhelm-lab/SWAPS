@@ -550,6 +550,8 @@ def run_fdr_control_onwards(
             "sift_distance",
             "zernike_distance",
             "count_confounders",
+            "rt_profile_corr",
+            "im_profile_corr",
         ]
         # rt_shift/im_shift/template_matching_score are meaningless when
         # align_images=False (alignment is skipped, so shift is always (0,0)

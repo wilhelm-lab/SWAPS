@@ -274,7 +274,7 @@ def match_features_batches_parallel(
         else pd.DataFrame()
     )
     # Drop descriptor columns — only needed during comparison, not in output
-    _desc_cols = ["sift_des", "zernike"]
+    _desc_cols = ["sift_des", "zernike", "rt_profile", "im_profile"]
     for _df in (pp_reference_target, pp_match_target, pp_match_decoy):
         _drop = [c for c in _desc_cols if c in _df.columns]
         if _drop:
@@ -1258,6 +1258,14 @@ def compare_peak_properties(peak_properties_a, peak_properties_b):
             peak_properties_a["shift_im"].values[0]
             - peak_properties_b["shift_im"].values[0]
         ),
+        "rt_profile_corr": _profile_correlation(
+            peak_properties_a["rt_profile"].values[0],
+            peak_properties_b["rt_profile"].values[0],
+        ),
+        "im_profile_corr": _profile_correlation(
+            peak_properties_a["im_profile"].values[0],
+            peak_properties_b["im_profile"].values[0],
+        ),
         "rt_length_diff": abs(
             peak_properties_a["rt_length"].values[0]
             - peak_properties_b["rt_length"].values[0]
@@ -1351,6 +1359,26 @@ def compare_sift_descriptors_similarities(des1, des2):
     # SIFT distances for a match are usually < 200
     similarity = np.exp(-dist / 362.0)  # mid-point of range
     return similarity
+
+
+def _profile_correlation(profile_a, profile_b) -> float:
+    """Pearson correlation between two 1D masked-intensity profiles.
+
+    Pearson r is invariant to independent affine transforms of each input
+    (r(a*x+b, y) == r(x, y) for a>0), so a real abundance difference between
+    runs -- an overall gain and/or baseline offset on the profile -- does not
+    by itself lower this score; only a genuine shape mismatch does.
+    """
+    if profile_a is None or profile_b is None:
+        return 0.0
+    n = min(len(profile_a), len(profile_b))
+    if n < 2:
+        return 0.0
+    p1 = np.asarray(profile_a[:n], dtype=np.float64)
+    p2 = np.asarray(profile_b[:n], dtype=np.float64)
+    if np.std(p1) == 0 or np.std(p2) == 0:
+        return 0.0
+    return float(np.corrcoef(p1, p2)[0, 1])
 
 
 def _draw_rect(ax, rt_start, im_start, rt_end, im_end, color, linestyle):
@@ -2376,6 +2404,22 @@ def _extract_feature_rows_for_label_ids(
     seg_bbox = denoised_image[_r0:_r1, _c0:_c1]
     peak_properties["zernike"] = None
     peak_properties.at[0, "zernike"] = get_roi_descriptor(seg_bbox)
+    # RT/IM intensity profiles within the imposed mask, for scale-invariant
+    # shape comparison across runs (Pearson correlation in compare_peak_properties
+    # is invariant to the per-run gain/offset that real abundance differences
+    # introduce, so no separate normalization is needed here).
+    _region_mask = merged_mask.astype(bool)
+    _masked_intensity = np.where(_region_mask, raw_image, 0.0)
+    _mask_rows = np.where(_region_mask.any(axis=1))[0]
+    _mask_cols = np.where(_region_mask.any(axis=0))[0]
+    peak_properties["rt_profile"] = None
+    peak_properties["im_profile"] = None
+    peak_properties.at[0, "rt_profile"] = _masked_intensity.sum(axis=1)[
+        _mask_rows.min() : _mask_rows.max() + 1
+    ]
+    peak_properties.at[0, "im_profile"] = _masked_intensity.sum(axis=0)[
+        _mask_cols.min() : _mask_cols.max() + 1
+    ]
     peak_properties["Run_name"] = run_name
     return peak_properties
 
