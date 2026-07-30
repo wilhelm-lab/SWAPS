@@ -583,6 +583,15 @@ def run_fdr_control_onwards(
                 "delta_shift_im",
                 "delta_template_matching_score",
             ]
+        _missing_feature_cols = [c for c in _feature_cols if c not in tdc_df.columns]
+        if _missing_feature_cols:
+            logging.warning(
+                "Feature column(s) %s not present in tdc_df (matches_target/decoy "
+                "predate this feature being added) -- dropping from feature_cols "
+                "for this run instead of failing.",
+                _missing_feature_cols,
+            )
+            _feature_cols = [c for c in _feature_cols if c not in _missing_feature_cols]
         percolator_post_processing = cfg.FDR.PERCOLATOR_POST_PROCESSING
         percolator_dir_name = f"percolator_postprocessing_{percolator_post_processing}"
         if not cfg.FDR.ONLY_SCORE_MATCH:
