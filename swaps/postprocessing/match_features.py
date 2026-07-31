@@ -51,6 +51,12 @@ class ConsensusAlignmentState:
     match_score_peaks: list[tuple[int, int]] = field(default_factory=list)
     match_score_label_indices: list[int] = field(default_factory=list)
     use_shift_crop_pad: bool = False
+    # Whether `template` lives in log2(1+x) search space (vs. linear) -- recorded so
+    # decoy builders that reuse `template` for their own shift search (e.g.
+    # _build_consensus_peptide_swap_decoy) know which space to transform their own
+    # candidate image into first. `resized_images`/`aligned_images` are always linear
+    # regardless of this flag -- only `template` (and the search itself) is affected.
+    align_in_log_space: bool = False
 
 
 @dataclass
@@ -422,26 +428,25 @@ def _parse_jump_dist_thres(val, default: tuple[int, int] = (0, 0)) -> tuple[int,
 
 
 def _denoise_kwargs_for_stage(denoise_cfg: dict, stage: str) -> dict:
-    """Build smooth_and_denoise_image kwargs for ops whose ``at`` field == stage."""
+    """Build smooth_and_denoise_image kwargs for smooth/clean ops whose ``at`` field
+    == stage. log_transform is deliberately not staged here -- see
+    MATCH_FEATURES_KWARGS.denoise.log_transform's config comment: it is applied at one
+    fixed point (after averaging for the consensus, after alignment for each individual
+    run), never before, so callers needing it add it explicitly at that point instead
+    of through this helper.
+    """
     kwargs: dict = {}
     smooth = dict(denoise_cfg.get("smooth") or {})
     clean = dict(denoise_cfg.get("clean") or {})
-    log_tf = dict(denoise_cfg.get("log_transform") or {})
     if smooth.get("at") == stage:
         kwargs["smooth"] = {k: v for k, v in smooth.items() if k != "at"}
     if clean.get("at") == stage:
         kwargs["clean"] = {k: v for k, v in clean.items() if k != "at"}
-    if log_tf.get("at") == stage:
-        kwargs["log_transform"] = bool(log_tf.get("enabled", True))
     return kwargs
 
 
-def _denoise_kwargs_all(denoise_cfg: dict) -> dict:
-    """Combine raw + consensus stage kwargs (for full-pipeline denoising of raw_aligned)."""
-    return {
-        **_denoise_kwargs_for_stage(denoise_cfg, "raw"),
-        **_denoise_kwargs_for_stage(denoise_cfg, "consensus"),
-    }
+def _log_transform_enabled(denoise_cfg: dict) -> bool:
+    return bool(dict(denoise_cfg.get("log_transform") or {}).get("enabled", True))
 
 
 def _annotate_peak_properties(
@@ -495,7 +500,7 @@ def match_features_batch(
     match_decoy: bool = True,
     illustration_dir: str | None = None,
     merge_confounders_enabled: bool = True,
-    illustration_log_transform_raw: bool = False,
+    illustration_log_transform: bool = False,
 ):
     """Process one peptide batch using the consensus image path."""
     results_target, results_decoy = [], []
@@ -516,8 +521,11 @@ def match_features_batch(
     )
     denoise_cfg = dict((processing_kwargs or {}).get("denoise", {}))
     raw_denoise_kwargs = _denoise_kwargs_for_stage(denoise_cfg, "raw")
-    full_denoise_kwargs = _denoise_kwargs_all(denoise_cfg)
+    _log_enabled = _log_transform_enabled(denoise_cfg)
     _align_images = bool((processing_kwargs or {}).get("align_images", True))
+    _align_in_log_space = bool(
+        (processing_kwargs or {}).get("align_in_log_space", True)
+    )
     _use_shift_crop_pad = bool(
         (processing_kwargs or {}).get("use_shift_crop_pad", False)
     )
@@ -746,6 +754,7 @@ def match_features_batch(
             jump_dist_thres=_jump_dist_thres,
             consensus_image_indices=_anchor_image_indices,
             align_images=_align_images,
+            align_in_log_space=_align_in_log_space,
             use_shift_crop_pad=_use_shift_crop_pad,
             forced_shifts=_forced_shifts,
             broad_alignment_max_deviation=_broad_alignment_max_deviation,
@@ -771,6 +780,7 @@ def match_features_batch(
                 fig_dir=visualize_dir,
                 filename=f"mz{pept_idx}_consensus.png",
                 labels=_consensus_raw_files,
+                log_transform_display=illustration_log_transform,
             )
         _batch_svg_dir = (
             os.path.join(
@@ -787,7 +797,7 @@ def match_features_batch(
                 _consensus_raw_files,
                 _batch_svg_dir,
                 raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
-                log_transform_raw=illustration_log_transform_raw,
+                log_transform_display=illustration_log_transform,
             )
         consensus_pp = _consensus_bundle.consensus_pp
         individual_pps = _consensus_bundle.individual_pps
@@ -900,6 +910,7 @@ def match_features_batch(
                             (processing_kwargs or {}).get("jump_dist_thres")
                         ),
                         align_images=_align_images,
+                        align_in_log_space=_align_in_log_space,
                         use_shift_crop_pad=_use_shift_crop_pad,
                     )
                     if visualize_dir is not None:
@@ -911,6 +922,7 @@ def match_features_batch(
                                 f"mz{pept_idx}_consensus_decoy_peptide_swap_rep{_rep}.png"
                             ),
                             labels=_plot_labels,
+                            log_transform_display=illustration_log_transform,
                         )
                     if _batch_svg_dir is not None:
                         _save_illustration_svgs(
@@ -920,7 +932,7 @@ def match_features_batch(
                             _batch_svg_dir,
                             raw_images=_plot_raw_images,
                             filename_prefix=f"decoy_peptide_swap_rep{_rep}_",
-                            log_transform_raw=illustration_log_transform_raw,
+                            log_transform_display=illustration_log_transform,
                         )
 
         _off_target_label_shifts: list[tuple[int, int] | None] = []
@@ -954,6 +966,7 @@ def match_features_batch(
                                 f"mz{pept_idx}_consensus_decoy_off_target_shift_rep{_rep}.png"
                             ),
                             labels=_consensus_raw_files,
+                            log_transform_display=illustration_log_transform,
                         )
                     if _batch_svg_dir is not None:
                         _save_illustration_svgs(
@@ -964,6 +977,7 @@ def match_features_batch(
                             segmentation_override=_shifted_seg,
                             filename_prefix=f"decoy_off_target_shift_rep{_rep}_",
                             skip_per_run=True,
+                            log_transform_display=illustration_log_transform,
                         )
         if consensus_pp is not None:
             for _ci, (_rf, _ind_pp) in enumerate(
@@ -1040,6 +1054,7 @@ def match_features_batch(
                             decoy_act,
                             _rf,
                             raw_denoise_kwargs=raw_denoise_kwargs,
+                            log_transform_enabled=_log_enabled,
                             forced_shift=(
                                 _consensus_bundle.alignment.shifts[_ci]
                                 if _broad_alignment_enabled
@@ -1638,6 +1653,7 @@ def _align_resized_image_to_template(
     scaled_anchor: tuple[float, float] | None = None,
     search_center: tuple[int, int] | None = None,
     max_deviation: int | None = None,
+    search_image: np.ndarray | None = None,
 ) -> tuple[
     np.ndarray,
     tuple[int, int, int, int],
@@ -1647,10 +1663,15 @@ def _align_resized_image_to_template(
     np.ndarray,
     tuple[int, int],
 ]:
+    """`search_image`, if given, is correlated against `template` to find the shift
+    (e.g. a log2(1+x) transform of `resized_image` for log-space alignment) while the
+    shift itself is always applied to (and `aligned_image` always derived from)
+    `resized_image` unchanged -- so the returned image stays in whatever space the
+    caller passed in, regardless of which space the search ran in."""
     from scipy.ndimage import shift as nd_shift
 
     shift, max_score, match_score, match_topleft = _find_shift_via_template_match(
-        resized_image,
+        search_image if search_image is not None else resized_image,
         template,
         template_bounds,
         search_center=search_center,
@@ -1682,7 +1703,7 @@ def align_images_to_reference(
     anchors: list[tuple[int, int] | None] | None = None,
     additional_anchors: list[list[tuple[int, int] | None]] | None = None,
     align_images: bool = True,
-    post_align_log_transform: bool = False,
+    align_in_log_space: bool = False,
     use_shift_crop_pad: bool = False,
     forced_shifts: list[tuple[int, int] | None] | None = None,
     broad_alignment_max_deviation: int | None = None,
@@ -1710,12 +1731,18 @@ def align_images_to_reference(
     narrowed) to the smallest fraction that still covers every anchor point
     around the resolved template anchor, capped at 0.5.
 
-    `post_align_log_transform`, if set, applies log2(1+x) to every aligned
-    image right after shift-finding -- template matching itself still runs
-    on the un-transformed images (less sensitive to noise amplified near
-    zero by the log), while everything downstream (consensus averaging,
-    descriptors) sees log-space images, same as the "raw"-stage log_transform
-    does today.
+    `align_in_log_space`, if set, runs the template-matching correlation itself on a
+    log2(1+x) transform of the reference template and every candidate image, purely
+    to find the shift; the discovered shift is then applied to the linear image
+    either way. The returned `resized_images`/`aligned_images` (and everything built
+    from them downstream: consensus averaging, descriptors) therefore always stay
+    linear regardless of this flag -- see MATCH_FEATURES_KWARGS.denoise.log_transform
+    for the separate, always-linear-then-log-once step applied downstream to build
+    descriptor images. Only the returned `template` itself is in search space (log or
+    linear, matching this flag), since its only consumer is shift-finding -- decoy
+    builders that reuse it (e.g. _build_consensus_peptide_swap_decoy) read
+    `align_in_log_space` back off the returned state to transform their own candidate
+    image into the same space before correlating against it.
 
     `use_shift_crop_pad`, if set, skips cv2.resize entirely: match_template
     runs directly on each run's native-shaped image, and the found integer
@@ -1810,6 +1837,10 @@ def align_images_to_reference(
         resolved_template_anchor,
         resolved_template_frac,
     )
+    # search_template/search_image(s) below are used only to find each shift; the
+    # positions (template_bounds/anchor_row/anchor_col) are unaffected by this
+    # monotonic transform, and every returned/stored image stays linear.
+    search_template = np.log2(1 + template) if align_in_log_space else template
 
     aligned_images: list[np.ndarray] = []
     matched_boxes: list[tuple[int, int, int, int]] = []
@@ -1859,10 +1890,13 @@ def align_images_to_reference(
             else None
         )
         if use_shift_crop_pad:
+            _search_image = (
+                np.log2(1 + images[i]) if align_in_log_space else images[i]
+            )
             shift, max_score, match_score_map, match_score_peak = (
                 _find_shift_native_image(
-                    images[i],
-                    template,
+                    _search_image,
+                    search_template,
                     template_bounds,
                     search_center=_search_center,
                     max_deviation=_max_deviation,
@@ -1877,6 +1911,9 @@ def align_images_to_reference(
                 else None
             )
         else:
+            _search_image = (
+                np.log2(1 + resized_image) if align_in_log_space else resized_image
+            )
             (
                 aligned_image,
                 matched_box,
@@ -1887,11 +1924,12 @@ def align_images_to_reference(
                 match_score_peak,
             ) = _align_resized_image_to_template(
                 resized_image,
-                template,
+                search_template,
                 template_bounds,
                 scaled_anchors[i],
                 search_center=_search_center,
                 max_deviation=_max_deviation,
+                search_image=_search_image,
             )
         aligned_images.append(aligned_image)
         matched_boxes.append(matched_box)
@@ -1910,16 +1948,13 @@ def align_images_to_reference(
         match_score_peaks.append(match_score_peak)
         match_score_label_indices.append(i)
 
-    if post_align_log_transform:
-        aligned_images = [np.log2(1 + img) for img in aligned_images]
-
     return ConsensusAlignmentState(
         reference_idx=reference_idx,
         target_shape=resolved_target_shape,
         anchor_row=anchor_row,
         anchor_col=anchor_col,
         template_bounds=template_bounds,
-        template=template,
+        template=search_template,
         resized_images=resized_images,
         aligned_images=aligned_images,
         matched_boxes=matched_boxes,
@@ -1933,6 +1968,7 @@ def align_images_to_reference(
         match_score_peaks=match_score_peaks,
         match_score_label_indices=match_score_label_indices,
         use_shift_crop_pad=use_shift_crop_pad,
+        align_in_log_space=align_in_log_space,
     )
 
 
@@ -2485,6 +2521,7 @@ def extract_peak_properties_from_consensus_labels(
     *,
     raw_images: list[np.ndarray] | None = None,
     labels: list[str] | None = None,
+    log_transform_enabled: bool = True,
 ) -> tuple[
     pd.DataFrame | None,
     list[pd.DataFrame | None],
@@ -2512,9 +2549,20 @@ def extract_peak_properties_from_consensus_labels(
         alignment_state.use_shift_crop_pad,
     )  # no raw denoise kwargs
 
+    # raw_consensus is the linear-space mean of aligned_images (see
+    # segment_consensus_from_aligned) -- log2(1+x) is applied here, once, AFTER
+    # averaging/alignment, to both sides identically: this is what keeps the
+    # consensus descriptor and each individual run's own descriptor comparable
+    # (both "linear value -> log once"), instead of averaging already-logged images.
     raw_consensus = segmentation_state.consensus  # with raw denoise kwargs
-    raw_aligned_logged = alignment_state.aligned_images
-    raw_consensus_logged_mean = raw_consensus
+    raw_aligned_logged = (
+        [np.log2(1 + img) for img in alignment_state.aligned_images]
+        if log_transform_enabled
+        else list(alignment_state.aligned_images)
+    )
+    raw_consensus_logged_mean = (
+        np.log2(1 + raw_consensus) if log_transform_enabled else raw_consensus
+    )
     consensus_pp: pd.DataFrame | None = None
     if segmentation_state.target_label_ids:
         for i in range(len(raw_aligned)):
@@ -2622,6 +2670,7 @@ def build_consensus_feature_bundle(
     jump_dist_thres: tuple[int, int] = (0, 0),
     consensus_image_indices: list[int] | None = None,
     align_images: bool = True,
+    align_in_log_space: bool = False,
     use_shift_crop_pad: bool = False,
     reuse_from: ConsensusFeatureBundle | None = None,
     collapse_to_single_label: bool = False,
@@ -2676,11 +2725,11 @@ def build_consensus_feature_bundle(
             f"(got {len(labels)}, expected {_n_runs})."
         )
     _denoise_cfg = denoise_cfg or {}
-    _consensus_denoise_kwargs = _denoise_kwargs_for_stage(_denoise_cfg, "consensus")
-    _full_denoise_kwargs = _denoise_kwargs_all(_denoise_cfg)
-    _post_align_log_transform = bool(
-        _denoise_kwargs_for_stage(_denoise_cfg, "aligned").get("log_transform", False)
-    )
+    _log_enabled = _log_transform_enabled(_denoise_cfg)
+    _consensus_denoise_kwargs = {
+        **_denoise_kwargs_for_stage(_denoise_cfg, "consensus"),
+        "log_transform": _log_enabled,
+    }
     if precomputed_states is not None:
         alignment_state, segmentation_state = precomputed_states
     elif reuse_from is None:
@@ -2693,7 +2742,7 @@ def build_consensus_feature_bundle(
             anchors=anchors,
             additional_anchors=additional_anchors,
             align_images=align_images,
-            post_align_log_transform=_post_align_log_transform,
+            align_in_log_space=align_in_log_space,
             use_shift_crop_pad=use_shift_crop_pad,
             forced_shifts=forced_shifts,
             broad_alignment_max_deviation=broad_alignment_max_deviation,
@@ -2736,6 +2785,7 @@ def build_consensus_feature_bundle(
         segmentation_state,
         raw_images=raw_images,
         labels=labels,
+        log_transform_enabled=_log_enabled,
     )
     return ConsensusFeatureBundle(
         alignment=alignment_state,
@@ -2825,18 +2875,34 @@ def _visualize_consensus_bundle(
     aligned_images: list[np.ndarray] | None = None,
     consensus: np.ndarray | None = None,
     consensus_denoised: np.ndarray | None = None,
+    log_transform_display: bool = False,
 ) -> None:
-    """Visualize aligned images plus consensus panels for targets or decoys."""
+    """Visualize aligned images plus consensus panels for targets or decoys.
+
+    `aligned_images`/`consensus` are always linear-space (see
+    align_images_to_reference / segment_consensus_from_aligned); `log_transform_display`
+    applies log2(1+x) to them for plotting only, for contrast on the same footing as
+    `consensus_denoised`, which already went through MATCH_FEATURES_KWARGS.denoise.
+    log_transform if that's enabled -- purely cosmetic, does not affect any feature.
+    """
 
     import math
     import matplotlib.lines as mlines
     import matplotlib.patches as mpatches
     import matplotlib.pyplot as plt
 
-    display_aligned = (
-        alignment_state.aligned_images if aligned_images is None else aligned_images
+    def _maybe_log(img: np.ndarray) -> np.ndarray:
+        return np.log2(1 + img) if log_transform_display else img
+
+    display_aligned = [
+        _maybe_log(img)
+        for img in (
+            alignment_state.aligned_images if aligned_images is None else aligned_images
+        )
+    ]
+    display_consensus = _maybe_log(
+        segmentation_state.consensus if consensus is None else consensus
     )
-    display_consensus = segmentation_state.consensus if consensus is None else consensus
     display_consensus_denoised = (
         segmentation_state.consensus_denoised
         if consensus_denoised is None
@@ -3118,7 +3184,7 @@ def _save_illustration_svgs(
     filename_prefix: str = "",
     segmentation_override: "ConsensusSegmentationState | None" = None,
     skip_per_run: bool = False,
-    log_transform_raw: bool = False,
+    log_transform_display: bool = False,
 ) -> None:
     """Save individual clean SVG images for one peptide: raw, aligned, consensus, watershed.
 
@@ -3128,8 +3194,11 @@ def _save_illustration_svgs(
     segmentation_override: if provided, use instead of bundle.segmentation for consensus panels.
     skip_per_run: if True, skip per-run raw/aligned panels (useful for off-target decoys where
                   per-run images are identical to the target).
-    log_transform_raw: if True, plot the per-run raw panel as log2(1 + x) instead of the raw
-                        linear intensity scale.
+    log_transform_display: if True, plot the raw/aligned/consensus panels as log2(1 + x)
+                            instead of their native linear intensity scale. Purely cosmetic
+                            (consensus_denoised already reflects
+                            MATCH_FEATURES_KWARGS.denoise.log_transform if that's enabled, so
+                            it is not affected by this flag).
     """
     import matplotlib.pyplot as plt
 
@@ -3173,13 +3242,18 @@ def _save_illustration_svgs(
             max(img.max() for img in imgs)
         )
 
-    def _maybe_log_raw(img: np.ndarray) -> np.ndarray:
-        return np.log2(1 + img) if log_transform_raw else img
+    def _maybe_log(img: np.ndarray) -> np.ndarray:
+        return np.log2(1 + img) if log_transform_display else img
 
-    # raw and denoised-aligned images live on different intensity scales — keep
-    # them separate so neither set looks empty next to the other
-    raw_vmin, raw_vmax = _range([_maybe_log_raw(img) for img in (raw_images or [])])
-    aligned_vmin, aligned_vmax = _range(aligned_imgs)
+    # raw, aligned, and consensus are all linear-space (see align_images_to_reference /
+    # segment_consensus_from_aligned) -- one shared range keeps them comparable.
+    _shared_vmin, _shared_vmax = _range(
+        [_maybe_log(img) for img in (raw_images or [])]
+        + [_maybe_log(img) for img in aligned_imgs]
+        + [_maybe_log(seg.consensus)]
+    )
+    raw_vmin, raw_vmax = _shared_vmin, _shared_vmax
+    aligned_vmin, aligned_vmax = _shared_vmin, _shared_vmax
 
     # anchor colour map — same indexing as _visualize_consensus_bundle
     non_none_indices = seg.non_none_indices
@@ -3265,18 +3339,18 @@ def _save_illustration_svgs(
             safe = _sanitize(label)
             if raw_images is not None and i < len(raw_images):
                 fig, ax = _make_ax(
-                    _maybe_log_raw(raw_images[i]), vmin=raw_vmin, vmax=raw_vmax
+                    _maybe_log(raw_images[i]), vmin=raw_vmin, vmax=raw_vmax
                 )
                 _overlay_run_anchor(ax, i, aligned=False)
                 _save_fig(fig, f"mz{pept_idx}_raw_{i:02d}_{safe}.svg")
             if i < len(aligned_imgs):
                 fig, ax = _make_ax(
-                    aligned_imgs[i], vmin=aligned_vmin, vmax=aligned_vmax
+                    _maybe_log(aligned_imgs[i]), vmin=aligned_vmin, vmax=aligned_vmax
                 )
                 _overlay_run_anchor(ax, i, aligned=True)
                 _save_fig(fig, f"mz{pept_idx}_aligned_{i:02d}_{safe}.svg")
 
-    fig, ax = _make_ax(seg.consensus, vmin=aligned_vmin, vmax=aligned_vmax)
+    fig, ax = _make_ax(_maybe_log(seg.consensus), vmin=aligned_vmin, vmax=aligned_vmax)
     _overlay_consensus_anchors(ax)
     _save_fig(fig, f"mz{pept_idx}_consensus.svg")
 
@@ -3401,6 +3475,7 @@ def _build_consensus_peptide_swap_decoy(
     decoy_raw_image: np.ndarray,
     run_name: str,
     raw_denoise_kwargs: dict | None = None,
+    log_transform_enabled: bool = True,
     forced_shift: tuple[int, int] | None = None,
     max_deviation: int | None = None,
 ) -> tuple[pd.DataFrame | None, tuple[int, int], float]:
@@ -3414,12 +3489,21 @@ def _build_consensus_peptide_swap_decoy(
     (needed for valid target-decoy competition in Percolator) while staying
     anchored near the same registered coordinate frame as the target it's
     compared against.
+
+    `bundle.alignment.template` lives in whatever search space that alignment used
+    (`bundle.alignment.align_in_log_space`); the decoy's own denoised image is put
+    through the same transform, purely for shift-finding, mirroring
+    align_images_to_reference. The descriptor image handed to
+    _extract_feature_rows_for_label_ids is always "linear denoised, aligned, then
+    log2(1+x) once if log_transform_enabled" -- same recipe as real targets and the
+    consensus, so decoys stay comparable to the target they compete against.
     """
 
-    decoy_raw_logged = smooth_and_denoise_image(
+    decoy_denoised = smooth_and_denoise_image(
         decoy_raw_image, **(raw_denoise_kwargs or {})
     )
     target_shape = bundle.alignment.target_shape
+    _align_in_log_space = bundle.alignment.align_in_log_space
     # A forced_shift with no explicit max_deviation defaults to an exact
     # rescore (deviation 0), same convention as align_images_to_reference.
     _max_deviation = (
@@ -3428,21 +3512,29 @@ def _build_consensus_peptide_swap_decoy(
         else None
     )
     if bundle.alignment.use_shift_crop_pad:
+        _search_image = (
+            np.log2(1 + decoy_denoised) if _align_in_log_space else decoy_denoised
+        )
         shift, max_score, match_score_map, _match_score_peak = (
             _find_shift_native_image(
-                decoy_raw_logged,
+                _search_image,
                 bundle.alignment.template,
                 bundle.alignment.template_bounds,
                 search_center=forced_shift,
                 max_deviation=_max_deviation,
             )
         )
-        decoy_raw_logged_resized = _shift_and_fit(decoy_raw_logged, target_shape, shift)
+        decoy_denoised_aligned = _shift_and_fit(decoy_denoised, target_shape, shift)
         decoy_raw_aligned = _shift_and_fit(decoy_raw_image, target_shape, shift)
     else:
-        decoy_raw_logged_resized = _resize_image_to_shape(decoy_raw_logged, target_shape)
+        decoy_denoised_resized = _resize_image_to_shape(decoy_denoised, target_shape)
+        _search_image = (
+            np.log2(1 + decoy_denoised_resized)
+            if _align_in_log_space
+            else decoy_denoised_resized
+        )
         (
-            _aligned_denoised,
+            decoy_denoised_aligned,
             _matched_box,
             _aligned_anchor,
             shift,
@@ -3450,12 +3542,13 @@ def _build_consensus_peptide_swap_decoy(
             match_score_map,
             _match_score_peak,
         ) = _align_resized_image_to_template(
-            decoy_raw_logged_resized,
+            decoy_denoised_resized,
             bundle.alignment.template,
             bundle.alignment.template_bounds,
             None,
             search_center=forced_shift,
             max_deviation=_max_deviation,
+            search_image=_search_image,
         )
         decoy_raw_resized = _resize_image_to_shape(decoy_raw_image, target_shape)
         from scipy.ndimage import shift as nd_shift
@@ -3471,11 +3564,16 @@ def _build_consensus_peptide_swap_decoy(
     else:
         free_shift, free_max_score = None, None
 
+    decoy_descriptor_image = (
+        np.log2(1 + decoy_denoised_aligned)
+        if log_transform_enabled
+        else decoy_denoised_aligned
+    )
     decoy_pp = _extract_feature_rows_for_label_ids(
         bundle.segmentation.target_label_ids,
         bundle.segmentation.watershed_labels,
         decoy_raw_aligned,
-        decoy_raw_logged_resized,
+        decoy_descriptor_image,
         run_name=run_name,
         shift=shift,
         template_matching_score=max_score,
@@ -3563,7 +3661,9 @@ def generate_consensus_image(
     filename: str = "consensus_image.png",
     apply_seg: bool = True,
     seg_mask_thres: tuple[int, int] = (3, 3),
+    align_in_log_space: bool = False,
     use_shift_crop_pad: bool = False,
+    log_transform_display: bool = False,
 ) -> tuple[
     np.ndarray,
     list[np.ndarray],
@@ -3636,6 +3736,7 @@ def generate_consensus_image(
         raw_images=raw_images,
         apply_seg=apply_seg,
         seg_mask_thres=seg_mask_thres,
+        align_in_log_space=align_in_log_space,
         use_shift_crop_pad=use_shift_crop_pad,
     )
     alignment = bundle.alignment
@@ -3665,6 +3766,7 @@ def generate_consensus_image(
             fig_dir=fig_dir,
             filename=filename,
             labels=labels,
+            log_transform_display=log_transform_display,
         )
 
     return (

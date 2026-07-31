@@ -99,6 +99,7 @@ __C.OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH = 4  # width for IM peak extraction; o
 __C.MATCH_FEATURES_KWARGS = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.apply_seg = True
 __C.MATCH_FEATURES_KWARGS.align_images = True  # set False to skip template-matching alignment; rt/im shift and template_matching_score will be 0
+__C.MATCH_FEATURES_KWARGS.align_in_log_space = True  # whether the template-matching shift search itself runs on log2(1+x)-transformed images (True) or on linear images (False). Purely an alignment/registration knob -- independent of denoise.log_transform.enabled below, which controls the separate question of whether the consensus average and per-run descriptor images end up in log space. Search always finds a shift; that shift is then applied to the linear image regardless of this flag.
 __C.MATCH_FEATURES_KWARGS.use_shift_crop_pad = False  # False (default): resize every image to the reference's shape via cv2.resize before template matching. True: skip resizing -- match_template runs directly on each run's native-shaped image, and the found integer shift is applied by exact slicing (pad where the image is smaller than the reference, crop where larger) instead of interpolation.
 __C.MATCH_FEATURES_KWARGS.broad_alignment = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.broad_alignment.enabled = False  # if True, center each candidate's per-run RT/IM template-match search on a precalibrated, RT-binned majority-vote shift (swaps.postprocessing.broad_alignment) instead of searching the whole image -- fixes low-S/N peptides picking a spurious, far-away shift, while still letting the true local optimum (bounded by max_deviation) win over the table's own (imperfect, per-bin) estimate. The table auto-builds (if missing) at RESULT_PATH/broad_alignment_shift_table.parquet, shared across every quantification_* config variant of the same dataset. No-ops with a warning if align_images=False. rt_shift/im_shift/template_matching_score stay real (non-NaN) values and remain in the Mokapot FDR feature list.
@@ -111,15 +112,25 @@ __C.MATCH_FEATURES_KWARGS.jump_dist_thres = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.jump_dist_thres.rt = 10  # max RT jump in pixels; 0 = disabled
 __C.MATCH_FEATURES_KWARGS.jump_dist_thres.im = 10  # max IM jump in pixels; 0 = disabled
 __C.MATCH_FEATURES_KWARGS.template_frac = 0.3  # half-width (as a fraction of each dim) of the template patch used for SIFT/consensus template matching; must be in (0, 0.5]
-# denoise: three sequential ops applied across pipeline stages.
-#   smooth.at / clean.at / log_transform.at controls which stage each op executes.
-#   "raw"       → applied to raw images before SIFT template-matching alignment
+# denoise: smooth/clean are staged ops (smooth.at / clean.at select which pipeline
+# stage each runs at); log_transform is NOT staged -- see below.
+#   "raw"       → applied to each run's own image before template-matching alignment
 #   "consensus" → applied to the averaged consensus image before watershed segmentation
-#   "aligned"   → log_transform only: applied right after alignment/template matching,
-#                 to the already-aligned per-run images, before they are averaged into
-#                 the consensus. Lets alignment run on un-transformed (noise-amplification-
-#                 free) images while consensus averaging still happens in log space.
-#   At peak-property extraction, raw_aligned images are compensated by applying all ops.
+#
+# log_transform.enabled controls a single, fixed point in the pipeline that applies to
+# BOTH the consensus image and every individual run's own image: log2(1+x) is applied
+# exactly once, AFTER averaging (for the consensus descriptor) or AFTER alignment (for
+# each run's own descriptor) -- never before, and never as part of the average itself.
+# This matters because mean_i(log2(1+x_i)) != log2(1 + mean_i(x_i)): averaging
+# already-logged images (a geometric-mean-like quantity, by Jensen's inequality)
+# systematically under-represents the true consensus intensity/shape relative to
+# log-transforming the linear-space average, and would make the consensus descriptor
+# incomparable to a real run's own log2(1+x) descriptor. Keeping log_transform
+# unstaged guarantees the consensus is always built by averaging in linear space first.
+# Watershed segmentation (on the consensus) also has log_transform applied to it,
+# after smooth/clean, consistent with the "consensus" stage order (smooth -> clean ->
+# log_transform); this is separate from the alignment search space, see
+# align_in_log_space above.
 __C.MATCH_FEATURES_KWARGS.denoise = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.denoise.smooth = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.denoise.smooth.at = "consensus"
@@ -135,7 +146,6 @@ __C.MATCH_FEATURES_KWARGS.denoise.clean.threshold = 0
 __C.MATCH_FEATURES_KWARGS.denoise.clean.remove_kwargs = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.denoise.clean.remove_kwargs.min_size = 3
 __C.MATCH_FEATURES_KWARGS.denoise.log_transform = ConfigurationNode()
-__C.MATCH_FEATURES_KWARGS.denoise.log_transform.at = "raw"
 __C.MATCH_FEATURES_KWARGS.denoise.log_transform.enabled = True
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.int_threshold = 1
