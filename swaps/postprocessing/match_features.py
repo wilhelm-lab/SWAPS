@@ -140,11 +140,94 @@ def _pack_confounder_groups_into_batches(
     return batches
 
 
+def _estimate_peptide_pixel_weights(
+    dict_ref: pd.DataFrame, peptide_indicies: np.ndarray, raw_file_list: list[str]
+) -> np.ndarray:
+    """Cheap per-peptide memory-proxy: total RT×IM pixel area summed across
+    raw_file_list, computed straight from dict_ref's own index columns (no
+    parquet/image I/O). Used to keep oversized images from compounding
+    within one worker batch (see _build_peptide_batches).
+
+    Uses the confounder-group merged window (MS1_frame_idx_left/right_
+    group_ref_<run>, mobility_values_index_left/right_group_ref_<run> --
+    the same columns get_pept_act_from_parquet reads with
+    use_group_window=True, see helper.py) for grouped peptides, else each
+    peptide's own individual window. Returns all-ones (pure count-based
+    fallback, i.e. today's behavior) when the index columns aren't present,
+    e.g. dict_ref.pkl without activation, or synthetic test frames.
+    """
+    n = len(peptide_indicies)
+    if not raw_file_list or f"MS1_frame_idx_left_ref_{raw_file_list[0]}" not in dict_ref.columns:
+        return np.ones(n, dtype=float)
+
+    row = dict_ref.drop_duplicates("mz_rank").set_index("mz_rank").reindex(peptide_indicies)
+    use_group = (
+        row["confounder_group_id"].to_numpy() != -1
+        if "confounder_group_id" in row.columns
+        else np.zeros(n, dtype=bool)
+    )
+    has_group_cols = f"MS1_frame_idx_left_group_ref_{raw_file_list[0]}" in row.columns
+    use_group = use_group & has_group_cols
+
+    weights = np.zeros(n, dtype=float)
+    for rf in raw_file_list:
+        l_i = row[f"MS1_frame_idx_left_ref_{rf}"].to_numpy()
+        r_i = row[f"MS1_frame_idx_right_ref_{rf}"].to_numpy()
+        il_i = row[f"mobility_values_index_left_ref_{rf}"].to_numpy()
+        ir_i = row[f"mobility_values_index_right_ref_{rf}"].to_numpy()
+        if has_group_cols:
+            l_g = row[f"MS1_frame_idx_left_group_ref_{rf}"].to_numpy()
+            r_g = row[f"MS1_frame_idx_right_group_ref_{rf}"].to_numpy()
+            il_g = row[f"mobility_values_index_left_group_ref_{rf}"].to_numpy()
+            ir_g = row[f"mobility_values_index_right_group_ref_{rf}"].to_numpy()
+            rt_span = np.where(use_group, r_g - l_g + 1, r_i - l_i + 1)
+            im_span = np.where(use_group, ir_g - il_g + 1, ir_i - il_i + 1)
+        else:
+            rt_span = r_i - l_i + 1
+            im_span = ir_i - il_i + 1
+        weights += rt_span * im_span
+
+    weights = np.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1.0)
+    weights[weights <= 0] = 1.0
+    return weights
+
+
+def _carve_out_oversized(
+    mz_ranks: np.ndarray,
+    weights: np.ndarray,
+    oversize_multiplier: float | None,
+    oversize_batch_size: int,
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Pull items whose weight exceeds oversize_multiplier x median(weights)
+    out into their own batches of <=oversize_batch_size, so a few oversized
+    images can't land in the same worker batch as hundreds of normal ones
+    (or each other). Returns (remaining_mz_ranks, oversize_batches).
+    """
+    if not oversize_multiplier or len(mz_ranks) == 0:
+        return mz_ranks, []
+    median_w = float(np.median(weights))
+    if median_w <= 0:
+        return mz_ranks, []
+    is_oversized = weights > oversize_multiplier * median_w
+    if not np.any(is_oversized):
+        return mz_ranks, []
+    oversized_mz = mz_ranks[is_oversized]
+    remaining_mz = mz_ranks[~is_oversized]
+    oversize_batches = [
+        oversized_mz[i : i + oversize_batch_size]
+        for i in range(0, len(oversized_mz), oversize_batch_size)
+    ]
+    return remaining_mz, oversize_batches
+
+
 def _build_peptide_batches(
     dict_ref: pd.DataFrame,
     peptide_indicies: np.ndarray,
     batch_size_max: int,
     max_workers: int,
+    raw_file_list: list[str] | None = None,
+    oversize_multiplier: float | None = 3.0,
+    oversize_batch_size: int = 20,
 ) -> list[np.ndarray]:
     """Split peptide_indicies (mz_ranks) into worker batches.
 
@@ -154,6 +237,14 @@ def _build_peptide_batches(
     packed by whole confounder group -- never splitting a group's members
     across two batches, since coSWA merging needs all of a group's members
     together in one worker.
+
+    Before that count-based packing, peptides/groups whose estimated image
+    size (_estimate_peptide_pixel_weights) is far above the typical size --
+    oversize_multiplier x the median -- are carved out into their own small
+    batches (oversize_batch_size for solo items; one batch per oversized
+    group, never split) so a batch can't accumulate several oversized images
+    at once. Set oversize_multiplier=None/0 to disable and fall back to pure
+    count-based batching (today's behavior).
     """
     if "confounder_group_id" in dict_ref.columns:
         group_map = dict_ref.drop_duplicates("mz_rank").set_index("mz_rank")[
@@ -168,11 +259,43 @@ def _build_peptide_batches(
     grouped_mz = peptide_indicies[~solo_mask]
     grouped_gid = group_ids[~solo_mask]
 
+    oversize_batches: list[np.ndarray] = []
+    if oversize_multiplier:
+        weights = _estimate_peptide_pixel_weights(
+            dict_ref, peptide_indicies, raw_file_list or []
+        )
+        weight_by_mz = pd.Series(weights, index=peptide_indicies)
+
+        solo_w = weight_by_mz.reindex(solo_mz).to_numpy()
+        solo_mz, solo_oversize = _carve_out_oversized(
+            solo_mz, solo_w, oversize_multiplier, oversize_batch_size
+        )
+        oversize_batches += solo_oversize
+
+        if len(grouped_mz):
+            grouped_w = weight_by_mz.reindex(grouped_mz).to_numpy()
+            gdf = pd.DataFrame({"mz": grouped_mz, "gid": grouped_gid, "w": grouped_w})
+            group_weight = gdf.groupby("gid")["w"].sum()
+            median_gw = float(group_weight.median()) if len(group_weight) else 0.0
+            if median_gw > 0:
+                oversized_gids = group_weight[
+                    group_weight > oversize_multiplier * median_gw
+                ].index
+                if len(oversized_gids):
+                    is_oversized_member = gdf["gid"].isin(oversized_gids).to_numpy()
+                    for _, _members in gdf.loc[is_oversized_member].groupby("gid")["mz"]:
+                        # Never split a group across batches, regardless of
+                        # oversize_batch_size -- one oversized group = one batch.
+                        oversize_batches.append(_members.to_numpy())
+                    keep = ~is_oversized_member
+                    grouped_mz = gdf.loc[keep, "mz"].to_numpy()
+                    grouped_gid = gdf.loc[keep, "gid"].to_numpy()
+
     solo_batches = _split_contiguous_into_batches(solo_mz, batch_size_max, max_workers)
     grouped_batches = _pack_confounder_groups_into_batches(
         grouped_mz, grouped_gid, batch_size_max
     )
-    return solo_batches + grouped_batches
+    return oversize_batches + solo_batches + grouped_batches
 
 
 def match_features_batches_parallel(
@@ -185,6 +308,8 @@ def match_features_batches_parallel(
     processing_kwargs: dict | None = None,
     match_decoy: bool = True,
     merge_confounders_enabled: bool = True,
+    oversize_multiplier: float | None = 3.0,
+    oversize_batch_size: int = 20,
 ):
     if peptide_indicies is None:
         peptide_indicies = dict_ref["mz_rank"].values
@@ -197,7 +322,13 @@ def match_features_batches_parallel(
     peptide_indicies = np.asarray(peptide_indicies)
     n_total = len(peptide_indicies)
     peptide_batches = _build_peptide_batches(
-        dict_ref, peptide_indicies, batch_size_max, max_workers
+        dict_ref,
+        peptide_indicies,
+        batch_size_max,
+        max_workers,
+        raw_file_list=raw_file_list,
+        oversize_multiplier=oversize_multiplier,
+        oversize_batch_size=oversize_batch_size,
     )
     Logger.info(
         "Batching: %d peptides → %d batches of ≤%d (batch_size_max=%d, max_workers=%d)",
@@ -841,9 +972,39 @@ def match_features_batch(
                 _all_member_anchors[_m],
             )
 
+    # `for` loops don't scope their targets -- without this, _group_raw_images/
+    # _group_denoised_images/_group_bundle/_m_alignment/_m_segmentation would
+    # keep the LAST processed group's full multi-run image set (and its last
+    # member's aliased alignment/segmentation) resident as ordinary function
+    # locals for the rest of this call, regardless of the _group_bundle_cache/
+    # _member_prepass_cache freeing below -- popping a dict entry doesn't
+    # help if the loop variable that pointed at the same objects is still
+    # live. Only defined when the pre-pass loop actually ran.
+    if _members_by_group:
+        del (
+            _group_raw_images,
+            _group_denoised_images,
+            _group_bundle,
+            _m_alignment,
+            _m_segmentation,
+        )
+
     # Post-hoc overlap/diagnostics cache: populated below for group members
     # only, consumed after the main loop by _mark_overlapping_group_members.
     _member_overlap_cache: dict[int, dict] = {}
+
+    # _group_bundle_cache/_member_prepass_cache hold full multi-run image
+    # data (raw/resized/aligned/match-score-map/consensus arrays -- roughly
+    # 8xN_runs arrays per group) for every in-batch confounder group at
+    # once, built entirely upfront in the pre-pass above. Nothing else in
+    # this loop needs a group's entry once its last member has been
+    # processed (_member_overlap_cache/_mark_overlapping_group_members only
+    # ever need the small per-member segmentation state stashed below), so
+    # free each group's entry as soon as its member count hits zero instead
+    # of holding every in-batch group's images resident for the whole batch.
+    _group_members_remaining = {
+        gid: len(members) for gid, members in _members_by_group.items()
+    }
 
     for pept_idx in batch_np:
         pept_act_cache: dict[str, tuple[np.ndarray, int, int, tuple[int, int]]] = {}
@@ -1455,6 +1616,12 @@ def match_features_batch(
                         "feature_instance_id": feature_instance_id,
                     }
                 )
+
+        if _group_id != -1:
+            _member_prepass_cache.pop(int(pept_idx), None)
+            _group_members_remaining[_group_id] -= 1
+            if _group_members_remaining[_group_id] <= 0:
+                _group_bundle_cache.pop(_group_id, None)
 
     # coSWA: now that every member of every in-batch group has been snapped
     # onto its group's shared segmentation above, check whether their own

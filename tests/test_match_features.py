@@ -1,4 +1,6 @@
+import gc
 import os
+import weakref
 
 import numpy as np
 import pandas as pd
@@ -6,10 +8,14 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from swaps.postprocessing import match_features as match_features_module
 from swaps.postprocessing.match_features import (
     _build_consensus_peptide_swap_decoy,
+    _build_peptide_batches,
+    _carve_out_oversized,
     _confounder_pool,
     _crop_consensus_feature_bundle_to_window,
+    _estimate_peptide_pixel_weights,
     _find_shift_via_template_match,
     _select_group_reference_run,
     _shift_and_fit,
@@ -1008,3 +1014,248 @@ class TestMatchFeaturesBatchConfounderGroups:
         )
         pp_ref = pd.concat(pp_reference_list)
         assert (pp_ref["undistinguishable_group_id"] == -1).all()
+
+
+class TestGroupBundleCacheFreedEarly:
+    def test_group_raw_images_released_before_batch_returns(self, tmp_path, monkeypatch):
+        """OOM fix: match_features_batch's group pre-pass builds full
+        multi-run raw/aligned image sets for every in-batch confounder
+        group up front (_group_bundle_cache/_member_prepass_cache). Once a
+        group's last member has been processed in the main per-peptide
+        loop, that group's entry must be popped so the arrays can be
+        garbage-collected -- not held resident for the rest of the batch.
+
+        Verified by spying on get_pept_act_from_parquet's use_group_window=
+        True calls (the group pre-pass's own raw-image loads), keeping only
+        weakrefs, and checking they're already dead by the time
+        _mark_overlapping_group_members runs (after the main loop, but
+        still inside match_features_batch -- i.e. released *during*
+        processing, not merely once the whole function/its locals go out
+        of scope on return, which every Python function does regardless of
+        this fix)."""
+        captured_refs: list[weakref.ReferenceType] = []
+        orig_get_pept_act = match_features_module.get_pept_act_from_parquet
+
+        def _spy_get_pept_act(*args, **kwargs):
+            result = orig_get_pept_act(*args, **kwargs)
+            if kwargs.get("use_group_window"):
+                captured_refs.append(weakref.ref(result[0]))
+            return result
+
+        monkeypatch.setattr(
+            match_features_module, "get_pept_act_from_parquet", _spy_get_pept_act
+        )
+
+        checked_alive: list[list[weakref.ReferenceType]] = []
+        orig_mark = match_features_module._mark_overlapping_group_members
+
+        def _spy_mark(*args, **kwargs):
+            gc.collect()
+            checked_alive.append([r for r in captured_refs if r() is not None])
+            return orig_mark(*args, **kwargs)
+
+        monkeypatch.setattr(
+            match_features_module, "_mark_overlapping_group_members", _spy_mark
+        )
+
+        _run_group_scenario(
+            tmp_path,
+            group_blobs=[(15, 8, 10.0, 2.0), (15, 18, 10.0, 2.0)],
+            a_anchor_offset=(15, 8),
+            b_anchor_offset=(15, 18),
+        )
+
+        assert captured_refs, "expected at least one group-window raw image load"
+        assert checked_alive, "_mark_overlapping_group_members was not called"
+        assert checked_alive[0] == [], (
+            f"{len(checked_alive[0])}/{len(captured_refs)} group raw images "
+            "were still referenced by the time _mark_overlapping_group_members "
+            "ran -- _group_bundle_cache/_member_prepass_cache entries were not "
+            "freed once the group's members were done"
+        )
+
+
+class TestEstimatePeptidePixelWeights:
+    def test_all_ones_when_window_columns_absent(self):
+        dict_ref = pd.DataFrame({"mz_rank": [1, 2, 3]})
+        weights = _estimate_peptide_pixel_weights(dict_ref, np.array([1, 2, 3]), ["run1"])
+        assert np.array_equal(weights, np.ones(3))
+
+    def test_all_ones_when_raw_file_list_empty(self):
+        dict_ref = pd.DataFrame({"mz_rank": [1, 2]})
+        weights = _estimate_peptide_pixel_weights(dict_ref, np.array([1, 2]), [])
+        assert np.array_equal(weights, np.ones(2))
+
+    def test_sums_individual_window_across_runs(self):
+        rows = [
+            {
+                "mz_rank": 1,
+                "confounder_group_id": -1,
+                "MS1_frame_idx_left_ref_run1": 0,
+                "MS1_frame_idx_right_ref_run1": 9,  # 10 frames
+                "mobility_values_index_left_ref_run1": 0,
+                "mobility_values_index_right_ref_run1": 4,  # 5 bins -> 50 px
+                "MS1_frame_idx_left_ref_run2": 0,
+                "MS1_frame_idx_right_ref_run2": 19,  # 20 frames
+                "mobility_values_index_left_ref_run2": 0,
+                "mobility_values_index_right_ref_run2": 1,  # 2 bins -> 40 px
+            }
+        ]
+        dict_ref = pd.DataFrame(rows)
+        weights = _estimate_peptide_pixel_weights(
+            dict_ref, np.array([1]), ["run1", "run2"]
+        )
+        assert weights[0] == pytest.approx(90.0)
+
+    def test_uses_group_window_for_grouped_peptide(self):
+        rows = [
+            {
+                "mz_rank": 1,
+                "confounder_group_id": 1001,
+                "MS1_frame_idx_left_ref_run1": 0,
+                "MS1_frame_idx_right_ref_run1": 4,  # individual: 5 frames
+                "mobility_values_index_left_ref_run1": 0,
+                "mobility_values_index_right_ref_run1": 4,  # 5 bins -> 25 px
+                "MS1_frame_idx_left_group_ref_run1": 0,
+                "MS1_frame_idx_right_group_ref_run1": 9,  # group: 10 frames
+                "mobility_values_index_left_group_ref_run1": 0,
+                "mobility_values_index_right_group_ref_run1": 9,  # 10 bins -> 100 px
+            },
+            {
+                "mz_rank": 2,
+                "confounder_group_id": -1,  # solo -- individual window even though group cols present
+                "MS1_frame_idx_left_ref_run1": 0,
+                "MS1_frame_idx_right_ref_run1": 4,
+                "mobility_values_index_left_ref_run1": 0,
+                "mobility_values_index_right_ref_run1": 4,  # 25 px
+                "MS1_frame_idx_left_group_ref_run1": 0,
+                "MS1_frame_idx_right_group_ref_run1": 9,
+                "mobility_values_index_left_group_ref_run1": 0,
+                "mobility_values_index_right_group_ref_run1": 9,
+            },
+        ]
+        dict_ref = pd.DataFrame(rows)
+        weights = _estimate_peptide_pixel_weights(dict_ref, np.array([1, 2]), ["run1"])
+        assert weights[0] == pytest.approx(100.0)  # grouped -> group window
+        assert weights[1] == pytest.approx(25.0)  # solo -> individual window
+
+
+class TestCarveOutOversized:
+    def test_no_carve_out_when_multiplier_disabled(self):
+        mz = np.array([1, 2, 3])
+        weights = np.array([1.0, 100.0, 1.0])
+        remaining, batches = _carve_out_oversized(mz, weights, None, 20)
+        assert np.array_equal(remaining, mz)
+        assert batches == []
+
+    def test_no_carve_out_when_nothing_oversized(self):
+        mz = np.array([1, 2, 3])
+        weights = np.array([1.0, 1.1, 0.9])
+        remaining, batches = _carve_out_oversized(mz, weights, 3.0, 20)
+        assert np.array_equal(remaining, mz)
+        assert batches == []
+
+    def test_carves_out_items_above_threshold(self):
+        mz = np.array([1, 2, 3, 4])
+        weights = np.array([1.0, 1.0, 1.0, 100.0])  # item 4 >> 3x median
+        remaining, batches = _carve_out_oversized(mz, weights, 3.0, 20)
+        assert set(remaining.tolist()) == {1, 2, 3}
+        assert len(batches) == 1
+        assert list(batches[0]) == [4]
+
+    def test_chunks_oversized_items_by_oversize_batch_size(self):
+        # 9 normal items (weight 1.0, keeps the median low) + 6 oversized
+        # ones (weight 100.0) -> 6/2 = 3 carved-out batches of size <=2.
+        mz = np.arange(1, 16)
+        weights = np.array([1.0] * 9 + [100.0] * 6)
+        remaining, batches = _carve_out_oversized(mz, weights, 3.0, 2)
+        assert list(remaining) == list(range(1, 10))
+        assert len(batches) == 3
+        assert all(len(b) <= 2 for b in batches)
+        assert sorted(np.concatenate(batches).tolist()) == list(range(10, 16))
+
+
+class TestBuildPeptideBatchesSizeAware:
+    def _dict_ref_with_windows(self, mz_ranks, group_ids, rt_spans, im_spans, run="run1"):
+        rows = []
+        for mz, gid, rt_span, im_span in zip(mz_ranks, group_ids, rt_spans, im_spans):
+            rows.append(
+                {
+                    "mz_rank": mz,
+                    "confounder_group_id": gid,
+                    f"MS1_frame_idx_left_ref_{run}": 0,
+                    f"MS1_frame_idx_right_ref_{run}": rt_span - 1,
+                    f"mobility_values_index_left_ref_{run}": 0,
+                    f"mobility_values_index_right_ref_{run}": im_span - 1,
+                    f"MS1_frame_idx_left_group_ref_{run}": 0,
+                    f"MS1_frame_idx_right_group_ref_{run}": rt_span - 1,
+                    f"mobility_values_index_left_group_ref_{run}": 0,
+                    f"mobility_values_index_right_group_ref_{run}": im_span - 1,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_identical_output_when_oversize_disabled(self):
+        mz_ranks = np.arange(1, 21)
+        group_ids = np.array([-1] * 15 + [1001] * 3 + [1002] * 2)
+        dict_ref = self._dict_ref_with_windows(
+            mz_ranks, group_ids, rt_spans=[10] * 20, im_spans=[10] * 20
+        )
+        without_weights = _build_peptide_batches(
+            dict_ref, mz_ranks, batch_size_max=5, max_workers=1
+        )
+        disabled = _build_peptide_batches(
+            dict_ref,
+            mz_ranks,
+            batch_size_max=5,
+            max_workers=1,
+            raw_file_list=["run1"],
+            oversize_multiplier=None,
+        )
+        legacy = _build_peptide_batches(dict_ref, mz_ranks, batch_size_max=5, max_workers=1)
+        for batches in (without_weights, disabled, legacy):
+            all_mz = sorted(int(v) for b in batches for v in b)
+            assert all_mz == list(range(1, 21))
+
+    def test_oversized_solo_isolated_from_normal_batches(self):
+        mz_ranks = np.arange(1, 11)
+        group_ids = np.full(10, -1)
+        rt_spans = [10] * 9 + [500]  # last peptide is far larger
+        im_spans = [10] * 9 + [500]
+        dict_ref = self._dict_ref_with_windows(mz_ranks, group_ids, rt_spans, im_spans)
+        batches = _build_peptide_batches(
+            dict_ref,
+            mz_ranks,
+            batch_size_max=100,
+            max_workers=1,
+            raw_file_list=["run1"],
+            oversize_multiplier=3.0,
+            oversize_batch_size=20,
+        )
+        all_mz = sorted(int(v) for b in batches for v in b)
+        assert all_mz == list(range(1, 11))
+        oversized_batch = [b for b in batches if 10 in b]
+        assert len(oversized_batch) == 1
+        assert list(oversized_batch[0]) == [10]
+
+    def test_oversized_group_isolated_and_never_split(self):
+        mz_ranks = np.arange(1, 11)
+        # peptides 1-8 solo, 9-10 form one confounder group with a huge window
+        group_ids = np.array([-1] * 8 + [1001, 1001])
+        rt_spans = [10] * 8 + [500, 500]
+        im_spans = [10] * 8 + [500, 500]
+        dict_ref = self._dict_ref_with_windows(mz_ranks, group_ids, rt_spans, im_spans)
+        batches = _build_peptide_batches(
+            dict_ref,
+            mz_ranks,
+            batch_size_max=100,
+            max_workers=1,
+            raw_file_list=["run1"],
+            oversize_multiplier=3.0,
+            oversize_batch_size=20,
+        )
+        all_mz = sorted(int(v) for b in batches for v in b)
+        assert all_mz == list(range(1, 11))
+        group_batch = [b for b in batches if 9 in b or 10 in b]
+        assert len(group_batch) == 1
+        assert sorted(group_batch[0].tolist()) == [9, 10]  # group never split

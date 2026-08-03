@@ -396,13 +396,15 @@ def opt_scan_by_scan(config_path: str):
         raw_file_list=raw_file_list,
         result_dir=cfg.RESULT_PATH,
         peptide_indicies=dict_ref["mz_rank"].values,  # type: ignore
-        batch_size_max=500,
+        batch_size_max=cfg.MATCH_FEATURES_KWARGS.batching.batch_size_max,
         max_workers=cfg.N_CPU,
         processing_kwargs=processing_kwargs,
         # Decoys only exist to feed Mokapot/percolator FDR control below —
         # skip generating them entirely when FDR is disabled.
         match_decoy=cfg.FDR.ENABLED,
         merge_confounders_enabled=cfg.PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED,
+        oversize_multiplier=cfg.MATCH_FEATURES_KWARGS.batching.oversize_multiplier,
+        oversize_batch_size=cfg.MATCH_FEATURES_KWARGS.batching.oversize_batch_size,
     )
     quant_dir = _quant_dir(cfg)
     os.makedirs(quant_dir, exist_ok=True)
