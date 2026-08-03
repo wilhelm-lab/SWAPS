@@ -9,7 +9,9 @@ import pytest
 from swaps.postprocessing.match_features import (
     _build_consensus_peptide_swap_decoy,
     _confounder_pool,
+    _crop_consensus_feature_bundle_to_window,
     _find_shift_via_template_match,
+    _select_group_reference_run,
     _shift_and_fit,
     align_images_to_reference,
     build_consensus_feature_bundle,
@@ -600,9 +602,12 @@ class TestBuildConsensusFeatureBundleReuse:
 
 
 # ---------------------------------------------------------------------------
-# match_features_batch end-to-end: coSWA confounder-group orchestration
-# (each member independently aligned + segmented; overlap between members'
-# own assigned segments is flagged post-hoc via undistinguishable_group_id)
+# match_features_batch end-to-end: coSWA confounder-group orchestration (ONE
+# shared alignment + watershed segmentation per group; each member snaps its
+# own anchors onto it, without forcing a single-label collapse; overlap
+# between members' own assigned label sets is flagged via
+# undistinguishable_group_id, plus continuous pixel/intensity overlap-
+# fraction diagnostics -- see _mark_overlapping_group_members)
 # ---------------------------------------------------------------------------
 
 _RT_RANGE = (100, 139)  # 40 frames
@@ -710,13 +715,100 @@ def _run_group_scenario(tmp_path, group_blobs, a_anchor_offset, b_anchor_offset)
     )
 
 
+class TestSelectGroupReferenceRun:
+    def test_picks_run_with_most_anchors(self):
+        # run1: both members anchored (m1 Reference, m2 Quant_Only) -> count 2.
+        # run2: only m1 anchored (Quant_Only) -> count 1.
+        member_roles = {
+            1: ("run1", ["run2"], ["run2"]),
+            2: ("run3", ["run1"], ["run1", "run3"]),
+        }
+        assert _select_group_reference_run(member_roles) == "run1"
+
+    def test_tie_broken_by_reference_role_count(self):
+        # run1 and run2 both have 2 anchored members (tied), but run2 has 2
+        # members with the Reference role specifically vs run1's 1.
+        member_roles = {
+            1: ("run1", ["run2"], ["run2"]),
+            2: ("run2", ["run1"], ["run1"]),
+            3: ("run2", [], []),
+        }
+        assert _select_group_reference_run(member_roles) == "run2"
+
+    def test_final_tie_broken_randomly_among_remaining(self):
+        # run1 and run2 are identical in both anchor count and Reference
+        # count -- the result must be one of the two, deterministically
+        # reproducible only up to that random choice.
+        member_roles = {
+            1: ("run1", [], []),
+            2: ("run2", [], []),
+        }
+        result = _select_group_reference_run(member_roles)
+        assert result in ("run1", "run2")
+
+
+class TestCropConsensusFeatureBundleToWindow:
+    """Unit coverage for the decoy-scoring crop helper: a coSWA group's
+    shared (group-window-scale) bundle cropped down to one member's own
+    (smaller) individual window -- the mechanism match_features_batch uses
+    so decoy feature scale stays comparable to a solo candidate's own decoy."""
+
+    def test_crop_shapes_and_preserves_contained_quantification(self):
+        img = _two_blob_image()  # 40x40, blobs at (row10,col10) and (row10,col30)
+        bundle = build_consensus_feature_bundle(
+            images=[img], anchors=[(10, 10)], raw_images=[img], labels=["run1"]
+        )
+        assert bundle.consensus_pp is not None
+
+        cropped = _crop_consensus_feature_bundle_to_window(
+            bundle,
+            crop_origin=(0, 0),
+            crop_shape=(40, 20),  # cols [0, 20) -- fully contains blob at col 10
+            member_ref_anchor_local=(10, 10),
+            template_frac=0.3,
+            labels=["run1"],
+        )
+        assert cropped.alignment.target_shape == (40, 20)
+        assert cropped.raw_aligned_images[0].shape == (40, 20)
+        assert cropped.raw_aligned_denoised_images[0].shape == (40, 20)
+        assert cropped.segmentation.watershed_labels.shape == (40, 20)
+        assert cropped.consensus_pp is not None
+        # The far blob (col 30) was never part of this label's own mask, so
+        # cropping it out of frame changes nothing about this label's area.
+        assert (
+            cropped.consensus_pp["area"].iloc[0] == bundle.consensus_pp["area"].iloc[0]
+        )
+        assert cropped.consensus_pp["intensity_sum"].iloc[0] == pytest.approx(
+            bundle.consensus_pp["intensity_sum"].iloc[0]
+        )
+
+    def test_crop_that_clips_the_blob_reduces_area(self):
+        img = _two_blob_image()
+        bundle = build_consensus_feature_bundle(
+            images=[img], anchors=[(10, 10)], raw_images=[img], labels=["run1"]
+        )
+        cropped = _crop_consensus_feature_bundle_to_window(
+            bundle,
+            crop_origin=(0, 5),
+            crop_shape=(40, 10),  # cols [5, 15) -- clips the blob at col 10
+            member_ref_anchor_local=(10, 10),
+            template_frac=0.3,
+            labels=["run1"],
+        )
+        assert cropped.consensus_pp is not None
+        assert (
+            cropped.consensus_pp["area"].iloc[0] < bundle.consensus_pp["area"].iloc[0]
+        )
+
+
 class TestMatchFeaturesBatchConfounderGroups:
     def test_bimodal_signal_separates_group_members_no_collision(self, tmp_path):
-        """Two distinguishable sub-peaks within the shared merged image -> A
-        and B each independently align + segment their own image, and each
-        one's own assigned segment lands on a different, non-overlapping
-        region -> both correctly quantified independently, no
-        undistinguishable flag."""
+        """Two distinguishable sub-peaks within the ONE shared group
+        segmentation -> A and B's own anchors snap to DIFFERENT watershed
+        labels (no forced collapse needed since neither spans more than one
+        label) -> both correctly quantified independently, no
+        undistinguishable flag, and neither member's own pixels/intensity
+        are claimed by the other (0.0 overlap fraction)."""
         (
             results_target,
             results_decoy,
@@ -744,16 +836,18 @@ class TestMatchFeaturesBatchConfounderGroups:
         assert by_rank_match.loc[2, "undistinguishable_group_id"] == -1
         # correctly told apart: distinct quantification for A vs B
         assert by_rank_ref.loc[1, "area"] != by_rank_ref.loc[2, "area"]
+        # neither member's own assigned pixels/intensity are shared
+        assert by_rank_ref.loc[1, "undistinguishable_pixel_fraction"] == 0.0
+        assert by_rank_ref.loc[2, "undistinguishable_pixel_fraction"] == 0.0
+        assert by_rank_ref.loc[1, "undistinguishable_intensity_fraction"] == 0.0
+        assert by_rank_ref.loc[2, "undistinguishable_intensity_fraction"] == 0.0
 
     def test_unimodal_signal_flags_group_members_as_undistinguishable(self, tmp_path):
-        """A single peak in the shared merged image -> A and B each
-        independently align + segment their own image, and each one's own
-        assigned segment (there's only one label to land on) overlaps the
-        other's -> flagged with a shared undistinguishable_group_id. Their
-        quantification is no longer forced identical by construction (each
-        is computed fully independently) -- it happens to match here only
-        because both use identical anchors/runs/windows, not because that's
-        a guaranteed invariant of the new design."""
+        """A single peak in the shared group segmentation -> A and B's own
+        (identical) anchors both snap to the SAME single watershed label ->
+        flagged with a shared undistinguishable_group_id, and BOTH members'
+        own assigned pixels/intensity are entirely (fraction 1.0) claimed by
+        the other, since they share the one label."""
         (
             results_target,
             results_decoy,
@@ -785,6 +879,13 @@ class TestMatchFeaturesBatchConfounderGroups:
         # both are still genuinely quantified (not dropped just for overlapping)
         assert by_rank_ref.loc[1, "area"] > 0
         assert by_rank_ref.loc[2, "area"] > 0
+        # sharing the ONE label -> entirely overlapping, both directions
+        assert by_rank_ref.loc[1, "undistinguishable_pixel_fraction"] == 1.0
+        assert by_rank_ref.loc[2, "undistinguishable_pixel_fraction"] == 1.0
+        assert by_rank_ref.loc[1, "undistinguishable_intensity_fraction"] == 1.0
+        assert by_rank_ref.loc[2, "undistinguishable_intensity_fraction"] == 1.0
+        # C (solo) has no group to overlap with
+        assert by_rank_ref.loc[3, "undistinguishable_pixel_fraction"] == 0.0
 
     def test_solo_candidate_unaffected_by_group_presence(self, tmp_path):
         """C's own quantification and -1 tag hold regardless of whether the

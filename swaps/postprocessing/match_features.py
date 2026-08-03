@@ -404,6 +404,35 @@ def _group_members_in_batch(
     return members_by_group
 
 
+def _select_group_reference_run(
+    member_roles: dict[int, tuple[str, list[str], list[str]]],
+) -> str:
+    """Pick the run to use as reference_idx=0 for a coSWA group's shared
+    alignment build: the run with the most members having a real MS/MS
+    anchor there (Reference or Quant_Only role -- matches
+    _positional_anchors' own definition of an anchored run), tie-broken by
+    the run with the most members specifically in the Reference role, then
+    a random pick among whatever's still tied.
+
+    `member_roles`: {mz_rank: (reference_raw_file, quant_only_raw_files,
+    match_raw_files)}, i.e. _reference_match_quant_files's return value per
+    member.
+    """
+    anchor_count: dict[str, int] = {}
+    reference_count: dict[str, int] = {}
+    for ref_rf, quant_rf, _ in member_roles.values():
+        anchor_count[ref_rf] = anchor_count.get(ref_rf, 0) + 1
+        reference_count[ref_rf] = reference_count.get(ref_rf, 0) + 1
+        for rf in quant_rf:
+            anchor_count[rf] = anchor_count.get(rf, 0) + 1
+    max_anchor_count = max(anchor_count.values())
+    tied_runs = [rf for rf, c in anchor_count.items() if c == max_anchor_count]
+    if len(tied_runs) > 1:
+        max_ref_count = max(reference_count.get(rf, 0) for rf in tied_runs)
+        tied_runs = [rf for rf in tied_runs if reference_count.get(rf, 0) == max_ref_count]
+    return tied_runs[0] if len(tied_runs) == 1 else str(np.random.choice(tied_runs))
+
+
 def _parse_seg_mask_thres(val, default: tuple[int, int] = (3, 3)) -> tuple[int, int]:
     if isinstance(val, dict):
         return (int(val.get("rt", default[0])), int(val.get("im", default[1])))
@@ -462,15 +491,22 @@ def _annotate_peak_properties(
     source_type: str,
     decoy_mz_rank: int | None = None,
     undistinguishable_group_id: str | int = -1,
+    undistinguishable_pixel_fraction: float = 0.0,
+    undistinguishable_intensity_fraction: float = 0.0,
 ) -> pd.DataFrame | None:
     """Add anchor-aware metadata columns to a quantified peak-properties row.
 
     undistinguishable_group_id flags coSWA confounder-group members whose own
-    independently-computed assigned segments spatially overlap (see
+    assigned segments overlap another present member's (see
     _mark_overlapping_group_members in match_features_batch) -- -1 (the
-    default) means not part of such an overlap. Always -1 at the point this
-    function is called; patched in afterward once every member of the
-    member's group has been processed.
+    default) means not part of such an overlap. undistinguishable_pixel_fraction/
+    undistinguishable_intensity_fraction are the same function's continuous
+    per-member diagnostic (fraction of this member's own assigned pixels/
+    summed consensus intensity also claimed by another present member) --
+    0.0 for solo candidates and members of a group with no other present
+    member. All three are always at their default at the point this function
+    is called; patched in afterward once every member of the group has been
+    processed.
     """
 
     if peak_properties is None:
@@ -485,6 +521,12 @@ def _annotate_peak_properties(
     peak_properties["source_run"] = source_run
     peak_properties["source_type"] = source_type
     peak_properties["undistinguishable_group_id"] = undistinguishable_group_id
+    peak_properties["undistinguishable_pixel_fraction"] = (
+        undistinguishable_pixel_fraction
+    )
+    peak_properties["undistinguishable_intensity_fraction"] = (
+        undistinguishable_intensity_fraction
+    )
     if decoy_mz_rank is not None:
         peak_properties["decoy_mz_rank"] = decoy_mz_rank
     return peak_properties
@@ -649,19 +691,158 @@ def match_features_batch(
         ].tolist()
         return reference_raw_file, quant_only_raw_files, match_raw_files
 
-    # coSWA: every candidate -- group member or solo -- gets its own
-    # independent alignment + watershed segmentation below (own roles, own
-    # anchors, own window). Group members' assigned segments are compared for
-    # spatial overlap AFTER the main loop (_mark_overlapping_group_members),
-    # once every member of every in-batch group has been processed; pairs
-    # (or larger connected sets) whose own segments overlap are tagged with a
-    # shared undistinguishable_group_id, patched into the rows built below.
-    #
-    # Deliberately out of scope here: decoy generation (_confounder_pool /
-    # peptide_swap sampling) is left completely untouched -- grouped
-    # candidates go through the exact same per-candidate decoy code as solo
-    # candidates, operating on whichever ConsensusFeatureBundle this loop
-    # built for them.
+    # coSWA: build ONE shared alignment + watershed segmentation per
+    # multi-member group (every run any member is identified/matched in,
+    # fetched via the group's MERGED/union window -- use_group_window=True),
+    # then let each member snap its own anchors onto it below WITHOUT forcing
+    # a single-label collapse -- a member can legitimately span more than one
+    # watershed label, exactly like a solo candidate already can (its
+    # quantified region is the union over all of them, via the existing
+    # np.isin(label_image, label_ids) logic in _extract_feature_rows_for_label_ids).
+    # Solo candidates (and any candidate whose group has <2 present members)
+    # are untouched by this pre-pass and keep going through the independent
+    # per-candidate path further down.
+    _group_bundle_cache: dict[int, dict] = {}
+    _member_prepass_cache: dict[
+        int,
+        tuple[
+            ConsensusAlignmentState,
+            ConsensusSegmentationState,
+            list[tuple[int, int] | None],
+        ],
+    ] = {}
+
+    def _load_group_pept_act(
+        pept_idx: int, raw_file: str, gid: int
+    ) -> tuple[np.ndarray, int, int, tuple[int, int]]:
+        return get_pept_act_from_parquet(  # pyright: ignore[reportArgumentType]
+            _select_mz(raw_file, gid),
+            int(pept_idx),
+            dict_ref_by_mz,
+            raw_file,
+            return_offset=True,
+            use_group_window=True,
+        )
+
+    _group_apply_seg = bool((processing_kwargs or {}).get("apply_seg", True))
+    _group_seg_mask_thres = _parse_seg_mask_thres(
+        (processing_kwargs or {}).get("seg_mask_thres")
+    )
+    _group_template_frac = float((processing_kwargs or {}).get("template_frac", 0.3))
+    _group_watershed_kwargs = dict(
+        (processing_kwargs or {}).get("peak_consensus_kwargs", {})
+    )
+
+    for _gid, _gmembers in _members_by_group.items():
+        _member_roles = {m: _reference_match_quant_files(m) for m in _gmembers}
+        _group_repr = min(_gmembers)  # any member works: group window columns are shared
+
+        _group_ref_run = _select_group_reference_run(_member_roles)
+
+        # Group run stack: winning reference run first, then the union of
+        # every member's own [reference] + match runs (already includes
+        # quant_only, per _reference_match_quant_files), deterministic order.
+        _group_raw_files = [_group_ref_run]
+        _seen_rf = {_group_ref_run}
+        for _m in sorted(_gmembers):
+            _m_ref, _m_quant, _m_match = _member_roles[_m]
+            for _rf in [_m_ref] + _m_match:
+                if _rf not in _seen_rf:
+                    _group_raw_files.append(_rf)
+                    _seen_rf.add(_rf)
+        _group_stack_index = {rf: i for i, rf in enumerate(_group_raw_files)}
+
+        _all_member_anchors: dict[int, list[tuple[int, int] | None]] = {
+            _m: _positional_anchors(
+                _group_raw_files,
+                _member_roles[_m][0],
+                set(_member_roles[_m][1]),
+                lambda rf, _m=_m: _load_group_pept_act(_m, rf, _gid),
+            )
+            for _m in _gmembers
+        }
+        _group_consensus_indices = sorted(
+            {
+                _group_stack_index[_rf]
+                for _m in _gmembers
+                for _rf in [_member_roles[_m][0]] + _member_roles[_m][1]
+            }
+        )
+
+        _group_raw_images = [
+            _load_group_pept_act(_group_repr, rf, _gid)[0] for rf in _group_raw_files
+        ]
+        _group_denoised_images = [
+            smooth_and_denoise_image(img, **raw_denoise_kwargs)
+            for img in _group_raw_images
+        ]
+
+        _group_forced_shifts = None
+        if _shift_lookup is not None:
+            _group_rt_pos = float(
+                np.mean(
+                    [dict_ref_by_mz.at[m, "RT_search_center"] for m in _gmembers]
+                )
+            )
+            _group_forced_shifts = [None] + [
+                _shift_lookup.lookup(_group_ref_run, rf, _group_rt_pos)
+                for rf in _group_raw_files[1:]
+            ]
+
+        _group_bundle = build_consensus_feature_bundle(
+            images=_group_denoised_images,
+            reference_idx=0,
+            template_frac=_group_template_frac,
+            anchors=_all_member_anchors[_group_repr],
+            additional_anchors=list(_all_member_anchors.values()),
+            denoise_cfg=denoise_cfg,
+            watershed_kwargs=_group_watershed_kwargs,
+            raw_images=_group_raw_images,
+            labels=_group_raw_files,
+            apply_seg=_group_apply_seg,
+            seg_mask_thres=_group_seg_mask_thres,
+            jump_dist_thres=_jump_dist_thres,
+            consensus_image_indices=_group_consensus_indices,
+            align_images=_align_images,
+            align_in_log_space=_align_in_log_space,
+            use_shift_crop_pad=_use_shift_crop_pad,
+            forced_shifts=_group_forced_shifts,
+            broad_alignment_max_deviation=_broad_alignment_max_deviation,
+        )
+        _group_bundle_cache[_gid] = {
+            "bundle": _group_bundle,
+            "raw_files": _group_raw_files,
+            "reference_run": _group_ref_run,
+            "reference_run_origin": _load_group_pept_act(
+                _group_repr, _group_ref_run, _gid
+            )[3],
+            "raw_images": _group_raw_images,
+        }
+
+        _source_shapes = [img.shape for img in _group_raw_images]
+        for _m in _gmembers:
+            _m_alignment = _reuse_alignment_with_new_anchors(
+                _group_bundle.alignment, _all_member_anchors[_m], _source_shapes
+            )
+            _m_segmentation = _snap_all_anchors_to_watershed(
+                _m_alignment,
+                _group_bundle.segmentation.consensus,
+                _group_bundle.segmentation.consensus_denoised,
+                _group_bundle.segmentation.watershed_labels,
+                _group_bundle.segmentation.all_peaks,
+                _group_apply_seg,
+                _group_seg_mask_thres,
+                _jump_dist_thres,
+                collapse_to_single_label=False,
+            )
+            _member_prepass_cache[_m] = (
+                _m_alignment,
+                _m_segmentation,
+                _all_member_anchors[_m],
+            )
+
+    # Post-hoc overlap/diagnostics cache: populated below for group members
+    # only, consumed after the main loop by _mark_overlapping_group_members.
     _member_overlap_cache: dict[int, dict] = {}
 
     for pept_idx in batch_np:
@@ -707,72 +888,125 @@ def match_features_batch(
 
         # Roles are ALWAYS this candidate's OWN (fixes the coSWA bug where
         # group members used to reuse a representative's per-run role
-        # assignment).
+        # assignment) -- used for per-run role classification below and for
+        # decoy generation, regardless of which branch (group/solo) built
+        # _consensus_bundle.
         reference_raw_file, quant_only_raw_files, match_raw_files = (
             _reference_match_quant_files(pept_idx)
         )
         _quant_only_set = set(quant_only_raw_files)
 
-        _consensus_raw_files = [reference_raw_file] + match_raw_files
-        _consensus_anchors = _positional_anchors(
-            _consensus_raw_files,
-            reference_raw_file,
-            _quant_only_set,
-            _get_pept_act_tuple,
-        )
-
         own_anchor_id = 0
         feature_instance_id = _feature_instance_id(pept_idx, own_anchor_id)
 
-        # Only files with known anchors contribute to the consensus average;
-        # files without anchors are still aligned and quantified from the labels.
-        _anchor_image_indices = [
-            i for i, a in enumerate(_consensus_anchors) if a is not None
-        ]
-        _forced_shifts = None
-        if _shift_lookup is not None:
-            _rt_pos = float(dict_ref_by_mz.at[pept_idx, "RT_search_center"])
-            _forced_shifts = [None] + [
-                _shift_lookup.lookup(reference_raw_file, rf, _rt_pos)
-                for rf in match_raw_files
-            ]
-        _consensus_bundle = build_consensus_feature_bundle(
-            images=[_get_raw_denoised_pept_act(rf) for rf in _consensus_raw_files],
-            reference_idx=0,
-            template_frac=float((processing_kwargs or {}).get("template_frac", 0.3)),
-            anchors=_consensus_anchors,
-            denoise_cfg=denoise_cfg,
-            watershed_kwargs=dict(
-                (processing_kwargs or {}).get("peak_consensus_kwargs", {})
-            ),
-            raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
-            labels=_consensus_raw_files,
-            apply_seg=bool((processing_kwargs or {}).get("apply_seg", True)),
-            seg_mask_thres=_parse_seg_mask_thres(
-                (processing_kwargs or {}).get("seg_mask_thres")
-            ),
-            jump_dist_thres=_jump_dist_thres,
-            consensus_image_indices=_anchor_image_indices,
-            align_images=_align_images,
-            align_in_log_space=_align_in_log_space,
-            use_shift_crop_pad=_use_shift_crop_pad,
-            forced_shifts=_forced_shifts,
-            broad_alignment_max_deviation=_broad_alignment_max_deviation,
-        )
-        if _group_id in _members_by_group:
-            # Stash what the post-hoc overlap pass needs -- this member's own
-            # alignment/segmentation state, run stack, and per-run absolute
-            # window origins (to project its assigned segment mask into a
-            # common run's real frame_idx/mobility_index coordinates).
+        _cached_group = _group_bundle_cache.get(_group_id) if _group_id != -1 else None
+        if _cached_group is not None:
+            # Group member: reuse the group's shared alignment + watershed
+            # segmentation, computed in the pre-pass above; this member's own
+            # anchors were already snapped onto it there (no forced collapse
+            # -- see _member_prepass_cache).
+            _consensus_raw_files = _cached_group["raw_files"]
+            _m_alignment, _m_segmentation, _consensus_anchors = (
+                _member_prepass_cache[int(pept_idx)]
+            )
+            _consensus_bundle = build_consensus_feature_bundle(
+                images=[],
+                raw_images=_cached_group["raw_images"],
+                labels=_consensus_raw_files,
+                precomputed_states=(_m_alignment, _m_segmentation),
+            )
             _member_overlap_cache[int(pept_idx)] = {
-                "alignment": _consensus_bundle.alignment,
-                "segmentation": _consensus_bundle.segmentation,
-                "consensus_raw_files": _consensus_raw_files,
-                "reference_raw_file": reference_raw_file,
-                "window_origin_by_run": {
-                    rf: _get_pept_act_tuple(rf)[3] for rf in _consensus_raw_files
-                },
+                "segmentation": _m_segmentation,
             }
+        else:
+            _consensus_raw_files = [reference_raw_file] + match_raw_files
+            _consensus_anchors = _positional_anchors(
+                _consensus_raw_files,
+                reference_raw_file,
+                _quant_only_set,
+                _get_pept_act_tuple,
+            )
+            # Only files with known anchors contribute to the consensus
+            # average; files without anchors are still aligned and quantified
+            # from the labels.
+            _anchor_image_indices = [
+                i for i, a in enumerate(_consensus_anchors) if a is not None
+            ]
+            _forced_shifts = None
+            if _shift_lookup is not None:
+                _rt_pos = float(dict_ref_by_mz.at[pept_idx, "RT_search_center"])
+                _forced_shifts = [None] + [
+                    _shift_lookup.lookup(reference_raw_file, rf, _rt_pos)
+                    for rf in match_raw_files
+                ]
+            _consensus_bundle = build_consensus_feature_bundle(
+                images=[_get_raw_denoised_pept_act(rf) for rf in _consensus_raw_files],
+                reference_idx=0,
+                template_frac=float(
+                    (processing_kwargs or {}).get("template_frac", 0.3)
+                ),
+                anchors=_consensus_anchors,
+                denoise_cfg=denoise_cfg,
+                watershed_kwargs=dict(
+                    (processing_kwargs or {}).get("peak_consensus_kwargs", {})
+                ),
+                raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
+                labels=_consensus_raw_files,
+                apply_seg=bool((processing_kwargs or {}).get("apply_seg", True)),
+                seg_mask_thres=_parse_seg_mask_thres(
+                    (processing_kwargs or {}).get("seg_mask_thres")
+                ),
+                jump_dist_thres=_jump_dist_thres,
+                consensus_image_indices=_anchor_image_indices,
+                align_images=_align_images,
+                align_in_log_space=_align_in_log_space,
+                use_shift_crop_pad=_use_shift_crop_pad,
+                forced_shifts=_forced_shifts,
+                broad_alignment_max_deviation=_broad_alignment_max_deviation,
+            )
+
+        # Decoys are scored against a version of the consensus CROPPED down
+        # to this candidate's own individual window -- for solo candidates
+        # that's already _consensus_bundle itself (identity); for group
+        # members, crop the shared group-scale bundle down to this member's
+        # own window so decoy feature scale stays comparable to a solo
+        # candidate's own decoy, rather than being inflated by sitting inside
+        # the group's larger, richer-signal merged image. Real (non-decoy)
+        # target quantification above always uses the full _consensus_bundle.
+        if _cached_group is not None:
+            _group_ref_run = _cached_group["reference_run"]
+            # Member's own individual window at the group's reference run
+            # (bounds only, from dict_ref_by_mz -- this member's own
+            # activation isn't stored under its own mz_rank in act_dfs for
+            # group members, but the window bounds/offset/shape don't depend
+            # on act_df content, only on dict_ref_by_mz's own window columns).
+            _member_own_ref_img, _, _, _member_own_origin_at_ref = (
+                get_pept_act_from_parquet(
+                    _select_mz(_group_ref_run, int(pept_idx)),
+                    int(pept_idx),
+                    dict_ref_by_mz,
+                    _group_ref_run,
+                    return_offset=True,
+                )
+            )
+            _crop_origin = (
+                _member_own_origin_at_ref[0]
+                - _cached_group["reference_run_origin"][0],
+                _member_own_origin_at_ref[1]
+                - _cached_group["reference_run_origin"][1],
+            )
+            _crop_shape = _member_own_ref_img.shape
+            _decoy_score_bundle = _crop_consensus_feature_bundle_to_window(
+                _consensus_bundle,
+                _crop_origin,
+                _crop_shape,
+                member_ref_anchor_local=_consensus_anchors[0],
+                template_frac=_group_template_frac,
+                labels=_consensus_raw_files,
+            )
+        else:
+            _decoy_score_bundle = _consensus_bundle
+
         if visualize_dir is not None:
             _visualize_consensus_bundle(
                 _consensus_bundle.alignment,
@@ -869,7 +1103,11 @@ def match_features_batch(
                         _decoy_mz,
                         dict_ref_by_mz,
                         _plot_rf,
-                        shape=_get_pept_act_tuple(_plot_rf)[0].shape,
+                        shape=(
+                            _decoy_score_bundle.alignment.target_shape
+                            if _cached_group is not None
+                            else _get_pept_act_tuple(_plot_rf)[0].shape
+                        ),
                     )
                     _decoy_raw_denoised = smooth_and_denoise_image(
                         _decoy_raw, **raw_denoise_kwargs
@@ -943,8 +1181,8 @@ def match_features_batch(
         ):
             for _rep in range(_n_off_target_decoys):
                 _shift = _choose_off_target_shift(
-                    _consensus_bundle.segmentation.watershed_labels,
-                    _consensus_bundle.segmentation.target_label_ids,
+                    _decoy_score_bundle.segmentation.watershed_labels,
+                    _decoy_score_bundle.segmentation.target_label_ids,
                     rep=_rep,
                     min_offset_frac=_off_target_min_offset_frac,
                     max_overlap_fraction=_off_target_max_overlap_fraction,
@@ -954,12 +1192,12 @@ def match_features_batch(
                     visualize_dir is not None or _batch_svg_dir is not None
                 ):
                     _shifted_seg = _make_shifted_consensus_segmentation_state(
-                        _consensus_bundle.segmentation,
+                        _decoy_score_bundle.segmentation,
                         _shift,
                     )
                     if visualize_dir is not None:
                         _visualize_consensus_bundle(
-                            _consensus_bundle.alignment,
+                            _decoy_score_bundle.alignment,
                             _shifted_seg,
                             fig_dir=visualize_dir,
                             filename=(
@@ -971,7 +1209,7 @@ def match_features_batch(
                     if _batch_svg_dir is not None:
                         _save_illustration_svgs(
                             int(pept_idx),
-                            _consensus_bundle,
+                            _decoy_score_bundle,
                             _consensus_raw_files,
                             _batch_svg_dir,
                             segmentation_override=_shifted_seg,
@@ -1032,6 +1270,8 @@ def match_features_batch(
                 _match_t["source_run"] = "consensus"
                 _match_t["source_type"] = "Consensus"
                 _match_t["undistinguishable_group_id"] = -1  # patched post-loop
+                _match_t["undistinguishable_pixel_fraction"] = 0.0  # patched post-loop
+                _match_t["undistinguishable_intensity_fraction"] = 0.0
                 results_target.append(_match_t)
                 pp_match_target_list.append(_annotated_pp)
 
@@ -1050,13 +1290,13 @@ def match_features_batch(
                         decoy_pept_idx = int(_rep_spec["decoy_mz_rank"])
                         decoy_act = _rep_spec["decoy_raw_image"]
                         decoy_pp_raw, _, _ = _build_consensus_peptide_swap_decoy(
-                            _consensus_bundle,
+                            _decoy_score_bundle,
                             decoy_act,
                             _rf,
                             raw_denoise_kwargs=raw_denoise_kwargs,
                             log_transform_enabled=_log_enabled,
                             forced_shift=(
-                                _consensus_bundle.alignment.shifts[_ci]
+                                _decoy_score_bundle.alignment.shifts[_ci]
                                 if _broad_alignment_enabled
                                 else None
                             ),
@@ -1107,7 +1347,9 @@ def match_features_batch(
                         _prop_d["decoy_strategy"] = "peptide_swap_consensus"
                         _prop_d["decoy_rep"] = _rep
                         pp_match_decoy_list.append(_prop_d)
-                        _match_d = compare_peak_properties(consensus_pp, _prop_d)
+                        _match_d = compare_peak_properties(
+                            _decoy_score_bundle.consensus_pp, _prop_d
+                        )
                         _match_d["mz_rank"] = pept_idx
                         _match_d["decoy_mz_rank"] = decoy_pept_idx
                         _match_d["feature_instance_id"] = feature_instance_id
@@ -1130,7 +1372,7 @@ def match_features_batch(
                             else None
                         )
                         decoy_pp_raw, label_shift = _build_consensus_off_target_decoy(
-                            _consensus_bundle,
+                            _decoy_score_bundle,
                             run_index=_ci,
                             run_name=_rf,
                             rep=_rep,
@@ -1179,7 +1421,9 @@ def match_features_batch(
                         _prop_d["label_shift_rt"] = int(label_shift[0])
                         _prop_d["label_shift_im"] = int(label_shift[1])
                         pp_match_decoy_list.append(_prop_d)
-                        _match_d = compare_peak_properties(consensus_pp, _prop_d)
+                        _match_d = compare_peak_properties(
+                            _decoy_score_bundle.consensus_pp, _prop_d
+                        )
                         _match_d["mz_rank"] = pept_idx
                         _match_d["decoy_mz_rank"] = -1
                         _match_d["feature_instance_id"] = feature_instance_id
@@ -1212,25 +1456,37 @@ def match_features_batch(
                     }
                 )
 
-    # coSWA: now that every member of every in-batch group has been
-    # independently aligned + segmented above, check whether their own
-    # assigned segments spatially overlap and tag the overlapping ones.
-    # undistinguishable_group_id was written as -1 everywhere above (the tag
-    # isn't knowable until this point), so patch it into the already-built
-    # rows for the subset of mz_ranks flagged below.
-    _undistinguishable_tag = _mark_overlapping_group_members(
-        _members_by_group, _member_overlap_cache
+    # coSWA: now that every member of every in-batch group has been snapped
+    # onto its group's shared segmentation above, check whether their own
+    # assigned segments overlap and tag the overlapping ones, plus compute
+    # each member's own pixel/intensity overlap-fraction diagnostic.
+    # undistinguishable_group_id/_pixel_fraction/_intensity_fraction were
+    # written as -1/0.0/0.0 everywhere above (not knowable until every member
+    # of a group has been processed), so patch them into the already-built
+    # rows for the members present below.
+    _undistinguishable_tag, _pixel_fraction, _intensity_fraction = (
+        _mark_overlapping_group_members(_members_by_group, _member_overlap_cache)
     )
-    if _undistinguishable_tag:
+    if _undistinguishable_tag or _pixel_fraction:
         for _row in results_target:
-            _tag = _undistinguishable_tag.get(int(_row["mz_rank"]))
+            _mz = int(_row["mz_rank"])
+            _tag = _undistinguishable_tag.get(_mz)
             if _tag is not None:
                 _row["undistinguishable_group_id"] = _tag
+            if _mz in _pixel_fraction:
+                _row["undistinguishable_pixel_fraction"] = _pixel_fraction[_mz]
+                _row["undistinguishable_intensity_fraction"] = _intensity_fraction[_mz]
         for _pp_list in (pp_reference_list, pp_match_target_list):
             for _df in _pp_list:
-                _tag = _undistinguishable_tag.get(int(_df["mz_rank"].iat[0]))
+                _mz = int(_df["mz_rank"].iat[0])
+                _tag = _undistinguishable_tag.get(_mz)
                 if _tag is not None:
                     _df["undistinguishable_group_id"] = _tag
+                if _mz in _pixel_fraction:
+                    _df["undistinguishable_pixel_fraction"] = _pixel_fraction[_mz]
+                    _df["undistinguishable_intensity_fraction"] = _intensity_fraction[
+                        _mz
+                    ]
 
     return (
         results_target,
@@ -2261,75 +2517,82 @@ def _snap_all_anchors_to_watershed(
     )
 
 
-def _project_member_mask_to_common_run(
-    member: dict, common_run: str, common_run_position: int
-) -> set[tuple[int, int]]:
-    """Project one coSWA group member's own assigned-segment mask into
-    `common_run`'s absolute (frame_idx, mobility_index) coordinates.
-
-    The member's own aligned/consensus space differs only from
-    `common_run`'s own raw crop window by that run's per-run alignment shift
-    (`member["alignment"].shifts[common_run_position]`); adding back the
-    window's own absolute origin (`member["window_origin_by_run"][common_run]`)
-    lands the mask in `common_run`'s real coordinate grid, directly
-    comparable across members regardless of which run each one used as its
-    own alignment reference.
-    """
-    seg = member["segmentation"]
-    if not seg.target_label_ids:
-        return set()
-    mask = np.isin(seg.watershed_labels, seg.target_label_ids)
-    rows, cols = np.where(mask)
-    if rows.size == 0:
-        return set()
-    shift = member["alignment"].shifts[common_run_position]
-    origin = member["window_origin_by_run"][common_run]
-    abs_rows = rows - shift[0] + origin[0]
-    abs_cols = cols - shift[1] + origin[1]
-    return set(zip(abs_rows.tolist(), abs_cols.tolist()))
-
-
 def _mark_overlapping_group_members(
     members_by_group: dict[int, list[int]],
     member_cache: dict[int, dict],
-) -> dict[int, str]:
-    """Flag coSWA group members whose own independently-computed assigned
-    segments spatially overlap.
+) -> tuple[dict[int, str], dict[int, float], dict[int, float]]:
+    """Flag coSWA group members whose own assigned segments overlap, and
+    report per-member pixel/intensity overlap fractions against the rest of
+    the group.
 
-    Each member in `member_cache` was aligned + segmented fully
-    independently (own roles, own anchors, own window). This projects every
-    member's own assigned-segment mask into one common run's absolute
-    coordinates (the group representative's -- i.e. min(mz_rank) --
-    reference run, fixed once per group for consistency across all pairwise
-    comparisons) and flags pairs whose projected pixel sets intersect.
-    Overlapping members within a group are connected-component-grouped and
-    given a shared tag, mirroring the old `undistinguishable_group_id`
-    convention.
+    Every present member was snapped against the SAME shared group
+    watershed segmentation (see the group pre-pass in match_features_batch),
+    without a forced single-label collapse, so a member's own assigned
+    region can span more than one label (`segmentation.target_label_ids`).
+    Overlap is tested via boolean pixel-mask intersection
+    (`np.isin(watershed_labels, target_label_ids)`) rather than raw
+    label-id-set intersection, so it stays correct even when one member's
+    own snap fell back to a private bbox mask (via
+    `_snap_all_anchors_to_watershed`'s `seg_mask_thres` rollback) that isn't
+    label-id-comparable to the shared array -- both sides are still boolean
+    arrays over the same `target_shape` either way.
+
+    Returns `(tags, pixel_fraction, intensity_fraction)`:
+      - `tags`: `{mz_rank: "{group_id}_{component_index}"}` for members whose
+        mask is part of a >=2-member overlapping connected component (absent
+        means untagged; caller defaults to -1).
+      - `pixel_fraction` / `intensity_fraction`: `{mz_rank: float in [0, 1]}`
+        for EVERY present group member (not just tagged ones) -- what
+        fraction of this member's own assigned pixels (resp. summed
+        `segmentation.consensus` intensity, the same linear image
+        `_extract_feature_rows_for_label_ids` uses for `area`/
+        `intensity_sum`) is also claimed by at least one other present
+        member.
     """
     tags: dict[int, str] = {}
+    pixel_fraction: dict[int, float] = {}
+    intensity_fraction: dict[int, float] = {}
     for gid, members in members_by_group.items():
         present = [m for m in members if m in member_cache]
         if len(present) < 2:
             continue
-        common_run = member_cache[min(present)]["reference_raw_file"]
-        projected: dict[int, set[tuple[int, int]]] = {}
+        masks: dict[int, np.ndarray] = {}
+        consensus_img: np.ndarray | None = None
         for m in present:
-            stack = member_cache[m]["consensus_raw_files"]
-            if common_run not in stack:
-                continue  # shouldn't happen: every member's own stack spans all runs
-            projected[m] = _project_member_mask_to_common_run(
-                member_cache[m], common_run, stack.index(common_run)
+            seg = member_cache[m]["segmentation"]
+            masks[m] = (
+                np.isin(seg.watershed_labels, seg.target_label_ids)
+                if seg.target_label_ids
+                else np.zeros(seg.watershed_labels.shape, dtype=bool)
             )
-        adj: dict[int, set[int]] = {m: set() for m in projected}
-        keys = list(projected)
-        for i, m1 in enumerate(keys):
-            for m2 in keys[i + 1 :]:
-                if projected[m1] & projected[m2]:
+            if consensus_img is None:
+                consensus_img = seg.consensus
+
+        for m in present:
+            own = masks[m]
+            other = np.zeros_like(own)
+            for m2 in present:
+                if m2 != m:
+                    other |= masks[m2]
+            shared = own & other
+            own_px = int(own.sum())
+            pixel_fraction[m] = float(shared.sum()) / own_px if own_px > 0 else 0.0
+            own_intensity = float(consensus_img[own].sum()) if own_px > 0 else 0.0
+            intensity_fraction[m] = (
+                float(consensus_img[shared].sum()) / own_intensity
+                if own_intensity > 0
+                else 0.0
+            )
+
+        adj: dict[int, set[int]] = {m: set() for m in present}
+        for i, m1 in enumerate(present):
+            for m2 in present[i + 1 :]:
+                if np.any(masks[m1] & masks[m2]):
                     adj[m1].add(m2)
                     adj[m2].add(m1)
         visited: set[int] = set()
         counter = 0
-        for m in keys:
+        for m in present:
             if m in visited:
                 continue
             comp: list[int] = []
@@ -2347,7 +2610,7 @@ def _mark_overlapping_group_members(
                 counter += 1
                 for mm in comp:
                     tags[mm] = tag
-    return tags
+    return tags, pixel_fraction, intensity_fraction
 
 
 def segment_consensus_from_aligned(
@@ -2515,6 +2778,64 @@ def _extract_feature_rows_for_label_ids(
     return peak_properties
 
 
+def _extract_feature_rows_from_prealigned(
+    alignment_state: ConsensusAlignmentState,
+    segmentation_state: ConsensusSegmentationState,
+    raw_aligned: list[np.ndarray],
+    raw_aligned_logged: list[np.ndarray],
+    raw_consensus: np.ndarray,
+    raw_consensus_logged_mean: np.ndarray,
+    labels: list[str] | None = None,
+) -> tuple[pd.DataFrame | None, list[pd.DataFrame | None]]:
+    """Extract per-run and consensus peak-property rows from ALREADY aligned
+    (and possibly cropped) images against segmentation_state's watershed
+    labels.
+
+    Factored out of extract_peak_properties_from_consensus_labels so a
+    caller with already-registered data (e.g.
+    _crop_consensus_feature_bundle_to_window's decoy-window crop) can go
+    straight to extraction -- re-running the raw-image alignment step on
+    already-aligned/cropped arrays would double-apply registration.
+    """
+    individual_pps: list[pd.DataFrame | None] = [None] * len(raw_aligned)
+    consensus_pp: pd.DataFrame | None = None
+    if not segmentation_state.target_label_ids:
+        return consensus_pp, individual_pps
+    for i in range(len(raw_aligned)):
+        run_name = labels[i] if (labels is not None and i < len(labels)) else str(i)
+        individual_pps[i] = _extract_feature_rows_for_label_ids(
+            segmentation_state.target_label_ids,
+            segmentation_state.watershed_labels,
+            raw_aligned[i],
+            raw_aligned_logged[i],
+            run_name=run_name,
+            shift=alignment_state.shifts[i],
+            template_matching_score=alignment_state.max_scores[i],
+            free_shift=alignment_state.free_shifts[i]
+            if i < len(alignment_state.free_shifts)
+            else None,
+            free_max_score=alignment_state.free_max_scores[i]
+            if i < len(alignment_state.free_max_scores)
+            else None,
+            snap_resolver=lambda label_id, i=i: (
+                segmentation_state.snapped_per_anchor[i]
+                if segmentation_state.snapped_per_anchor[i] is not None
+                else segmentation_state.label_to_snap.get(label_id)
+            ),
+        )
+    consensus_pp = _extract_feature_rows_for_label_ids(
+        segmentation_state.target_label_ids,
+        segmentation_state.watershed_labels,
+        raw_consensus,
+        raw_consensus_logged_mean,
+        run_name="consensus",
+        shift=(0, 0),
+        template_matching_score=1.0,
+        snap_resolver=lambda label_id: segmentation_state.label_to_snap.get(label_id),
+    )
+    return consensus_pp, individual_pps
+
+
 def extract_peak_properties_from_consensus_labels(
     alignment_state: ConsensusAlignmentState,
     segmentation_state: ConsensusSegmentationState,
@@ -2563,42 +2884,15 @@ def extract_peak_properties_from_consensus_labels(
     raw_consensus_logged_mean = (
         np.log2(1 + raw_consensus) if log_transform_enabled else raw_consensus
     )
-    consensus_pp: pd.DataFrame | None = None
-    if segmentation_state.target_label_ids:
-        for i in range(len(raw_aligned)):
-            run_name = labels[i] if (labels is not None and i < len(labels)) else str(i)
-            individual_pps[i] = _extract_feature_rows_for_label_ids(
-                segmentation_state.target_label_ids,
-                segmentation_state.watershed_labels,
-                raw_aligned[i],
-                raw_aligned_logged[i],
-                run_name=run_name,
-                shift=alignment_state.shifts[i],
-                template_matching_score=alignment_state.max_scores[i],
-                free_shift=alignment_state.free_shifts[i]
-                if i < len(alignment_state.free_shifts)
-                else None,
-                free_max_score=alignment_state.free_max_scores[i]
-                if i < len(alignment_state.free_max_scores)
-                else None,
-                snap_resolver=lambda label_id, i=i: (
-                    segmentation_state.snapped_per_anchor[i]
-                    if segmentation_state.snapped_per_anchor[i] is not None
-                    else segmentation_state.label_to_snap.get(label_id)
-                ),
-            )
-        consensus_pp = _extract_feature_rows_for_label_ids(
-            segmentation_state.target_label_ids,
-            segmentation_state.watershed_labels,
-            raw_consensus,
-            raw_consensus_logged_mean,
-            run_name="consensus",
-            shift=(0, 0),
-            template_matching_score=1.0,
-            snap_resolver=lambda label_id: segmentation_state.label_to_snap.get(
-                label_id
-            ),
-        )
+    consensus_pp, individual_pps = _extract_feature_rows_from_prealigned(
+        alignment_state,
+        segmentation_state,
+        raw_aligned,
+        raw_aligned_logged,
+        raw_consensus,
+        raw_consensus_logged_mean,
+        labels=labels,
+    )
 
     return (
         consensus_pp,
@@ -2607,6 +2901,94 @@ def extract_peak_properties_from_consensus_labels(
         raw_aligned_logged,
         raw_consensus,
         raw_consensus_logged_mean,
+    )
+
+
+def _crop_consensus_feature_bundle_to_window(
+    bundle: ConsensusFeatureBundle,
+    crop_origin: tuple[int, int],
+    crop_shape: tuple[int, int],
+    member_ref_anchor_local: tuple[float, float] | None,
+    template_frac: float,
+    labels: list[str] | None,
+) -> ConsensusFeatureBundle:
+    """Crop a coSWA group's shared ConsensusFeatureBundle down to one
+    member's own individual window, for decoy scoring only (real target
+    quantification keeps using the full group-scale bundle).
+
+    Because align_images_to_reference resizes every run to the reference
+    run's own shape and gives the reference position shift=(0, 0)
+    unconditionally, the group's aligned/consensus coordinate frame is
+    pixel-identical to the reference run's own (group-window) raw image --
+    ONE crop rectangle, computed once from the reference run, applies
+    identically to every run's already-aligned arrays (consensus,
+    watershed_labels, each run's raw_aligned_images/raw_aligned_denoised_images).
+    No per-run shift/rescale needs to be reapplied at crop time -- alignment
+    already put everything in one shared frame.
+    """
+    r0, c0 = int(crop_origin[0]), int(crop_origin[1])
+    rows, cols = int(crop_shape[0]), int(crop_shape[1])
+    _slice = (slice(r0, r0 + rows), slice(c0, c0 + cols))
+
+    seg = bundle.segmentation
+    cropped_label_to_snap = {
+        lid: (r - r0, c - c0) for lid, (r, c) in seg.label_to_snap.items()
+    }
+    new_seg = replace(
+        seg,
+        consensus=seg.consensus[_slice],
+        consensus_denoised=seg.consensus_denoised[_slice],
+        watershed_labels=seg.watershed_labels[_slice],
+        label_to_snap=cropped_label_to_snap,
+        all_peaks=np.empty((0, 2), dtype=int),
+    )
+
+    align = bundle.alignment
+    ref_denoised_cropped = align.aligned_images[align.reference_idx][_slice]
+    _anchor_local = (
+        (member_ref_anchor_local[0] - r0, member_ref_anchor_local[1] - c0)
+        if member_ref_anchor_local is not None
+        else None
+    )
+    anchor_row, anchor_col, template_bounds, template = _build_reference_template(
+        ref_denoised_cropped, _anchor_local, template_frac
+    )
+    search_template = np.log2(1 + template) if align.align_in_log_space else template
+    new_align = replace(
+        align,
+        target_shape=(rows, cols),
+        anchor_row=anchor_row,
+        anchor_col=anchor_col,
+        template_bounds=template_bounds,
+        template=search_template,
+    )
+
+    raw_aligned_cropped = [img[_slice] for img in bundle.raw_aligned_images]
+    raw_aligned_denoised_cropped = [
+        img[_slice] for img in bundle.raw_aligned_denoised_images
+    ]
+    raw_consensus_cropped = bundle.raw_consensus[_slice]
+    raw_consensus_denoised_cropped = bundle.raw_consensus_denoised[_slice]
+
+    consensus_pp, individual_pps = _extract_feature_rows_from_prealigned(
+        new_align,
+        new_seg,
+        raw_aligned_cropped,
+        raw_aligned_denoised_cropped,
+        raw_consensus_cropped,
+        raw_consensus_denoised_cropped,
+        labels=labels,
+    )
+
+    return ConsensusFeatureBundle(
+        alignment=new_align,
+        segmentation=new_seg,
+        consensus_pp=consensus_pp,
+        individual_pps=individual_pps,
+        raw_aligned_images=raw_aligned_cropped,
+        raw_aligned_denoised_images=raw_aligned_denoised_cropped,
+        raw_consensus=raw_consensus_cropped,
+        raw_consensus_denoised=raw_consensus_denoised_cropped,
     )
 
 
