@@ -1816,6 +1816,16 @@ def _profile_correlation(profile_a, profile_b) -> float:
     """
     if profile_a is None or profile_b is None:
         return 0.0
+    # A profile spanning exactly one row/column is a genuine 1-element numpy
+    # array when written into peak_properties (_extract_feature_rows_for_label_ids),
+    # but pandas' `.at[0, col] = arr` collapses a length-1 array to a 0-d
+    # ndarray on the way back out -- len() raises "TypeError: len() of unsized
+    # object" on those. np.atleast_1d restores the (1,)-shaped view. A narrow
+    # cropped decoy/match window (e.g. this candidate's own individual window)
+    # makes single-row/column regions far more common than a full group-scale
+    # window would, so this isn't just a defensive nicety.
+    profile_a = np.atleast_1d(profile_a)
+    profile_b = np.atleast_1d(profile_b)
     n = min(len(profile_a), len(profile_b))
     if n < 2:
         return 0.0

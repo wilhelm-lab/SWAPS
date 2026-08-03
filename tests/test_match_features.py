@@ -17,6 +17,7 @@ from swaps.postprocessing.match_features import (
     _crop_consensus_feature_bundle_to_window,
     _estimate_peptide_pixel_weights,
     _find_shift_via_template_match,
+    _profile_correlation,
     _select_group_reference_run,
     _shift_and_fit,
     align_images_to_reference,
@@ -256,6 +257,40 @@ def _bump(img, center, amp=5.0, sigma=1.5):
     yy, xx = np.mgrid[0 : img.shape[0], 0 : img.shape[1]]
     img += amp * np.exp(-(((yy - center[0]) ** 2 + (xx - center[1]) ** 2) / (2 * sigma**2)))
     return img
+
+
+class TestProfileCorrelation:
+    def test_none_inputs_return_zero(self):
+        assert _profile_correlation(None, np.array([1.0, 2.0])) == 0.0
+        assert _profile_correlation(np.array([1.0, 2.0]), None) == 0.0
+
+    def test_normal_arrays_correlate(self):
+        a = np.array([1.0, 2.0, 3.0, 4.0])
+        b = np.array([2.0, 4.0, 6.0, 8.0])  # perfectly correlated (affine)
+        assert _profile_correlation(a, b) == pytest.approx(1.0)
+
+    def test_constant_profile_returns_zero(self):
+        assert _profile_correlation(np.array([1.0, 1.0]), np.array([1.0, 2.0])) == 0.0
+
+    def test_zero_dim_array_from_pandas_at_unboxing_does_not_crash(self):
+        """A profile spanning exactly one row/column is a genuine 1-element
+        array when written into peak_properties, but pandas' `.at[0, col] =
+        arr` silently collapses a length-1 array to a 0-d ndarray on the way
+        back out (confirmed: `df.at[0,'c']=np.array([1.0]); type(df['c'][0])`
+        is `numpy.ndarray` with `.ndim == 0`) -- bare `len()` on that raises
+        `TypeError: len() of unsized object`. A narrow cropped decoy/match
+        window (this candidate's own individual window, smaller than the old
+        group-scale window) makes single-row/column regions far more likely
+        than before, so this is a real, previously-crashing case, not just a
+        defensive one."""
+        df = pd.DataFrame({"a": [1]})
+        df["rt_profile"] = None
+        df.at[0, "rt_profile"] = np.array([123.4])
+        zero_d = df["rt_profile"].values[0]
+        assert np.ndim(zero_d) == 0  # confirms the unboxing actually happened
+        # single-point profiles can't be correlated -- 0.0, not a crash
+        assert _profile_correlation(zero_d, zero_d) == 0.0
+        assert _profile_correlation(zero_d, np.array([1.0, 2.0])) == 0.0
 
 
 class TestFindShiftViaTemplateMatchConstrained:
