@@ -944,6 +944,85 @@ class TestMatchFeaturesBatchConfounderGroups:
             assert pp_match.loc[3, "undistinguishable_group_id"] == -1
             assert pp_ref.loc[3, "area"] > 0
 
+    def test_group_member_real_match_uses_individual_window_crop(self, tmp_path):
+        """The shared group build spans the group's full merged RT window,
+        but a member's own real-match consensus_pp/individual_pps must be
+        computed on a version CROPPED down to that member's own (narrower)
+        individual window -- mirrors decoy scoring's existing crop, now
+        applied to real target quantification too. A's own individual RT
+        window (run1, the group's reference run) is a narrow sub-range of
+        the group's merged window; B's own individual window equals the
+        full group window (no-op crop). Both anchor to the SAME single
+        blob/label (identical shared group activation), so any area/
+        intensity difference between A and B is attributable only to A's
+        window being narrower -- while template_matching_score stays
+        identical (still derived from the one shared group alignment,
+        untouched by the crop)."""
+        raw_files = ["run1", "run2"]
+        blob = _group_blob_image([(20, 10, 10.0, 4.0)])  # wide support ~cols 10-30
+        for rf in raw_files:
+            _write_combined_activation_parquet(
+                os.path.join(tmp_path, rf, "activation"),
+                {1001: blob},
+            )
+
+        def _row(mz_rank, rt_left_rel, rt_right_rel):
+            row = {"mz_rank": mz_rank, "confounder_group_id": 1001}
+            for i, rf in enumerate(raw_files):
+                row[rf] = "Reference" if i == 0 else "Match"
+                # Individual window: narrow for A on run1 (the group's
+                # reference run, where the crop rectangle is computed
+                # from), full range elsewhere/for B.
+                row[f"MS1_frame_idx_left_ref_{rf}"] = _RT_RANGE[0] + (
+                    rt_left_rel if rf == "run1" else 0
+                )
+                row[f"MS1_frame_idx_right_ref_{rf}"] = _RT_RANGE[0] + (
+                    rt_right_rel if rf == "run1" else (_RT_RANGE[1] - _RT_RANGE[0])
+                )
+                row[f"mobility_values_index_left_ref_{rf}"] = _IM_RANGE[0]
+                row[f"mobility_values_index_right_ref_{rf}"] = _IM_RANGE[1]
+                # Group (merged) window: full range for every member.
+                row[f"MS1_frame_idx_left_group_ref_{rf}"] = _RT_RANGE[0]
+                row[f"MS1_frame_idx_right_group_ref_{rf}"] = _RT_RANGE[1]
+                row[f"mobility_values_index_left_group_ref_{rf}"] = _IM_RANGE[0]
+                row[f"mobility_values_index_right_group_ref_{rf}"] = _IM_RANGE[1]
+                row[f"{rf}_MS1_frame_idx_exp"] = _RT_RANGE[0] + 20
+                row[f"{rf}_mobility_values_index_exp"] = _IM_RANGE[0] + 10
+            return row
+
+        dict_ref = pd.DataFrame(
+            [
+                _row(1, 15, 25),  # A: 11-col individual window, clips the blob
+                _row(2, 0, _RT_RANGE[1] - _RT_RANGE[0]),  # B: full window
+            ]
+        )
+
+        (
+            results_target,
+            results_decoy,
+            pp_reference_list,
+            pp_match_target_list,
+            pp_match_decoy_list,
+            no_quant_log,
+            no_match_log,
+            snap_log_collection,
+        ) = match_features_batch(
+            dict_ref=dict_ref,
+            raw_file_list=raw_files,
+            result_dir=str(tmp_path),
+            batch=[1, 2],
+            processing_kwargs={"apply_seg": True},
+            match_decoy=False,
+        )
+        pp_ref = pd.concat(pp_reference_list).set_index("mz_rank")
+        assert pp_ref.loc[1, "area"] < pp_ref.loc[2, "area"]
+        assert pp_ref.loc[1, "intensity_sum"] < pp_ref.loc[2, "intensity_sum"]
+        # Registration-derived features stay group-wide regardless of the
+        # crop -- both members share the one alignment.
+        assert pp_ref.loc[1, "template_matching_score"] == pytest.approx(
+            pp_ref.loc[2, "template_matching_score"]
+        )
+
     def test_merge_confounders_disabled_ignores_stale_group_id_column(
         self, tmp_path
     ):

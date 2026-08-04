@@ -353,15 +353,6 @@ def match_features_batches_parallel(
     no_quant_log = []
     no_match_log = []
     snap_log_collection: dict[int, dict] = {}
-    if merge_confounders_enabled:
-        processing_kwargs = dict(processing_kwargs or {})
-        processing_kwargs["consensus_decoy_kwargs"] = {
-            **processing_kwargs.get("consensus_decoy_kwargs", {}),
-            "use_confounder_sampling": False,
-        }
-        Logger.info(
-            "merge_confounders_enabled=True: disabling confounder sampling for decoys."
-        )
     with ProcessPoolExecutor(
         max_workers=max_workers,
         initializer=_init_match_features_worker,
@@ -1135,14 +1126,20 @@ def match_features_batch(
                 broad_alignment_max_deviation=_broad_alignment_max_deviation,
             )
 
-        # Decoys are scored against a version of the consensus CROPPED down
-        # to this candidate's own individual window -- for solo candidates
-        # that's already _consensus_bundle itself (identity); for group
-        # members, crop the shared group-scale bundle down to this member's
-        # own window so decoy feature scale stays comparable to a solo
-        # candidate's own decoy, rather than being inflated by sitting inside
-        # the group's larger, richer-signal merged image. Real (non-decoy)
-        # target quantification above always uses the full _consensus_bundle.
+        # Both the real target's own consensus_pp/individual_pps AND decoy
+        # scoring are computed against a version of the consensus CROPPED
+        # down to this candidate's own individual window -- for solo
+        # candidates that's already _consensus_bundle itself (identity); for
+        # group members, crop the shared group-scale bundle down to this
+        # member's own window so its measured region (area, intensity,
+        # SIFT/Zernike descriptors, rt/im profiles) stays comparable to a
+        # solo candidate's own quantification and to this member's own
+        # decoys, rather than being inflated by sitting inside the group's
+        # larger, richer-signal merged image. The crop only touches the
+        # MEASURED region: alignment.shifts/max_scores (and hence
+        # template_matching_score/shift_rt/shift_im) are copied verbatim
+        # from the shared group registration either way -- see
+        # _crop_consensus_feature_bundle_to_window.
         if _cached_group is not None:
             _group_ref_run = _cached_group["reference_run"]
             # Member's own individual window at the group's reference run
@@ -1166,7 +1163,7 @@ def match_features_batch(
                 - _cached_group["reference_run_origin"][1],
             )
             _crop_shape = _member_own_ref_img.shape
-            _decoy_score_bundle = _crop_consensus_feature_bundle_to_window(
+            _scoring_bundle = _crop_consensus_feature_bundle_to_window(
                 _consensus_bundle,
                 _crop_origin,
                 _crop_shape,
@@ -1175,7 +1172,7 @@ def match_features_batch(
                 labels=_consensus_raw_files,
             )
         else:
-            _decoy_score_bundle = _consensus_bundle
+            _scoring_bundle = _consensus_bundle
 
         if visualize_dir is not None:
             _visualize_consensus_bundle(
@@ -1203,8 +1200,11 @@ def match_features_batch(
                 raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
                 log_transform_display=illustration_log_transform,
             )
-        consensus_pp = _consensus_bundle.consensus_pp
-        individual_pps = _consensus_bundle.individual_pps
+        # consensus_pp/individual_pps are the CROPPED (individual-window)
+        # peak properties for group members -- see _scoring_bundle above;
+        # identical to _consensus_bundle's own for solo candidates.
+        consensus_pp = _scoring_bundle.consensus_pp
+        individual_pps = _scoring_bundle.individual_pps
         snap_log_collection[int(pept_idx)] = _consensus_bundle.segmentation.snap_log
         _consensus_decoy_kwargs = dict(
             (processing_kwargs or {}).get("consensus_decoy_kwargs", {})
@@ -1274,7 +1274,7 @@ def match_features_batch(
                         dict_ref_by_mz,
                         _plot_rf,
                         shape=(
-                            _decoy_score_bundle.alignment.target_shape
+                            _scoring_bundle.alignment.target_shape
                             if _cached_group is not None
                             else _get_pept_act_tuple(_plot_rf)[0].shape
                         ),
@@ -1351,8 +1351,8 @@ def match_features_batch(
         ):
             for _rep in range(_n_off_target_decoys):
                 _shift = _choose_off_target_shift(
-                    _decoy_score_bundle.segmentation.watershed_labels,
-                    _decoy_score_bundle.segmentation.target_label_ids,
+                    _scoring_bundle.segmentation.watershed_labels,
+                    _scoring_bundle.segmentation.target_label_ids,
                     rep=_rep,
                     min_offset_frac=_off_target_min_offset_frac,
                     max_overlap_fraction=_off_target_max_overlap_fraction,
@@ -1362,12 +1362,12 @@ def match_features_batch(
                     visualize_dir is not None or _batch_svg_dir is not None
                 ):
                     _shifted_seg = _make_shifted_consensus_segmentation_state(
-                        _decoy_score_bundle.segmentation,
+                        _scoring_bundle.segmentation,
                         _shift,
                     )
                     if visualize_dir is not None:
                         _visualize_consensus_bundle(
-                            _decoy_score_bundle.alignment,
+                            _scoring_bundle.alignment,
                             _shifted_seg,
                             fig_dir=visualize_dir,
                             filename=(
@@ -1379,7 +1379,7 @@ def match_features_batch(
                     if _batch_svg_dir is not None:
                         _save_illustration_svgs(
                             int(pept_idx),
-                            _decoy_score_bundle,
+                            _scoring_bundle,
                             _consensus_raw_files,
                             _batch_svg_dir,
                             segmentation_override=_shifted_seg,
@@ -1460,13 +1460,13 @@ def match_features_batch(
                         decoy_pept_idx = int(_rep_spec["decoy_mz_rank"])
                         decoy_act = _rep_spec["decoy_raw_image"]
                         decoy_pp_raw, _, _ = _build_consensus_peptide_swap_decoy(
-                            _decoy_score_bundle,
+                            _scoring_bundle,
                             decoy_act,
                             _rf,
                             raw_denoise_kwargs=raw_denoise_kwargs,
                             log_transform_enabled=_log_enabled,
                             forced_shift=(
-                                _decoy_score_bundle.alignment.shifts[_ci]
+                                _scoring_bundle.alignment.shifts[_ci]
                                 if _broad_alignment_enabled
                                 else None
                             ),
@@ -1518,7 +1518,7 @@ def match_features_batch(
                         _prop_d["decoy_rep"] = _rep
                         pp_match_decoy_list.append(_prop_d)
                         _match_d = compare_peak_properties(
-                            _decoy_score_bundle.consensus_pp, _prop_d
+                            _scoring_bundle.consensus_pp, _prop_d
                         )
                         _match_d["mz_rank"] = pept_idx
                         _match_d["decoy_mz_rank"] = decoy_pept_idx
@@ -1542,7 +1542,7 @@ def match_features_batch(
                             else None
                         )
                         decoy_pp_raw, label_shift = _build_consensus_off_target_decoy(
-                            _decoy_score_bundle,
+                            _scoring_bundle,
                             run_index=_ci,
                             run_name=_rf,
                             rep=_rep,
@@ -1592,7 +1592,7 @@ def match_features_batch(
                         _prop_d["label_shift_im"] = int(label_shift[1])
                         pp_match_decoy_list.append(_prop_d)
                         _match_d = compare_peak_properties(
-                            _decoy_score_bundle.consensus_pp, _prop_d
+                            _scoring_bundle.consensus_pp, _prop_d
                         )
                         _match_d["mz_rank"] = pept_idx
                         _match_d["decoy_mz_rank"] = -1
@@ -3099,8 +3099,10 @@ def _crop_consensus_feature_bundle_to_window(
     labels: list[str] | None,
 ) -> ConsensusFeatureBundle:
     """Crop a coSWA group's shared ConsensusFeatureBundle down to one
-    member's own individual window, for decoy scoring only (real target
-    quantification keeps using the full group-scale bundle).
+    member's own individual window -- used both for this member's own real
+    (non-decoy) consensus_pp/individual_pps and for decoy scoring, so a
+    group member's measured region is comparable to a solo candidate's own
+    (and to its own decoys) regardless of the group's larger merged window.
 
     Because align_images_to_reference resizes every run to the reference
     run's own shape and gives the reference position shift=(0, 0)
