@@ -17,6 +17,7 @@ from swaps.postprocessing.match_features import (
     _crop_consensus_feature_bundle_to_window,
     _estimate_peptide_pixel_weights,
     _find_shift_via_template_match,
+    _pack_confounder_groups_into_batches,
     _profile_correlation,
     _select_group_reference_run,
     _shift_and_fit,
@@ -1420,3 +1421,124 @@ class TestBuildPeptideBatchesSizeAware:
             for gid, members in [(2001, {15, 16}), (2002, {17, 18}), (2003, {19, 20})]:
                 present = members & set(b.tolist())
                 assert present in (set(), members)
+
+    def test_gid_ordered_size_ramp_does_not_cluster_into_heavy_tail_batches(self):
+        """Regression: a real 20-run HYE benchmark's confounder_group_id
+        order happened to correlate with image size, so pure count-based
+        packing (_pack_confounder_groups_into_batches with no weight
+        budget) put the heaviest surviving (non-outlier) groups into the
+        last several batches -- per-batch total weight climbing from ~470M
+        to a 692M peak vs a healthy ~120-150M solo-batch baseline, right
+        where max_workers keeps several of them running concurrently.
+        _build_peptide_batches must now cap every batch's total weight
+        close to the pool average instead of letting it ramp with gid
+        order."""
+        # 40 groups of 2 members each, gid ascending == weight ascending
+        # (the pathological correlation) -- none individually 3x the
+        # median, but the largest are still ~8x the smallest, so naive
+        # gid-ordered packing would cluster the heavy tail together.
+        # Spans ramp gently (30->60, max/min weight ratio 4x, all comfortably
+        # under the 3x-median oversize threshold) so every group goes
+        # through the normal (non-outlier) packing path -- isolating this
+        # test to that remainder-weight-budget logic specifically. Enough
+        # groups/batches (200 groups -> ~10 batches) for the weight-budget
+        # averaging to behave the way it does on a real, larger dataset
+        # instead of being dominated by small-N quantization.
+        n_groups = 200
+        mz_ranks = np.arange(1, 2 * n_groups + 1)
+        group_ids = np.repeat(np.arange(1, n_groups + 1), 2)
+        spans = np.repeat(np.linspace(30, 60, n_groups), 2).astype(int)
+        rt_spans = spans.tolist()
+        im_spans = spans.tolist()
+        dict_ref = self._dict_ref_with_windows(mz_ranks, group_ids, rt_spans, im_spans)
+
+        batches = _build_peptide_batches(
+            dict_ref,
+            mz_ranks,
+            batch_size_max=40,  # forces several batches (400 members / 40)
+            max_workers=1,
+            raw_file_list=["run1"],
+            oversize_multiplier=3.0,
+            oversize_batch_size=20,
+        )
+        all_mz = sorted(int(v) for b in batches for v in b)
+        assert all_mz == list(range(1, 2 * n_groups + 1))
+
+        weight_by_gid = {
+            int(gid): 2 * int(span) ** 2
+            for gid, span in zip(np.arange(1, n_groups + 1), np.linspace(30, 60, n_groups))
+        }
+        gid_by_mz = dict(zip(mz_ranks.tolist(), group_ids.tolist()))
+
+        def _batch_weight(b):
+            # sum over each batch's UNIQUE groups, not per member (every
+            # group here has 2 members, so summing per member would double
+            # count each group's own weight).
+            gids_in_batch = {gid_by_mz[int(m)] for m in b.tolist()}
+            return sum(weight_by_gid[g] for g in gids_in_batch)
+
+        batch_weights = [_batch_weight(b) for b in batches]
+
+        # The code's actual contract: a batch's weight only ever exceeds
+        # weight_budget by (at most) the one group whose own weight already
+        # exceeds it standalone -- none do here (max group weight 7200 <<
+        # budget), so every batch must land at/under the same budget
+        # _build_peptide_batches computed internally.
+        total_weight = sum(weight_by_gid.values())
+        n_count_batches = max(1, round(len(mz_ranks) / 40))
+        expected_budget = 1.2 * total_weight / n_count_batches
+        assert max(batch_weights) <= expected_budget + 1e-6, (
+            f"heaviest batch ({max(batch_weights)}) exceeds the expected "
+            f"weight budget ({expected_budget}) -- gid-order clustering "
+            "doesn't look prevented"
+        )
+
+        # Baseline: what pure gid-order, count-only packing (no weight
+        # budget -- the pre-fix behavior) would have produced on this same
+        # pool, to show the fix meaningfully flattens the ramp rather than
+        # merely satisfying the budget by coincidence.
+        baseline_batches = _pack_confounder_groups_into_batches(
+            mz_ranks, group_ids, batch_size_max=40
+        )
+        baseline_weights = [_batch_weight(b) for b in baseline_batches]
+        assert max(batch_weights) < max(baseline_weights), (
+            f"heaviest with-budget batch ({max(batch_weights)}) isn't lower "
+            f"than the no-budget baseline's heaviest batch "
+            f"({max(baseline_weights)}) -- gid-order clustering doesn't "
+            "look prevented"
+        )
+
+
+class TestPackConfounderGroupsWeightBudget:
+    def test_weight_budget_splits_batch_early(self):
+        mz = np.arange(1, 7)
+        gid = np.array([1, 1, 2, 2, 3, 3])
+        weights = {1: 10.0, 2: 10.0, 3: 10.0}
+        # count cap alone (100) would pack all 3 groups into one batch;
+        # weight_budget=15 forces a new batch after each single group.
+        batches = _pack_confounder_groups_into_batches(
+            mz, gid, batch_size_max=100, group_weights=weights, weight_budget=15.0
+        )
+        assert len(batches) == 3
+        assert all(len(b) == 2 for b in batches)
+
+    def test_weight_budget_none_matches_count_only_behavior(self):
+        mz = np.arange(1, 7)
+        gid = np.array([1, 1, 2, 2, 3, 3])
+        batches_a = _pack_confounder_groups_into_batches(mz, gid, batch_size_max=100)
+        batches_b = _pack_confounder_groups_into_batches(
+            mz, gid, batch_size_max=100, group_weights=None, weight_budget=None
+        )
+        assert len(batches_a) == 1
+        assert [sorted(b.tolist()) for b in batches_a] == [
+            sorted(b.tolist()) for b in batches_b
+        ]
+
+    def test_never_splits_a_single_group_even_over_weight_budget(self):
+        mz = np.arange(1, 5)
+        gid = np.array([1, 1, 1, 1])  # one group of 4
+        batches = _pack_confounder_groups_into_batches(
+            mz, gid, batch_size_max=100, group_weights={1: 1000.0}, weight_budget=1.0
+        )
+        assert len(batches) == 1
+        assert sorted(batches[0].tolist()) == [1, 2, 3, 4]

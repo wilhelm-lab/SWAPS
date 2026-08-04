@@ -109,14 +109,32 @@ def _split_contiguous_into_batches(
 
 
 def _pack_confounder_groups_into_batches(
-    mz_ranks: np.ndarray, group_ids: np.ndarray, batch_size_max: int
+    mz_ranks: np.ndarray,
+    group_ids: np.ndarray,
+    batch_size_max: int,
+    group_weights: dict[int, float] | None = None,
+    weight_budget: float | None = None,
 ) -> list[np.ndarray]:
-    """Greedily pack whole confounder groups into batches of ≤batch_size_max.
+    """Greedily pack whole confounder groups into batches of ≤batch_size_max
+    (and, if group_weights/weight_budget are given, ≤weight_budget total
+    estimated image weight).
 
     Members of the same confounder_group_id must land in the same batch (see
     _group_members_in_batch): coSWA merging needs every group member present
     in one worker's batch to fetch/expand the group's single stored parquet
     row. Contiguity of mz_ranks within a batch is not required here.
+
+    Groups are visited in confounder_group_id order, which is NOT
+    size-ordered -- on at least one real dataset (20-run HYE benchmark)
+    group_id happened to correlate with image size, so pure count-based
+    packing concentrated the heaviest surviving (non-outlier-carved-out)
+    groups into the last several batches (per-batch total weight climbing
+    from ~470M to a 692M peak vs a ~120-150M healthy baseline elsewhere),
+    causing OOM near the end of the run even after _carve_out_oversized
+    removed the individual worst offenders. The weight_budget cut (in
+    addition to the existing count cap) prevents that clustering regardless
+    of visiting order, by starting a new batch whenever either budget would
+    be exceeded.
     """
     if len(mz_ranks) == 0:
         return []
@@ -125,16 +143,24 @@ def _pack_confounder_groups_into_batches(
     sorted_mz = mz_ranks[order]
     change_points = np.flatnonzero(np.diff(sorted_gid)) + 1
     member_groups = np.split(sorted_mz, change_points)
+    group_id_per_chunk = [int(g[0]) for g in np.split(sorted_gid, change_points)]
 
     batches: list[np.ndarray] = []
     current: list[np.ndarray] = []
     current_size = 0
-    for grp in member_groups:
-        if current and current_size + len(grp) > batch_size_max:
+    current_weight = 0.0
+    for grp, gid in zip(member_groups, group_id_per_chunk):
+        grp_weight = (group_weights or {}).get(gid, 0.0)
+        exceeds_count = current_size + len(grp) > batch_size_max
+        exceeds_weight = (
+            weight_budget is not None and current_weight + grp_weight > weight_budget
+        )
+        if current and (exceeds_count or exceeds_weight):
             batches.append(np.concatenate(current))
-            current, current_size = [], 0
+            current, current_size, current_weight = [], 0, 0.0
         current.append(grp)
         current_size += len(grp)
+        current_weight += grp_weight
     if current:
         batches.append(np.concatenate(current))
     return batches
@@ -260,6 +286,8 @@ def _build_peptide_batches(
     grouped_gid = group_ids[~solo_mask]
 
     oversize_batches: list[np.ndarray] = []
+    remaining_group_weights: dict[int, float] | None = None
+    remaining_weight_budget: float | None = None
     if oversize_multiplier:
         weights = _estimate_peptide_pixel_weights(
             dict_ref, peptide_indicies, raw_file_list or []
@@ -299,10 +327,33 @@ def _build_peptide_batches(
                     keep = ~is_oversized_member
                     grouped_mz = gdf.loc[keep, "mz"].to_numpy()
                     grouped_gid = gdf.loc[keep, "gid"].to_numpy()
+                    group_weight = group_weight[~group_weight.index.isin(oversized_gids)]
+                # Even non-outlier groups still vary in size; cap the
+                # remainder's per-batch total weight too, sized off the
+                # remaining pool itself -- total remaining weight spread
+                # evenly over however many batches count-based packing would
+                # produce anyway (batch_size_max=500), plus 20% slack so the
+                # weight cap doesn't itself force extra batches beyond that.
+                # Without this, groups visited in confounder_group_id order
+                # (not size order) can cluster the heaviest surviving groups
+                # into a handful of batches -- observed on a real 20-run HYE
+                # benchmark as per-batch weight climbing to a 692M peak (vs
+                # ~120-150M elsewhere) in the last several batches, right
+                # where max_workers keeps them running concurrently.
+                if len(grouped_mz):
+                    n_count_batches = max(1, round(len(grouped_mz) / batch_size_max))
+                    remaining_group_weights = group_weight.to_dict()
+                    remaining_weight_budget = (
+                        1.2 * float(group_weight.sum()) / n_count_batches
+                    )
 
     solo_batches = _split_contiguous_into_batches(solo_mz, batch_size_max, max_workers)
     grouped_batches = _pack_confounder_groups_into_batches(
-        grouped_mz, grouped_gid, batch_size_max
+        grouped_mz,
+        grouped_gid,
+        batch_size_max,
+        group_weights=remaining_group_weights,
+        weight_budget=remaining_weight_budget,
     )
     return oversize_batches + solo_batches + grouped_batches
 
