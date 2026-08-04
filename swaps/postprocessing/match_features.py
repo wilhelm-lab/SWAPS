@@ -240,11 +240,11 @@ def _build_peptide_batches(
 
     Before that count-based packing, peptides/groups whose estimated image
     size (_estimate_peptide_pixel_weights) is far above the typical size --
-    oversize_multiplier x the median -- are carved out into their own small
-    batches (oversize_batch_size for solo items; one batch per oversized
-    group, never split) so a batch can't accumulate several oversized images
-    at once. Set oversize_multiplier=None/0 to disable and fall back to pure
-    count-based batching (today's behavior).
+    oversize_multiplier x the median -- are carved out and packed (never
+    splitting a group) into their own batches of <=oversize_batch_size, kept
+    separate from normal-sized peptides so they can't accumulate alongside
+    hundreds of them. Set oversize_multiplier=None/0 to disable and fall
+    back to pure count-based batching (today's behavior).
     """
     if "confounder_group_id" in dict_ref.columns:
         group_map = dict_ref.drop_duplicates("mz_rank").set_index("mz_rank")[
@@ -283,10 +283,19 @@ def _build_peptide_batches(
                 ].index
                 if len(oversized_gids):
                     is_oversized_member = gdf["gid"].isin(oversized_gids).to_numpy()
-                    for _, _members in gdf.loc[is_oversized_member].groupby("gid")["mz"]:
-                        # Never split a group across batches, regardless of
-                        # oversize_batch_size -- one oversized group = one batch.
-                        oversize_batches.append(_members.to_numpy())
+                    # Pack oversized groups together (never splitting any one
+                    # group) up to oversize_batch_size members per batch --
+                    # NOT one batch per oversized group: on some datasets a
+                    # large fraction of groups exceed the multiplier (e.g.
+                    # ~10% on a 20-run HYE benchmark), and isolating each one
+                    # individually fragmented a 284-batch run into 2570
+                    # mostly single-digit-sized batches, trading a memory
+                    # problem for an I/O/orchestration-overhead one.
+                    oversize_batches += _pack_confounder_groups_into_batches(
+                        gdf.loc[is_oversized_member, "mz"].to_numpy(),
+                        gdf.loc[is_oversized_member, "gid"].to_numpy(),
+                        oversize_batch_size,
+                    )
                     keep = ~is_oversized_member
                     grouped_mz = gdf.loc[keep, "mz"].to_numpy()
                     grouped_gid = gdf.loc[keep, "gid"].to_numpy()

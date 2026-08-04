@@ -1294,3 +1294,50 @@ class TestBuildPeptideBatchesSizeAware:
         group_batch = [b for b in batches if 9 in b or 10 in b]
         assert len(group_batch) == 1
         assert sorted(group_batch[0].tolist()) == [9, 10]  # group never split
+
+    def test_multiple_oversized_groups_are_packed_together_not_isolated(self):
+        """Regression: when MANY groups qualify as oversized (observed on a
+        real 20-run HYE benchmark, ~10% of groups), isolating each one into
+        its own singleton batch fragmented a 284-batch run into 2570 mostly
+        single-digit-sized batches (median size 6), massively multiplying
+        per-batch DuckDB/ProcessPoolExecutor overhead. Oversized groups must
+        be packed together (never splitting any one group) up to
+        oversize_batch_size, like solo oversized items already are -- not
+        each isolated alone."""
+        # 6 solo peptides (kept out of the group-weight median entirely) +
+        # 4 small confounder groups (window 10x10, group_weight=200 each --
+        # the majority, so the median stays small) + 3 big groups (window
+        # 500x500, group_weight=500000 each -- clearly >3x the 200 median).
+        mz_ranks = np.arange(1, 21)
+        group_ids = np.array(
+            [-1] * 6
+            + [3001, 3001, 3002, 3002, 3003, 3003, 3004, 3004]  # small groups
+            + [2001, 2001, 2002, 2002, 2003, 2003]  # big groups
+        )
+        rt_spans = [10] * 6 + [10] * 8 + [500] * 6
+        im_spans = [10] * 6 + [10] * 8 + [500] * 6
+        dict_ref = self._dict_ref_with_windows(mz_ranks, group_ids, rt_spans, im_spans)
+        batches = _build_peptide_batches(
+            dict_ref,
+            mz_ranks,
+            batch_size_max=100,
+            max_workers=1,
+            raw_file_list=["run1"],
+            oversize_multiplier=3.0,
+            oversize_batch_size=4,  # 2 members/group -> 2 groups should share a batch
+        )
+        all_mz = sorted(int(v) for b in batches for v in b)
+        assert all_mz == list(range(1, 21))
+
+        big_group_mz = set(range(15, 21))
+        oversized_batches = [b for b in batches if set(b.tolist()) & big_group_mz]
+        # 6 big-group members packed at <=4/batch -> 2 batches, not 3 (one
+        # per group, the pre-fix behavior) or 1 (everything crammed together).
+        assert len(oversized_batches) == 2
+        for b in oversized_batches:
+            assert len(b) <= 4
+            assert set(b.tolist()) <= big_group_mz  # small groups untouched
+            # a batch never contains only half of a group
+            for gid, members in [(2001, {15, 16}), (2002, {17, 18}), (2003, {19, 20})]:
+                present = members & set(b.tolist())
+                assert present in (set(), members)
