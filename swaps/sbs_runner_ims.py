@@ -465,48 +465,31 @@ def run_fdr_control_onwards(
     logging.info("=================FDR control==================")
 
     pp_match_target_msms = None
-    if cfg.FDR.ONLY_SCORE_MATCH:
-        pp_match_target, pp_match_target_msms, pp_match_decoy = (
-            split_pp_by_match_status(dict_ref, pp_match_target, pp_match_decoy)
+
+    # Intensity filtering always runs first, on the full (unsplit) target/decoy
+    # pools, so it applies uniformly regardless of ONLY_SCORE_MATCH -- MS/MS-
+    # status rows must not bypass it just because they later skip the p-value
+    # filter.
+    if cfg.FDR.INT_THRES > 0:
+        pp_match_target = pp_match_target.loc[
+            pp_match_target["intensity_sum"] >= cfg.FDR.INT_THRES
+        ].copy()
+        pp_match_decoy = pp_match_decoy.loc[
+            pp_match_decoy["intensity_sum"] >= cfg.FDR.INT_THRES
+        ].copy()
+        logging.info(
+            "After intensity filtering (>= %s): %d target, %d decoy pp rows kept",
+            cfg.FDR.INT_THRES,
+            len(pp_match_target),
+            len(pp_match_decoy),
         )
         if cfg.FDR.ENABLED:
-            _valid_t = pd.MultiIndex.from_frame(
+            valid_target = pd.MultiIndex.from_frame(
                 pp_match_target[["feature_instance_id", "Run_name"]].drop_duplicates()
             )
-            _valid_d = pd.MultiIndex.from_frame(
+            valid_decoy = pd.MultiIndex.from_frame(
                 pp_match_decoy[["feature_instance_id", "Run_name"]].drop_duplicates()
             )
-            matches_target = matches_target[
-                pd.MultiIndex.from_arrays(
-                    [
-                        matches_target["feature_instance_id"],
-                        matches_target["matched_run"],
-                    ]
-                ).isin(_valid_t)
-            ]
-            matches_decoy = matches_decoy[
-                pd.MultiIndex.from_arrays(
-                    [matches_decoy["feature_instance_id"], matches_decoy["matched_run"]]
-                ).isin(_valid_d)
-            ]
-            logging.info(
-                "only_score_match: %d target, %d decoy matches after removing MS/MS-identified entries",
-                len(matches_target),
-                len(matches_decoy),
-            )
-
-    if cfg.FDR.ENABLED:
-        if cfg.FDR.INT_THRES > 0:
-            pp_target_passing = pp_match_target.loc[
-                pp_match_target["intensity_sum"] >= cfg.FDR.INT_THRES,
-                ["feature_instance_id", "Run_name"],
-            ].drop_duplicates()
-            pp_decoy_passing = pp_match_decoy.loc[
-                pp_match_decoy["intensity_sum"] >= cfg.FDR.INT_THRES,
-                ["feature_instance_id", "Run_name"],
-            ].drop_duplicates()
-            valid_target = pd.MultiIndex.from_frame(pp_target_passing)
-            valid_decoy = pd.MultiIndex.from_frame(pp_decoy_passing)
             matches_target = matches_target[
                 pd.MultiIndex.from_arrays(
                     [
@@ -527,6 +510,18 @@ def run_fdr_control_onwards(
                 len(matches_decoy),
             )
 
+    # Percolator is always trained/scored on everything (Match + MS/MS-status
+    # rows alike). ONLY_SCORE_MATCH only changes what happens to the scored
+    # output below: MS/MS-status rows are kept regardless of q-value (already
+    # intensity-filtered above), Match rows still need q-value < 0.01.
+    if cfg.FDR.ONLY_SCORE_MATCH:
+        pp_match_target_notmsms, pp_match_target_msms, _ = split_pp_by_match_status(
+            dict_ref, pp_match_target, pp_match_decoy
+        )
+    else:
+        pp_match_target_notmsms = pp_match_target
+
+    if cfg.FDR.ENABLED:
         matches_target_normalized, matches_decoy_normalized = normalize_shift_by_runs(
             matches_target, matches_decoy
         )
@@ -595,15 +590,19 @@ def run_fdr_control_onwards(
             )
             _feature_cols = [c for c in _feature_cols if c not in _missing_feature_cols]
         percolator_post_processing = cfg.FDR.PERCOLATOR_POST_PROCESSING
-        percolator_dir_name = f"percolator_postprocessing_{percolator_post_processing}"
-        if not cfg.FDR.ONLY_SCORE_MATCH:
-            percolator_dir_name += "_only_score_match_False"
+        # Percolator itself is trained/scored identically regardless of
+        # ONLY_SCORE_MATCH, so its work_dir (and cache) is shared; only the
+        # downstream filtered outputs differ, so they get their own subdir.
+        percolator_base_dir = f"percolator_postprocessing_{percolator_post_processing}"
+        percolator_dir_name = os.path.join(
+            percolator_base_dir, f"only_score_match_{cfg.FDR.ONLY_SCORE_MATCH}"
+        )
         psms, peptide, all_psms = brew_with_percolator(
             tdc_df,
             feature_cols=_feature_cols,
             # train_fdr=cfg.FDR.TRAIN,
             # test_fdr=cfg.FDR.TEST,
-            work_dir=os.path.join(quant_dir, percolator_dir_name),
+            work_dir=os.path.join(quant_dir, percolator_base_dir),
             post_processing=percolator_post_processing,
             decoy_col="Decoy",
             filename_col="matched_run",
@@ -615,7 +614,7 @@ def run_fdr_control_onwards(
 
         # Filter for the columns passed the makopot filter
         psms_filtered = psms.loc[(psms["q-value"] < 0.01)]
-        pp_match_target_filtered = pp_match_target.merge(
+        pp_match_target_filtered = pp_match_target_notmsms.merge(
             psms_filtered[["filename", "mz_rank"]],
             left_on=["mz_rank", "Run_name"],
             right_on=["mz_rank", "filename"],
@@ -633,22 +632,14 @@ def run_fdr_control_onwards(
     else:
         logging.info(
             "cfg.FDR.ENABLED is False — skipping Mokapot/percolator FDR control; "
-            "pp_match_target_filtered is pp_match_target with only intensity "
-            "filtering (FDR.INT_THRES) applied."
+            "pp_match_target_filtered is pp_match_target_notmsms with only "
+            "intensity filtering (FDR.INT_THRES) applied."
         )
-        if cfg.FDR.INT_THRES > 0:
-            pp_match_target_filtered = pp_match_target.loc[
-                pp_match_target["intensity_sum"] >= cfg.FDR.INT_THRES
-            ].copy()
-            logging.info(
-                "After intensity filtering (>= %s): %d of %d pp_match_target rows kept",
-                cfg.FDR.INT_THRES,
-                len(pp_match_target_filtered),
-                len(pp_match_target),
-            )
-        else:
-            pp_match_target_filtered = pp_match_target.copy()
-        percolator_dir_name = "intensity_filtered_postprocessing"
+        pp_match_target_filtered = pp_match_target_notmsms.copy()
+        percolator_dir_name = os.path.join(
+            "intensity_filtered_postprocessing",
+            f"only_score_match_{cfg.FDR.ONLY_SCORE_MATCH}",
+        )
         os.makedirs(os.path.join(quant_dir, percolator_dir_name), exist_ok=True)
         _to_parquet_safe(
             pp_match_target_filtered,
