@@ -14,10 +14,11 @@ from swaps.postprocessing.match_features import (
     _build_peptide_batches,
     _carve_out_oversized,
     _confounder_pool,
-    _crop_consensus_feature_bundle_to_window,
     _estimate_peptide_pixel_weights,
     _find_shift_via_template_match,
+    _mark_overlapping_group_members,
     _pack_confounder_groups_into_batches,
+    _place_mask_in_canvas,
     _profile_correlation,
     _select_group_reference_run,
     _shift_and_fit,
@@ -789,68 +790,154 @@ class TestSelectGroupReferenceRun:
         assert result in ("run1", "run2")
 
 
-class TestCropConsensusFeatureBundleToWindow:
-    """Unit coverage for the decoy-scoring crop helper: a coSWA group's
-    shared (group-window-scale) bundle cropped down to one member's own
-    (smaller) individual window -- the mechanism match_features_batch uses
-    so decoy feature scale stays comparable to a solo candidate's own decoy."""
+class TestPlaceMaskInCanvas:
+    """Unit coverage for the mask-placement helper coSWA's overlap check
+    uses to project each independently-detected member mask into the
+    group's shared (registration-only) canvas."""
 
-    def test_crop_shapes_and_preserves_contained_quantification(self):
-        img = _two_blob_image()  # 40x40, blobs at (row10,col10) and (row10,col30)
-        bundle = build_consensus_feature_bundle(
-            images=[img], anchors=[(10, 10)], raw_images=[img], labels=["run1"]
-        )
-        assert bundle.consensus_pp is not None
+    def test_fully_contained_placement(self):
+        local = np.ones((3, 3), dtype=bool)
+        placed = _place_mask_in_canvas(local, origin=(2, 2), canvas_shape=(10, 10))
+        assert placed.shape == (10, 10)
+        assert placed.sum() == 9
+        assert placed[2:5, 2:5].all()
+        placed[2:5, 2:5] = False
+        assert not placed.any()
 
-        cropped = _crop_consensus_feature_bundle_to_window(
-            bundle,
-            crop_origin=(0, 0),
-            crop_shape=(40, 20),  # cols [0, 20) -- fully contains blob at col 10
-            member_ref_anchor_local=(10, 10),
-            template_frac=0.3,
-            labels=["run1"],
-        )
-        assert cropped.alignment.target_shape == (40, 20)
-        assert cropped.raw_aligned_images[0].shape == (40, 20)
-        assert cropped.raw_aligned_denoised_images[0].shape == (40, 20)
-        assert cropped.segmentation.watershed_labels.shape == (40, 20)
-        assert cropped.consensus_pp is not None
-        # The far blob (col 30) was never part of this label's own mask, so
-        # cropping it out of frame changes nothing about this label's area.
-        assert (
-            cropped.consensus_pp["area"].iloc[0] == bundle.consensus_pp["area"].iloc[0]
-        )
-        assert cropped.consensus_pp["intensity_sum"].iloc[0] == pytest.approx(
-            bundle.consensus_pp["intensity_sum"].iloc[0]
-        )
+    def test_negative_origin_clips_leading_edge(self):
+        local = np.ones((3, 3), dtype=bool)
+        placed = _place_mask_in_canvas(local, origin=(-1, -1), canvas_shape=(5, 5))
+        # Only local[1:3, 1:3] (a 2x2 sub-region) falls within the canvas,
+        # landing at placed[0:2, 0:2].
+        assert placed.sum() == 4
+        assert placed[0:2, 0:2].all()
+        placed[0:2, 0:2] = False
+        assert not placed.any()
 
-    def test_crop_that_clips_the_blob_reduces_area(self):
-        img = _two_blob_image()
-        bundle = build_consensus_feature_bundle(
-            images=[img], anchors=[(10, 10)], raw_images=[img], labels=["run1"]
+    def test_origin_clips_trailing_edge(self):
+        local = np.ones((5, 5), dtype=bool)
+        placed = _place_mask_in_canvas(local, origin=(3, 3), canvas_shape=(6, 6))
+        # Only local[0:3, 0:3] fits before the canvas edge, landing at
+        # placed[3:6, 3:6].
+        assert placed.sum() == 9
+        assert placed[3:6, 3:6].all()
+        placed[3:6, 3:6] = False
+        assert not placed.any()
+
+    def test_fully_outside_canvas_yields_empty_mask(self):
+        local = np.ones((3, 3), dtype=bool)
+        placed = _place_mask_in_canvas(local, origin=(20, 20), canvas_shape=(10, 10))
+        assert placed.shape == (10, 10)
+        assert not placed.any()
+
+
+class TestMarkOverlappingGroupMembers:
+    """Direct unit coverage for the >50% OR-direction tagging threshold and
+    the pixel/intensity diagnostics, independent of the full
+    match_features_batch pipeline."""
+
+    def _meta(self, shape=(10, 10), intensity=None):
+        return {
+            "target_shape": shape,
+            "intensity_image": intensity if intensity is not None else np.ones(shape),
+        }
+
+    def test_below_threshold_overlap_not_tagged_but_fraction_reported(self):
+        # A: cols [0, 5) (50 px); B: cols [3, 8) (50 px) -> intersection
+        # cols [3, 5) = 20 px. frac_A = frac_B = 20/50 = 0.4, below 0.5.
+        mask_a = np.zeros((10, 10), dtype=bool)
+        mask_a[:, 0:5] = True
+        mask_b = np.zeros((10, 10), dtype=bool)
+        mask_b[:, 3:8] = True
+        member_cache = {
+            1: {"mask": mask_a, "placement_origin": (0, 0)},
+            2: {"mask": mask_b, "placement_origin": (0, 0)},
+        }
+        tags, pixel_fraction, intensity_fraction = _mark_overlapping_group_members(
+            {100: [1, 2]}, member_cache, {100: self._meta()}
         )
-        cropped = _crop_consensus_feature_bundle_to_window(
-            bundle,
-            crop_origin=(0, 5),
-            crop_shape=(40, 10),  # cols [5, 15) -- clips the blob at col 10
-            member_ref_anchor_local=(10, 10),
-            template_frac=0.3,
-            labels=["run1"],
+        assert tags == {}
+        assert pixel_fraction[1] == pytest.approx(0.4)
+        assert pixel_fraction[2] == pytest.approx(0.4)
+
+    def test_or_direction_flags_small_member_engulfed_by_large_one(self):
+        # A: cols [0, 2) (20 px, small); B: cols [0, 10) (100 px, large) --
+        # A is entirely contained in B. frac_A = 20/20 = 1.0 (> 0.5), but
+        # frac_B = 20/100 = 0.2 (<= 0.5). OR logic must still tag both.
+        mask_a = np.zeros((10, 10), dtype=bool)
+        mask_a[:, 0:2] = True
+        mask_b = np.ones((10, 10), dtype=bool)
+        member_cache = {
+            1: {"mask": mask_a, "placement_origin": (0, 0)},
+            2: {"mask": mask_b, "placement_origin": (0, 0)},
+        }
+        tags, pixel_fraction, _ = _mark_overlapping_group_members(
+            {100: [1, 2]}, member_cache, {100: self._meta()}
         )
-        assert cropped.consensus_pp is not None
-        assert (
-            cropped.consensus_pp["area"].iloc[0] < bundle.consensus_pp["area"].iloc[0]
+        assert 1 in tags and 2 in tags and tags[1] == tags[2]
+        assert pixel_fraction[1] == pytest.approx(1.0)
+        assert pixel_fraction[2] == pytest.approx(0.2)
+
+    def test_above_threshold_overlap_is_tagged(self):
+        # C: cols [0, 5) (50 px); D: cols [2, 5) (30 px) -> intersection
+        # cols [2, 5) = 30 px. frac_C = 30/50 = 0.6 (> 0.5).
+        mask_c = np.zeros((10, 10), dtype=bool)
+        mask_c[:, 0:5] = True
+        mask_d = np.zeros((10, 10), dtype=bool)
+        mask_d[:, 2:5] = True
+        member_cache = {
+            1: {"mask": mask_c, "placement_origin": (0, 0)},
+            2: {"mask": mask_d, "placement_origin": (0, 0)},
+        }
+        tags, _, _ = _mark_overlapping_group_members(
+            {100: [1, 2]}, member_cache, {100: self._meta()}
         )
+        assert 1 in tags and 2 in tags and tags[1] == tags[2]
+
+    def test_intensity_fraction_is_informational_only(self):
+        # member 1: cols [0, 5); member 2: cols [1, 5) -> intersection
+        # cols [1, 5). frac_1 = 40/50 = 0.8, frac_2 = 40/40 = 1.0 -- pixel
+        # overlap tags both. Intensity is concentrated in member 1's own
+        # NON-shared column (col 0), so intensity_fraction[1] comes out
+        # near-zero despite the pixel-based tag firing -- proving intensity
+        # never gates the tag, purely informational.
+        mask_1 = np.zeros((10, 10), dtype=bool)
+        mask_1[:, 0:5] = True
+        mask_2 = np.zeros((10, 10), dtype=bool)
+        mask_2[:, 1:5] = True
+        intensity = np.ones((10, 10))
+        intensity[:, 0] = 1000.0  # all in member 1's own non-shared column
+        member_cache = {
+            1: {"mask": mask_1, "placement_origin": (0, 0)},
+            2: {"mask": mask_2, "placement_origin": (0, 0)},
+        }
+        tags, pixel_fraction, intensity_fraction = _mark_overlapping_group_members(
+            {100: [1, 2]}, member_cache, {100: self._meta(intensity=intensity)}
+        )
+        assert 1 in tags and 2 in tags
+        assert pixel_fraction[1] == pytest.approx(0.8)
+        assert intensity_fraction[1] < 0.1
+
+    def test_groups_with_fewer_than_two_present_members_are_skipped(self):
+        member_cache = {1: {"mask": np.ones((5, 5), dtype=bool), "placement_origin": (0, 0)}}
+        tags, pixel_fraction, intensity_fraction = _mark_overlapping_group_members(
+            {100: [1]}, member_cache, {100: self._meta(shape=(5, 5))}
+        )
+        assert tags == {}
+        assert pixel_fraction == {}
+        assert intensity_fraction == {}
 
 
 class TestMatchFeaturesBatchConfounderGroups:
     def test_bimodal_signal_separates_group_members_no_collision(self, tmp_path):
-        """Two distinguishable sub-peaks within the ONE shared group
-        segmentation -> A and B's own anchors snap to DIFFERENT watershed
-        labels (no forced collapse needed since neither spans more than one
-        label) -> both correctly quantified independently, no
-        undistinguishable flag, and neither member's own pixels/intensity
-        are claimed by the other (0.0 overlap fraction)."""
+        """A and B share the identical group activation image (two
+        well-separated sub-peaks) but are each aligned and segmented fully
+        INDEPENDENTLY, from their own anchor only -> each one's own
+        watershed run picks out the label under its own anchor -> both
+        correctly quantified independently. Their own independently-
+        detected masks, placed into the group's shared (registration-only)
+        canvas, don't overlap -> no undistinguishable flag, 0.0 overlap
+        fraction both directions."""
         (
             results_target,
             results_decoy,
@@ -885,11 +972,14 @@ class TestMatchFeaturesBatchConfounderGroups:
         assert by_rank_ref.loc[2, "undistinguishable_intensity_fraction"] == 0.0
 
     def test_unimodal_signal_flags_group_members_as_undistinguishable(self, tmp_path):
-        """A single peak in the shared group segmentation -> A and B's own
-        (identical) anchors both snap to the SAME single watershed label ->
-        flagged with a shared undistinguishable_group_id, and BOTH members'
-        own assigned pixels/intensity are entirely (fraction 1.0) claimed by
-        the other, since they share the one label."""
+        """A and B share the identical group activation image (a single
+        peak) and identical anchor positions -> each one's own INDEPENDENT
+        watershed run (same input, deterministic) detects the same one
+        peak -> their own independently-detected masks are identical, so
+        once placed into the group's shared canvas they overlap 100% (well
+        past the new 50% threshold, both directions) -> flagged with a
+        shared undistinguishable_group_id, and BOTH members' own assigned
+        pixels/intensity are entirely (fraction 1.0) claimed by the other."""
         (
             results_target,
             results_decoy,
@@ -945,58 +1035,67 @@ class TestMatchFeaturesBatchConfounderGroups:
             assert pp_match.loc[3, "undistinguishable_group_id"] == -1
             assert pp_ref.loc[3, "area"] > 0
 
-    def test_group_member_real_match_uses_individual_window_crop(self, tmp_path):
-        """The shared group build spans the group's full merged RT window,
-        but a member's own real-match consensus_pp/individual_pps must be
-        computed on a version CROPPED down to that member's own (narrower)
-        individual window -- mirrors decoy scoring's existing crop, now
-        applied to real target quantification too. A's own individual RT
-        window (run1, the group's reference run) is a narrow sub-range of
-        the group's merged window; B's own individual window equals the
-        full group window (no-op crop). Both anchor to the SAME single
-        blob/label (identical shared group activation), so any area/
-        intensity difference between A and B is attributable only to A's
-        window being narrower -- while template_matching_score stays
-        identical (still derived from the one shared group alignment,
-        untouched by the crop)."""
+    def test_overlap_detection_when_member_own_reference_run_differs_from_group(
+        self, tmp_path
+    ):
+        """A's own reference_raw_file (run1) differs from the group's own
+        chosen reference run (run2, since A's Quant_Only role on run2 plus
+        B's Reference role on run2 outweigh A's lone Reference vote for
+        run1 -- see _select_group_reference_run). This exercises the
+        registration-shift-correction branch of the placement computation
+        (main loop): A's own window/mask has to be expressed relative to
+        run1 first, then corrected into the group's run2-anchored canvas via
+        that run's own registration shift, rather than the trivial
+        same-run-as-group-reference case the other scenarios in this class
+        exercise. Both members still share the identical group activation
+        image and anchor position (unimodal), so this must still end up
+        correctly quantified and flagged as overlapping, exactly like
+        test_unimodal_signal_flags_group_members_as_undistinguishable."""
         raw_files = ["run1", "run2"]
-        blob = _group_blob_image([(20, 10, 10.0, 4.0)])  # wide support ~cols 10-30
+        group_img = _group_blob_image([(15, 12, 10.0, 2.0)])
+        solo_img = _group_blob_image([(25, 25, 10.0, 2.0)])
         for rf in raw_files:
             _write_combined_activation_parquet(
                 os.path.join(tmp_path, rf, "activation"),
-                {1001: blob},
+                {1001: group_img, 3: solo_img},
             )
 
-        def _row(mz_rank, rt_left_rel, rt_right_rel):
-            row = {"mz_rank": mz_rank, "confounder_group_id": 1001}
-            for i, rf in enumerate(raw_files):
-                row[rf] = "Reference" if i == 0 else "Match"
-                # Individual window: narrow for A on run1 (the group's
-                # reference run, where the crop rectangle is computed
-                # from), full range elsewhere/for B.
-                row[f"MS1_frame_idx_left_ref_{rf}"] = _RT_RANGE[0] + (
-                    rt_left_rel if rf == "run1" else 0
-                )
-                row[f"MS1_frame_idx_right_ref_{rf}"] = _RT_RANGE[0] + (
-                    rt_right_rel if rf == "run1" else (_RT_RANGE[1] - _RT_RANGE[0])
-                )
+        def _abs(offset):
+            return (_RT_RANGE[0] + offset[0], _IM_RANGE[0] + offset[1])
+
+        rt_c, im_c = _abs((15, 12))
+        rows = [
+            {
+                "mz_rank": 1,
+                "confounder_group_id": 1001,
+                "run1": "Reference",
+                "run2": "Quant_Only",
+            },
+            {
+                "mz_rank": 2,
+                "confounder_group_id": 1001,
+                "run1": "Match",
+                "run2": "Reference",
+            },
+            {
+                "mz_rank": 3,
+                "confounder_group_id": -1,
+                "run1": "Reference",
+                "run2": "Match",
+            },
+        ]
+        solo_rt_c, solo_im_c = _abs((25, 25))
+        for row, (own_rt_c, own_im_c) in zip(
+            rows, [(rt_c, im_c), (rt_c, im_c), (solo_rt_c, solo_im_c)]
+        ):
+            for rf in raw_files:
+                row[f"MS1_frame_idx_left_ref_{rf}"] = _RT_RANGE[0]
+                row[f"MS1_frame_idx_right_ref_{rf}"] = _RT_RANGE[1]
                 row[f"mobility_values_index_left_ref_{rf}"] = _IM_RANGE[0]
                 row[f"mobility_values_index_right_ref_{rf}"] = _IM_RANGE[1]
-                # Group (merged) window: full range for every member.
-                row[f"MS1_frame_idx_left_group_ref_{rf}"] = _RT_RANGE[0]
-                row[f"MS1_frame_idx_right_group_ref_{rf}"] = _RT_RANGE[1]
-                row[f"mobility_values_index_left_group_ref_{rf}"] = _IM_RANGE[0]
-                row[f"mobility_values_index_right_group_ref_{rf}"] = _IM_RANGE[1]
-                row[f"{rf}_MS1_frame_idx_exp"] = _RT_RANGE[0] + 20
-                row[f"{rf}_mobility_values_index_exp"] = _IM_RANGE[0] + 10
-            return row
-
-        dict_ref = pd.DataFrame(
-            [
-                _row(1, 15, 25),  # A: 11-col individual window, clips the blob
-                _row(2, 0, _RT_RANGE[1] - _RT_RANGE[0]),  # B: full window
-            ]
-        )
+                row[f"{rf}_MS1_frame_idx_exp"] = own_rt_c
+                row[f"{rf}_mobility_values_index_exp"] = own_im_c
+        dict_ref = pd.DataFrame(rows)
 
         (
             results_target,
@@ -1011,18 +1110,22 @@ class TestMatchFeaturesBatchConfounderGroups:
             dict_ref=dict_ref,
             raw_file_list=raw_files,
             result_dir=str(tmp_path),
-            batch=[1, 2],
+            batch=[1, 2, 3],
             processing_kwargs={"apply_seg": True},
             match_decoy=False,
         )
+        assert _select_group_reference_run(
+            {1: ("run1", ["run2"], ["run2"]), 2: ("run2", [], ["run1"])}
+        ) == "run2"  # sanity-check the mismatch premise this test relies on
+
         pp_ref = pd.concat(pp_reference_list).set_index("mz_rank")
-        assert pp_ref.loc[1, "area"] < pp_ref.loc[2, "area"]
-        assert pp_ref.loc[1, "intensity_sum"] < pp_ref.loc[2, "intensity_sum"]
-        # Registration-derived features stay group-wide regardless of the
-        # crop -- both members share the one alignment.
-        assert pp_ref.loc[1, "template_matching_score"] == pytest.approx(
-            pp_ref.loc[2, "template_matching_score"]
-        )
+        assert pp_ref.loc[1, "area"] > 0
+        assert pp_ref.loc[2, "area"] > 0
+        tag = pp_ref.loc[1, "undistinguishable_group_id"]
+        assert tag != -1
+        assert pp_ref.loc[2, "undistinguishable_group_id"] == tag
+        assert pp_ref.loc[1, "undistinguishable_pixel_fraction"] == 1.0
+        assert pp_ref.loc[3, "undistinguishable_group_id"] == -1  # solo untouched
 
     def test_merge_confounders_disabled_ignores_stale_group_id_column(
         self, tmp_path
@@ -1134,11 +1237,11 @@ class TestMatchFeaturesBatchConfounderGroups:
 class TestGroupBundleCacheFreedEarly:
     def test_group_raw_images_released_before_batch_returns(self, tmp_path, monkeypatch):
         """OOM fix: match_features_batch's group pre-pass builds full
-        multi-run raw/aligned image sets for every in-batch confounder
-        group up front (_group_bundle_cache/_member_prepass_cache). Once a
-        group's last member has been processed in the main per-peptide
-        loop, that group's entry must be popped so the arrays can be
-        garbage-collected -- not held resident for the rest of the batch.
+        multi-run registration data for every in-batch confounder group up
+        front (_group_bundle_cache). Once a group's last member has been
+        processed in the main per-peptide loop, that group's entry must be
+        popped so the arrays can be garbage-collected -- not held resident
+        for the rest of the batch.
 
         Verified by spying on get_pept_act_from_parquet's use_group_window=
         True calls (the group pre-pass's own raw-image loads), keeping only
@@ -1185,8 +1288,8 @@ class TestGroupBundleCacheFreedEarly:
         assert checked_alive[0] == [], (
             f"{len(checked_alive[0])}/{len(captured_refs)} group raw images "
             "were still referenced by the time _mark_overlapping_group_members "
-            "ran -- _group_bundle_cache/_member_prepass_cache entries were not "
-            "freed once the group's members were done"
+            "ran -- _group_bundle_cache entries were not freed once the "
+            "group's members were done"
         )
 
 
