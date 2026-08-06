@@ -1,0 +1,557 @@
+<title>sbs_runner_ims — decision flow</title>
+<style>
+  :root{
+    --ink:#14181c;
+    --ink-soft:#454c54;
+    --paper:#f5f6f4;
+    --paper-raised:#ffffff;
+    --line:#d9dcd7;
+    --accent:#1f7a8c;
+    --accent-ink:#0d3d46;
+    --accent-soft:#e3f0f1;
+    --amber:#b8722a;
+    --amber-soft:#f6e6cf;
+    --violet:#6a5a8c;
+    --violet-soft:#e8e3f2;
+    --grey-soft:#e8eaec;
+    --grey-line:#7a828c;
+    --warn:#a13a3a;
+    --warn-soft:#f7d9d9;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --serif: Georgia, "Iowan Old Style", "Palatino Linotype", Palatino, "URW Palladio L", serif;
+    --sans: -apple-system, "Segoe UI", system-ui, Roboto, Helvetica, Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --ink:#e8eae7;
+      --ink-soft:#a9b0b6;
+      --paper:#12151a;
+      --paper-raised:#1a1e24;
+      --line:#2b3037;
+      --accent:#4fb3c2;
+      --accent-ink:#d8f2f5;
+      --accent-soft:#163238;
+      --amber:#e0a256;
+      --amber-soft:#3a2c1a;
+      --violet:#b6a6dd;
+      --violet-soft:#2a2438;
+      --grey-soft:#20242a;
+      --grey-line:#8a9099;
+      --warn:#e08a8a;
+      --warn-soft:#3a1e1e;
+    }
+  }
+  :root[data-theme="dark"]{
+    --ink:#e8eae7; --ink-soft:#a9b0b6; --paper:#12151a; --paper-raised:#1a1e24;
+    --line:#2b3037; --accent:#4fb3c2; --accent-ink:#d8f2f5; --accent-soft:#163238;
+    --amber:#e0a256; --amber-soft:#3a2c1a; --violet:#b6a6dd; --violet-soft:#2a2438;
+    --grey-soft:#20242a; --grey-line:#8a9099; --warn:#e08a8a; --warn-soft:#3a1e1e;
+  }
+  :root[data-theme="light"]{
+    --ink:#14181c; --ink-soft:#454c54; --paper:#f5f6f4; --paper-raised:#ffffff;
+    --line:#d9dcd7; --accent:#1f7a8c; --accent-ink:#0d3d46; --accent-soft:#e3f0f1;
+    --amber:#b8722a; --amber-soft:#f6e6cf; --violet:#6a5a8c; --violet-soft:#e8e3f2;
+    --grey-soft:#e8eaec; --grey-line:#7a828c; --warn:#a13a3a; --warn-soft:#f7d9d9;
+  }
+
+  *{ box-sizing:border-box; }
+  body{
+    margin:0;
+    background:var(--paper);
+    color:var(--ink);
+    font-family:var(--sans);
+    line-height:1.5;
+  }
+  .page{
+    max-width:1040px;
+    margin:0 auto;
+    padding:3rem 1.5rem 5rem;
+  }
+  header.hero{
+    display:flex;
+    flex-direction:column;
+    gap:.6rem;
+    padding-bottom:1.75rem;
+    border-bottom:1px solid var(--line);
+    margin-bottom:2rem;
+  }
+  .eyebrow{
+    font-family:var(--mono);
+    font-size:.72rem;
+    letter-spacing:.09em;
+    text-transform:uppercase;
+    color:var(--accent);
+  }
+  h1{
+    font-family:var(--serif);
+    font-weight:600;
+    font-size:2.15rem;
+    line-height:1.15;
+    margin:0;
+    text-wrap:balance;
+    color:var(--ink);
+  }
+  h1 code{
+    font-family:var(--mono);
+    font-size:.75em;
+    background:var(--accent-soft);
+    color:var(--accent-ink);
+    padding:.1em .35em;
+    border-radius:4px;
+  }
+  .dek{
+    max-width:66ch;
+    color:var(--ink-soft);
+    font-size:1.02rem;
+  }
+  .dek code{ font-family:var(--mono); font-size:.92em; color:var(--ink); }
+
+  h2{
+    font-family:var(--serif);
+    font-size:1.3rem;
+    font-weight:600;
+    margin:2.5rem 0 .9rem;
+    color:var(--ink);
+  }
+  h2 .stage-no{
+    font-family:var(--mono);
+    font-size:.75rem;
+    color:var(--ink-soft);
+    font-weight:500;
+    margin-right:.5em;
+  }
+  p.lede{ color:var(--ink-soft); max-width:70ch; margin:0 0 1.1rem; }
+
+  /* legend */
+  .legend{
+    display:flex;
+    flex-wrap:wrap;
+    gap:.55rem .9rem;
+    padding:1rem 1.1rem;
+    background:var(--paper-raised);
+    border:1px solid var(--line);
+    border-radius:10px;
+    margin-bottom:1.75rem;
+  }
+  .legend-item{
+    display:flex;
+    align-items:center;
+    gap:.5rem;
+    font-size:.82rem;
+    color:var(--ink-soft);
+  }
+  .swatch{
+    width:14px; height:14px;
+    border-radius:3px;
+    flex:none;
+    border:1.5px solid transparent;
+  }
+  .swatch.diamond{ transform:rotate(45deg); border-radius:2px; }
+  .sw-cfg{ background:var(--amber-soft); border-color:var(--amber); }
+  .sw-state{ background:var(--grey-soft); border-color:var(--grey-line); }
+  .sw-step{ background:var(--accent-soft); border-color:var(--accent); }
+  .sw-artifact{ background:var(--violet-soft); border-color:var(--violet); }
+  .sw-warn{ background:var(--warn-soft); border-color:var(--warn); }
+  .sw-terminal{ background:var(--accent); border-color:var(--accent-ink); border-radius:8px; }
+
+  /* diagram frame */
+  .diagram-frame{
+    background:var(--paper-raised);
+    border:1px solid var(--line);
+    border-radius:12px;
+    padding:1.25rem;
+    margin-bottom:1rem;
+  }
+  .diagram-scroll{
+    overflow-x:auto;
+    overflow-y:hidden;
+  }
+  .diagram-scroll pre.mermaid{
+    margin:0;
+    min-width:720px;
+  }
+  .diagram-caption{
+    font-size:.82rem;
+    color:var(--ink-soft);
+    padding:.15rem .2rem 0;
+  }
+
+  /* reference tables */
+  .table-wrap{
+    overflow-x:auto;
+    border:1px solid var(--line);
+    border-radius:10px;
+    background:var(--paper-raised);
+    margin-bottom:1.6rem;
+  }
+  table{
+    border-collapse:collapse;
+    width:100%;
+    font-size:.87rem;
+    min-width:640px;
+  }
+  thead th{
+    text-align:left;
+    font-family:var(--mono);
+    font-size:.7rem;
+    letter-spacing:.06em;
+    text-transform:uppercase;
+    color:var(--ink-soft);
+    padding:.7rem .9rem;
+    border-bottom:1px solid var(--line);
+    background:var(--grey-soft);
+  }
+  tbody td{
+    padding:.65rem .9rem;
+    border-bottom:1px solid var(--line);
+    vertical-align:top;
+    color:var(--ink);
+  }
+  tbody tr:last-child td{ border-bottom:none; }
+  td.key{ font-family:var(--mono); font-size:.83rem; white-space:nowrap; color:var(--accent-ink); background:var(--accent-soft); }
+  td.default{ font-family:var(--mono); font-size:.8rem; color:var(--ink-soft); white-space:nowrap; }
+  td.effect{ color:var(--ink-soft); }
+  td.effect code{ font-family:var(--mono); font-size:.85em; color:var(--ink); }
+
+  .callout{
+    display:flex;
+    gap:.7rem;
+    padding:1rem 1.1rem;
+    border:1px solid var(--amber);
+    background:var(--amber-soft);
+    border-radius:10px;
+    margin:0 0 2rem;
+    font-size:.88rem;
+    color:var(--ink);
+  }
+  .callout b{ font-family:var(--mono); font-size:.82rem; }
+  .callout-mark{ font-family:var(--mono); color:var(--amber); flex:none; font-weight:700; }
+
+  footer{
+    margin-top:3rem;
+    padding-top:1.25rem;
+    border-top:1px solid var(--line);
+    font-size:.78rem;
+    color:var(--ink-soft);
+    font-family:var(--mono);
+  }
+</style>
+
+<div class="page">
+
+  <header class="hero">
+    <span class="eyebrow">SWAPS · pipeline reference</span>
+    <h1>Decision flow of <code>sbs_runner_ims</code></h1>
+    <p class="dek">Every branch point in <code>swaps/sbs_runner_ims.py</code> — which are driven by a YAML config value versus a plain on-disk cache check — traced from CLI entry through Prepare Dictionary, Scan-Wise Activation, Feature-Feature Match, FDR control, and DirectLFQ/result analysis.</p>
+  </header>
+
+  <div class="legend">
+    <div class="legend-item"><span class="swatch diamond sw-cfg"></span>config flag decides</div>
+    <div class="legend-item"><span class="swatch diamond sw-state"></span>cache / file-exists check</div>
+    <div class="legend-item"><span class="swatch sw-step"></span>processing step</div>
+    <div class="legend-item"><span class="swatch sw-artifact"></span>writes a cached file</div>
+    <div class="legend-item"><span class="swatch sw-warn"></span>hard failure path</div>
+    <div class="legend-item"><span class="swatch sw-terminal"></span>entry / exit</div>
+  </div>
+
+  <div class="diagram-frame">
+    <div class="diagram-scroll">
+<pre class="mermaid">
+%%{init: {"theme": "base", "themeVariables": {"primaryColor": "#dcecec", "primaryBorderColor": "#7a828c", "primaryTextColor": "#14181c", "lineColor": "#7a828c", "fontFamily": "ui-monospace, monospace", "fontSize": "13px", "edgeLabelBackground": "rgba(122,130,140,0.20)", "clusterBkg": "rgba(122,130,140,0.05)", "clusterBorder": "#9aa1a8"}}}%%
+flowchart TD
+
+  Start(["sbs_runner_ims config.yaml"])
+  D0{"--from-fdr passed?"}
+  FDRRESUME["run_from_fdr_control<br/>load dict_ref + quant_dir parquets"]
+  LOADCFG["opt_scan_by_scan<br/>merge YAML onto YACS defaults"]
+
+  subgraph SG1["Setup"]
+    TS{"ADD_TIMESTAMP_TO_RESULT_PATH?"}
+    TSY["append run timestamp to RESULT_PATH"]
+    TSN["use RESULT_PATH as given"]
+    NCPU{"N_CPU less than 0?"}
+    NCPUY["N_CPU = $SLURM_CPUS_PER_TASK (else 1)"]
+    NCPUN["use configured N_CPU"]
+  end
+
+  subgraph SG2["Stage 1 · Prepare Dictionary"]
+    DICTCHK{"dict_ref.pkl cached?"}
+    DICTREADY["dict_ref ready"]
+    ENGINE{"PREPARE_DICT.SEARCH_ENGINE"}
+    EVMQ["read evidence.txt"]
+    EVSAGE["read results.sage.tsv<br/>sage_parser RT/IM windows"]
+    EVFP["concat psm.tsv per experiment dir"]
+    OK{"PREPARE_DICT.OK.DIR set?"}
+    OKY["filter by Oktoberfest rescore @ OK.FDR"]
+    OKN["no rescoring filter"]
+    EXCL{"EXCLUDE_DATASET_NAME set?"}
+    EXCLY["drop excluded raw files"]
+    EXCLN["keep all raw files"]
+    BUILD["construct_dict_from_search_pivoted<br/>write dict_ref.pkl"]
+  end
+
+  subgraph SG3["Stage 2 · Scan-Wise Activation (gated by SWA)"]
+    SWAGATE{"cfg.SWA?"}
+    SWAOFF["assert dict_ref_with_activation.pkl exists<br/>fails if SWA never ran"]
+    PERFILE["for each .d not in EXCLUDE_DATASET_NAME"]
+    USEIMS{"USE_IMS?"}
+    NOTIMPL["NotImplementedError<br/>mzML path unimplemented"]
+    LOADD["load .d via AlphaTims<br/>export ms1scans + mobility values"]
+    ADDIDX["add per-run RT/IM index columns"]
+    COSWACOL{"GroupIM_search_left present?<br/>coSWA columns built upstream"}
+    COSWAIDX["also index group-window RT/IM<br/>for confounder members"]
+    SOLVE["process_frames_parallel<br/>sparse-code every MS1 frame<br/>batched over OPTIMIZATION.N_BATCH"]
+    MERGEC{"MERGE_CONFOUNDERS.ENABLED?"}
+    MERGECY["co-eluting isobaric candidates<br/>solved jointly (coSWA)"]
+    MERGECN["every candidate solved independently"]
+    ACTOUT["write activation/*.parquet<br/>+ dict_ref_with_activation.pkl"]
+    NEXTD{"more .d files?"}
+  end
+
+  subgraph SG4["Stage 3 · Feature-Feature Match &amp; Quant"]
+    FFMPRE["build mz-sorted activation parquet<br/>per run (idempotent)"]
+    BA{"broad_alignment.enabled?"}
+    BATBL{"shift table cached?"}
+    BASKIP["reuse cached shift table"]
+    BACALC["calibrate_broad_alignment<br/>RT-binned majority-vote shift per run"]
+    MATCH["match_features_batches_parallel<br/>watershed + SIFT/Zernike template match"]
+    DECOYGATE{"FDR.ENABLED?"}
+    DECOYY["also build decoy matches"]
+    DECOYN["skip decoys entirely"]
+    QUANTDIR["write matches_*/pp_*.parquet to<br/>RESULT_PATH/dir_name (+_no_fdr if FDR off)"]
+  end
+
+  FDRSTAGE["FDR control entry"]
+
+  subgraph SG5["Stage 4 · FDR Control"]
+    INTTHRES{"FDR.INT_THRES greater than 0?"}
+    INTY["drop pp rows below intensity_sum<br/>target + decoy pools"]
+    INTN["no intensity filter"]
+    OSM{"FDR.ONLY_SCORE_MATCH?"}
+    OSMY["split off MS/MS-status rows<br/>bypass rescoring"]
+    OSMN["all pp_match_target rows rescored"]
+    FDREN{"FDR.ENABLED?"}
+    NOFDR["pp_match_target_filtered =<br/>intensity-filtered rows only"]
+    ALIGNFEAT{"align_images?"}
+    ALIGNY["feature set: rt/im shift +<br/>template_matching_score + base"]
+    ALIGNN["feature set: base features only"]
+    DELTAGATE{"broad_alignment.enabled AND<br/>max_deviation == 0?"}
+    DELTAY["+ delta_shift_rt/im,<br/>delta_template_matching_score"]
+    DELTAN["no delta features"]
+    PERC["brew_with_percolator (Mokapot/XGBoost)<br/>PERCOLATOR_POST_PROCESSING: tdc / mix-max"]
+    QVAL["keep q-value less than 0.01<br/>to pp_match_target_filtered"]
+  end
+
+  subgraph SG6["Stage 5 · DirectLFQ + Result Analysis"]
+    PIVOT["concat MBR (+MS/MS if split) + MS/MS Ref<br/>build_pivot"]
+    LFQ["reformat for DirectLFQ, run_lfq"]
+    COSWAEXCL{"undistinguishable-excluded<br/>coSWA file exists?"}
+    COSWAEXCLY["run_lfq again excluding<br/>undistinguishable coSWA ions"]
+    RESULTAN["quant correlation + match-type<br/>+ per-run quant plots"]
+    IONQ{"combined_ion.tsv found in<br/>SEARCH_OUTPUT_PATH?"}
+    IONQY["also plot vs IonQuant"]
+    IONQN["skip, log message"]
+  end
+
+  DONE(["done"])
+
+  Start --> D0
+  D0 -->|yes| FDRRESUME
+  D0 -->|no| LOADCFG
+  LOADCFG --> TS
+  TS -->|true| TSY
+  TS -->|false| TSN
+  TSY --> NCPU
+  TSN --> NCPU
+  NCPU -->|yes| NCPUY
+  NCPU -->|no| NCPUN
+  NCPUY --> DICTCHK
+  NCPUN --> DICTCHK
+  DICTCHK -->|yes| DICTREADY
+  DICTCHK -->|no| ENGINE
+  ENGINE -->|maxquant| EVMQ
+  ENGINE -->|sage| EVSAGE
+  ENGINE -->|fragpipe| EVFP
+  EVMQ --> OK
+  EVSAGE --> OK
+  EVFP --> OK
+  OK -->|yes| OKY
+  OK -->|no| OKN
+  OKY --> EXCL
+  OKN --> EXCL
+  EXCL -->|yes| EXCLY
+  EXCL -->|no| EXCLN
+  EXCLY --> BUILD
+  EXCLN --> BUILD
+  BUILD --> DICTREADY
+  DICTREADY --> SWAGATE
+  SWAGATE -->|false| SWAOFF
+  SWAGATE -->|true| PERFILE
+  PERFILE --> USEIMS
+  USEIMS -->|false| NOTIMPL
+  USEIMS -->|true| LOADD
+  LOADD --> ADDIDX
+  ADDIDX --> COSWACOL
+  COSWACOL -->|yes| COSWAIDX
+  COSWACOL -->|no| SOLVE
+  COSWAIDX --> SOLVE
+  SOLVE --> MERGEC
+  MERGEC -->|yes| MERGECY
+  MERGEC -->|no| MERGECN
+  MERGECY --> ACTOUT
+  MERGECN --> ACTOUT
+  ACTOUT --> NEXTD
+  NEXTD -->|yes| PERFILE
+  NEXTD -->|no| FFMPRE
+  SWAOFF --> FFMPRE
+  FFMPRE --> BA
+  BA -->|yes| BATBL
+  BATBL -->|yes| BASKIP
+  BATBL -->|no| BACALC
+  BASKIP --> MATCH
+  BACALC --> MATCH
+  BA -->|no| MATCH
+  MATCH --> DECOYGATE
+  DECOYGATE -->|yes| DECOYY
+  DECOYGATE -->|no| DECOYN
+  DECOYY --> QUANTDIR
+  DECOYN --> QUANTDIR
+  QUANTDIR --> FDRSTAGE
+  FDRRESUME --> FDRSTAGE
+  FDRSTAGE --> INTTHRES
+  INTTHRES -->|yes| INTY
+  INTTHRES -->|no| INTN
+  INTY --> OSM
+  INTN --> OSM
+  OSM -->|true| OSMY
+  OSM -->|false| OSMN
+  OSMY --> FDREN
+  OSMN --> FDREN
+  FDREN -->|false| NOFDR
+  FDREN -->|true| ALIGNFEAT
+  ALIGNFEAT -->|true| ALIGNY
+  ALIGNFEAT -->|false| ALIGNN
+  ALIGNY --> DELTAGATE
+  DELTAGATE -->|yes| DELTAY
+  DELTAGATE -->|no| DELTAN
+  ALIGNN --> PERC
+  DELTAY --> PERC
+  DELTAN --> PERC
+  PERC --> QVAL
+  QVAL --> PIVOT
+  NOFDR --> PIVOT
+  PIVOT --> LFQ
+  LFQ --> COSWAEXCL
+  COSWAEXCL -->|yes| COSWAEXCLY
+  COSWAEXCL -->|no| RESULTAN
+  COSWAEXCLY --> RESULTAN
+  RESULTAN --> IONQ
+  IONQ -->|yes| IONQY
+  IONQ -->|no| IONQN
+  IONQY --> DONE
+  IONQN --> DONE
+
+  classDef step fill:#dcecec,stroke:#1f7a8c,stroke-width:1px,color:#0d2b30;
+  classDef artifact fill:#e8e3f2,stroke:#6a5a8c,stroke-width:1px,color:#2c2340;
+  classDef cfgGate fill:#f6e6cf,stroke:#b8722a,stroke-width:1.5px,color:#4a2f10;
+  classDef stateGate fill:#e8eaec,stroke:#7a828c,stroke-width:1px,color:#20242a;
+  classDef warn fill:#f7d9d9,stroke:#a13a3a,stroke-width:1.5px,color:#4a1414;
+  classDef terminal fill:#1f7a8c,stroke:#0d3d46,stroke-width:1.5px,color:#ffffff;
+
+  class Start,DONE terminal
+  class D0,TS,NCPU,ENGINE,OK,EXCL,SWAGATE,USEIMS,MERGEC,BA,DECOYGATE,INTTHRES,OSM,FDREN,ALIGNFEAT,DELTAGATE cfgGate
+  class DICTCHK,COSWACOL,NEXTD,BATBL,COSWAEXCL,IONQ stateGate
+  class NOTIMPL warn
+  class BUILD,ACTOUT,QUANTDIR,DICTREADY artifact
+  class LOADCFG,TSY,TSN,NCPUY,NCPUN,EVMQ,EVSAGE,EVFP,OKY,OKN,EXCLY,EXCLN,FDRRESUME,PERFILE,LOADD,ADDIDX,COSWAIDX,SOLVE,MERGECY,MERGECN,FFMPRE,BASKIP,BACALC,MATCH,DECOYY,DECOYN,FDRSTAGE,INTY,INTN,OSMY,OSMN,NOFDR,ALIGNY,ALIGNN,DELTAY,DELTAN,PERC,QVAL,PIVOT,LFQ,COSWAEXCLY,RESULTAN,IONQY,IONQN step
+</pre>
+    </div>
+    <p class="diagram-caption">Scroll horizontally / pinch-zoom on the panel above — the graph is wide by design, it mirrors six sequential stages left to bottom.</p>
+  </div>
+
+  <div class="callout">
+    <span class="callout-mark">⚠</span>
+    <div><b>--from-fdr</b> skips Prepare Dictionary, Scan-Wise Activation, and Feature-Feature Match entirely, re-reading <code>matches_target/decoy.parquet</code> and <code>pp_*.parquet</code> from the existing <code>quant_dir</code>. It re-enters the graph at <b>FDR control entry</b> — useful for re-running FDR/DirectLFQ with a changed <code>FDR.*</code> or <code>MATCH_FEATURES_KWARGS</code> setting without recomputing matches.</div>
+  </div>
+
+  <h2><span class="stage-no">01</span>Global setup</h2>
+  <p class="lede">Resolved once, before any stage runs.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td class="key">SWA</td><td class="default">True</td><td class="effect">False skips scan-wise activation and requires an existing <code>dict_ref_with_activation.pkl</code> — for re-running downstream stages without resolving raw data again.</td></tr>
+        <tr><td class="key">USE_IMS</td><td class="default">True</td><td class="effect">Only supported value; False raises <code>NotImplementedError</code> (mzML/non-IMS path was never finished).</td></tr>
+        <tr><td class="key">N_CPU</td><td class="default">-1</td><td class="effect">&lt;0 pulls <code>SLURM_CPUS_PER_TASK</code> (falls back to 1 outside Slurm). Also seeds <code>OPTIMIZATION.N_BATCH</code> when that is left at -1.</td></tr>
+        <tr><td class="key">ADD_TIMESTAMP_TO_RESULT_PATH</td><td class="default">False</td><td class="effect">True appends a run timestamp to <code>RESULT_PATH</code>, then flips itself back to False in the in-memory config so a reused config file doesn't double-stamp.</td></tr>
+        <tr><td class="key">EXCLUDE_DATASET_NAME</td><td class="default">[]</td><td class="effect">Raw file basenames dropped from both dictionary construction and the SWA <code>.d</code> file loop.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2><span class="stage-no">02</span>Prepare Dictionary</h2>
+  <p class="lede">Skipped wholesale if <code>RESULT_PATH/dict_ref.pkl</code> already exists.</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td class="key">PREPARE_DICT.SEARCH_ENGINE</td><td class="default">maxquant</td><td class="effect">One of <code>maxquant</code> / <code>sage</code> / <code>fragpipe</code>; selects the evidence file format and parser (<code>sage_parser</code>, <code>fragpipe_psm_parser</code>).</td></tr>
+        <tr><td class="key">PREPARE_DICT.OK.DIR</td><td class="default">"" (disabled)</td><td class="effect">Non-empty path filters evidence by Oktoberfest rescoring output at <code>PREPARE_DICT.OK.FDR</code>, output type per <code>PREPARE_DICT.OK.OUTPUT</code> (psms/peptides).</td></tr>
+        <tr><td class="key">PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED</td><td class="default">False</td><td class="effect">Turns on coSWA: co-eluting isobaric candidates get merged into one confounder group, later solved jointly in SWA and quantified with per-member role/anchor snapping in match_features.</td></tr>
+        <tr><td class="key">PREPARE_DICT.RT_REF / IM_REF</td><td class="default">pred / ref</td><td class="effect">Reference RT from a PeptDeep prediction; reference IM taken directly from search-engine output.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2><span class="stage-no">03</span>Scan-Wise Activation</h2>
+  <p class="lede">Runs once per <code>.d</code> file when <code>SWA</code> is True; the coSWA group-window indexing step only fires if <code>dict_ref</code> already carries <code>GroupIM_search_left</code> (i.e. MERGE_CONFOUNDERS ran upstream in dictionary construction).</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td class="key">OPTIMIZATION.N_BATCH</td><td class="default">-1 (= N_CPU)</td><td class="effect">Number of round-robin batches of MS1 scan indices handed to <code>process_frames_parallel</code>.</td></tr>
+        <tr><td class="key">OPTIMIZATION.DELTA_MOBILITY_INDEX_THRES</td><td class="default">80</td><td class="effect"><b>Currently inert</b> — only read when <code>extract_im_peak=True</code>, which the runner hardcodes to <code>False</code>.</td></tr>
+        <tr><td class="key">OPTIMIZATION.IM_PEAK_EXTRACTION_WIDTH</td><td class="default">4</td><td class="effect"><b>Currently inert</b> — same <code>extract_im_peak=False</code> hardcode as above.</td></tr>
+        <tr><td class="key">PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED</td><td class="default">False</td><td class="effect">Passed through as <code>merge_confounders</code> to <code>process_frames_parallel</code> — confounder-group members are sparse-coded jointly rather than independently.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2><span class="stage-no">04</span>Feature-Feature Match &amp; Quant</h2>
+  <p class="lede">The largest stage. <code>broad_alignment</code>'s shift table and the mz-sorted activation parquets are both build-once-reuse caches, independent of any config re-check beyond "does the file exist".</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td class="key">MATCH_FEATURES_KWARGS.align_images</td><td class="default">True</td><td class="effect">False skips template-matching alignment entirely; rt/im shift and template_matching_score become fixed 0.0 sentinels downstream.</td></tr>
+        <tr><td class="key">MATCH_FEATURES_KWARGS.broad_alignment.enabled</td><td class="default">False</td><td class="effect">Centers each candidate's per-run search on a precalibrated RT-binned shift instead of searching the whole image; auto-builds <code>broad_alignment_shift_table.parquet</code> once per <code>RESULT_PATH</code>, shared across <code>quantification_*</code> variants. No-ops with a warning if <code>align_images=False</code>.</td></tr>
+        <tr><td class="key">MATCH_FEATURES_KWARGS.broad_alignment.max_deviation</td><td class="default">5</td><td class="effect">Search radius (pixels) around the calibrated shift; 0 forces the exact calibrated shift and unlocks the <code>delta_*</code> FDR features (see Stage 4 below).</td></tr>
+        <tr><td class="key">FDR.ENABLED</td><td class="default">True</td><td class="effect">False skips decoy generation entirely in <code>match_features_batches_parallel</code> (decoys only exist to feed percolator).</td></tr>
+        <tr><td class="key">MATCH_FEATURES_KWARGS.dir_name</td><td class="default">quantification</td><td class="effect">Output subdirectory name under <code>RESULT_PATH</code>; gets a <code>_no_fdr</code> suffix automatically whenever <code>FDR.ENABLED=False</code>, so the two output modes never collide.</td></tr>
+        <tr><td class="key">MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.strategies</td><td class="default">[peptide_swap]</td><td class="effect">Decoy construction strategy list; <code>off_target_shift</code> is the alternative/additional strategy.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2><span class="stage-no">05</span>FDR Control</h2>
+  <p class="lede">Percolator is <i>always</i> trained and scored on the full target+decoy pool regardless of <code>ONLY_SCORE_MATCH</code> — that flag only gates which rows are exempted from the resulting q-value filter (recent fix, see commit <code>746a90d</code>).</p>
+  <div class="table-wrap">
+    <table>
+      <thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
+      <tbody>
+        <tr><td class="key">FDR.INT_THRES</td><td class="default">100</td><td class="effect">Intensity floor applied first, uniformly, to every pp row (target/decoy, Match/MS-MS alike) before any other gate; 0 disables it.</td></tr>
+        <tr><td class="key">FDR.ONLY_SCORE_MATCH</td><td class="default">True</td><td class="effect">True routes Reference/Quant-Only ("MS/MS-status") rows straight to output labeled "MS/MS", skipping the q-value&lt;0.01 filter; only "Match"-status rows are held to it.</td></tr>
+        <tr><td class="key">FDR.ENABLED</td><td class="default">True</td><td class="effect">False skips Mokapot/percolator entirely — <code>pp_match_target_filtered</code> is just the intensity-filtered pool, written to <code>intensity_filtered_postprocessing/</code> instead of a <code>percolator_postprocessing_*/</code> dir.</td></tr>
+        <tr><td class="key">FDR.PERCOLATOR_POST_PROCESSING</td><td class="default">tdc</td><td class="effect"><code>tdc</code> (target-decoy competition, percolator <code>-Y</code>) or <code>mix-max</code> (percolator <code>-y</code>); also names the output subdirectory.</td></tr>
+        <tr><td class="key">FDR.TRAIN / FDR.TEST</td><td class="default">0.01 / 0.01</td><td class="effect">Passed to percolator as <code>-F</code>/<code>-f</code>. <code>FDR.TRAIN</code> also suffixes the output subdirectory (<code>percolator_postprocessing_&lt;method&gt;_trainfdr&lt;value&gt;/</code>) since it changes what percolator learns, unlike <code>ONLY_SCORE_MATCH</code>. Default matches percolator's own built-in <code>-F</code> default (0.01), which is what every run used before these were wired up.</td></tr>
+        <tr><td class="key">MATCH_FEATURES_KWARGS.align_images</td><td class="default">True</td><td class="effect">Gates whether alignment-derived columns (rt/im shift, template_matching_score) enter the percolator feature set at all, vs. base geometry/correlation features only.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h2><span class="stage-no">06</span>DirectLFQ + Result Analysis</h2>
+  <p class="lede">Runs unconditionally once FDR control produces <code>pp_match_target_filtered</code>; the only branch is whether a coSWA undistinguishable-ion exclusion file exists to warrant a second DirectLFQ pass, and whether an IonQuant <code>combined_ion.tsv</code> is present for comparison plots.</p>
+
+  <footer>swaps/sbs_runner_ims.py · traced 2026-08-05</footer>
+
+</div>

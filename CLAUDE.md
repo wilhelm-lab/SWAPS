@@ -79,6 +79,10 @@ Top-level entry point. Loops over raw files, calls each stage in order, saves a 
 - `pytest -m integration` requires setting `SWAPS_TEST_RAW_DIR` / `SWAPS_TEST_FRAGPIPE_DIR` env vars pointing to real `.d` files.
 - Coverage excludes `peak_detection_2d` and `result_analysis` modules.
 
+## Documentation Maintenance
+
+`docs/sbs_runner_flow.html` is a standalone decision-flow diagram + config reference table for `swaps/sbs_runner_ims.py` (the six-stage orchestration logic and every YACS config branch it reads). After any code change touching `sbs_runner_ims.py`, the stage modules it calls, or the config defaults in `swaps/utils/singleton_swaps_optimization.py`, evaluate whether the change alters a branch, gate, default, or config key shown in that doc (new/removed config flag, changed default, new decision point, changed stage order, a knob that becomes live/dead). If so, update `docs/sbs_runner_flow.html` (the mermaid flowchart and/or the config reference tables) to match before considering the task done.
+
 ## Don't
 - Don't duplicate logic — always check for existing functions/utilities before writing new code. Refactor and reuse.
 - Don't write long monolithic functions — extract repeated patterns into shared helpers.
