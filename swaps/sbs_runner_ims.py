@@ -593,15 +593,22 @@ def run_fdr_control_onwards(
         # Percolator itself is trained/scored identically regardless of
         # ONLY_SCORE_MATCH, so its work_dir (and cache) is shared; only the
         # downstream filtered outputs differ, so they get their own subdir.
-        percolator_base_dir = f"percolator_postprocessing_{percolator_post_processing}"
+        # train_fdr changes what percolator actually learns (unlike
+        # ONLY_SCORE_MATCH, which only gates downstream filtering), so every
+        # value gets its own work_dir to avoid silently overwriting a
+        # different train_fdr's percolator_psms.tsv.
+        percolator_base_dir = (
+            f"percolator_postprocessing_{percolator_post_processing}"
+            f"_trainfdr{cfg.FDR.TRAIN}"
+        )
         percolator_dir_name = os.path.join(
             percolator_base_dir, f"only_score_match_{cfg.FDR.ONLY_SCORE_MATCH}"
         )
         psms, peptide, all_psms = brew_with_percolator(
             tdc_df,
             feature_cols=_feature_cols,
-            # train_fdr=cfg.FDR.TRAIN,
-            # test_fdr=cfg.FDR.TEST,
+            train_fdr=cfg.FDR.TRAIN,
+            test_fdr=cfg.FDR.TEST,
             work_dir=os.path.join(quant_dir, percolator_base_dir),
             post_processing=percolator_post_processing,
             decoy_col="Decoy",

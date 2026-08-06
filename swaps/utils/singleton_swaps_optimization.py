@@ -171,7 +171,7 @@ __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.use_confounder_sampling = True
 
 __C.FDR = ConfigurationNode()
 __C.FDR.ENABLED = True  # if False, skip Mokapot/percolator FDR control entirely; pp_match_target_filtered is pp_match_target with only intensity filtering (FDR.INT_THRES) applied
-__C.FDR.TRAIN = 0.05
+__C.FDR.TRAIN = 0.01  # percolator's own -F default; train_fdr was never actually passed to percolator until this was wired up, so 0.01 matches what every prior run actually used
 __C.FDR.TEST = 0.01
 __C.FDR.INT_THRES = 100  # intensity threshold for FDR; 0 means no threshold
 __C.FDR.ONLY_SCORE_MATCH = True  # if True, exclude Reference/Quant_Only run-peptide pairs from rescoring and pass them directly as "MS/MS" in the output

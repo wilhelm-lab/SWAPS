@@ -297,6 +297,8 @@ _PERCOLATOR_POST_PROCESSING_FLAGS = {
 
 def brew_with_percolator(
     peptide_info_dataframe: pd.DataFrame | None = None,
+    train_fdr: float = 0.1,
+    test_fdr: float = 0.1,
     work_dir: Optional[str] = None,
     post_processing: str = "tdc",
     **kwargs,
@@ -379,10 +381,10 @@ def brew_with_percolator(
         "-I",
         "separate",
         "--no-terminate",
-        # "-F",
-        # str(train_fdr),
-        # "-f",
-        # str(test_fdr),
+        "-F",
+        str(train_fdr),
+        "-f",
+        str(test_fdr),
         "-m",
         psms_path,
         "-M",
