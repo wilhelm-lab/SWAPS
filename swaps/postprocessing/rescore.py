@@ -398,9 +398,16 @@ def brew_with_percolator(
         raise RuntimeError(
             f"Percolator failed (exit {e.returncode}):\n{e.stderr}"
         ) from e
-    Logger.info("Percolator stdout: %s", proc.stdout)
-    if proc.stderr:
-        Logger.info("Percolator stderr: %s", proc.stderr)
+    # percolator's own stdout (feature normalization stats, per-iteration progress,
+    # etc.) is long enough to swamp the caller's own log/SLURM .out file -- keep it
+    # on disk instead, next to the rest of this work_dir's percolator artifacts.
+    percolator_log_path = os.path.join(work_dir, "percolator_run.log")
+    with open(percolator_log_path, "w") as f:
+        f.write(proc.stdout)
+        if proc.stderr:
+            f.write("\n--- stderr ---\n")
+            f.write(proc.stderr)
+    Logger.info("Percolator finished; full stdout/stderr written to %s", percolator_log_path)
 
     psms_df = pd.read_csv(psms_path, sep="\t")
     decoy_psms_df = pd.read_csv(decoy_psms_path, sep="\t")
