@@ -90,6 +90,12 @@ class ConsensusFeatureBundle:
     raw_aligned_denoised_images: list[np.ndarray] = field(default_factory=list)
     raw_consensus: np.ndarray | None = None
     raw_consensus_denoised: np.ndarray | None = None
+    # Extra-scale alignments (see MATCH_FEATURES_KWARGS.broad_alignment.
+    # multi_scale_template_fracs), keyed by template_frac. Empty unless
+    # multi_scale_template_fracs was passed to build_consensus_feature_bundle.
+    multi_scale_alignments: dict[float, ConsensusAlignmentState] = field(
+        default_factory=dict
+    )
 
 
 def _split_contiguous_into_batches(
@@ -772,6 +778,22 @@ def match_features_batch(
     _broad_alignment_max_deviation = int(
         (processing_kwargs or {}).get("broad_alignment", {}).get("max_deviation", 5)
     )
+    # Extra template_frac scales to additionally search at (see
+    # MATCH_FEATURES_KWARGS.broad_alignment.multi_scale_template_fracs) -- gated
+    # behind the same broad_alignment.enabled + max_deviation=0 condition as the
+    # existing delta_shift_rt/im/delta_template_matching_score columns, since the
+    # "forced vs free" comparison these extra scales also produce only makes
+    # sense there. Empty (default) = zero extra cost.
+    _multi_scale_fracs: list[float] = (
+        [
+            float(f)
+            for f in (processing_kwargs or {})
+            .get("broad_alignment", {})
+            .get("multi_scale_template_fracs", [])
+        ]
+        if _broad_alignment_enabled and _broad_alignment_max_deviation == 0
+        else []
+    )
     if _broad_alignment_enabled:
         _cached_lookup = _WORKER_CONTEXT.get("broad_alignment_lookup")
         if _cached_lookup is not None:
@@ -1136,6 +1158,7 @@ def match_features_batch(
             use_shift_crop_pad=_use_shift_crop_pad,
             forced_shifts=_forced_shifts,
             broad_alignment_max_deviation=_broad_alignment_max_deviation,
+            multi_scale_template_fracs=_multi_scale_fracs,
         )
 
         if _cached_group is not None:
@@ -1426,7 +1449,9 @@ def match_features_batch(
                 if _rf == reference_raw_file:
                     pp_reference_list.append(_annotated_pp)
                     continue
-                _match_t = compare_peak_properties(consensus_pp, _annotated_pp)
+                _match_t = compare_peak_properties(
+                    consensus_pp, _annotated_pp, multi_scale_fracs=_multi_scale_fracs
+                )
                 _match_t["mz_rank"] = pept_idx
                 _match_t["feature_instance_id"] = feature_instance_id
                 _match_t["own_anchor_id"] = own_anchor_id
@@ -1466,6 +1491,16 @@ def match_features_batch(
                             ),
                             max_deviation=(
                                 _broad_alignment_max_deviation
+                                if _broad_alignment_enabled
+                                else None
+                            ),
+                            multi_scale_forced_shifts=(
+                                {
+                                    _frac: _state.shifts[_ci]
+                                    for _frac, _state in (
+                                        _consensus_bundle.multi_scale_alignments.items()
+                                    )
+                                }
                                 if _broad_alignment_enabled
                                 else None
                             ),
@@ -1512,7 +1547,9 @@ def match_features_batch(
                         _prop_d["decoy_rep"] = _rep
                         pp_match_decoy_list.append(_prop_d)
                         _match_d = compare_peak_properties(
-                            _consensus_bundle.consensus_pp, _prop_d
+                            _consensus_bundle.consensus_pp,
+                            _prop_d,
+                            multi_scale_fracs=_multi_scale_fracs,
                         )
                         _match_d["mz_rank"] = pept_idx
                         _match_d["decoy_mz_rank"] = decoy_pept_idx
@@ -1586,7 +1623,9 @@ def match_features_batch(
                         _prop_d["label_shift_im"] = int(label_shift[1])
                         pp_match_decoy_list.append(_prop_d)
                         _match_d = compare_peak_properties(
-                            _consensus_bundle.consensus_pp, _prop_d
+                            _consensus_bundle.consensus_pp,
+                            _prop_d,
+                            multi_scale_fracs=_multi_scale_fracs,
                         )
                         _match_d["mz_rank"] = pept_idx
                         _match_d["decoy_mz_rank"] = -1
@@ -1673,8 +1712,10 @@ def match_features_batch(
     )
 
 
-def compare_peak_properties(peak_properties_a, peak_properties_b):
-    return {
+def compare_peak_properties(
+    peak_properties_a, peak_properties_b, multi_scale_fracs: list[float] | None = None
+):
+    result = {
         "template_matching_score": peak_properties_b["template_matching_score"].values[
             0
         ],
@@ -1752,6 +1793,29 @@ def compare_peak_properties(peak_properties_a, peak_properties_b):
         "reference_run": peak_properties_a["Run_name"].values[0],
         "matched_run": peak_properties_b["Run_name"].values[0],
     }
+    for _frac in multi_scale_fracs or []:
+        _tag = f"frac_{_frac}"
+        result[f"template_matching_score_{_tag}"] = peak_properties_b[
+            f"template_matching_score_{_tag}"
+        ].values[0]
+        result[f"delta_shift_rt_{_tag}"] = peak_properties_b[
+            f"delta_shift_rt_{_tag}"
+        ].values[0]
+        result[f"delta_shift_im_{_tag}"] = peak_properties_b[
+            f"delta_shift_im_{_tag}"
+        ].values[0]
+        result[f"delta_template_matching_score_{_tag}"] = peak_properties_b[
+            f"delta_template_matching_score_{_tag}"
+        ].values[0]
+        result[f"rt_shift_{_tag}"] = abs(
+            peak_properties_a[f"shift_rt_{_tag}"].values[0]
+            - peak_properties_b[f"shift_rt_{_tag}"].values[0]
+        )
+        result[f"im_shift_{_tag}"] = abs(
+            peak_properties_a[f"shift_im_{_tag}"].values[0]
+            - peak_properties_b[f"shift_im_{_tag}"].values[0]
+        )
+    return result
 
 
 def compare_image_descriptors_cosine(des1, des2, log_transform: bool = True):
@@ -2904,6 +2968,65 @@ def _align_raw_images_with_shifts(
     return raw_aligned
 
 
+def _multi_scale_feature_columns(
+    multi_scale_alignments: dict[float, ConsensusAlignmentState] | None,
+    run_index: int,
+) -> dict[str, float]:
+    """shift_rt/shift_im/template_matching_score (+delta_*) at each extra
+    MATCH_FEATURES_KWARGS.broad_alignment.multi_scale_template_fracs scale, for
+    one run index -- shared by real targets and off-target decoys (which reuse
+    the real target's own per-run alignment at every scale, same as they
+    already do at the main scale). Empty dict (no columns added) when
+    multi_scale_alignments is empty/None -- the default, zero-cost case."""
+    cols: dict[str, float] = {}
+    for _frac, _state in (multi_scale_alignments or {}).items():
+        _tag = f"frac_{_frac}"
+        _shift = _state.shifts[run_index]
+        _score = _state.max_scores[run_index]
+        _free_shift = (
+            _state.free_shifts[run_index]
+            if run_index < len(_state.free_shifts)
+            else None
+        )
+        _free_score = (
+            _state.free_max_scores[run_index]
+            if run_index < len(_state.free_max_scores)
+            else None
+        )
+        cols[f"shift_rt_{_tag}"] = float(_shift[0])
+        cols[f"shift_im_{_tag}"] = float(_shift[1])
+        cols[f"template_matching_score_{_tag}"] = float(_score)
+        cols[f"delta_shift_rt_{_tag}"] = (
+            float(abs(_free_shift[0] - _shift[0])) if _free_shift is not None else 0.0
+        )
+        cols[f"delta_shift_im_{_tag}"] = (
+            float(abs(_free_shift[1] - _shift[1])) if _free_shift is not None else 0.0
+        )
+        cols[f"delta_template_matching_score_{_tag}"] = (
+            float(_free_score - _score) if _free_score is not None else 0.0
+        )
+    return cols
+
+
+def _multi_scale_consensus_columns(
+    multi_scale_alignments: dict[float, ConsensusAlignmentState] | None,
+) -> dict[str, float]:
+    """Sentinel multi-scale columns for the consensus row itself -- shift is
+    always (0, 0) and score always 1.0 against itself, at every scale, mirroring
+    the single-scale consensus row's own sentinel shift/template_matching_score
+    (see _extract_feature_rows_from_prealigned's consensus_pp call)."""
+    cols: dict[str, float] = {}
+    for _frac in multi_scale_alignments or {}:
+        _tag = f"frac_{_frac}"
+        cols[f"shift_rt_{_tag}"] = 0.0
+        cols[f"shift_im_{_tag}"] = 0.0
+        cols[f"template_matching_score_{_tag}"] = 1.0
+        cols[f"delta_shift_rt_{_tag}"] = 0.0
+        cols[f"delta_shift_im_{_tag}"] = 0.0
+        cols[f"delta_template_matching_score_{_tag}"] = 0.0
+    return cols
+
+
 def _extract_feature_rows_for_label_ids(
     label_ids: list[int],
     label_image: np.ndarray,
@@ -2916,6 +3039,7 @@ def _extract_feature_rows_for_label_ids(
     snap_resolver: Callable[[int], tuple[int, int] | None],
     free_shift: tuple[int, int] | None = None,
     free_max_score: float | None = None,
+    multi_scale_columns: dict[str, float] | None = None,
 ) -> pd.DataFrame | None:
     # Pick the dominant label by area in label_image (deterministic across runs
     # sharing the same segmentation).
@@ -2992,6 +3116,8 @@ def _extract_feature_rows_for_label_ids(
         _mask_cols.min() : _mask_cols.max() + 1
     ]
     peak_properties["Run_name"] = run_name
+    for _col, _val in (multi_scale_columns or {}).items():
+        peak_properties[_col] = _val
     return peak_properties
 
 
@@ -3003,6 +3129,7 @@ def _extract_feature_rows_from_prealigned(
     raw_consensus: np.ndarray,
     raw_consensus_logged_mean: np.ndarray,
     labels: list[str] | None = None,
+    multi_scale_alignments: dict[float, ConsensusAlignmentState] | None = None,
 ) -> tuple[pd.DataFrame | None, list[pd.DataFrame | None]]:
     """Extract per-run and consensus peak-property rows from ALREADY aligned
     images against segmentation_state's watershed labels.
@@ -3037,6 +3164,7 @@ def _extract_feature_rows_from_prealigned(
                 if segmentation_state.snapped_per_anchor[i] is not None
                 else segmentation_state.label_to_snap.get(label_id)
             ),
+            multi_scale_columns=_multi_scale_feature_columns(multi_scale_alignments, i),
         )
     consensus_pp = _extract_feature_rows_for_label_ids(
         segmentation_state.target_label_ids,
@@ -3047,6 +3175,7 @@ def _extract_feature_rows_from_prealigned(
         shift=(0, 0),
         template_matching_score=1.0,
         snap_resolver=lambda label_id: segmentation_state.label_to_snap.get(label_id),
+        multi_scale_columns=_multi_scale_consensus_columns(multi_scale_alignments),
     )
     return consensus_pp, individual_pps
 
@@ -3058,6 +3187,7 @@ def extract_peak_properties_from_consensus_labels(
     raw_images: list[np.ndarray] | None = None,
     labels: list[str] | None = None,
     log_transform_enabled: bool = True,
+    multi_scale_alignments: dict[float, ConsensusAlignmentState] | None = None,
 ) -> tuple[
     pd.DataFrame | None,
     list[pd.DataFrame | None],
@@ -3107,6 +3237,7 @@ def extract_peak_properties_from_consensus_labels(
         raw_consensus,
         raw_consensus_logged_mean,
         labels=labels,
+        multi_scale_alignments=multi_scale_alignments,
     )
 
     return (
@@ -3189,6 +3320,7 @@ def build_consensus_feature_bundle(
     ) = None,
     forced_shifts: list[tuple[int, int] | None] | None = None,
     broad_alignment_max_deviation: int | None = None,
+    multi_scale_template_fracs: list[float] | None = None,
 ) -> ConsensusFeatureBundle:
     """Build alignment, segmentation, and feature tables for consensus scoring.
 
@@ -3239,6 +3371,7 @@ def build_consensus_feature_bundle(
         **_denoise_kwargs_for_stage(_denoise_cfg, "consensus"),
         "log_transform": _log_enabled,
     }
+    _multi_scale_alignments: dict[float, ConsensusAlignmentState] = {}
     if precomputed_states is not None:
         alignment_state, segmentation_state = precomputed_states
     elif reuse_from is None:
@@ -3256,6 +3389,25 @@ def build_consensus_feature_bundle(
             forced_shifts=forced_shifts,
             broad_alignment_max_deviation=broad_alignment_max_deviation,
         )
+        # Extra-scale alignments (see MATCH_FEATURES_KWARGS.broad_alignment.
+        # multi_scale_template_fracs): only the shift-search substep is
+        # repeated per extra scale -- segmentation/consensus averaging below
+        # still runs exactly once, off the main-scale alignment_state.
+        for _frac in multi_scale_template_fracs or []:
+            _multi_scale_alignments[_frac] = align_images_to_reference(
+                images=images,
+                reference_idx=reference_idx,
+                target_shape=target_shape,
+                template_anchor=template_anchor,
+                template_frac=_frac,
+                anchors=anchors,
+                additional_anchors=additional_anchors,
+                align_images=align_images,
+                align_in_log_space=align_in_log_space,
+                use_shift_crop_pad=use_shift_crop_pad,
+                forced_shifts=forced_shifts,
+                broad_alignment_max_deviation=broad_alignment_max_deviation,
+            )
         segmentation_state = segment_consensus_from_aligned(
             alignment_state,
             denoise_kwargs=_consensus_denoise_kwargs,
@@ -3295,6 +3447,7 @@ def build_consensus_feature_bundle(
         raw_images=raw_images,
         labels=labels,
         log_transform_enabled=_log_enabled,
+        multi_scale_alignments=_multi_scale_alignments,
     )
     return ConsensusFeatureBundle(
         alignment=alignment_state,
@@ -3305,6 +3458,7 @@ def build_consensus_feature_bundle(
         raw_aligned_denoised_images=raw_aligned_denoised,
         raw_consensus=raw_consensus,
         raw_consensus_denoised=raw_consensus_denoised,
+        multi_scale_alignments=_multi_scale_alignments,
     )
 
 
@@ -3979,6 +4133,79 @@ def _choose_off_target_shift(
     return None
 
 
+def _peptide_swap_decoy_multi_scale_columns(
+    decoy_denoised: np.ndarray,
+    multi_scale_alignments: dict[float, ConsensusAlignmentState] | None,
+    multi_scale_forced_shifts: dict[float, tuple[int, int] | None] | None,
+    max_deviation: int | None,
+) -> dict[str, float]:
+    """Same output shape as _multi_scale_feature_columns, but for a
+    peptide-swap decoy: re-searches the decoy's own (wrong-peptide) denoised
+    image against each extra-scale target's already-built template, mirroring
+    _build_consensus_peptide_swap_decoy's own shift-finding (minus the
+    raw-image alignment + peak-property extraction, not needed for these
+    summary columns alone) -- so the decoy gets a genuine
+    template_matching_score of its own at every scale too, same reasoning as
+    the main-scale search (see _build_consensus_peptide_swap_decoy docstring)."""
+    cols: dict[str, float] = {}
+    for _frac, _state in (multi_scale_alignments or {}).items():
+        _forced_shift = (multi_scale_forced_shifts or {}).get(_frac)
+        _max_deviation = (
+            (max_deviation if max_deviation is not None else 0)
+            if _forced_shift is not None
+            else None
+        )
+        _target_shape = _state.target_shape
+        _align_in_log_space = _state.align_in_log_space
+        if _state.use_shift_crop_pad:
+            _search_image = (
+                np.log2(1 + decoy_denoised) if _align_in_log_space else decoy_denoised
+            )
+            _shift, _score, _match_score_map, _ = _find_shift_native_image(
+                _search_image,
+                _state.template,
+                _state.template_bounds,
+                search_center=_forced_shift,
+                max_deviation=_max_deviation,
+            )
+        else:
+            _decoy_resized = _resize_image_to_shape(decoy_denoised, _target_shape)
+            _search_image = (
+                np.log2(1 + _decoy_resized) if _align_in_log_space else _decoy_resized
+            )
+            (_, _, _, _shift, _score, _match_score_map, _) = (
+                _align_resized_image_to_template(
+                    _decoy_resized,
+                    _state.template,
+                    _state.template_bounds,
+                    None,
+                    search_center=_forced_shift,
+                    max_deviation=_max_deviation,
+                    search_image=_search_image,
+                )
+            )
+        if _forced_shift is not None and _max_deviation == 0:
+            _free_shift, _free_score = _global_best_from_score_map(
+                _match_score_map, _state.template_bounds
+            )
+        else:
+            _free_shift, _free_score = None, None
+        _tag = f"frac_{_frac}"
+        cols[f"shift_rt_{_tag}"] = float(_shift[0])
+        cols[f"shift_im_{_tag}"] = float(_shift[1])
+        cols[f"template_matching_score_{_tag}"] = float(_score)
+        cols[f"delta_shift_rt_{_tag}"] = (
+            float(abs(_free_shift[0] - _shift[0])) if _free_shift is not None else 0.0
+        )
+        cols[f"delta_shift_im_{_tag}"] = (
+            float(abs(_free_shift[1] - _shift[1])) if _free_shift is not None else 0.0
+        )
+        cols[f"delta_template_matching_score_{_tag}"] = (
+            float(_free_score - _score) if _free_score is not None else 0.0
+        )
+    return cols
+
+
 def _build_consensus_peptide_swap_decoy(
     bundle: ConsensusFeatureBundle,
     decoy_raw_image: np.ndarray,
@@ -3987,6 +4214,7 @@ def _build_consensus_peptide_swap_decoy(
     log_transform_enabled: bool = True,
     forced_shift: tuple[int, int] | None = None,
     max_deviation: int | None = None,
+    multi_scale_forced_shifts: dict[float, tuple[int, int] | None] | None = None,
 ) -> tuple[pd.DataFrame | None, tuple[int, int], float]:
     """Align a wrong same-run peptide image and score it under target consensus labels.
 
@@ -4089,6 +4317,12 @@ def _build_consensus_peptide_swap_decoy(
         free_shift=free_shift,
         free_max_score=free_max_score,
         snap_resolver=lambda label_id: bundle.segmentation.label_to_snap.get(label_id),
+        multi_scale_columns=_peptide_swap_decoy_multi_scale_columns(
+            decoy_denoised,
+            bundle.multi_scale_alignments,
+            multi_scale_forced_shifts,
+            max_deviation,
+        ),
     )
     return decoy_pp, shift, max_score
 
@@ -4149,6 +4383,13 @@ def _build_consensus_off_target_decoy(
                     + resolved_label_shift[1]
                 ),
             ),
+        ),
+        # Off-target decoys quantify the SAME run image (just against a
+        # deliberately shifted label mask), so their multi-scale shift/score
+        # are identical to the real target's own at that run index -- same
+        # reuse pattern as the main-scale shift/template_matching_score above.
+        multi_scale_columns=_multi_scale_feature_columns(
+            bundle.multi_scale_alignments, run_index
         ),
     )
     return decoy_pp, resolved_label_shift

@@ -570,16 +570,33 @@ def run_fdr_control_onwards(
         # in when the config guarantees every row actually has a genuine
         # value.
         _broad_alignment_cfg = processing_kwargs.get("broad_alignment", {})
-        if (
+        _broad_alignment_forced_rescore = (
             _align_images
             and bool(_broad_alignment_cfg.get("enabled", False))
             and int(_broad_alignment_cfg.get("max_deviation", 5)) == 0
-        ):
+        )
+        if _broad_alignment_forced_rescore:
             _feature_cols = _feature_cols + [
                 "delta_shift_rt",
                 "delta_shift_im",
                 "delta_template_matching_score",
             ]
+        # Extra template_frac scales (see MATCH_FEATURES_KWARGS.broad_alignment.
+        # multi_scale_template_fracs) -- same shape as the main-scale block
+        # above (rt_shift/im_shift/template_matching_score + delta_*), suffixed
+        # "_frac_<x>" per scale; only wired in under the same forced-rescore
+        # gating, since match_features.py only ever populates them there too.
+        if _broad_alignment_forced_rescore:
+            for _frac in _broad_alignment_cfg.get("multi_scale_template_fracs", []):
+                _tag = f"frac_{float(_frac)}"
+                _feature_cols = _feature_cols + [
+                    f"template_matching_score_{_tag}",
+                    f"rt_shift_{_tag}",
+                    f"im_shift_{_tag}",
+                    f"delta_shift_rt_{_tag}",
+                    f"delta_shift_im_{_tag}",
+                    f"delta_template_matching_score_{_tag}",
+                ]
         _missing_feature_cols = [c for c in _feature_cols if c not in tdc_df.columns]
         if _missing_feature_cols:
             logging.warning(
