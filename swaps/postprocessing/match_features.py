@@ -1742,13 +1742,18 @@ def compare_peak_properties(
             peak_properties_b["zernike"].values[0],
             l2_norm=True,
         ),
+        # From free_shift_rt/im (unconstrained registration), not shift_rt/im
+        # (the possibly-forced one) -- see free_shift_rt/im's comment in
+        # _extract_feature_rows_for_label_ids for why: under a max_deviation=0
+        # forced rescore, shift_rt/im collapse to the same value for a target
+        # and its paired decoy, carrying no signal.
         "rt_shift": abs(
-            peak_properties_a["shift_rt"].values[0]
-            - peak_properties_b["shift_rt"].values[0]
+            peak_properties_a["free_shift_rt"].values[0]
+            - peak_properties_b["free_shift_rt"].values[0]
         ),
         "im_shift": abs(
-            peak_properties_a["shift_im"].values[0]
-            - peak_properties_b["shift_im"].values[0]
+            peak_properties_a["free_shift_im"].values[0]
+            - peak_properties_b["free_shift_im"].values[0]
         ),
         "rt_profile_corr": _profile_correlation(
             peak_properties_a["rt_profile"].values[0],
@@ -1807,13 +1812,15 @@ def compare_peak_properties(
         result[f"delta_template_matching_score_{_tag}"] = peak_properties_b[
             f"delta_template_matching_score_{_tag}"
         ].values[0]
+        # From free_shift_rt/im_frac_<x> (unconstrained), not shift_rt/im_
+        # frac_<x> -- see the main-scale rt_shift/im_shift comment above.
         result[f"rt_shift_{_tag}"] = abs(
-            peak_properties_a[f"shift_rt_{_tag}"].values[0]
-            - peak_properties_b[f"shift_rt_{_tag}"].values[0]
+            peak_properties_a[f"free_shift_rt_{_tag}"].values[0]
+            - peak_properties_b[f"free_shift_rt_{_tag}"].values[0]
         )
         result[f"im_shift_{_tag}"] = abs(
-            peak_properties_a[f"shift_im_{_tag}"].values[0]
-            - peak_properties_b[f"shift_im_{_tag}"].values[0]
+            peak_properties_a[f"free_shift_im_{_tag}"].values[0]
+            - peak_properties_b[f"free_shift_im_{_tag}"].values[0]
         )
     return result
 
@@ -2995,6 +3002,15 @@ def _multi_scale_feature_columns(
         )
         cols[f"shift_rt_{_tag}"] = float(_shift[0])
         cols[f"shift_im_{_tag}"] = float(_shift[1])
+        # See free_shift_rt/im's comment in _extract_feature_rows_for_label_ids
+        # -- compare_peak_properties' rt_shift_frac_<x>/im_shift_frac_<x> read
+        # from these, not shift_rt_frac_<x>/shift_im_frac_<x>.
+        cols[f"free_shift_rt_{_tag}"] = (
+            float(_free_shift[0]) if _free_shift is not None else float(_shift[0])
+        )
+        cols[f"free_shift_im_{_tag}"] = (
+            float(_free_shift[1]) if _free_shift is not None else float(_shift[1])
+        )
         cols[f"template_matching_score_{_tag}"] = float(_score)
         cols[f"delta_shift_rt_{_tag}"] = (
             float(abs(_free_shift[0] - _shift[0])) if _free_shift is not None else 0.0
@@ -3020,6 +3036,8 @@ def _multi_scale_consensus_columns(
         _tag = f"frac_{_frac}"
         cols[f"shift_rt_{_tag}"] = 0.0
         cols[f"shift_im_{_tag}"] = 0.0
+        cols[f"free_shift_rt_{_tag}"] = 0.0
+        cols[f"free_shift_im_{_tag}"] = 0.0
         cols[f"template_matching_score_{_tag}"] = 1.0
         cols[f"delta_shift_rt_{_tag}"] = 0.0
         cols[f"delta_shift_im_{_tag}"] = 0.0
@@ -3063,6 +3081,23 @@ def _extract_feature_rows_for_label_ids(
     peak_properties["snap_im"] = int(snap_rc[1])
     peak_properties["shift_rt"] = int(shift[0])
     peak_properties["shift_im"] = int(shift[1])
+    # Unconstrained/free registration shift -- falls back to `shift` itself
+    # when free_shift is None (i.e. no forced rescore was in effect, so
+    # `shift` already IS the free result). compare_peak_properties' rt_shift/
+    # im_shift (and the multi-scale _frac_<x> versions) are computed from
+    # THIS, not shift_rt/shift_im directly: under a max_deviation=0 forced
+    # rescore, a decoy's `shift` is forced to its paired target's own already-
+    # resolved shift (see _build_consensus_peptide_swap_decoy's forced_shift
+    # arg), so shift_rt/shift_im collapse to the same value for target and
+    # decoy alike and carry zero discriminative signal there -- free_shift_rt/
+    # im is what each candidate's own image content actually best correlates
+    # against, unconstrained, and so still differs between target and decoy.
+    peak_properties["free_shift_rt"] = (
+        int(free_shift[0]) if free_shift is not None else int(shift[0])
+    )
+    peak_properties["free_shift_im"] = (
+        int(free_shift[1]) if free_shift is not None else int(shift[1])
+    )
     peak_properties["template_matching_score"] = float(template_matching_score)
     # Only populated for a max_deviation=0 forced rescore (see
     # _global_best_from_score_map) -- 0.0 sentinel elsewhere, same convention
@@ -4193,6 +4228,12 @@ def _peptide_swap_decoy_multi_scale_columns(
         _tag = f"frac_{_frac}"
         cols[f"shift_rt_{_tag}"] = float(_shift[0])
         cols[f"shift_im_{_tag}"] = float(_shift[1])
+        cols[f"free_shift_rt_{_tag}"] = (
+            float(_free_shift[0]) if _free_shift is not None else float(_shift[0])
+        )
+        cols[f"free_shift_im_{_tag}"] = (
+            float(_free_shift[1]) if _free_shift is not None else float(_shift[1])
+        )
         cols[f"template_matching_score_{_tag}"] = float(_score)
         cols[f"delta_shift_rt_{_tag}"] = (
             float(abs(_free_shift[0] - _shift[0])) if _free_shift is not None else 0.0
