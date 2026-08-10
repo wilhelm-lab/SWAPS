@@ -1435,6 +1435,42 @@ class TestBuildPeptideBatchesSizeAware:
             all_mz = sorted(int(v) for b in batches for v in b)
             assert all_mz == list(range(1, 21))
 
+    def test_batches_ordered_heaviest_first(self):
+        """Regression: ProcessPoolExecutor.submit() consumes futures roughly
+        in list order, so a run used to plow through all the (small) solo
+        batches before ever touching the (systematically larger) confounder-
+        group batches -- meaning an OOM only ever surfaced near the very
+        end, after hours of otherwise-successful work. Batches must now be
+        ordered by descending estimated weight so a genuine OOM shows up in
+        the first few batches instead."""
+        mz_ranks = np.arange(1, 41)
+        # 20 solo peptides with a range of sizes, plus 10 confounder groups
+        # (2 members each) with a range of sizes -- deliberately interleaved
+        # so ordering can't come "for free" from category concatenation.
+        group_ids = np.array(
+            [-1] * 20 + sorted([g for g in range(1, 11) for _ in range(2)])
+        )
+        rt_spans = list(range(5, 25)) + [v for g in range(1, 11) for v in (g * 3, g * 3)]
+        im_spans = rt_spans
+        dict_ref = self._dict_ref_with_windows(mz_ranks, group_ids, rt_spans, im_spans)
+
+        batches = _build_peptide_batches(
+            dict_ref,
+            mz_ranks,
+            batch_size_max=4,  # forces many small batches so order is meaningful
+            max_workers=1,
+            raw_file_list=["run1"],
+            oversize_multiplier=3.0,
+            oversize_batch_size=4,
+        )
+        all_mz = sorted(int(v) for b in batches for v in b)
+        assert all_mz == list(range(1, 41))
+
+        weights = _estimate_peptide_pixel_weights(dict_ref, mz_ranks, ["run1"])
+        w_by_mz = dict(zip(mz_ranks.tolist(), weights.tolist()))
+        batch_weights = [sum(w_by_mz[int(m)] for m in b) for b in batches]
+        assert batch_weights == sorted(batch_weights, reverse=True)
+
     def test_oversized_solo_isolated_from_normal_batches(self):
         mz_ranks = np.arange(1, 11)
         group_ids = np.full(10, -1)

@@ -276,7 +276,14 @@ def _build_peptide_batches(
     splitting a group) into their own batches of <=oversize_batch_size, kept
     separate from normal-sized peptides so they can't accumulate alongside
     hundreds of them. Set oversize_multiplier=None/0 to disable and fall
-    back to pure count-based batching (today's behavior).
+    back to pure count-based batching (today's behavior), which also skips
+    the descending-weight sort below.
+
+    Returned batches are ordered by descending estimated weight (heaviest
+    first), independent of which of the three packers above built them, so
+    that if worker-concurrent memory pressure is going to OOM the run, it
+    surfaces in the first few batches instead of only after everything
+    smaller has already finished successfully.
     """
     if "confounder_group_id" in dict_ref.columns:
         group_map = dict_ref.drop_duplicates("mz_rank").set_index("mz_rank")[
@@ -361,7 +368,21 @@ def _build_peptide_batches(
         group_weights=remaining_group_weights,
         weight_budget=remaining_weight_budget,
     )
-    return oversize_batches + solo_batches + grouped_batches
+    all_batches = oversize_batches + solo_batches + grouped_batches
+
+    if oversize_multiplier:
+        # ProcessPoolExecutor.submit() order is FIFO-ish consumption order
+        # (all futures queue up front; idle workers pull the next one), so
+        # the order returned here is roughly processing order. Schedule the
+        # heaviest batches first: solo batches used to run for most of the
+        # job before the (systematically larger) confounder-group batches
+        # even started, so an OOM only ever surfaced near the very end,
+        # after hours of otherwise-successful work. Sorting by descending
+        # weight surfaces a genuine OOM within the first few batches instead.
+        batch_weight = np.array([weight_by_mz.reindex(b).sum() for b in all_batches])
+        all_batches = [all_batches[i] for i in np.argsort(-batch_weight)]
+
+    return all_batches
 
 
 def match_features_batches_parallel(
