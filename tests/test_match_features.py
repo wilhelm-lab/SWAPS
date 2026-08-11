@@ -1,4 +1,6 @@
+import gc
 import os
+import weakref
 
 import numpy as np
 import pandas as pd
@@ -6,8 +8,20 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from swaps.postprocessing import match_features as match_features_module
 from swaps.postprocessing.match_features import (
+    _build_consensus_peptide_swap_decoy,
+    _build_peptide_batches,
+    _carve_out_oversized,
     _confounder_pool,
+    _estimate_peptide_pixel_weights,
+    _find_shift_via_template_match,
+    _mark_overlapping_group_members,
+    _pack_confounder_groups_into_batches,
+    _place_mask_in_canvas,
+    _profile_correlation,
+    _select_group_reference_run,
+    _shift_and_fit,
     align_images_to_reference,
     build_consensus_feature_bundle,
     match_features_batch,
@@ -112,6 +126,234 @@ class TestAlignImagesDisabled:
         bundle = build_consensus_feature_bundle(images, align_images=False)
         assert all(s == (0, 0) for s in bundle.alignment.shifts)
         assert bundle.alignment.max_scores[1] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# broad_alignment: forced_shifts center (rather than replace) template-match
+# discovery on a small window around the given shift -- a real
+# (non-NaN) template_matching_score comes out either way, distinct from the
+# 0.0 sentinel align_images=False uses ("bounded search" vs "not attempted").
+# With no explicit max_deviation, the window collapses to the forced shift
+# itself (an exact rescore there), as long as that position is actually
+# reachable by valid-mode template matching -- template_anchor=(15, 15) below
+# keeps the template away from the image edge so it always is; see
+# TestFindShiftViaTemplateMatchConstrained for the near-edge/clamped case.
+# ---------------------------------------------------------------------------
+
+
+class TestBroadAlignmentForcedShift:
+    def test_resize_mode_applies_forced_shift(self):
+        images = _make_test_images(2, shape=(30, 30))
+        state = align_images_to_reference(
+            images, forced_shifts=[None, (2, -3)], template_anchor=(15, 15)
+        )
+        assert state.shifts[1] == (2, -3)
+        assert not np.isnan(state.max_scores[1])
+
+    def test_crop_pad_mode_applies_forced_shift(self):
+        images = _make_test_images(2, shape=(30, 30))
+        state = align_images_to_reference(
+            images,
+            forced_shifts=[None, (2, -3)],
+            use_shift_crop_pad=True,
+            template_anchor=(15, 15),
+        )
+        assert state.shifts[1] == (2, -3)
+        assert not np.isnan(state.max_scores[1])
+
+    def test_crop_pad_mode_forced_shift_matches_shift_and_fit(self):
+        images = _make_test_images(2, shape=(30, 30))
+        state = align_images_to_reference(
+            images,
+            forced_shifts=[None, (2, -3)],
+            use_shift_crop_pad=True,
+            template_anchor=(15, 15),
+        )
+        expected = _shift_and_fit(images[1], (30, 30), (2, -3))
+        np.testing.assert_array_equal(state.aligned_images[1], expected)
+
+    def test_reference_image_ignores_forced_shifts(self):
+        images = _make_test_images(2, shape=(30, 30))
+        state = align_images_to_reference(images, reference_idx=0, forced_shifts=[(9, 9), None])
+        assert state.shifts[0] == (0, 0)
+        assert state.max_scores[0] == 1.0
+
+    def test_none_entries_still_discover_normally(self):
+        images = _make_test_images(3, shape=(30, 30))
+        forced = align_images_to_reference(images, forced_shifts=[None, (2, -3), None])
+        discovered = align_images_to_reference(images)
+        assert forced.shifts[2] == discovered.shifts[2]
+        assert forced.max_scores[2] == discovered.max_scores[2]
+
+    def test_build_bundle_propagates_forced_shifts(self):
+        images = _make_test_images(2, shape=(30, 30))
+        bundle = build_consensus_feature_bundle(
+            images, forced_shifts=[None, (4, 1)], template_anchor=(15, 15)
+        )
+        assert bundle.alignment.shifts[1] == (4, 1)
+        assert not np.isnan(bundle.alignment.max_scores[1])
+
+    def test_bundle_forced_shift_ignores_broad_alignment_max_deviation_when_none(self):
+        # No max_deviation given at all (neither forced_shifts-adjacent kwarg) ->
+        # still defaults to an exact rescore (deviation 0), not an unconstrained
+        # search that would silently discard the forced shift.
+        images = _make_test_images(2, shape=(30, 30))
+        bundle = build_consensus_feature_bundle(
+            images,
+            forced_shifts=[None, (4, 1)],
+            template_anchor=(15, 15),
+            broad_alignment_max_deviation=None,
+        )
+        assert bundle.alignment.shifts[1] == (4, 1)
+
+    def test_peptide_swap_decoy_rescores_at_forced_shift(self):
+        # Real blobs (not random noise), plus anchors/raw_images/labels, so
+        # watershed finds a non-empty target_label_ids -- mirrors
+        # TestBuildConsensusFeatureBundleReuse's fixture requirements.
+        img = _two_blob_image()
+        bundle = build_consensus_feature_bundle(
+            images=[img, img],
+            anchors=[(10, 10), (10, 10)],
+            raw_images=[img, img],
+            labels=["R1", "R2"],
+        )
+        decoy_image = _two_blob_image(centers=((25, 5), (25, 25)))
+        # (-2, -2), not (5, -2): the target's own template touches the image's
+        # top/left edge (anchor (10, 10), template_frac 0.3 on a 40x40 image),
+        # so only non-positive rt shifts are reachable by valid-mode
+        # template matching without clamping -- see the module-level note
+        # above and TestFindShiftViaTemplateMatchConstrained for that clamp.
+        _decoy_pp, shift, max_score = _build_consensus_peptide_swap_decoy(
+            bundle, decoy_image, "R2", forced_shift=(-2, -2)
+        )
+        assert shift == (-2, -2)
+        assert not np.isnan(max_score)
+
+    def test_peptide_swap_decoy_constrained_search_stays_within_window(self):
+        img = _two_blob_image()
+        bundle = build_consensus_feature_bundle(
+            images=[img, img],
+            anchors=[(10, 10), (10, 10)],
+            raw_images=[img, img],
+            labels=["R1", "R2"],
+        )
+        decoy_image = _two_blob_image(centers=((25, 5), (25, 25)))
+        _decoy_pp, shift, _max_score = _build_consensus_peptide_swap_decoy(
+            bundle, decoy_image, "R2", forced_shift=(-2, -2), max_deviation=3
+        )
+        assert abs(shift[0] - (-2)) <= 3
+        assert abs(shift[1] - (-2)) <= 3
+
+
+# ---------------------------------------------------------------------------
+# _find_shift_via_template_match's search_center/max_deviation constraint --
+# the core mechanism broad_alignment uses to bound per-candidate discovery to
+# a small neighborhood of a precalibrated shift instead of either fixing it
+# outright (old behavior) or searching the whole image (the original
+# unconstrained per-candidate discovery, which is what let low-S/N peptides
+# lock onto a spurious, far-away, higher-scoring correlation peak).
+# ---------------------------------------------------------------------------
+
+
+def _bump(img, center, amp=5.0, sigma=1.5):
+    yy, xx = np.mgrid[0 : img.shape[0], 0 : img.shape[1]]
+    img += amp * np.exp(-(((yy - center[0]) ** 2 + (xx - center[1]) ** 2) / (2 * sigma**2)))
+    return img
+
+
+class TestProfileCorrelation:
+    def test_none_inputs_return_zero(self):
+        assert _profile_correlation(None, np.array([1.0, 2.0])) == 0.0
+        assert _profile_correlation(np.array([1.0, 2.0]), None) == 0.0
+
+    def test_normal_arrays_correlate(self):
+        a = np.array([1.0, 2.0, 3.0, 4.0])
+        b = np.array([2.0, 4.0, 6.0, 8.0])  # perfectly correlated (affine)
+        assert _profile_correlation(a, b) == pytest.approx(1.0)
+
+    def test_constant_profile_returns_zero(self):
+        assert _profile_correlation(np.array([1.0, 1.0]), np.array([1.0, 2.0])) == 0.0
+
+    def test_zero_dim_array_from_pandas_at_unboxing_does_not_crash(self):
+        """A profile spanning exactly one row/column is a genuine 1-element
+        array when written into peak_properties, but pandas' `.at[0, col] =
+        arr` silently collapses a length-1 array to a 0-d ndarray on the way
+        back out (confirmed: `df.at[0,'c']=np.array([1.0]); type(df['c'][0])`
+        is `numpy.ndarray` with `.ndim == 0`) -- bare `len()` on that raises
+        `TypeError: len() of unsized object`. A narrow cropped decoy/match
+        window (this candidate's own individual window, smaller than the old
+        group-scale window) makes single-row/column regions far more likely
+        than before, so this is a real, previously-crashing case, not just a
+        defensive one."""
+        df = pd.DataFrame({"a": [1]})
+        df["rt_profile"] = None
+        df.at[0, "rt_profile"] = np.array([123.4])
+        zero_d = df["rt_profile"].values[0]
+        assert np.ndim(zero_d) == 0  # confirms the unboxing actually happened
+        # single-point profiles can't be correlated -- 0.0, not a crash
+        assert _profile_correlation(zero_d, zero_d) == 0.0
+        assert _profile_correlation(zero_d, np.array([1.0, 2.0])) == 0.0
+
+
+class TestFindShiftViaTemplateMatchConstrained:
+    """search_image has two bumps: a nearby, shape-mismatched one (imperfect
+    correlation) at the position search_center=(0, 0) implies, and a distant
+    one built from the exact same gaussian as the template (near-perfect
+    correlation) 9 pixels away in each axis -- so unconstrained discovery
+    reliably prefers the distant, better-scoring, but wrong bump."""
+
+    def _search_image_and_template(self):
+        search_image = np.random.default_rng(0).normal(0, 0.05, (20, 20))
+        _bump(search_image, (5, 5), amp=5.0, sigma=2.5)  # near, shape-mismatched
+        _bump(search_image, (14, 14), amp=3.0, sigma=1.5)  # far, shape-matched
+        template = _bump(np.zeros((5, 5)), (2, 2), amp=1.0, sigma=1.5)
+        template_bounds = (3, 3, 8, 8)
+        return search_image, template, template_bounds
+
+    def test_unconstrained_prefers_the_far_better_match(self):
+        search_image, template, template_bounds = self._search_image_and_template()
+        shift, score, _, _ = _find_shift_via_template_match(
+            search_image, template, template_bounds
+        )
+        assert shift == (-9, -9)
+        assert score > 0.99
+
+    def test_zero_deviation_forces_exact_center_even_if_worse(self):
+        search_image, template, template_bounds = self._search_image_and_template()
+        shift, score, _, _ = _find_shift_via_template_match(
+            search_image, template, template_bounds, search_center=(0, 0), max_deviation=0
+        )
+        assert shift == (0, 0)
+        assert score < 0.99  # the near bump's imperfect match, not the far one's
+
+    def test_small_deviation_window_excludes_the_far_optimum(self):
+        search_image, template, template_bounds = self._search_image_and_template()
+        shift, score, _, _ = _find_shift_via_template_match(
+            search_image, template, template_bounds, search_center=(0, 0), max_deviation=2
+        )
+        assert abs(shift[0]) <= 2 and abs(shift[1]) <= 2
+        assert shift != (-9, -9)
+
+    def test_large_enough_deviation_recovers_the_far_optimum(self):
+        search_image, template, template_bounds = self._search_image_and_template()
+        shift, score, _, _ = _find_shift_via_template_match(
+            search_image, template, template_bounds, search_center=(0, 0), max_deviation=9
+        )
+        assert shift == (-9, -9)
+        assert score > 0.99
+
+    def test_search_center_beyond_valid_range_is_clamped_not_erroring(self):
+        # template_bounds' top-left is (3, 3); a search_center that would
+        # imply a negative match_score index (e.g. (10, 10), far outside the
+        # image) must clamp into the valid range rather than raising/
+        # wrapping -- the exact returned shift isn't asserted, only that it
+        # stays finite and near the clamped boundary.
+        search_image, template, template_bounds = self._search_image_and_template()
+        shift, score, _, _ = _find_shift_via_template_match(
+            search_image, template, template_bounds, search_center=(10, 10), max_deviation=0
+        )
+        assert np.isfinite(score)
+        assert shift[0] <= 3 and shift[1] <= 3
 
 
 # ---------------------------------------------------------------------------
@@ -403,9 +645,12 @@ class TestBuildConsensusFeatureBundleReuse:
 
 
 # ---------------------------------------------------------------------------
-# match_features_batch end-to-end: coSWA confounder-group orchestration
-# (each member independently aligned + segmented; overlap between members'
-# own assigned segments is flagged post-hoc via undistinguishable_group_id)
+# match_features_batch end-to-end: coSWA confounder-group orchestration (ONE
+# shared alignment + watershed segmentation per group; each member snaps its
+# own anchors onto it, without forcing a single-label collapse; overlap
+# between members' own assigned label sets is flagged via
+# undistinguishable_group_id, plus continuous pixel/intensity overlap-
+# fraction diagnostics -- see _mark_overlapping_group_members)
 # ---------------------------------------------------------------------------
 
 _RT_RANGE = (100, 139)  # 40 frames
@@ -513,13 +758,186 @@ def _run_group_scenario(tmp_path, group_blobs, a_anchor_offset, b_anchor_offset)
     )
 
 
+class TestSelectGroupReferenceRun:
+    def test_picks_run_with_most_anchors(self):
+        # run1: both members anchored (m1 Reference, m2 Quant_Only) -> count 2.
+        # run2: only m1 anchored (Quant_Only) -> count 1.
+        member_roles = {
+            1: ("run1", ["run2"], ["run2"]),
+            2: ("run3", ["run1"], ["run1", "run3"]),
+        }
+        assert _select_group_reference_run(member_roles) == "run1"
+
+    def test_tie_broken_by_reference_role_count(self):
+        # run1 and run2 both have 2 anchored members (tied), but run2 has 2
+        # members with the Reference role specifically vs run1's 1.
+        member_roles = {
+            1: ("run1", ["run2"], ["run2"]),
+            2: ("run2", ["run1"], ["run1"]),
+            3: ("run2", [], []),
+        }
+        assert _select_group_reference_run(member_roles) == "run2"
+
+    def test_final_tie_broken_randomly_among_remaining(self):
+        # run1 and run2 are identical in both anchor count and Reference
+        # count -- the result must be one of the two, deterministically
+        # reproducible only up to that random choice.
+        member_roles = {
+            1: ("run1", [], []),
+            2: ("run2", [], []),
+        }
+        result = _select_group_reference_run(member_roles)
+        assert result in ("run1", "run2")
+
+
+class TestPlaceMaskInCanvas:
+    """Unit coverage for the mask-placement helper coSWA's overlap check
+    uses to project each independently-detected member mask into the
+    group's shared (registration-only) canvas."""
+
+    def test_fully_contained_placement(self):
+        local = np.ones((3, 3), dtype=bool)
+        placed = _place_mask_in_canvas(local, origin=(2, 2), canvas_shape=(10, 10))
+        assert placed.shape == (10, 10)
+        assert placed.sum() == 9
+        assert placed[2:5, 2:5].all()
+        placed[2:5, 2:5] = False
+        assert not placed.any()
+
+    def test_negative_origin_clips_leading_edge(self):
+        local = np.ones((3, 3), dtype=bool)
+        placed = _place_mask_in_canvas(local, origin=(-1, -1), canvas_shape=(5, 5))
+        # Only local[1:3, 1:3] (a 2x2 sub-region) falls within the canvas,
+        # landing at placed[0:2, 0:2].
+        assert placed.sum() == 4
+        assert placed[0:2, 0:2].all()
+        placed[0:2, 0:2] = False
+        assert not placed.any()
+
+    def test_origin_clips_trailing_edge(self):
+        local = np.ones((5, 5), dtype=bool)
+        placed = _place_mask_in_canvas(local, origin=(3, 3), canvas_shape=(6, 6))
+        # Only local[0:3, 0:3] fits before the canvas edge, landing at
+        # placed[3:6, 3:6].
+        assert placed.sum() == 9
+        assert placed[3:6, 3:6].all()
+        placed[3:6, 3:6] = False
+        assert not placed.any()
+
+    def test_fully_outside_canvas_yields_empty_mask(self):
+        local = np.ones((3, 3), dtype=bool)
+        placed = _place_mask_in_canvas(local, origin=(20, 20), canvas_shape=(10, 10))
+        assert placed.shape == (10, 10)
+        assert not placed.any()
+
+
+class TestMarkOverlappingGroupMembers:
+    """Direct unit coverage for the >50% OR-direction tagging threshold and
+    the pixel/intensity diagnostics, independent of the full
+    match_features_batch pipeline."""
+
+    def _meta(self, shape=(10, 10), intensity=None):
+        return {
+            "target_shape": shape,
+            "intensity_image": intensity if intensity is not None else np.ones(shape),
+        }
+
+    def test_below_threshold_overlap_not_tagged_but_fraction_reported(self):
+        # A: cols [0, 5) (50 px); B: cols [3, 8) (50 px) -> intersection
+        # cols [3, 5) = 20 px. frac_A = frac_B = 20/50 = 0.4, below 0.5.
+        mask_a = np.zeros((10, 10), dtype=bool)
+        mask_a[:, 0:5] = True
+        mask_b = np.zeros((10, 10), dtype=bool)
+        mask_b[:, 3:8] = True
+        member_cache = {
+            1: {"mask": mask_a, "placement_origin": (0, 0)},
+            2: {"mask": mask_b, "placement_origin": (0, 0)},
+        }
+        tags, pixel_fraction, intensity_fraction = _mark_overlapping_group_members(
+            {100: [1, 2]}, member_cache, {100: self._meta()}
+        )
+        assert tags == {}
+        assert pixel_fraction[1] == pytest.approx(0.4)
+        assert pixel_fraction[2] == pytest.approx(0.4)
+
+    def test_or_direction_flags_small_member_engulfed_by_large_one(self):
+        # A: cols [0, 2) (20 px, small); B: cols [0, 10) (100 px, large) --
+        # A is entirely contained in B. frac_A = 20/20 = 1.0 (> 0.5), but
+        # frac_B = 20/100 = 0.2 (<= 0.5). OR logic must still tag both.
+        mask_a = np.zeros((10, 10), dtype=bool)
+        mask_a[:, 0:2] = True
+        mask_b = np.ones((10, 10), dtype=bool)
+        member_cache = {
+            1: {"mask": mask_a, "placement_origin": (0, 0)},
+            2: {"mask": mask_b, "placement_origin": (0, 0)},
+        }
+        tags, pixel_fraction, _ = _mark_overlapping_group_members(
+            {100: [1, 2]}, member_cache, {100: self._meta()}
+        )
+        assert 1 in tags and 2 in tags and tags[1] == tags[2]
+        assert pixel_fraction[1] == pytest.approx(1.0)
+        assert pixel_fraction[2] == pytest.approx(0.2)
+
+    def test_above_threshold_overlap_is_tagged(self):
+        # C: cols [0, 5) (50 px); D: cols [2, 5) (30 px) -> intersection
+        # cols [2, 5) = 30 px. frac_C = 30/50 = 0.6 (> 0.5).
+        mask_c = np.zeros((10, 10), dtype=bool)
+        mask_c[:, 0:5] = True
+        mask_d = np.zeros((10, 10), dtype=bool)
+        mask_d[:, 2:5] = True
+        member_cache = {
+            1: {"mask": mask_c, "placement_origin": (0, 0)},
+            2: {"mask": mask_d, "placement_origin": (0, 0)},
+        }
+        tags, _, _ = _mark_overlapping_group_members(
+            {100: [1, 2]}, member_cache, {100: self._meta()}
+        )
+        assert 1 in tags and 2 in tags and tags[1] == tags[2]
+
+    def test_intensity_fraction_is_informational_only(self):
+        # member 1: cols [0, 5); member 2: cols [1, 5) -> intersection
+        # cols [1, 5). frac_1 = 40/50 = 0.8, frac_2 = 40/40 = 1.0 -- pixel
+        # overlap tags both. Intensity is concentrated in member 1's own
+        # NON-shared column (col 0), so intensity_fraction[1] comes out
+        # near-zero despite the pixel-based tag firing -- proving intensity
+        # never gates the tag, purely informational.
+        mask_1 = np.zeros((10, 10), dtype=bool)
+        mask_1[:, 0:5] = True
+        mask_2 = np.zeros((10, 10), dtype=bool)
+        mask_2[:, 1:5] = True
+        intensity = np.ones((10, 10))
+        intensity[:, 0] = 1000.0  # all in member 1's own non-shared column
+        member_cache = {
+            1: {"mask": mask_1, "placement_origin": (0, 0)},
+            2: {"mask": mask_2, "placement_origin": (0, 0)},
+        }
+        tags, pixel_fraction, intensity_fraction = _mark_overlapping_group_members(
+            {100: [1, 2]}, member_cache, {100: self._meta(intensity=intensity)}
+        )
+        assert 1 in tags and 2 in tags
+        assert pixel_fraction[1] == pytest.approx(0.8)
+        assert intensity_fraction[1] < 0.1
+
+    def test_groups_with_fewer_than_two_present_members_are_skipped(self):
+        member_cache = {1: {"mask": np.ones((5, 5), dtype=bool), "placement_origin": (0, 0)}}
+        tags, pixel_fraction, intensity_fraction = _mark_overlapping_group_members(
+            {100: [1]}, member_cache, {100: self._meta(shape=(5, 5))}
+        )
+        assert tags == {}
+        assert pixel_fraction == {}
+        assert intensity_fraction == {}
+
+
 class TestMatchFeaturesBatchConfounderGroups:
     def test_bimodal_signal_separates_group_members_no_collision(self, tmp_path):
-        """Two distinguishable sub-peaks within the shared merged image -> A
-        and B each independently align + segment their own image, and each
-        one's own assigned segment lands on a different, non-overlapping
-        region -> both correctly quantified independently, no
-        undistinguishable flag."""
+        """A and B share the identical group activation image (two
+        well-separated sub-peaks) but are each aligned and segmented fully
+        INDEPENDENTLY, from their own anchor only -> each one's own
+        watershed run picks out the label under its own anchor -> both
+        correctly quantified independently. Their own independently-
+        detected masks, placed into the group's shared (registration-only)
+        canvas, don't overlap -> no undistinguishable flag, 0.0 overlap
+        fraction both directions."""
         (
             results_target,
             results_decoy,
@@ -547,16 +965,21 @@ class TestMatchFeaturesBatchConfounderGroups:
         assert by_rank_match.loc[2, "undistinguishable_group_id"] == -1
         # correctly told apart: distinct quantification for A vs B
         assert by_rank_ref.loc[1, "area"] != by_rank_ref.loc[2, "area"]
+        # neither member's own assigned pixels/intensity are shared
+        assert by_rank_ref.loc[1, "undistinguishable_pixel_fraction"] == 0.0
+        assert by_rank_ref.loc[2, "undistinguishable_pixel_fraction"] == 0.0
+        assert by_rank_ref.loc[1, "undistinguishable_intensity_fraction"] == 0.0
+        assert by_rank_ref.loc[2, "undistinguishable_intensity_fraction"] == 0.0
 
     def test_unimodal_signal_flags_group_members_as_undistinguishable(self, tmp_path):
-        """A single peak in the shared merged image -> A and B each
-        independently align + segment their own image, and each one's own
-        assigned segment (there's only one label to land on) overlaps the
-        other's -> flagged with a shared undistinguishable_group_id. Their
-        quantification is no longer forced identical by construction (each
-        is computed fully independently) -- it happens to match here only
-        because both use identical anchors/runs/windows, not because that's
-        a guaranteed invariant of the new design."""
+        """A and B share the identical group activation image (a single
+        peak) and identical anchor positions -> each one's own INDEPENDENT
+        watershed run (same input, deterministic) detects the same one
+        peak -> their own independently-detected masks are identical, so
+        once placed into the group's shared canvas they overlap 100% (well
+        past the new 50% threshold, both directions) -> flagged with a
+        shared undistinguishable_group_id, and BOTH members' own assigned
+        pixels/intensity are entirely (fraction 1.0) claimed by the other."""
         (
             results_target,
             results_decoy,
@@ -588,6 +1011,13 @@ class TestMatchFeaturesBatchConfounderGroups:
         # both are still genuinely quantified (not dropped just for overlapping)
         assert by_rank_ref.loc[1, "area"] > 0
         assert by_rank_ref.loc[2, "area"] > 0
+        # sharing the ONE label -> entirely overlapping, both directions
+        assert by_rank_ref.loc[1, "undistinguishable_pixel_fraction"] == 1.0
+        assert by_rank_ref.loc[2, "undistinguishable_pixel_fraction"] == 1.0
+        assert by_rank_ref.loc[1, "undistinguishable_intensity_fraction"] == 1.0
+        assert by_rank_ref.loc[2, "undistinguishable_intensity_fraction"] == 1.0
+        # C (solo) has no group to overlap with
+        assert by_rank_ref.loc[3, "undistinguishable_pixel_fraction"] == 0.0
 
     def test_solo_candidate_unaffected_by_group_presence(self, tmp_path):
         """C's own quantification and -1 tag hold regardless of whether the
@@ -604,6 +1034,98 @@ class TestMatchFeaturesBatchConfounderGroups:
             assert pp_ref.loc[3, "undistinguishable_group_id"] == -1
             assert pp_match.loc[3, "undistinguishable_group_id"] == -1
             assert pp_ref.loc[3, "area"] > 0
+
+    def test_overlap_detection_when_member_own_reference_run_differs_from_group(
+        self, tmp_path
+    ):
+        """A's own reference_raw_file (run1) differs from the group's own
+        chosen reference run (run2, since A's Quant_Only role on run2 plus
+        B's Reference role on run2 outweigh A's lone Reference vote for
+        run1 -- see _select_group_reference_run). This exercises the
+        registration-shift-correction branch of the placement computation
+        (main loop): A's own window/mask has to be expressed relative to
+        run1 first, then corrected into the group's run2-anchored canvas via
+        that run's own registration shift, rather than the trivial
+        same-run-as-group-reference case the other scenarios in this class
+        exercise. Both members still share the identical group activation
+        image and anchor position (unimodal), so this must still end up
+        correctly quantified and flagged as overlapping, exactly like
+        test_unimodal_signal_flags_group_members_as_undistinguishable."""
+        raw_files = ["run1", "run2"]
+        group_img = _group_blob_image([(15, 12, 10.0, 2.0)])
+        solo_img = _group_blob_image([(25, 25, 10.0, 2.0)])
+        for rf in raw_files:
+            _write_combined_activation_parquet(
+                os.path.join(tmp_path, rf, "activation"),
+                {1001: group_img, 3: solo_img},
+            )
+
+        def _abs(offset):
+            return (_RT_RANGE[0] + offset[0], _IM_RANGE[0] + offset[1])
+
+        rt_c, im_c = _abs((15, 12))
+        rows = [
+            {
+                "mz_rank": 1,
+                "confounder_group_id": 1001,
+                "run1": "Reference",
+                "run2": "Quant_Only",
+            },
+            {
+                "mz_rank": 2,
+                "confounder_group_id": 1001,
+                "run1": "Match",
+                "run2": "Reference",
+            },
+            {
+                "mz_rank": 3,
+                "confounder_group_id": -1,
+                "run1": "Reference",
+                "run2": "Match",
+            },
+        ]
+        solo_rt_c, solo_im_c = _abs((25, 25))
+        for row, (own_rt_c, own_im_c) in zip(
+            rows, [(rt_c, im_c), (rt_c, im_c), (solo_rt_c, solo_im_c)]
+        ):
+            for rf in raw_files:
+                row[f"MS1_frame_idx_left_ref_{rf}"] = _RT_RANGE[0]
+                row[f"MS1_frame_idx_right_ref_{rf}"] = _RT_RANGE[1]
+                row[f"mobility_values_index_left_ref_{rf}"] = _IM_RANGE[0]
+                row[f"mobility_values_index_right_ref_{rf}"] = _IM_RANGE[1]
+                row[f"{rf}_MS1_frame_idx_exp"] = own_rt_c
+                row[f"{rf}_mobility_values_index_exp"] = own_im_c
+        dict_ref = pd.DataFrame(rows)
+
+        (
+            results_target,
+            results_decoy,
+            pp_reference_list,
+            pp_match_target_list,
+            pp_match_decoy_list,
+            no_quant_log,
+            no_match_log,
+            snap_log_collection,
+        ) = match_features_batch(
+            dict_ref=dict_ref,
+            raw_file_list=raw_files,
+            result_dir=str(tmp_path),
+            batch=[1, 2, 3],
+            processing_kwargs={"apply_seg": True},
+            match_decoy=False,
+        )
+        assert _select_group_reference_run(
+            {1: ("run1", ["run2"], ["run2"]), 2: ("run2", [], ["run1"])}
+        ) == "run2"  # sanity-check the mismatch premise this test relies on
+
+        pp_ref = pd.concat(pp_reference_list).set_index("mz_rank")
+        assert pp_ref.loc[1, "area"] > 0
+        assert pp_ref.loc[2, "area"] > 0
+        tag = pp_ref.loc[1, "undistinguishable_group_id"]
+        assert tag != -1
+        assert pp_ref.loc[2, "undistinguishable_group_id"] == tag
+        assert pp_ref.loc[1, "undistinguishable_pixel_fraction"] == 1.0
+        assert pp_ref.loc[3, "undistinguishable_group_id"] == -1  # solo untouched
 
     def test_merge_confounders_disabled_ignores_stale_group_id_column(
         self, tmp_path
@@ -710,3 +1232,452 @@ class TestMatchFeaturesBatchConfounderGroups:
         )
         pp_ref = pd.concat(pp_reference_list)
         assert (pp_ref["undistinguishable_group_id"] == -1).all()
+
+
+class TestGroupBundleCacheFreedEarly:
+    def test_group_raw_images_released_before_batch_returns(self, tmp_path, monkeypatch):
+        """OOM fix: match_features_batch's group pre-pass builds full
+        multi-run registration data for every in-batch confounder group up
+        front (_group_bundle_cache). Once a group's last member has been
+        processed in the main per-peptide loop, that group's entry must be
+        popped so the arrays can be garbage-collected -- not held resident
+        for the rest of the batch.
+
+        Verified by spying on get_pept_act_from_parquet's use_group_window=
+        True calls (the group pre-pass's own raw-image loads), keeping only
+        weakrefs, and checking they're already dead by the time
+        _mark_overlapping_group_members runs (after the main loop, but
+        still inside match_features_batch -- i.e. released *during*
+        processing, not merely once the whole function/its locals go out
+        of scope on return, which every Python function does regardless of
+        this fix)."""
+        captured_refs: list[weakref.ReferenceType] = []
+        orig_get_pept_act = match_features_module.get_pept_act_from_parquet
+
+        def _spy_get_pept_act(*args, **kwargs):
+            result = orig_get_pept_act(*args, **kwargs)
+            if kwargs.get("use_group_window"):
+                captured_refs.append(weakref.ref(result[0]))
+            return result
+
+        monkeypatch.setattr(
+            match_features_module, "get_pept_act_from_parquet", _spy_get_pept_act
+        )
+
+        checked_alive: list[list[weakref.ReferenceType]] = []
+        orig_mark = match_features_module._mark_overlapping_group_members
+
+        def _spy_mark(*args, **kwargs):
+            gc.collect()
+            checked_alive.append([r for r in captured_refs if r() is not None])
+            return orig_mark(*args, **kwargs)
+
+        monkeypatch.setattr(
+            match_features_module, "_mark_overlapping_group_members", _spy_mark
+        )
+
+        _run_group_scenario(
+            tmp_path,
+            group_blobs=[(15, 8, 10.0, 2.0), (15, 18, 10.0, 2.0)],
+            a_anchor_offset=(15, 8),
+            b_anchor_offset=(15, 18),
+        )
+
+        assert captured_refs, "expected at least one group-window raw image load"
+        assert checked_alive, "_mark_overlapping_group_members was not called"
+        assert checked_alive[0] == [], (
+            f"{len(checked_alive[0])}/{len(captured_refs)} group raw images "
+            "were still referenced by the time _mark_overlapping_group_members "
+            "ran -- _group_bundle_cache entries were not freed once the "
+            "group's members were done"
+        )
+
+
+class TestEstimatePeptidePixelWeights:
+    def test_all_ones_when_window_columns_absent(self):
+        dict_ref = pd.DataFrame({"mz_rank": [1, 2, 3]})
+        weights = _estimate_peptide_pixel_weights(dict_ref, np.array([1, 2, 3]), ["run1"])
+        assert np.array_equal(weights, np.ones(3))
+
+    def test_all_ones_when_raw_file_list_empty(self):
+        dict_ref = pd.DataFrame({"mz_rank": [1, 2]})
+        weights = _estimate_peptide_pixel_weights(dict_ref, np.array([1, 2]), [])
+        assert np.array_equal(weights, np.ones(2))
+
+    def test_sums_individual_window_across_runs(self):
+        rows = [
+            {
+                "mz_rank": 1,
+                "confounder_group_id": -1,
+                "MS1_frame_idx_left_ref_run1": 0,
+                "MS1_frame_idx_right_ref_run1": 9,  # 10 frames
+                "mobility_values_index_left_ref_run1": 0,
+                "mobility_values_index_right_ref_run1": 4,  # 5 bins -> 50 px
+                "MS1_frame_idx_left_ref_run2": 0,
+                "MS1_frame_idx_right_ref_run2": 19,  # 20 frames
+                "mobility_values_index_left_ref_run2": 0,
+                "mobility_values_index_right_ref_run2": 1,  # 2 bins -> 40 px
+            }
+        ]
+        dict_ref = pd.DataFrame(rows)
+        weights = _estimate_peptide_pixel_weights(
+            dict_ref, np.array([1]), ["run1", "run2"]
+        )
+        assert weights[0] == pytest.approx(90.0)
+
+    def test_uses_group_window_for_grouped_peptide(self):
+        rows = [
+            {
+                "mz_rank": 1,
+                "confounder_group_id": 1001,
+                "MS1_frame_idx_left_ref_run1": 0,
+                "MS1_frame_idx_right_ref_run1": 4,  # individual: 5 frames
+                "mobility_values_index_left_ref_run1": 0,
+                "mobility_values_index_right_ref_run1": 4,  # 5 bins -> 25 px
+                "MS1_frame_idx_left_group_ref_run1": 0,
+                "MS1_frame_idx_right_group_ref_run1": 9,  # group: 10 frames
+                "mobility_values_index_left_group_ref_run1": 0,
+                "mobility_values_index_right_group_ref_run1": 9,  # 10 bins -> 100 px
+            },
+            {
+                "mz_rank": 2,
+                "confounder_group_id": -1,  # solo -- individual window even though group cols present
+                "MS1_frame_idx_left_ref_run1": 0,
+                "MS1_frame_idx_right_ref_run1": 4,
+                "mobility_values_index_left_ref_run1": 0,
+                "mobility_values_index_right_ref_run1": 4,  # 25 px
+                "MS1_frame_idx_left_group_ref_run1": 0,
+                "MS1_frame_idx_right_group_ref_run1": 9,
+                "mobility_values_index_left_group_ref_run1": 0,
+                "mobility_values_index_right_group_ref_run1": 9,
+            },
+        ]
+        dict_ref = pd.DataFrame(rows)
+        weights = _estimate_peptide_pixel_weights(dict_ref, np.array([1, 2]), ["run1"])
+        assert weights[0] == pytest.approx(100.0)  # grouped -> group window
+        assert weights[1] == pytest.approx(25.0)  # solo -> individual window
+
+
+class TestCarveOutOversized:
+    def test_no_carve_out_when_multiplier_disabled(self):
+        mz = np.array([1, 2, 3])
+        weights = np.array([1.0, 100.0, 1.0])
+        remaining, batches = _carve_out_oversized(mz, weights, None, 20)
+        assert np.array_equal(remaining, mz)
+        assert batches == []
+
+    def test_no_carve_out_when_nothing_oversized(self):
+        mz = np.array([1, 2, 3])
+        weights = np.array([1.0, 1.1, 0.9])
+        remaining, batches = _carve_out_oversized(mz, weights, 3.0, 20)
+        assert np.array_equal(remaining, mz)
+        assert batches == []
+
+    def test_carves_out_items_above_threshold(self):
+        mz = np.array([1, 2, 3, 4])
+        weights = np.array([1.0, 1.0, 1.0, 100.0])  # item 4 >> 3x median
+        remaining, batches = _carve_out_oversized(mz, weights, 3.0, 20)
+        assert set(remaining.tolist()) == {1, 2, 3}
+        assert len(batches) == 1
+        assert list(batches[0]) == [4]
+
+    def test_chunks_oversized_items_by_oversize_batch_size(self):
+        # 9 normal items (weight 1.0, keeps the median low) + 6 oversized
+        # ones (weight 100.0) -> 6/2 = 3 carved-out batches of size <=2.
+        mz = np.arange(1, 16)
+        weights = np.array([1.0] * 9 + [100.0] * 6)
+        remaining, batches = _carve_out_oversized(mz, weights, 3.0, 2)
+        assert list(remaining) == list(range(1, 10))
+        assert len(batches) == 3
+        assert all(len(b) <= 2 for b in batches)
+        assert sorted(np.concatenate(batches).tolist()) == list(range(10, 16))
+
+
+class TestBuildPeptideBatchesSizeAware:
+    def _dict_ref_with_windows(self, mz_ranks, group_ids, rt_spans, im_spans, run="run1"):
+        rows = []
+        for mz, gid, rt_span, im_span in zip(mz_ranks, group_ids, rt_spans, im_spans):
+            rows.append(
+                {
+                    "mz_rank": mz,
+                    "confounder_group_id": gid,
+                    f"MS1_frame_idx_left_ref_{run}": 0,
+                    f"MS1_frame_idx_right_ref_{run}": rt_span - 1,
+                    f"mobility_values_index_left_ref_{run}": 0,
+                    f"mobility_values_index_right_ref_{run}": im_span - 1,
+                    f"MS1_frame_idx_left_group_ref_{run}": 0,
+                    f"MS1_frame_idx_right_group_ref_{run}": rt_span - 1,
+                    f"mobility_values_index_left_group_ref_{run}": 0,
+                    f"mobility_values_index_right_group_ref_{run}": im_span - 1,
+                }
+            )
+        return pd.DataFrame(rows)
+
+    def test_identical_output_when_oversize_disabled(self):
+        mz_ranks = np.arange(1, 21)
+        group_ids = np.array([-1] * 15 + [1001] * 3 + [1002] * 2)
+        dict_ref = self._dict_ref_with_windows(
+            mz_ranks, group_ids, rt_spans=[10] * 20, im_spans=[10] * 20
+        )
+        without_weights = _build_peptide_batches(
+            dict_ref, mz_ranks, batch_size_max=5, max_workers=1
+        )
+        disabled = _build_peptide_batches(
+            dict_ref,
+            mz_ranks,
+            batch_size_max=5,
+            max_workers=1,
+            raw_file_list=["run1"],
+            oversize_multiplier=None,
+        )
+        legacy = _build_peptide_batches(dict_ref, mz_ranks, batch_size_max=5, max_workers=1)
+        for batches in (without_weights, disabled, legacy):
+            all_mz = sorted(int(v) for b in batches for v in b)
+            assert all_mz == list(range(1, 21))
+
+    def test_batches_ordered_heaviest_first(self):
+        """Regression: ProcessPoolExecutor.submit() consumes futures roughly
+        in list order, so a run used to plow through all the (small) solo
+        batches before ever touching the (systematically larger) confounder-
+        group batches -- meaning an OOM only ever surfaced near the very
+        end, after hours of otherwise-successful work. Batches must now be
+        ordered by descending estimated weight so a genuine OOM shows up in
+        the first few batches instead."""
+        mz_ranks = np.arange(1, 41)
+        # 20 solo peptides with a range of sizes, plus 10 confounder groups
+        # (2 members each) with a range of sizes -- deliberately interleaved
+        # so ordering can't come "for free" from category concatenation.
+        group_ids = np.array(
+            [-1] * 20 + sorted([g for g in range(1, 11) for _ in range(2)])
+        )
+        rt_spans = list(range(5, 25)) + [v for g in range(1, 11) for v in (g * 3, g * 3)]
+        im_spans = rt_spans
+        dict_ref = self._dict_ref_with_windows(mz_ranks, group_ids, rt_spans, im_spans)
+
+        batches = _build_peptide_batches(
+            dict_ref,
+            mz_ranks,
+            batch_size_max=4,  # forces many small batches so order is meaningful
+            max_workers=1,
+            raw_file_list=["run1"],
+            oversize_multiplier=3.0,
+            oversize_batch_size=4,
+        )
+        all_mz = sorted(int(v) for b in batches for v in b)
+        assert all_mz == list(range(1, 41))
+
+        weights = _estimate_peptide_pixel_weights(dict_ref, mz_ranks, ["run1"])
+        w_by_mz = dict(zip(mz_ranks.tolist(), weights.tolist()))
+        batch_weights = [sum(w_by_mz[int(m)] for m in b) for b in batches]
+        assert batch_weights == sorted(batch_weights, reverse=True)
+
+    def test_oversized_solo_isolated_from_normal_batches(self):
+        mz_ranks = np.arange(1, 11)
+        group_ids = np.full(10, -1)
+        rt_spans = [10] * 9 + [500]  # last peptide is far larger
+        im_spans = [10] * 9 + [500]
+        dict_ref = self._dict_ref_with_windows(mz_ranks, group_ids, rt_spans, im_spans)
+        batches = _build_peptide_batches(
+            dict_ref,
+            mz_ranks,
+            batch_size_max=100,
+            max_workers=1,
+            raw_file_list=["run1"],
+            oversize_multiplier=3.0,
+            oversize_batch_size=20,
+        )
+        all_mz = sorted(int(v) for b in batches for v in b)
+        assert all_mz == list(range(1, 11))
+        oversized_batch = [b for b in batches if 10 in b]
+        assert len(oversized_batch) == 1
+        assert list(oversized_batch[0]) == [10]
+
+    def test_oversized_group_isolated_and_never_split(self):
+        mz_ranks = np.arange(1, 11)
+        # peptides 1-8 solo, 9-10 form one confounder group with a huge window
+        group_ids = np.array([-1] * 8 + [1001, 1001])
+        rt_spans = [10] * 8 + [500, 500]
+        im_spans = [10] * 8 + [500, 500]
+        dict_ref = self._dict_ref_with_windows(mz_ranks, group_ids, rt_spans, im_spans)
+        batches = _build_peptide_batches(
+            dict_ref,
+            mz_ranks,
+            batch_size_max=100,
+            max_workers=1,
+            raw_file_list=["run1"],
+            oversize_multiplier=3.0,
+            oversize_batch_size=20,
+        )
+        all_mz = sorted(int(v) for b in batches for v in b)
+        assert all_mz == list(range(1, 11))
+        group_batch = [b for b in batches if 9 in b or 10 in b]
+        assert len(group_batch) == 1
+        assert sorted(group_batch[0].tolist()) == [9, 10]  # group never split
+
+    def test_multiple_oversized_groups_are_packed_together_not_isolated(self):
+        """Regression: when MANY groups qualify as oversized (observed on a
+        real 20-run HYE benchmark, ~10% of groups), isolating each one into
+        its own singleton batch fragmented a 284-batch run into 2570 mostly
+        single-digit-sized batches (median size 6), massively multiplying
+        per-batch DuckDB/ProcessPoolExecutor overhead. Oversized groups must
+        be packed together (never splitting any one group) up to
+        oversize_batch_size, like solo oversized items already are -- not
+        each isolated alone."""
+        # 6 solo peptides (kept out of the group-weight median entirely) +
+        # 4 small confounder groups (window 10x10, group_weight=200 each --
+        # the majority, so the median stays small) + 3 big groups (window
+        # 500x500, group_weight=500000 each -- clearly >3x the 200 median).
+        mz_ranks = np.arange(1, 21)
+        group_ids = np.array(
+            [-1] * 6
+            + [3001, 3001, 3002, 3002, 3003, 3003, 3004, 3004]  # small groups
+            + [2001, 2001, 2002, 2002, 2003, 2003]  # big groups
+        )
+        rt_spans = [10] * 6 + [10] * 8 + [500] * 6
+        im_spans = [10] * 6 + [10] * 8 + [500] * 6
+        dict_ref = self._dict_ref_with_windows(mz_ranks, group_ids, rt_spans, im_spans)
+        batches = _build_peptide_batches(
+            dict_ref,
+            mz_ranks,
+            batch_size_max=100,
+            max_workers=1,
+            raw_file_list=["run1"],
+            oversize_multiplier=3.0,
+            oversize_batch_size=4,  # 2 members/group -> 2 groups should share a batch
+        )
+        all_mz = sorted(int(v) for b in batches for v in b)
+        assert all_mz == list(range(1, 21))
+
+        big_group_mz = set(range(15, 21))
+        oversized_batches = [b for b in batches if set(b.tolist()) & big_group_mz]
+        # 6 big-group members packed at <=4/batch -> 2 batches, not 3 (one
+        # per group, the pre-fix behavior) or 1 (everything crammed together).
+        assert len(oversized_batches) == 2
+        for b in oversized_batches:
+            assert len(b) <= 4
+            assert set(b.tolist()) <= big_group_mz  # small groups untouched
+            # a batch never contains only half of a group
+            for gid, members in [(2001, {15, 16}), (2002, {17, 18}), (2003, {19, 20})]:
+                present = members & set(b.tolist())
+                assert present in (set(), members)
+
+    def test_gid_ordered_size_ramp_does_not_cluster_into_heavy_tail_batches(self):
+        """Regression: a real 20-run HYE benchmark's confounder_group_id
+        order happened to correlate with image size, so pure count-based
+        packing (_pack_confounder_groups_into_batches with no weight
+        budget) put the heaviest surviving (non-outlier) groups into the
+        last several batches -- per-batch total weight climbing from ~470M
+        to a 692M peak vs a healthy ~120-150M solo-batch baseline, right
+        where max_workers keeps several of them running concurrently.
+        _build_peptide_batches must now cap every batch's total weight
+        close to the pool average instead of letting it ramp with gid
+        order."""
+        # 40 groups of 2 members each, gid ascending == weight ascending
+        # (the pathological correlation) -- none individually 3x the
+        # median, but the largest are still ~8x the smallest, so naive
+        # gid-ordered packing would cluster the heavy tail together.
+        # Spans ramp gently (30->60, max/min weight ratio 4x, all comfortably
+        # under the 3x-median oversize threshold) so every group goes
+        # through the normal (non-outlier) packing path -- isolating this
+        # test to that remainder-weight-budget logic specifically. Enough
+        # groups/batches (200 groups -> ~10 batches) for the weight-budget
+        # averaging to behave the way it does on a real, larger dataset
+        # instead of being dominated by small-N quantization.
+        n_groups = 200
+        mz_ranks = np.arange(1, 2 * n_groups + 1)
+        group_ids = np.repeat(np.arange(1, n_groups + 1), 2)
+        spans = np.repeat(np.linspace(30, 60, n_groups), 2).astype(int)
+        rt_spans = spans.tolist()
+        im_spans = spans.tolist()
+        dict_ref = self._dict_ref_with_windows(mz_ranks, group_ids, rt_spans, im_spans)
+
+        batches = _build_peptide_batches(
+            dict_ref,
+            mz_ranks,
+            batch_size_max=40,  # forces several batches (400 members / 40)
+            max_workers=1,
+            raw_file_list=["run1"],
+            oversize_multiplier=3.0,
+            oversize_batch_size=20,
+        )
+        all_mz = sorted(int(v) for b in batches for v in b)
+        assert all_mz == list(range(1, 2 * n_groups + 1))
+
+        weight_by_gid = {
+            int(gid): 2 * int(span) ** 2
+            for gid, span in zip(np.arange(1, n_groups + 1), np.linspace(30, 60, n_groups))
+        }
+        gid_by_mz = dict(zip(mz_ranks.tolist(), group_ids.tolist()))
+
+        def _batch_weight(b):
+            # sum over each batch's UNIQUE groups, not per member (every
+            # group here has 2 members, so summing per member would double
+            # count each group's own weight).
+            gids_in_batch = {gid_by_mz[int(m)] for m in b.tolist()}
+            return sum(weight_by_gid[g] for g in gids_in_batch)
+
+        batch_weights = [_batch_weight(b) for b in batches]
+
+        # The code's actual contract: a batch's weight only ever exceeds
+        # weight_budget by (at most) the one group whose own weight already
+        # exceeds it standalone -- none do here (max group weight 7200 <<
+        # budget), so every batch must land at/under the same budget
+        # _build_peptide_batches computed internally.
+        total_weight = sum(weight_by_gid.values())
+        n_count_batches = max(1, round(len(mz_ranks) / 40))
+        expected_budget = 1.2 * total_weight / n_count_batches
+        assert max(batch_weights) <= expected_budget + 1e-6, (
+            f"heaviest batch ({max(batch_weights)}) exceeds the expected "
+            f"weight budget ({expected_budget}) -- gid-order clustering "
+            "doesn't look prevented"
+        )
+
+        # Baseline: what pure gid-order, count-only packing (no weight
+        # budget -- the pre-fix behavior) would have produced on this same
+        # pool, to show the fix meaningfully flattens the ramp rather than
+        # merely satisfying the budget by coincidence.
+        baseline_batches = _pack_confounder_groups_into_batches(
+            mz_ranks, group_ids, batch_size_max=40
+        )
+        baseline_weights = [_batch_weight(b) for b in baseline_batches]
+        assert max(batch_weights) < max(baseline_weights), (
+            f"heaviest with-budget batch ({max(batch_weights)}) isn't lower "
+            f"than the no-budget baseline's heaviest batch "
+            f"({max(baseline_weights)}) -- gid-order clustering doesn't "
+            "look prevented"
+        )
+
+
+class TestPackConfounderGroupsWeightBudget:
+    def test_weight_budget_splits_batch_early(self):
+        mz = np.arange(1, 7)
+        gid = np.array([1, 1, 2, 2, 3, 3])
+        weights = {1: 10.0, 2: 10.0, 3: 10.0}
+        # count cap alone (100) would pack all 3 groups into one batch;
+        # weight_budget=15 forces a new batch after each single group.
+        batches = _pack_confounder_groups_into_batches(
+            mz, gid, batch_size_max=100, group_weights=weights, weight_budget=15.0
+        )
+        assert len(batches) == 3
+        assert all(len(b) == 2 for b in batches)
+
+    def test_weight_budget_none_matches_count_only_behavior(self):
+        mz = np.arange(1, 7)
+        gid = np.array([1, 1, 2, 2, 3, 3])
+        batches_a = _pack_confounder_groups_into_batches(mz, gid, batch_size_max=100)
+        batches_b = _pack_confounder_groups_into_batches(
+            mz, gid, batch_size_max=100, group_weights=None, weight_budget=None
+        )
+        assert len(batches_a) == 1
+        assert [sorted(b.tolist()) for b in batches_a] == [
+            sorted(b.tolist()) for b in batches_b
+        ]
+
+    def test_never_splits_a_single_group_even_over_weight_budget(self):
+        mz = np.arange(1, 5)
+        gid = np.array([1, 1, 1, 1])  # one group of 4
+        batches = _pack_confounder_groups_into_batches(
+            mz, gid, batch_size_max=100, group_weights={1: 1000.0}, weight_budget=1.0
+        )
+        assert len(batches) == 1
+        assert sorted(batches[0].tolist()) == [1, 2, 3, 4]

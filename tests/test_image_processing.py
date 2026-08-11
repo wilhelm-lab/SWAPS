@@ -10,7 +10,7 @@ from unittest.mock import patch
 from postprocessing.image_processing import smooth_and_denoise_image
 from postprocessing.match_features import (
     _denoise_kwargs_for_stage,
-    _denoise_kwargs_all,
+    _log_transform_enabled,
     ConsensusAlignmentState,
     segment_consensus_from_aligned,
 )
@@ -112,17 +112,20 @@ class TestSmoothAndDenoiseImageOrder:
 _SAMPLE_DENOISE_CFG = {
     "smooth": {"at": "consensus", "filter": "uniform", "uniform_kwargs": {"size": [3, 5]}},
     "clean": {"at": "consensus", "threshold": 0, "remove_kwargs": {"min_size": 3}},
-    "log_transform": {"at": "raw", "enabled": True},
+    "log_transform": {"enabled": True},
 }
 
 
 class TestDenoiseKwargsForStage:
-    def test_raw_stage_returns_log_transform(self):
+    """log_transform is deliberately NOT staged (see the config comment on
+    MATCH_FEATURES_KWARGS.denoise.log_transform): it's applied once, downstream of
+    this helper, to the linear consensus average / each run's own aligned image --
+    never before alignment/averaging -- so _denoise_kwargs_for_stage never returns it,
+    for any stage."""
+
+    def test_raw_stage_returns_no_ops_here(self):
         kw = _denoise_kwargs_for_stage(_SAMPLE_DENOISE_CFG, "raw")
-        assert "log_transform" in kw
-        assert kw["log_transform"] is True
-        assert "smooth" not in kw
-        assert "clean" not in kw
+        assert kw == {}
 
     def test_consensus_stage_returns_smooth_and_clean(self):
         kw = _denoise_kwargs_for_stage(_SAMPLE_DENOISE_CFG, "consensus")
@@ -143,28 +146,25 @@ class TestDenoiseKwargsForStage:
         kw = _denoise_kwargs_for_stage({}, "raw")
         assert kw == {}
 
-    def test_log_transform_disabled(self):
-        cfg = {"log_transform": {"at": "raw", "enabled": False}}
-        kw = _denoise_kwargs_for_stage(cfg, "raw")
-        assert kw["log_transform"] is False
 
+class TestLogTransformEnabled:
+    def test_enabled_true(self):
+        assert _log_transform_enabled({"log_transform": {"enabled": True}}) is True
 
-class TestDenoiseKwargsAll:
-    def test_all_returns_both_stages(self):
-        kw = _denoise_kwargs_all(_SAMPLE_DENOISE_CFG)
-        assert "log_transform" in kw
-        assert "smooth" in kw
-        assert "clean" in kw
+    def test_enabled_false(self):
+        assert _log_transform_enabled({"log_transform": {"enabled": False}}) is False
 
-    def test_all_on_empty_cfg(self):
-        kw = _denoise_kwargs_all({})
-        assert kw == {}
+    def test_defaults_true_when_missing(self):
+        assert _log_transform_enabled({}) is True
 
-    def test_all_values_match_per_stage(self):
-        raw_kw = _denoise_kwargs_for_stage(_SAMPLE_DENOISE_CFG, "raw")
-        consensus_kw = _denoise_kwargs_for_stage(_SAMPLE_DENOISE_CFG, "consensus")
-        all_kw = _denoise_kwargs_all(_SAMPLE_DENOISE_CFG)
-        assert all_kw == {**raw_kw, **consensus_kw}
+    def test_ignores_stale_at_field(self):
+        """Old effective_config.yaml snapshots from before this option was
+        de-staged may still carry an `at` key -- it must be silently ignored,
+        not raise."""
+        assert (
+            _log_transform_enabled({"log_transform": {"at": "raw", "enabled": False}})
+            is False
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -203,8 +203,14 @@ class TestSingletonDenoiseConfig:
         from utils.singleton_swaps_optimization import swaps_optimization_cfg
         cfg = get_cfg_defaults(swaps_optimization_cfg)
         lt = cfg.MATCH_FEATURES_KWARGS.denoise.log_transform
-        assert lt.at == "raw"
+        assert not hasattr(lt, "at")  # not staged -- see config comment
         assert isinstance(lt.enabled, bool)
+
+    def test_align_in_log_space_flag(self):
+        from utils.config import get_cfg_defaults
+        from utils.singleton_swaps_optimization import swaps_optimization_cfg
+        cfg = get_cfg_defaults(swaps_optimization_cfg)
+        assert isinstance(cfg.MATCH_FEATURES_KWARGS.align_in_log_space, bool)
 
     def test_old_keys_absent(self):
         from utils.config import get_cfg_defaults

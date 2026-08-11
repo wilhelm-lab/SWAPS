@@ -40,6 +40,7 @@ from postprocessing.rescore import (
 from postprocessing.match_features import (
     match_features_batches_parallel,
 )
+from postprocessing.broad_alignment import calibrate_broad_alignment
 from postprocessing.match_features_non_ims import match_features_batches_parallel_non_ims
 from utils.plot import (
     calc_quant_corr,
@@ -439,46 +440,51 @@ def opt_scan_by_scan(config_path: str):
             else:
                 logging.info("Done: %s", d)
 
-    if cfg.USE_IMS:
-        (
-            matches_target,
-            matches_decoy,
-            pp_reference,
-            pp_match_target,
-            pp_match_decoy,
-            df_no_quant,
-            df_no_match,
-            snap_log_collection,
-        ) = match_features_batches_parallel(
-            dict_ref=dict_ref,
-            raw_file_list=raw_file_list,
-            result_dir=cfg.RESULT_PATH,
-            peptide_indicies=dict_ref["mz_rank"].values,  # type: ignore
-            batch_size_max=1500,
-            max_workers=cfg.N_CPU,
-            processing_kwargs=processing_kwargs,
+    if cfg.MATCH_FEATURES_KWARGS.broad_alignment.enabled:
+        broad_alignment_table_path = os.path.join(
+            cfg.RESULT_PATH, "broad_alignment_shift_table.parquet"
         )
-    else:
-        # Non-IMS path
-        (
-            matches_target,
-            matches_decoy,
-            pp_reference,
-            pp_match_target,
-            pp_match_decoy,
-            df_no_quant,
-            df_no_match,
-            snap_log_collection,
-        ) = match_features_batches_parallel_non_ims(
-            dict_ref=dict_ref,
-            raw_file_list=raw_file_list,
-            result_dir=cfg.RESULT_PATH,
-            peptide_indicies=dict_ref["mz_rank"].values,  # type: ignore
-            batch_size_max=1500,
-            max_workers=cfg.N_CPU,
-            processing_kwargs=processing_kwargs,
-        )
-    quant_dir = os.path.join(cfg.RESULT_PATH, cfg.MATCH_FEATURES_KWARGS.dir_name)
+        if os.path.exists(broad_alignment_table_path):
+            logging.info(
+                "broad_alignment shift table already exists, skipping calibration: %s",
+                broad_alignment_table_path,
+            )
+        else:
+            logging.info("Calibrating broad_alignment shift table...")
+            calibrate_broad_alignment(
+                result_dir=cfg.RESULT_PATH,
+                raw_file_list=raw_file_list,
+                dict_ref_path=os.path.join(
+                    cfg.RESULT_PATH, "dict_ref_with_activation.pkl"
+                ),
+                output_path=broad_alignment_table_path,
+            )
+
+    (
+        matches_target,
+        matches_decoy,
+        pp_reference,
+        pp_match_target,
+        pp_match_decoy,
+        df_no_quant,
+        df_no_match,
+        snap_log_collection,
+    ) = match_features_batches_parallel(
+        dict_ref=dict_ref,
+        raw_file_list=raw_file_list,
+        result_dir=cfg.RESULT_PATH,
+        peptide_indicies=dict_ref["mz_rank"].values,  # type: ignore
+        batch_size_max=cfg.MATCH_FEATURES_KWARGS.batching.batch_size_max,
+        max_workers=cfg.N_CPU,
+        processing_kwargs=processing_kwargs,
+        # Decoys only exist to feed Mokapot/percolator FDR control below —
+        # skip generating them entirely when FDR is disabled.
+        match_decoy=cfg.FDR.ENABLED,
+        merge_confounders_enabled=cfg.PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED,
+        oversize_multiplier=cfg.MATCH_FEATURES_KWARGS.batching.oversize_multiplier,
+        oversize_batch_size=cfg.MATCH_FEATURES_KWARGS.batching.oversize_batch_size,
+    )
+    quant_dir = _quant_dir(cfg)
     os.makedirs(quant_dir, exist_ok=True)
     dfs_to_save = {
         "no_quant_log.parquet": df_no_quant,
@@ -537,48 +543,31 @@ def run_fdr_control_onwards(
     logging.info("=================FDR control==================")
 
     pp_match_target_msms = None
-    if cfg.FDR.ONLY_SCORE_MATCH:
-        pp_match_target, pp_match_target_msms, pp_match_decoy = (
-            split_pp_by_match_status(dict_ref, pp_match_target, pp_match_decoy)
+
+    # Intensity filtering always runs first, on the full (unsplit) target/decoy
+    # pools, so it applies uniformly regardless of ONLY_SCORE_MATCH -- MS/MS-
+    # status rows must not bypass it just because they later skip the p-value
+    # filter.
+    if cfg.FDR.INT_THRES > 0:
+        pp_match_target = pp_match_target.loc[
+            pp_match_target["intensity_sum"] >= cfg.FDR.INT_THRES
+        ].copy()
+        pp_match_decoy = pp_match_decoy.loc[
+            pp_match_decoy["intensity_sum"] >= cfg.FDR.INT_THRES
+        ].copy()
+        logging.info(
+            "After intensity filtering (>= %s): %d target, %d decoy pp rows kept",
+            cfg.FDR.INT_THRES,
+            len(pp_match_target),
+            len(pp_match_decoy),
         )
         if cfg.FDR.ENABLED:
-            _valid_t = pd.MultiIndex.from_frame(
+            valid_target = pd.MultiIndex.from_frame(
                 pp_match_target[["feature_instance_id", "Run_name"]].drop_duplicates()
             )
-            _valid_d = pd.MultiIndex.from_frame(
+            valid_decoy = pd.MultiIndex.from_frame(
                 pp_match_decoy[["feature_instance_id", "Run_name"]].drop_duplicates()
             )
-            matches_target = matches_target[
-                pd.MultiIndex.from_arrays(
-                    [
-                        matches_target["feature_instance_id"],
-                        matches_target["matched_run"],
-                    ]
-                ).isin(_valid_t)
-            ]
-            matches_decoy = matches_decoy[
-                pd.MultiIndex.from_arrays(
-                    [matches_decoy["feature_instance_id"], matches_decoy["matched_run"]]
-                ).isin(_valid_d)
-            ]
-            logging.info(
-                "only_score_match: %d target, %d decoy matches after removing MS/MS-identified entries",
-                len(matches_target),
-                len(matches_decoy),
-            )
-
-    if cfg.FDR.ENABLED:
-        if cfg.FDR.INT_THRES > 0:
-            pp_target_passing = pp_match_target.loc[
-                pp_match_target["intensity_sum"] >= cfg.FDR.INT_THRES,
-                ["feature_instance_id", "Run_name"],
-            ].drop_duplicates()
-            pp_decoy_passing = pp_match_decoy.loc[
-                pp_match_decoy["intensity_sum"] >= cfg.FDR.INT_THRES,
-                ["feature_instance_id", "Run_name"],
-            ].drop_duplicates()
-            valid_target = pd.MultiIndex.from_frame(pp_target_passing)
-            valid_decoy = pd.MultiIndex.from_frame(pp_decoy_passing)
             matches_target = matches_target[
                 pd.MultiIndex.from_arrays(
                     [
@@ -599,6 +588,18 @@ def run_fdr_control_onwards(
                 len(matches_decoy),
             )
 
+    # Percolator is always trained/scored on everything (Match + MS/MS-status
+    # rows alike). ONLY_SCORE_MATCH only changes what happens to the scored
+    # output below: MS/MS-status rows are kept regardless of q-value (already
+    # intensity-filtered above), Match rows still need q-value < 0.01.
+    if cfg.FDR.ONLY_SCORE_MATCH:
+        pp_match_target_notmsms, pp_match_target_msms, _ = split_pp_by_match_status(
+            dict_ref, pp_match_target, pp_match_decoy
+        )
+    else:
+        pp_match_target_notmsms = pp_match_target
+
+    if cfg.FDR.ENABLED:
         matches_target_normalized, matches_decoy_normalized = normalize_shift_by_runs(
             matches_target, matches_decoy
         )
@@ -622,22 +623,86 @@ def run_fdr_control_onwards(
             "sift_distance",
             "zernike_distance",
             "count_confounders",
+            "rt_profile_corr",
+            "im_profile_corr",
         ]
+        # rt_shift/im_shift/template_matching_score are meaningless when
+        # align_images=False (alignment is skipped, so shift is always (0,0)
+        # and the score a fixed 0.0 sentinel), but stay genuine per-candidate
+        # values under broad_alignment (search is centered on, not fixed to,
+        # the calibrated shift -- see align_images_to_reference's
+        # broad_alignment_max_deviation), so they remain useful FDR features.
         _feature_cols = (
-            _alignment_feature_cols + _base_feature_cols
-            if _align_images
-            else _base_feature_cols
+            _base_feature_cols
+            if not _align_images
+            else _alignment_feature_cols + _base_feature_cols
         )
+        # delta_shift_rt/im and delta_template_matching_score compare a
+        # max_deviation=0 forced rescore against the unconstrained global
+        # optimum over the same match_template surface (see
+        # _global_best_from_score_map) -- 0.0 sentinel everywhere else, which
+        # would look like "free search agrees exactly" rather than "not
+        # applicable" for every row if max_deviation != 0, so only wire these
+        # in when the config guarantees every row actually has a genuine
+        # value.
+        _broad_alignment_cfg = processing_kwargs.get("broad_alignment", {})
+        _broad_alignment_forced_rescore = (
+            _align_images
+            and bool(_broad_alignment_cfg.get("enabled", False))
+            and int(_broad_alignment_cfg.get("max_deviation", 5)) == 0
+        )
+        if _broad_alignment_forced_rescore:
+            _feature_cols = _feature_cols + [
+                "delta_shift_rt",
+                "delta_shift_im",
+                "delta_template_matching_score",
+            ]
+        # Extra template_frac scales (see MATCH_FEATURES_KWARGS.broad_alignment.
+        # multi_scale_template_fracs) -- same shape as the main-scale block
+        # above (rt_shift/im_shift/template_matching_score + delta_*), suffixed
+        # "_frac_<x>" per scale; only wired in under the same forced-rescore
+        # gating, since match_features.py only ever populates them there too.
+        if _broad_alignment_forced_rescore:
+            for _frac in _broad_alignment_cfg.get("multi_scale_template_fracs", []):
+                _tag = f"frac_{float(_frac)}"
+                _feature_cols = _feature_cols + [
+                    f"template_matching_score_{_tag}",
+                    f"rt_shift_{_tag}",
+                    f"im_shift_{_tag}",
+                    f"delta_shift_rt_{_tag}",
+                    f"delta_shift_im_{_tag}",
+                    f"delta_template_matching_score_{_tag}",
+                ]
+        _missing_feature_cols = [c for c in _feature_cols if c not in tdc_df.columns]
+        if _missing_feature_cols:
+            logging.warning(
+                "Feature column(s) %s not present in tdc_df (matches_target/decoy "
+                "predate this feature being added) -- dropping from feature_cols "
+                "for this run instead of failing.",
+                _missing_feature_cols,
+            )
+            _feature_cols = [c for c in _feature_cols if c not in _missing_feature_cols]
         percolator_post_processing = cfg.FDR.PERCOLATOR_POST_PROCESSING
-        percolator_dir_name = f"percolator_postprocessing_{percolator_post_processing}"
-        if not cfg.FDR.ONLY_SCORE_MATCH:
-            percolator_dir_name += "_only_score_match_False"
+        # Percolator itself is trained/scored identically regardless of
+        # ONLY_SCORE_MATCH, so its work_dir (and cache) is shared; only the
+        # downstream filtered outputs differ, so they get their own subdir.
+        # train_fdr changes what percolator actually learns (unlike
+        # ONLY_SCORE_MATCH, which only gates downstream filtering), so every
+        # value gets its own work_dir to avoid silently overwriting a
+        # different train_fdr's percolator_psms.tsv.
+        percolator_base_dir = (
+            f"percolator_postprocessing_{percolator_post_processing}"
+            f"_trainfdr{cfg.FDR.TRAIN}"
+        )
+        percolator_dir_name = os.path.join(
+            percolator_base_dir, f"only_score_match_{cfg.FDR.ONLY_SCORE_MATCH}"
+        )
         psms, peptide, all_psms = brew_with_percolator(
             tdc_df,
             feature_cols=_feature_cols,
-            # train_fdr=cfg.FDR.TRAIN,
-            # test_fdr=cfg.FDR.TEST,
-            work_dir=os.path.join(quant_dir, percolator_dir_name),
+            train_fdr=cfg.FDR.TRAIN,
+            test_fdr=cfg.FDR.TEST,
+            work_dir=os.path.join(quant_dir, percolator_base_dir),
             post_processing=percolator_post_processing,
             decoy_col="Decoy",
             filename_col="matched_run",
@@ -647,7 +712,7 @@ def run_fdr_control_onwards(
         # Filter for the columns passed the makopot filter
         psms["mz_rank"] = psms["PSMId"].str.split("_").str[0].astype(int)
         psms_filtered = psms.loc[(psms["q-value"] < 0.01)]
-        pp_match_target_filtered = pp_match_target.merge(
+        pp_match_target_filtered = pp_match_target_notmsms.merge(
             psms_filtered[["filename", "mz_rank"]],
             left_on=["mz_rank", "Run_name"],
             right_on=["mz_rank", "filename"],
@@ -665,22 +730,14 @@ def run_fdr_control_onwards(
     else:
         logging.info(
             "cfg.FDR.ENABLED is False — skipping Mokapot/percolator FDR control; "
-            "pp_match_target_filtered is pp_match_target with only intensity "
-            "filtering (FDR.INT_THRES) applied."
+            "pp_match_target_filtered is pp_match_target_notmsms with only "
+            "intensity filtering (FDR.INT_THRES) applied."
         )
-        if cfg.FDR.INT_THRES > 0:
-            pp_match_target_filtered = pp_match_target.loc[
-                pp_match_target["intensity_sum"] >= cfg.FDR.INT_THRES
-            ].copy()
-            logging.info(
-                "After intensity filtering (>= %s): %d of %d pp_match_target rows kept",
-                cfg.FDR.INT_THRES,
-                len(pp_match_target_filtered),
-                len(pp_match_target),
-            )
-        else:
-            pp_match_target_filtered = pp_match_target.copy()
-        percolator_dir_name = "intensity_filtered_postprocessing"
+        pp_match_target_filtered = pp_match_target_notmsms.copy()
+        percolator_dir_name = os.path.join(
+            "intensity_filtered_postprocessing",
+            f"only_score_match_{cfg.FDR.ONLY_SCORE_MATCH}",
+        )
         os.makedirs(os.path.join(quant_dir, percolator_dir_name), exist_ok=True)
         _to_parquet_safe(
             pp_match_target_filtered,

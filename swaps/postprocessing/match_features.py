@@ -45,10 +45,18 @@ class ConsensusAlignmentState:
     scaled_anchors: list[tuple[float, float] | None]
     shifts: list[tuple[int, int]]
     max_scores: list[float]
+    free_shifts: list[tuple[int, int] | None] = field(default_factory=list)
+    free_max_scores: list[float | None] = field(default_factory=list)
     match_score_maps: list[np.ndarray] = field(default_factory=list)
     match_score_peaks: list[tuple[int, int]] = field(default_factory=list)
     match_score_label_indices: list[int] = field(default_factory=list)
     use_shift_crop_pad: bool = False
+    # Whether `template` lives in log2(1+x) search space (vs. linear) -- recorded so
+    # decoy builders that reuse `template` for their own shift search (e.g.
+    # _build_consensus_peptide_swap_decoy) know which space to transform their own
+    # candidate image into first. `resized_images`/`aligned_images` are always linear
+    # regardless of this flag -- only `template` (and the search itself) is affected.
+    align_in_log_space: bool = False
 
 
 @dataclass
@@ -82,6 +90,12 @@ class ConsensusFeatureBundle:
     raw_aligned_denoised_images: list[np.ndarray] = field(default_factory=list)
     raw_consensus: np.ndarray | None = None
     raw_consensus_denoised: np.ndarray | None = None
+    # Extra-scale alignments (see MATCH_FEATURES_KWARGS.broad_alignment.
+    # multi_scale_template_fracs), keyed by template_frac. Empty unless
+    # multi_scale_template_fracs was passed to build_consensus_feature_bundle.
+    multi_scale_alignments: dict[float, ConsensusAlignmentState] = field(
+        default_factory=dict
+    )
 
 
 def _split_contiguous_into_batches(
@@ -101,14 +115,32 @@ def _split_contiguous_into_batches(
 
 
 def _pack_confounder_groups_into_batches(
-    mz_ranks: np.ndarray, group_ids: np.ndarray, batch_size_max: int
+    mz_ranks: np.ndarray,
+    group_ids: np.ndarray,
+    batch_size_max: int,
+    group_weights: dict[int, float] | None = None,
+    weight_budget: float | None = None,
 ) -> list[np.ndarray]:
-    """Greedily pack whole confounder groups into batches of ≤batch_size_max.
+    """Greedily pack whole confounder groups into batches of ≤batch_size_max
+    (and, if group_weights/weight_budget are given, ≤weight_budget total
+    estimated image weight).
 
     Members of the same confounder_group_id must land in the same batch (see
     _group_members_in_batch): coSWA merging needs every group member present
     in one worker's batch to fetch/expand the group's single stored parquet
     row. Contiguity of mz_ranks within a batch is not required here.
+
+    Groups are visited in confounder_group_id order, which is NOT
+    size-ordered -- on at least one real dataset (20-run HYE benchmark)
+    group_id happened to correlate with image size, so pure count-based
+    packing concentrated the heaviest surviving (non-outlier-carved-out)
+    groups into the last several batches (per-batch total weight climbing
+    from ~470M to a 692M peak vs a ~120-150M healthy baseline elsewhere),
+    causing OOM near the end of the run even after _carve_out_oversized
+    removed the individual worst offenders. The weight_budget cut (in
+    addition to the existing count cap) prevents that clustering regardless
+    of visiting order, by starting a new batch whenever either budget would
+    be exceeded.
     """
     if len(mz_ranks) == 0:
         return []
@@ -117,19 +149,107 @@ def _pack_confounder_groups_into_batches(
     sorted_mz = mz_ranks[order]
     change_points = np.flatnonzero(np.diff(sorted_gid)) + 1
     member_groups = np.split(sorted_mz, change_points)
+    group_id_per_chunk = [int(g[0]) for g in np.split(sorted_gid, change_points)]
 
     batches: list[np.ndarray] = []
     current: list[np.ndarray] = []
     current_size = 0
-    for grp in member_groups:
-        if current and current_size + len(grp) > batch_size_max:
+    current_weight = 0.0
+    for grp, gid in zip(member_groups, group_id_per_chunk):
+        grp_weight = (group_weights or {}).get(gid, 0.0)
+        exceeds_count = current_size + len(grp) > batch_size_max
+        exceeds_weight = (
+            weight_budget is not None and current_weight + grp_weight > weight_budget
+        )
+        if current and (exceeds_count or exceeds_weight):
             batches.append(np.concatenate(current))
-            current, current_size = [], 0
+            current, current_size, current_weight = [], 0, 0.0
         current.append(grp)
         current_size += len(grp)
+        current_weight += grp_weight
     if current:
         batches.append(np.concatenate(current))
     return batches
+
+
+def _estimate_peptide_pixel_weights(
+    dict_ref: pd.DataFrame, peptide_indicies: np.ndarray, raw_file_list: list[str]
+) -> np.ndarray:
+    """Cheap per-peptide memory-proxy: total RT×IM pixel area summed across
+    raw_file_list, computed straight from dict_ref's own index columns (no
+    parquet/image I/O). Used to keep oversized images from compounding
+    within one worker batch (see _build_peptide_batches).
+
+    Uses the confounder-group merged window (MS1_frame_idx_left/right_
+    group_ref_<run>, mobility_values_index_left/right_group_ref_<run> --
+    the same columns get_pept_act_from_parquet reads with
+    use_group_window=True, see helper.py) for grouped peptides, else each
+    peptide's own individual window. Returns all-ones (pure count-based
+    fallback, i.e. today's behavior) when the index columns aren't present,
+    e.g. dict_ref.pkl without activation, or synthetic test frames.
+    """
+    n = len(peptide_indicies)
+    if not raw_file_list or f"MS1_frame_idx_left_ref_{raw_file_list[0]}" not in dict_ref.columns:
+        return np.ones(n, dtype=float)
+
+    row = dict_ref.drop_duplicates("mz_rank").set_index("mz_rank").reindex(peptide_indicies)
+    use_group = (
+        row["confounder_group_id"].to_numpy() != -1
+        if "confounder_group_id" in row.columns
+        else np.zeros(n, dtype=bool)
+    )
+    has_group_cols = f"MS1_frame_idx_left_group_ref_{raw_file_list[0]}" in row.columns
+    use_group = use_group & has_group_cols
+
+    weights = np.zeros(n, dtype=float)
+    for rf in raw_file_list:
+        l_i = row[f"MS1_frame_idx_left_ref_{rf}"].to_numpy()
+        r_i = row[f"MS1_frame_idx_right_ref_{rf}"].to_numpy()
+        il_i = row[f"mobility_values_index_left_ref_{rf}"].to_numpy()
+        ir_i = row[f"mobility_values_index_right_ref_{rf}"].to_numpy()
+        if has_group_cols:
+            l_g = row[f"MS1_frame_idx_left_group_ref_{rf}"].to_numpy()
+            r_g = row[f"MS1_frame_idx_right_group_ref_{rf}"].to_numpy()
+            il_g = row[f"mobility_values_index_left_group_ref_{rf}"].to_numpy()
+            ir_g = row[f"mobility_values_index_right_group_ref_{rf}"].to_numpy()
+            rt_span = np.where(use_group, r_g - l_g + 1, r_i - l_i + 1)
+            im_span = np.where(use_group, ir_g - il_g + 1, ir_i - il_i + 1)
+        else:
+            rt_span = r_i - l_i + 1
+            im_span = ir_i - il_i + 1
+        weights += rt_span * im_span
+
+    weights = np.nan_to_num(weights, nan=1.0, posinf=1.0, neginf=1.0)
+    weights[weights <= 0] = 1.0
+    return weights
+
+
+def _carve_out_oversized(
+    mz_ranks: np.ndarray,
+    weights: np.ndarray,
+    oversize_multiplier: float | None,
+    oversize_batch_size: int,
+) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Pull items whose weight exceeds oversize_multiplier x median(weights)
+    out into their own batches of <=oversize_batch_size, so a few oversized
+    images can't land in the same worker batch as hundreds of normal ones
+    (or each other). Returns (remaining_mz_ranks, oversize_batches).
+    """
+    if not oversize_multiplier or len(mz_ranks) == 0:
+        return mz_ranks, []
+    median_w = float(np.median(weights))
+    if median_w <= 0:
+        return mz_ranks, []
+    is_oversized = weights > oversize_multiplier * median_w
+    if not np.any(is_oversized):
+        return mz_ranks, []
+    oversized_mz = mz_ranks[is_oversized]
+    remaining_mz = mz_ranks[~is_oversized]
+    oversize_batches = [
+        oversized_mz[i : i + oversize_batch_size]
+        for i in range(0, len(oversized_mz), oversize_batch_size)
+    ]
+    return remaining_mz, oversize_batches
 
 
 def _build_peptide_batches(
@@ -137,6 +257,9 @@ def _build_peptide_batches(
     peptide_indicies: np.ndarray,
     batch_size_max: int,
     max_workers: int,
+    raw_file_list: list[str] | None = None,
+    oversize_multiplier: float | None = 3.0,
+    oversize_batch_size: int = 20,
 ) -> list[np.ndarray]:
     """Split peptide_indicies (mz_ranks) into worker batches.
 
@@ -146,6 +269,21 @@ def _build_peptide_batches(
     packed by whole confounder group -- never splitting a group's members
     across two batches, since coSWA merging needs all of a group's members
     together in one worker.
+
+    Before that count-based packing, peptides/groups whose estimated image
+    size (_estimate_peptide_pixel_weights) is far above the typical size --
+    oversize_multiplier x the median -- are carved out and packed (never
+    splitting a group) into their own batches of <=oversize_batch_size, kept
+    separate from normal-sized peptides so they can't accumulate alongside
+    hundreds of them. Set oversize_multiplier=None/0 to disable and fall
+    back to pure count-based batching (today's behavior), which also skips
+    the descending-weight sort below.
+
+    Returned batches are ordered by descending estimated weight (heaviest
+    first), independent of which of the three packers above built them, so
+    that if worker-concurrent memory pressure is going to OOM the run, it
+    surfaces in the first few batches instead of only after everything
+    smaller has already finished successfully.
     """
     if "confounder_group_id" in dict_ref.columns:
         group_map = dict_ref.drop_duplicates("mz_rank").set_index("mz_rank")[
@@ -160,11 +298,91 @@ def _build_peptide_batches(
     grouped_mz = peptide_indicies[~solo_mask]
     grouped_gid = group_ids[~solo_mask]
 
+    oversize_batches: list[np.ndarray] = []
+    remaining_group_weights: dict[int, float] | None = None
+    remaining_weight_budget: float | None = None
+    if oversize_multiplier:
+        weights = _estimate_peptide_pixel_weights(
+            dict_ref, peptide_indicies, raw_file_list or []
+        )
+        weight_by_mz = pd.Series(weights, index=peptide_indicies)
+
+        solo_w = weight_by_mz.reindex(solo_mz).to_numpy()
+        solo_mz, solo_oversize = _carve_out_oversized(
+            solo_mz, solo_w, oversize_multiplier, oversize_batch_size
+        )
+        oversize_batches += solo_oversize
+
+        if len(grouped_mz):
+            grouped_w = weight_by_mz.reindex(grouped_mz).to_numpy()
+            gdf = pd.DataFrame({"mz": grouped_mz, "gid": grouped_gid, "w": grouped_w})
+            group_weight = gdf.groupby("gid")["w"].sum()
+            median_gw = float(group_weight.median()) if len(group_weight) else 0.0
+            if median_gw > 0:
+                oversized_gids = group_weight[
+                    group_weight > oversize_multiplier * median_gw
+                ].index
+                if len(oversized_gids):
+                    is_oversized_member = gdf["gid"].isin(oversized_gids).to_numpy()
+                    # Pack oversized groups together (never splitting any one
+                    # group) up to oversize_batch_size members per batch --
+                    # NOT one batch per oversized group: on some datasets a
+                    # large fraction of groups exceed the multiplier (e.g.
+                    # ~10% on a 20-run HYE benchmark), and isolating each one
+                    # individually fragmented a 284-batch run into 2570
+                    # mostly single-digit-sized batches, trading a memory
+                    # problem for an I/O/orchestration-overhead one.
+                    oversize_batches += _pack_confounder_groups_into_batches(
+                        gdf.loc[is_oversized_member, "mz"].to_numpy(),
+                        gdf.loc[is_oversized_member, "gid"].to_numpy(),
+                        oversize_batch_size,
+                    )
+                    keep = ~is_oversized_member
+                    grouped_mz = gdf.loc[keep, "mz"].to_numpy()
+                    grouped_gid = gdf.loc[keep, "gid"].to_numpy()
+                    group_weight = group_weight[~group_weight.index.isin(oversized_gids)]
+                # Even non-outlier groups still vary in size; cap the
+                # remainder's per-batch total weight too, sized off the
+                # remaining pool itself -- total remaining weight spread
+                # evenly over however many batches count-based packing would
+                # produce anyway (batch_size_max=500), plus 20% slack so the
+                # weight cap doesn't itself force extra batches beyond that.
+                # Without this, groups visited in confounder_group_id order
+                # (not size order) can cluster the heaviest surviving groups
+                # into a handful of batches -- observed on a real 20-run HYE
+                # benchmark as per-batch weight climbing to a 692M peak (vs
+                # ~120-150M elsewhere) in the last several batches, right
+                # where max_workers keeps them running concurrently.
+                if len(grouped_mz):
+                    n_count_batches = max(1, round(len(grouped_mz) / batch_size_max))
+                    remaining_group_weights = group_weight.to_dict()
+                    remaining_weight_budget = (
+                        1.2 * float(group_weight.sum()) / n_count_batches
+                    )
+
     solo_batches = _split_contiguous_into_batches(solo_mz, batch_size_max, max_workers)
     grouped_batches = _pack_confounder_groups_into_batches(
-        grouped_mz, grouped_gid, batch_size_max
+        grouped_mz,
+        grouped_gid,
+        batch_size_max,
+        group_weights=remaining_group_weights,
+        weight_budget=remaining_weight_budget,
     )
-    return solo_batches + grouped_batches
+    all_batches = oversize_batches + solo_batches + grouped_batches
+
+    if oversize_multiplier:
+        # ProcessPoolExecutor.submit() order is FIFO-ish consumption order
+        # (all futures queue up front; idle workers pull the next one), so
+        # the order returned here is roughly processing order. Schedule the
+        # heaviest batches first: solo batches used to run for most of the
+        # job before the (systematically larger) confounder-group batches
+        # even started, so an OOM only ever surfaced near the very end,
+        # after hours of otherwise-successful work. Sorting by descending
+        # weight surfaces a genuine OOM within the first few batches instead.
+        batch_weight = np.array([weight_by_mz.reindex(b).sum() for b in all_batches])
+        all_batches = [all_batches[i] for i in np.argsort(-batch_weight)]
+
+    return all_batches
 
 
 def match_features_batches_parallel(
@@ -177,6 +395,8 @@ def match_features_batches_parallel(
     processing_kwargs: dict | None = None,
     match_decoy: bool = True,
     merge_confounders_enabled: bool = True,
+    oversize_multiplier: float | None = 3.0,
+    oversize_batch_size: int = 20,
 ):
     if peptide_indicies is None:
         peptide_indicies = dict_ref["mz_rank"].values
@@ -189,7 +409,13 @@ def match_features_batches_parallel(
     peptide_indicies = np.asarray(peptide_indicies)
     n_total = len(peptide_indicies)
     peptide_batches = _build_peptide_batches(
-        dict_ref, peptide_indicies, batch_size_max, max_workers
+        dict_ref,
+        peptide_indicies,
+        batch_size_max,
+        max_workers,
+        raw_file_list=raw_file_list,
+        oversize_multiplier=oversize_multiplier,
+        oversize_batch_size=oversize_batch_size,
     )
     Logger.info(
         "Batching: %d peptides → %d batches of ≤%d (batch_size_max=%d, max_workers=%d)",
@@ -205,15 +431,6 @@ def match_features_batches_parallel(
     no_quant_log = []
     no_match_log = []
     snap_log_collection: dict[int, dict] = {}
-    if merge_confounders_enabled:
-        processing_kwargs = dict(processing_kwargs or {})
-        processing_kwargs["consensus_decoy_kwargs"] = {
-            **processing_kwargs.get("consensus_decoy_kwargs", {}),
-            "use_confounder_sampling": False,
-        }
-        Logger.info(
-            "merge_confounders_enabled=True: disabling confounder sampling for decoys."
-        )
     with ProcessPoolExecutor(
         max_workers=max_workers,
         initializer=_init_match_features_worker,
@@ -274,7 +491,7 @@ def match_features_batches_parallel(
         else pd.DataFrame()
     )
     # Drop descriptor columns — only needed during comparison, not in output
-    _desc_cols = ["sift_des", "zernike"]
+    _desc_cols = ["sift_des", "zernike", "rt_profile", "im_profile"]
     for _df in (pp_reference_target, pp_match_target, pp_match_decoy):
         _drop = [c for c in _desc_cols if c in _df.columns]
         if _drop:
@@ -314,6 +531,13 @@ def _init_match_features_worker(
         if dict_ref["mz_rank"].is_unique
         else dict_ref.drop_duplicates("mz_rank").set_index("mz_rank")
     )
+    if bool((processing_kwargs or {}).get("broad_alignment", {}).get("enabled", False)):
+        from .broad_alignment import build_shift_lookup, load_shift_table
+
+        _table_path = os.path.join(result_dir, "broad_alignment_shift_table.parquet")
+        _WORKER_CONTEXT["broad_alignment_lookup"] = build_shift_lookup(
+            load_shift_table(_table_path)
+        )
 
 
 def _match_features_batch_worker(batch):
@@ -389,6 +613,35 @@ def _group_members_in_batch(
     return members_by_group
 
 
+def _select_group_reference_run(
+    member_roles: dict[int, tuple[str, list[str], list[str]]],
+) -> str:
+    """Pick the run to use as reference_idx=0 for a coSWA group's shared
+    alignment build: the run with the most members having a real MS/MS
+    anchor there (Reference or Quant_Only role -- matches
+    _positional_anchors' own definition of an anchored run), tie-broken by
+    the run with the most members specifically in the Reference role, then
+    a random pick among whatever's still tied.
+
+    `member_roles`: {mz_rank: (reference_raw_file, quant_only_raw_files,
+    match_raw_files)}, i.e. _reference_match_quant_files's return value per
+    member.
+    """
+    anchor_count: dict[str, int] = {}
+    reference_count: dict[str, int] = {}
+    for ref_rf, quant_rf, _ in member_roles.values():
+        anchor_count[ref_rf] = anchor_count.get(ref_rf, 0) + 1
+        reference_count[ref_rf] = reference_count.get(ref_rf, 0) + 1
+        for rf in quant_rf:
+            anchor_count[rf] = anchor_count.get(rf, 0) + 1
+    max_anchor_count = max(anchor_count.values())
+    tied_runs = [rf for rf, c in anchor_count.items() if c == max_anchor_count]
+    if len(tied_runs) > 1:
+        max_ref_count = max(reference_count.get(rf, 0) for rf in tied_runs)
+        tied_runs = [rf for rf in tied_runs if reference_count.get(rf, 0) == max_ref_count]
+    return tied_runs[0] if len(tied_runs) == 1 else str(np.random.choice(tied_runs))
+
+
 def _parse_seg_mask_thres(val, default: tuple[int, int] = (3, 3)) -> tuple[int, int]:
     if isinstance(val, dict):
         return (int(val.get("rt", default[0])), int(val.get("im", default[1])))
@@ -413,26 +666,25 @@ def _parse_jump_dist_thres(val, default: tuple[int, int] = (0, 0)) -> tuple[int,
 
 
 def _denoise_kwargs_for_stage(denoise_cfg: dict, stage: str) -> dict:
-    """Build smooth_and_denoise_image kwargs for ops whose ``at`` field == stage."""
+    """Build smooth_and_denoise_image kwargs for smooth/clean ops whose ``at`` field
+    == stage. log_transform is deliberately not staged here -- see
+    MATCH_FEATURES_KWARGS.denoise.log_transform's config comment: it is applied at one
+    fixed point (after averaging for the consensus, after alignment for each individual
+    run), never before, so callers needing it add it explicitly at that point instead
+    of through this helper.
+    """
     kwargs: dict = {}
     smooth = dict(denoise_cfg.get("smooth") or {})
     clean = dict(denoise_cfg.get("clean") or {})
-    log_tf = dict(denoise_cfg.get("log_transform") or {})
     if smooth.get("at") == stage:
         kwargs["smooth"] = {k: v for k, v in smooth.items() if k != "at"}
     if clean.get("at") == stage:
         kwargs["clean"] = {k: v for k, v in clean.items() if k != "at"}
-    if log_tf.get("at") == stage:
-        kwargs["log_transform"] = bool(log_tf.get("enabled", True))
     return kwargs
 
 
-def _denoise_kwargs_all(denoise_cfg: dict) -> dict:
-    """Combine raw + consensus stage kwargs (for full-pipeline denoising of raw_aligned)."""
-    return {
-        **_denoise_kwargs_for_stage(denoise_cfg, "raw"),
-        **_denoise_kwargs_for_stage(denoise_cfg, "consensus"),
-    }
+def _log_transform_enabled(denoise_cfg: dict) -> bool:
+    return bool(dict(denoise_cfg.get("log_transform") or {}).get("enabled", True))
 
 
 def _annotate_peak_properties(
@@ -448,15 +700,22 @@ def _annotate_peak_properties(
     source_type: str,
     decoy_mz_rank: int | None = None,
     undistinguishable_group_id: str | int = -1,
+    undistinguishable_pixel_fraction: float = 0.0,
+    undistinguishable_intensity_fraction: float = 0.0,
 ) -> pd.DataFrame | None:
     """Add anchor-aware metadata columns to a quantified peak-properties row.
 
     undistinguishable_group_id flags coSWA confounder-group members whose own
-    independently-computed assigned segments spatially overlap (see
+    assigned segments overlap another present member's (see
     _mark_overlapping_group_members in match_features_batch) -- -1 (the
-    default) means not part of such an overlap. Always -1 at the point this
-    function is called; patched in afterward once every member of the
-    member's group has been processed.
+    default) means not part of such an overlap. undistinguishable_pixel_fraction/
+    undistinguishable_intensity_fraction are the same function's continuous
+    per-member diagnostic (fraction of this member's own assigned pixels/
+    summed consensus intensity also claimed by another present member) --
+    0.0 for solo candidates and members of a group with no other present
+    member. All three are always at their default at the point this function
+    is called; patched in afterward once every member of the group has been
+    processed.
     """
 
     if peak_properties is None:
@@ -471,6 +730,12 @@ def _annotate_peak_properties(
     peak_properties["source_run"] = source_run
     peak_properties["source_type"] = source_type
     peak_properties["undistinguishable_group_id"] = undistinguishable_group_id
+    peak_properties["undistinguishable_pixel_fraction"] = (
+        undistinguishable_pixel_fraction
+    )
+    peak_properties["undistinguishable_intensity_fraction"] = (
+        undistinguishable_intensity_fraction
+    )
     if decoy_mz_rank is not None:
         peak_properties["decoy_mz_rank"] = decoy_mz_rank
     return peak_properties
@@ -486,7 +751,7 @@ def match_features_batch(
     match_decoy: bool = True,
     illustration_dir: str | None = None,
     merge_confounders_enabled: bool = True,
-    illustration_log_transform_raw: bool = False,
+    illustration_log_transform: bool = False,
 ):
     """Process one peptide batch using the consensus image path."""
     results_target, results_decoy = [], []
@@ -507,14 +772,58 @@ def match_features_batch(
     )
     denoise_cfg = dict((processing_kwargs or {}).get("denoise", {}))
     raw_denoise_kwargs = _denoise_kwargs_for_stage(denoise_cfg, "raw")
-    full_denoise_kwargs = _denoise_kwargs_all(denoise_cfg)
+    _log_enabled = _log_transform_enabled(denoise_cfg)
     _align_images = bool((processing_kwargs or {}).get("align_images", True))
+    _align_in_log_space = bool(
+        (processing_kwargs or {}).get("align_in_log_space", True)
+    )
     _use_shift_crop_pad = bool(
         (processing_kwargs or {}).get("use_shift_crop_pad", False)
     )
     _jump_dist_thres = _parse_jump_dist_thres(
         (processing_kwargs or {}).get("jump_dist_thres")
     )
+    _broad_alignment_enabled = (
+        bool((processing_kwargs or {}).get("broad_alignment", {}).get("enabled", False))
+        and _align_images
+    )
+    if (
+        bool((processing_kwargs or {}).get("broad_alignment", {}).get("enabled", False))
+        and not _align_images
+    ):
+        Logger.warning(
+            "MATCH_FEATURES_KWARGS.broad_alignment.enabled=True is ignored "
+            "because align_images=False."
+        )
+    _shift_lookup = None
+    _broad_alignment_max_deviation = int(
+        (processing_kwargs or {}).get("broad_alignment", {}).get("max_deviation", 5)
+    )
+    # Extra template_frac scales to additionally search at (see
+    # MATCH_FEATURES_KWARGS.broad_alignment.multi_scale_template_fracs) -- gated
+    # behind the same broad_alignment.enabled + max_deviation=0 condition as the
+    # existing delta_shift_rt/im/delta_template_matching_score columns, since the
+    # "forced vs free" comparison these extra scales also produce only makes
+    # sense there. Empty (default) = zero extra cost.
+    _multi_scale_fracs: list[float] = (
+        [
+            float(f)
+            for f in (processing_kwargs or {})
+            .get("broad_alignment", {})
+            .get("multi_scale_template_fracs", [])
+        ]
+        if _broad_alignment_enabled and _broad_alignment_max_deviation == 0
+        else []
+    )
+    if _broad_alignment_enabled:
+        _cached_lookup = _WORKER_CONTEXT.get("broad_alignment_lookup")
+        if _cached_lookup is not None:
+            _shift_lookup = _cached_lookup
+        else:
+            from .broad_alignment import build_shift_lookup, load_shift_table
+
+            _table_path = os.path.join(result_dir, "broad_alignment_shift_table.parquet")
+            _shift_lookup = build_shift_lookup(load_shift_table(_table_path))
 
     # coSWA groups are stored on disk as a single row-set keyed by their
     # confounder_group_id (never duplicated to every member's mz_rank -- see
@@ -607,20 +916,163 @@ def match_features_batch(
         ].tolist()
         return reference_raw_file, quant_only_raw_files, match_raw_files
 
-    # coSWA: every candidate -- group member or solo -- gets its own
-    # independent alignment + watershed segmentation below (own roles, own
-    # anchors, own window). Group members' assigned segments are compared for
-    # spatial overlap AFTER the main loop (_mark_overlapping_group_members),
-    # once every member of every in-batch group has been processed; pairs
-    # (or larger connected sets) whose own segments overlap are tagged with a
-    # shared undistinguishable_group_id, patched into the rows built below.
-    #
-    # Deliberately out of scope here: decoy generation (_confounder_pool /
-    # peptide_swap sampling) is left completely untouched -- grouped
-    # candidates go through the exact same per-candidate decoy code as solo
-    # candidates, operating on whichever ConsensusFeatureBundle this loop
-    # built for them.
+    # coSWA: every candidate -- group member or solo -- is aligned and
+    # segmented fully independently further down (own roles, own anchors,
+    # own individual window). This pre-pass builds only a REGISTRATION
+    # (no watershed) per multi-member group -- every run any member is
+    # identified/matched in, fetched via the group's MERGED/union window
+    # (use_group_window=True) -- purely to place each member's own,
+    # independently-detected mask into one common coordinate frame for the
+    # post-hoc overlap check (_mark_overlapping_group_members). Solo
+    # candidates (and any candidate whose group has <2 present members) are
+    # untouched by this pre-pass.
+    _group_bundle_cache: dict[int, dict] = {}
+    _group_overlap_meta: dict[int, dict] = {}
+
+    def _load_group_pept_act(
+        pept_idx: int, raw_file: str, gid: int
+    ) -> tuple[np.ndarray, int, int, tuple[int, int]]:
+        return get_pept_act_from_parquet(  # pyright: ignore[reportArgumentType]
+            _select_mz(raw_file, gid),
+            int(pept_idx),
+            dict_ref_by_mz,
+            raw_file,
+            return_offset=True,
+            use_group_window=True,
+        )
+
+    _group_seg_mask_thres = _parse_seg_mask_thres(
+        (processing_kwargs or {}).get("seg_mask_thres")
+    )
+    _group_template_frac = float((processing_kwargs or {}).get("template_frac", 0.3))
+    _group_watershed_kwargs = dict(
+        (processing_kwargs or {}).get("peak_consensus_kwargs", {})
+    )
+
+    for _gid, _gmembers in _members_by_group.items():
+        _member_roles = {m: _reference_match_quant_files(m) for m in _gmembers}
+        _group_repr = min(_gmembers)  # any member works: group window columns are shared
+
+        _group_ref_run = _select_group_reference_run(_member_roles)
+
+        # Group run stack: winning reference run first, then the union of
+        # every member's own [reference] + match runs (already includes
+        # quant_only, per _reference_match_quant_files), deterministic order.
+        _group_raw_files = [_group_ref_run]
+        _seen_rf = {_group_ref_run}
+        for _m in sorted(_gmembers):
+            _m_ref, _m_quant, _m_match = _member_roles[_m]
+            for _rf in [_m_ref] + _m_match:
+                if _rf not in _seen_rf:
+                    _group_raw_files.append(_rf)
+                    _seen_rf.add(_rf)
+        _group_stack_index = {rf: i for i, rf in enumerate(_group_raw_files)}
+
+        _all_member_anchors: dict[int, list[tuple[int, int] | None]] = {
+            _m: _positional_anchors(
+                _group_raw_files,
+                _member_roles[_m][0],
+                set(_member_roles[_m][1]),
+                lambda rf, _m=_m: _load_group_pept_act(_m, rf, _gid),
+            )
+            for _m in _gmembers
+        }
+        _group_consensus_indices = sorted(
+            {
+                _group_stack_index[_rf]
+                for _m in _gmembers
+                for _rf in [_member_roles[_m][0]] + _member_roles[_m][1]
+            }
+        )
+
+        _group_raw_images = [
+            _load_group_pept_act(_group_repr, rf, _gid)[0] for rf in _group_raw_files
+        ]
+        _group_denoised_images = [
+            smooth_and_denoise_image(img, **raw_denoise_kwargs)
+            for img in _group_raw_images
+        ]
+
+        _group_forced_shifts = None
+        if _shift_lookup is not None:
+            _group_rt_pos = float(
+                np.mean(
+                    [dict_ref_by_mz.at[m, "RT_search_center"] for m in _gmembers]
+                )
+            )
+            _group_forced_shifts = [None] + [
+                _shift_lookup.lookup(_group_ref_run, rf, _group_rt_pos)
+                for rf in _group_raw_files[1:]
+            ]
+
+        # apply_seg=False: segment_consensus_from_aligned still always
+        # computes consensus/consensus_denoised (the linear-space average
+        # across runs, needed below for the intensity_fraction diagnostic)
+        # regardless of apply_seg -- only the (expensive, and here unused --
+        # each member's own mask comes from its own independent watershed
+        # further down) detect_2d_peak_with_watershed call is skipped.
+        _group_bundle = build_consensus_feature_bundle(
+            images=_group_denoised_images,
+            reference_idx=0,
+            template_frac=_group_template_frac,
+            anchors=_all_member_anchors[_group_repr],
+            additional_anchors=list(_all_member_anchors.values()),
+            denoise_cfg=denoise_cfg,
+            watershed_kwargs=_group_watershed_kwargs,
+            raw_images=_group_raw_images,
+            labels=_group_raw_files,
+            apply_seg=False,
+            seg_mask_thres=_group_seg_mask_thres,
+            jump_dist_thres=_jump_dist_thres,
+            consensus_image_indices=_group_consensus_indices,
+            align_images=_align_images,
+            align_in_log_space=_align_in_log_space,
+            use_shift_crop_pad=_use_shift_crop_pad,
+            forced_shifts=_group_forced_shifts,
+            broad_alignment_max_deviation=_broad_alignment_max_deviation,
+        )
+        _group_bundle_cache[_gid] = {
+            "bundle": _group_bundle,
+            "reference_run": _group_ref_run,
+            "stack_index": _group_stack_index,
+        }
+        _group_overlap_meta[_gid] = {
+            "target_shape": _group_bundle.alignment.target_shape,
+            "intensity_image": _group_bundle.segmentation.consensus,
+        }
+
+    # `for` loops don't scope their targets -- without this,
+    # _group_raw_images/_group_denoised_images/_group_bundle would keep the
+    # LAST processed group's full multi-run image set resident as an
+    # ordinary function local for the rest of this call, regardless of the
+    # _group_bundle_cache freeing below -- popping a dict entry doesn't help
+    # if the loop variable that pointed at the same objects is still live.
+    # Only defined when the pre-pass loop actually ran.
+    if _members_by_group:
+        del (
+            _group_raw_images,
+            _group_denoised_images,
+            _group_bundle,
+        )
+
+    # Post-hoc overlap/diagnostics cache: populated below for group members
+    # only, consumed after the main loop by _mark_overlapping_group_members.
     _member_overlap_cache: dict[int, dict] = {}
+
+    # _group_bundle_cache holds full multi-run registration data (resized/
+    # aligned/match-score-map arrays -- roughly 6xN_runs arrays per group)
+    # for every in-batch confounder group at once, built entirely upfront in
+    # the pre-pass above. Nothing else in this loop needs a group's entry
+    # once its last member has been processed (only the placement
+    # computation, once per member, needs it), so free each group's entry
+    # as soon as its member count hits zero instead of holding every
+    # in-batch group's registration data resident for the whole batch.
+    # _group_overlap_meta (the two small per-group arrays/tuples needed by
+    # _mark_overlapping_group_members) is NOT freed here -- it must survive
+    # until the post-loop call below.
+    _group_members_remaining = {
+        gid: len(members) for gid, members in _members_by_group.items()
+    }
 
     for pept_idx in batch_np:
         pept_act_cache: dict[str, tuple[np.ndarray, int, int, tuple[int, int]]] = {}
@@ -665,12 +1117,26 @@ def match_features_batch(
 
         # Roles are ALWAYS this candidate's OWN (fixes the coSWA bug where
         # group members used to reuse a representative's per-run role
-        # assignment).
+        # assignment) -- used for per-run role classification below and for
+        # decoy generation, regardless of which branch (group/solo) built
+        # _consensus_bundle.
         reference_raw_file, quant_only_raw_files, match_raw_files = (
             _reference_match_quant_files(pept_idx)
         )
         _quant_only_set = set(quant_only_raw_files)
 
+        own_anchor_id = 0
+        feature_instance_id = _feature_instance_id(pept_idx, own_anchor_id)
+
+        _cached_group = _group_bundle_cache.get(_group_id) if _group_id != -1 else None
+
+        # Every candidate -- group member or solo -- is scored fully
+        # independently: own roles, own anchors, own individual window, own
+        # alignment + watershed. Group membership only affects (a) which
+        # activation store key raw images are fetched from (_act_key,
+        # above) and (b) the placement computation below, which projects
+        # this member's own detected mask into the group's shared
+        # (registration-only) frame for the post-hoc overlap check.
         _consensus_raw_files = [reference_raw_file] + match_raw_files
         _consensus_anchors = _positional_anchors(
             _consensus_raw_files,
@@ -678,15 +1144,19 @@ def match_features_batch(
             _quant_only_set,
             _get_pept_act_tuple,
         )
-
-        own_anchor_id = 0
-        feature_instance_id = _feature_instance_id(pept_idx, own_anchor_id)
-
-        # Only files with known anchors contribute to the consensus average;
-        # files without anchors are still aligned and quantified from the labels.
+        # Only files with known anchors contribute to the consensus
+        # average; files without anchors are still aligned and quantified
+        # from the labels.
         _anchor_image_indices = [
             i for i, a in enumerate(_consensus_anchors) if a is not None
         ]
+        _forced_shifts = None
+        if _shift_lookup is not None:
+            _rt_pos = float(dict_ref_by_mz.at[pept_idx, "RT_search_center"])
+            _forced_shifts = [None] + [
+                _shift_lookup.lookup(reference_raw_file, rf, _rt_pos)
+                for rf in match_raw_files
+            ]
         _consensus_bundle = build_consensus_feature_bundle(
             images=[_get_raw_denoised_pept_act(rf) for rf in _consensus_raw_files],
             reference_idx=0,
@@ -705,22 +1175,50 @@ def match_features_batch(
             jump_dist_thres=_jump_dist_thres,
             consensus_image_indices=_anchor_image_indices,
             align_images=_align_images,
+            align_in_log_space=_align_in_log_space,
             use_shift_crop_pad=_use_shift_crop_pad,
+            forced_shifts=_forced_shifts,
+            broad_alignment_max_deviation=_broad_alignment_max_deviation,
+            multi_scale_template_fracs=_multi_scale_fracs,
         )
-        if _group_id in _members_by_group:
-            # Stash what the post-hoc overlap pass needs -- this member's own
-            # alignment/segmentation state, run stack, and per-run absolute
-            # window origins (to project its assigned segment mask into a
-            # common run's real frame_idx/mobility_index coordinates).
+
+        if _cached_group is not None:
+            # Place this member's own independently-detected mask into the
+            # group's shared (registration-only) canvas for the post-hoc
+            # overlap check. reference_raw_file is guaranteed to be in the
+            # group's stack (it's part of the union every member's own
+            # [reference]+match runs contribute -- see the pre-pass above).
+            # When reference_raw_file == the group's own chosen reference
+            # run, reg_shift is (0, 0) (the unconditional reference shift)
+            # and this collapses to a pure same-run coordinate offset;
+            # otherwise reg_shift is what correctly accounts for this
+            # member's own reference run differing from the group's.
+            _own_origin_at_own_ref = _get_pept_act_tuple(reference_raw_file)[3]
+            _group_origin_at_own_ref = _load_group_pept_act(
+                int(pept_idx), reference_raw_file, _group_id
+            )[3]
+            _reg_shift = _cached_group["bundle"].alignment.shifts[
+                _cached_group["stack_index"][reference_raw_file]
+            ]
+            _placement_origin = (
+                _own_origin_at_own_ref[0] - _group_origin_at_own_ref[0] + _reg_shift[0],
+                _own_origin_at_own_ref[1] - _group_origin_at_own_ref[1] + _reg_shift[1],
+            )
+            _own_mask = (
+                np.isin(
+                    _consensus_bundle.segmentation.watershed_labels,
+                    _consensus_bundle.segmentation.target_label_ids,
+                )
+                if _consensus_bundle.segmentation.target_label_ids
+                else np.zeros(
+                    _consensus_bundle.segmentation.watershed_labels.shape, dtype=bool
+                )
+            )
             _member_overlap_cache[int(pept_idx)] = {
-                "alignment": _consensus_bundle.alignment,
-                "segmentation": _consensus_bundle.segmentation,
-                "consensus_raw_files": _consensus_raw_files,
-                "reference_raw_file": reference_raw_file,
-                "window_origin_by_run": {
-                    rf: _get_pept_act_tuple(rf)[3] for rf in _consensus_raw_files
-                },
+                "mask": _own_mask,
+                "placement_origin": _placement_origin,
             }
+
         if visualize_dir is not None:
             _visualize_consensus_bundle(
                 _consensus_bundle.alignment,
@@ -728,6 +1226,7 @@ def match_features_batch(
                 fig_dir=visualize_dir,
                 filename=f"mz{pept_idx}_consensus.png",
                 labels=_consensus_raw_files,
+                log_transform_display=illustration_log_transform,
             )
         _batch_svg_dir = (
             os.path.join(
@@ -744,7 +1243,7 @@ def match_features_batch(
                 _consensus_raw_files,
                 _batch_svg_dir,
                 raw_images=[_get_pept_act_tuple(rf)[0] for rf in _consensus_raw_files],
-                log_transform_raw=illustration_log_transform_raw,
+                log_transform_display=illustration_log_transform,
             )
         consensus_pp = _consensus_bundle.consensus_pp
         individual_pps = _consensus_bundle.individual_pps
@@ -857,6 +1356,7 @@ def match_features_batch(
                             (processing_kwargs or {}).get("jump_dist_thres")
                         ),
                         align_images=_align_images,
+                        align_in_log_space=_align_in_log_space,
                         use_shift_crop_pad=_use_shift_crop_pad,
                     )
                     if visualize_dir is not None:
@@ -868,6 +1368,7 @@ def match_features_batch(
                                 f"mz{pept_idx}_consensus_decoy_peptide_swap_rep{_rep}.png"
                             ),
                             labels=_plot_labels,
+                            log_transform_display=illustration_log_transform,
                         )
                     if _batch_svg_dir is not None:
                         _save_illustration_svgs(
@@ -877,7 +1378,7 @@ def match_features_batch(
                             _batch_svg_dir,
                             raw_images=_plot_raw_images,
                             filename_prefix=f"decoy_peptide_swap_rep{_rep}_",
-                            log_transform_raw=illustration_log_transform_raw,
+                            log_transform_display=illustration_log_transform,
                         )
 
         _off_target_label_shifts: list[tuple[int, int] | None] = []
@@ -911,6 +1412,7 @@ def match_features_batch(
                                 f"mz{pept_idx}_consensus_decoy_off_target_shift_rep{_rep}.png"
                             ),
                             labels=_consensus_raw_files,
+                            log_transform_display=illustration_log_transform,
                         )
                     if _batch_svg_dir is not None:
                         _save_illustration_svgs(
@@ -921,6 +1423,7 @@ def match_features_batch(
                             segmentation_override=_shifted_seg,
                             filename_prefix=f"decoy_off_target_shift_rep{_rep}_",
                             skip_per_run=True,
+                            log_transform_display=illustration_log_transform,
                         )
         if consensus_pp is not None:
             for _ci, (_rf, _ind_pp) in enumerate(
@@ -967,7 +1470,9 @@ def match_features_batch(
                 if _rf == reference_raw_file:
                     pp_reference_list.append(_annotated_pp)
                     continue
-                _match_t = compare_peak_properties(consensus_pp, _annotated_pp)
+                _match_t = compare_peak_properties(
+                    consensus_pp, _annotated_pp, multi_scale_fracs=_multi_scale_fracs
+                )
                 _match_t["mz_rank"] = pept_idx
                 _match_t["feature_instance_id"] = feature_instance_id
                 _match_t["own_anchor_id"] = own_anchor_id
@@ -975,6 +1480,8 @@ def match_features_batch(
                 _match_t["source_run"] = "consensus"
                 _match_t["source_type"] = "Consensus"
                 _match_t["undistinguishable_group_id"] = -1  # patched post-loop
+                _match_t["undistinguishable_pixel_fraction"] = 0.0  # patched post-loop
+                _match_t["undistinguishable_intensity_fraction"] = 0.0
                 results_target.append(_match_t)
                 pp_match_target_list.append(_annotated_pp)
 
@@ -997,6 +1504,27 @@ def match_features_batch(
                             decoy_act,
                             _rf,
                             raw_denoise_kwargs=raw_denoise_kwargs,
+                            log_transform_enabled=_log_enabled,
+                            forced_shift=(
+                                _consensus_bundle.alignment.shifts[_ci]
+                                if _broad_alignment_enabled
+                                else None
+                            ),
+                            max_deviation=(
+                                _broad_alignment_max_deviation
+                                if _broad_alignment_enabled
+                                else None
+                            ),
+                            multi_scale_forced_shifts=(
+                                {
+                                    _frac: _state.shifts[_ci]
+                                    for _frac, _state in (
+                                        _consensus_bundle.multi_scale_alignments.items()
+                                    )
+                                }
+                                if _broad_alignment_enabled
+                                else None
+                            ),
                         )
                         if decoy_pp_raw is None:
                             no_quant_log.append(
@@ -1039,7 +1567,11 @@ def match_features_batch(
                         _prop_d["decoy_strategy"] = "peptide_swap_consensus"
                         _prop_d["decoy_rep"] = _rep
                         pp_match_decoy_list.append(_prop_d)
-                        _match_d = compare_peak_properties(consensus_pp, _prop_d)
+                        _match_d = compare_peak_properties(
+                            _consensus_bundle.consensus_pp,
+                            _prop_d,
+                            multi_scale_fracs=_multi_scale_fracs,
+                        )
                         _match_d["mz_rank"] = pept_idx
                         _match_d["decoy_mz_rank"] = decoy_pept_idx
                         _match_d["feature_instance_id"] = feature_instance_id
@@ -1111,7 +1643,11 @@ def match_features_batch(
                         _prop_d["label_shift_rt"] = int(label_shift[0])
                         _prop_d["label_shift_im"] = int(label_shift[1])
                         pp_match_decoy_list.append(_prop_d)
-                        _match_d = compare_peak_properties(consensus_pp, _prop_d)
+                        _match_d = compare_peak_properties(
+                            _consensus_bundle.consensus_pp,
+                            _prop_d,
+                            multi_scale_fracs=_multi_scale_fracs,
+                        )
                         _match_d["mz_rank"] = pept_idx
                         _match_d["decoy_mz_rank"] = -1
                         _match_d["feature_instance_id"] = feature_instance_id
@@ -1144,25 +1680,46 @@ def match_features_batch(
                     }
                 )
 
-    # coSWA: now that every member of every in-batch group has been
-    # independently aligned + segmented above, check whether their own
-    # assigned segments spatially overlap and tag the overlapping ones.
-    # undistinguishable_group_id was written as -1 everywhere above (the tag
-    # isn't knowable until this point), so patch it into the already-built
-    # rows for the subset of mz_ranks flagged below.
-    _undistinguishable_tag = _mark_overlapping_group_members(
-        _members_by_group, _member_overlap_cache
+        if _group_id != -1:
+            _group_members_remaining[_group_id] -= 1
+            if _group_members_remaining[_group_id] <= 0:
+                _group_bundle_cache.pop(_group_id, None)
+
+    # coSWA: now that every present member of every in-batch group has been
+    # independently scored above, place each member's own detected mask
+    # into its group's shared (registration-only) frame and check for
+    # spatial overlap, plus compute each member's own pixel/intensity
+    # overlap-fraction diagnostic. undistinguishable_group_id/
+    # _pixel_fraction/_intensity_fraction were written as -1/0.0/0.0
+    # everywhere above (not knowable until every member of a group has been
+    # processed), so patch them into the already-built rows for the members
+    # present below.
+    _undistinguishable_tag, _pixel_fraction, _intensity_fraction = (
+        _mark_overlapping_group_members(
+            _members_by_group, _member_overlap_cache, _group_overlap_meta
+        )
     )
-    if _undistinguishable_tag:
+    _group_overlap_meta.clear()
+    if _undistinguishable_tag or _pixel_fraction:
         for _row in results_target:
-            _tag = _undistinguishable_tag.get(int(_row["mz_rank"]))
+            _mz = int(_row["mz_rank"])
+            _tag = _undistinguishable_tag.get(_mz)
             if _tag is not None:
                 _row["undistinguishable_group_id"] = _tag
+            if _mz in _pixel_fraction:
+                _row["undistinguishable_pixel_fraction"] = _pixel_fraction[_mz]
+                _row["undistinguishable_intensity_fraction"] = _intensity_fraction[_mz]
         for _pp_list in (pp_reference_list, pp_match_target_list):
             for _df in _pp_list:
-                _tag = _undistinguishable_tag.get(int(_df["mz_rank"].iat[0]))
+                _mz = int(_df["mz_rank"].iat[0])
+                _tag = _undistinguishable_tag.get(_mz)
                 if _tag is not None:
                     _df["undistinguishable_group_id"] = _tag
+                if _mz in _pixel_fraction:
+                    _df["undistinguishable_pixel_fraction"] = _pixel_fraction[_mz]
+                    _df["undistinguishable_intensity_fraction"] = _intensity_fraction[
+                        _mz
+                    ]
 
     return (
         results_target,
@@ -1176,11 +1733,18 @@ def match_features_batch(
     )
 
 
-def compare_peak_properties(peak_properties_a, peak_properties_b):
-    return {
+def compare_peak_properties(
+    peak_properties_a, peak_properties_b, multi_scale_fracs: list[float] | None = None
+):
+    result = {
         "template_matching_score": peak_properties_b["template_matching_score"].values[
             0
         ],
+        "delta_shift_rt": peak_properties_b["delta_shift_rt"].values[0],
+        "delta_shift_im": peak_properties_b["delta_shift_im"].values[0],
+        "delta_template_matching_score": peak_properties_b[
+            "delta_template_matching_score"
+        ].values[0],
         "sift_similarities": compare_sift_descriptors_similarities(
             peak_properties_a["sift_des"].values[0],
             peak_properties_b["sift_des"].values[0],
@@ -1199,13 +1763,26 @@ def compare_peak_properties(peak_properties_a, peak_properties_b):
             peak_properties_b["zernike"].values[0],
             l2_norm=True,
         ),
+        # From free_shift_rt/im (unconstrained registration), not shift_rt/im
+        # (the possibly-forced one) -- see free_shift_rt/im's comment in
+        # _extract_feature_rows_for_label_ids for why: under a max_deviation=0
+        # forced rescore, shift_rt/im collapse to the same value for a target
+        # and its paired decoy, carrying no signal.
         "rt_shift": abs(
-            peak_properties_a["shift_rt"].values[0]
-            - peak_properties_b["shift_rt"].values[0]
+            peak_properties_a["free_shift_rt"].values[0]
+            - peak_properties_b["free_shift_rt"].values[0]
         ),
         "im_shift": abs(
-            peak_properties_a["shift_im"].values[0]
-            - peak_properties_b["shift_im"].values[0]
+            peak_properties_a["free_shift_im"].values[0]
+            - peak_properties_b["free_shift_im"].values[0]
+        ),
+        "rt_profile_corr": _profile_correlation(
+            peak_properties_a["rt_profile"].values[0],
+            peak_properties_b["rt_profile"].values[0],
+        ),
+        "im_profile_corr": _profile_correlation(
+            peak_properties_a["im_profile"].values[0],
+            peak_properties_b["im_profile"].values[0],
         ),
         "rt_length_diff": abs(
             peak_properties_a["rt_length"].values[0]
@@ -1242,6 +1819,31 @@ def compare_peak_properties(peak_properties_a, peak_properties_b):
         "reference_run": peak_properties_a["Run_name"].values[0],
         "matched_run": peak_properties_b["Run_name"].values[0],
     }
+    for _frac in multi_scale_fracs or []:
+        _tag = f"frac_{_frac}"
+        result[f"template_matching_score_{_tag}"] = peak_properties_b[
+            f"template_matching_score_{_tag}"
+        ].values[0]
+        result[f"delta_shift_rt_{_tag}"] = peak_properties_b[
+            f"delta_shift_rt_{_tag}"
+        ].values[0]
+        result[f"delta_shift_im_{_tag}"] = peak_properties_b[
+            f"delta_shift_im_{_tag}"
+        ].values[0]
+        result[f"delta_template_matching_score_{_tag}"] = peak_properties_b[
+            f"delta_template_matching_score_{_tag}"
+        ].values[0]
+        # From free_shift_rt/im_frac_<x> (unconstrained), not shift_rt/im_
+        # frac_<x> -- see the main-scale rt_shift/im_shift comment above.
+        result[f"rt_shift_{_tag}"] = abs(
+            peak_properties_a[f"free_shift_rt_{_tag}"].values[0]
+            - peak_properties_b[f"free_shift_rt_{_tag}"].values[0]
+        )
+        result[f"im_shift_{_tag}"] = abs(
+            peak_properties_a[f"free_shift_im_{_tag}"].values[0]
+            - peak_properties_b[f"free_shift_im_{_tag}"].values[0]
+        )
+    return result
 
 
 def compare_image_descriptors_cosine(des1, des2, log_transform: bool = True):
@@ -1300,6 +1902,36 @@ def compare_sift_descriptors_similarities(des1, des2):
     # SIFT distances for a match are usually < 200
     similarity = np.exp(-dist / 362.0)  # mid-point of range
     return similarity
+
+
+def _profile_correlation(profile_a, profile_b) -> float:
+    """Pearson correlation between two 1D masked-intensity profiles.
+
+    Pearson r is invariant to independent affine transforms of each input
+    (r(a*x+b, y) == r(x, y) for a>0), so a real abundance difference between
+    runs -- an overall gain and/or baseline offset on the profile -- does not
+    by itself lower this score; only a genuine shape mismatch does.
+    """
+    if profile_a is None or profile_b is None:
+        return 0.0
+    # A profile spanning exactly one row/column is a genuine 1-element numpy
+    # array when written into peak_properties (_extract_feature_rows_for_label_ids),
+    # but pandas' `.at[0, col] = arr` collapses a length-1 array to a 0-d
+    # ndarray on the way back out -- len() raises "TypeError: len() of unsized
+    # object" on those. np.atleast_1d restores the (1,)-shaped view. A narrow
+    # cropped decoy/match window (e.g. this candidate's own individual window)
+    # makes single-row/column regions far more common than a full group-scale
+    # window would, so this isn't just a defensive nicety.
+    profile_a = np.atleast_1d(profile_a)
+    profile_b = np.atleast_1d(profile_b)
+    n = min(len(profile_a), len(profile_b))
+    if n < 2:
+        return 0.0
+    p1 = np.asarray(profile_a[:n], dtype=np.float64)
+    p2 = np.asarray(profile_b[:n], dtype=np.float64)
+    if np.std(p1) == 0 or np.std(p2) == 0:
+        return 0.0
+    return float(np.corrcoef(p1, p2)[0, 1])
 
 
 def _draw_rect(ax, rt_start, im_start, rt_end, im_end, color, linestyle):
@@ -1388,33 +2020,75 @@ def _find_shift_via_template_match(
     search_image: np.ndarray,
     template: np.ndarray,
     template_bounds: tuple[int, int, int, int],
+    search_center: tuple[int, int] | None = None,
+    max_deviation: int | None = None,
 ) -> tuple[tuple[int, int], float, np.ndarray, tuple[int, int]]:
     """Locate `template` in `search_image`; return the integer shift that
     aligns the match to `template_bounds` (the convention scipy.ndimage.shift
     expects), the match score, its full score map, and the matched top-left.
     Pure shift-finding -- callers decide how the shift gets applied.
+
+    `search_center`/`max_deviation`, if both given, restrict the search to a
+    `(2*max_deviation+1)`-wide window of the correlation surface centered on
+    the top-left implied by the `search_center` shift, instead of the global
+    argmax -- used by broad_alignment to bound per-candidate discovery to a
+    small neighborhood around a precalibrated shift (max_deviation=0 collapses
+    the window to that exact position, i.e. "rescore at the forced shift").
     """
     template_rt_start, template_im_start, _, _ = template_bounds
     match_score = match_template(search_image, template)
-    match_rt_topleft, match_im_topleft = np.unravel_index(
-        np.argmax(match_score), match_score.shape
-    )
+    if search_center is not None and max_deviation is not None:
+        center_rt = int(
+            np.clip(template_rt_start - search_center[0], 0, match_score.shape[0] - 1)
+        )
+        center_im = int(
+            np.clip(template_im_start - search_center[1], 0, match_score.shape[1] - 1)
+        )
+        row_lo = max(0, center_rt - max_deviation)
+        row_hi = min(match_score.shape[0], center_rt + max_deviation + 1)
+        col_lo = max(0, center_im - max_deviation)
+        col_hi = min(match_score.shape[1], center_im + max_deviation + 1)
+        window = match_score[row_lo:row_hi, col_lo:col_hi]
+        local_rt, local_im = np.unravel_index(np.argmax(window), window.shape)
+        match_rt_topleft, match_im_topleft = local_rt + row_lo, local_im + col_lo
+    else:
+        match_rt_topleft, match_im_topleft = np.unravel_index(
+            np.argmax(match_score), match_score.shape
+        )
     shift = (
         int(template_rt_start - match_rt_topleft),
         int(template_im_start - match_im_topleft),
     )
     return (
         shift,
-        float(match_score.max()),
+        float(match_score[match_rt_topleft, match_im_topleft]),
         match_score,
         (int(match_rt_topleft), int(match_im_topleft)),
     )
+
+
+def _global_best_from_score_map(
+    match_score: np.ndarray, template_bounds: tuple[int, int, int, int]
+) -> tuple[tuple[int, int], float]:
+    """Unconstrained best shift/score from an already-computed match_template
+    surface -- reuses the full correlation map broad_alignment's constrained
+    search already produced (see _find_shift_via_template_match), so this is
+    just an extra argmax on data already in memory, not a second match_template
+    call. Used to compare a max_deviation=0 forced rescore against what a free
+    search over the same surface would have found.
+    """
+    template_rt_start, template_im_start, _, _ = template_bounds
+    rt_topleft, im_topleft = np.unravel_index(np.argmax(match_score), match_score.shape)
+    shift = (int(template_rt_start - rt_topleft), int(template_im_start - im_topleft))
+    return shift, float(match_score[rt_topleft, im_topleft])
 
 
 def _find_shift_native_image(
     image: np.ndarray,
     template: np.ndarray,
     template_bounds: tuple[int, int, int, int],
+    search_center: tuple[int, int] | None = None,
+    max_deviation: int | None = None,
 ) -> tuple[tuple[int, int], float, np.ndarray, tuple[int, int]]:
     """_find_shift_via_template_match, but tolerant of `image` being smaller
     than `template` in a dimension -- possible in shift_crop_pad mode since
@@ -1422,6 +2096,10 @@ def _find_shift_native_image(
     template patch cut from the (larger, reference-shaped) template. Pads
     just enough to satisfy match_template's image >= template requirement,
     then corrects the returned shift back into `image`'s own coordinate frame.
+
+    `search_center` (given in `image`'s own, unpadded coordinate frame, same
+    as the returned shift) is translated into the padded frame before being
+    passed down to `_find_shift_via_template_match`.
     """
     pad_before = [0, 0]
     pads = []
@@ -1436,8 +2114,17 @@ def _find_shift_native_image(
     search_image = (
         image if pad_before == [0, 0] else np.pad(image, pads, mode="constant")
     )
+    padded_search_center = (
+        (search_center[0] - pad_before[0], search_center[1] - pad_before[1])
+        if search_center is not None
+        else None
+    )
     shift, max_score, match_score, match_topleft = _find_shift_via_template_match(
-        search_image, template, template_bounds
+        search_image,
+        template,
+        template_bounds,
+        search_center=padded_search_center,
+        max_deviation=max_deviation,
     )
     shift = (shift[0] + pad_before[0], shift[1] + pad_before[1])
     return shift, max_score, match_score, match_topleft
@@ -1495,6 +2182,9 @@ def _align_resized_image_to_template(
     template: np.ndarray,
     template_bounds: tuple[int, int, int, int],
     scaled_anchor: tuple[float, float] | None = None,
+    search_center: tuple[int, int] | None = None,
+    max_deviation: int | None = None,
+    search_image: np.ndarray | None = None,
 ) -> tuple[
     np.ndarray,
     tuple[int, int, int, int],
@@ -1504,10 +2194,19 @@ def _align_resized_image_to_template(
     np.ndarray,
     tuple[int, int],
 ]:
+    """`search_image`, if given, is correlated against `template` to find the shift
+    (e.g. a log2(1+x) transform of `resized_image` for log-space alignment) while the
+    shift itself is always applied to (and `aligned_image` always derived from)
+    `resized_image` unchanged -- so the returned image stays in whatever space the
+    caller passed in, regardless of which space the search ran in."""
     from scipy.ndimage import shift as nd_shift
 
     shift, max_score, match_score, match_topleft = _find_shift_via_template_match(
-        resized_image, template, template_bounds
+        search_image if search_image is not None else resized_image,
+        template,
+        template_bounds,
+        search_center=search_center,
+        max_deviation=max_deviation,
     )
     aligned_image = nd_shift(resized_image, shift=shift, mode="constant", cval=0.0)
     aligned_anchor = (
@@ -1535,10 +2234,24 @@ def align_images_to_reference(
     anchors: list[tuple[int, int] | None] | None = None,
     additional_anchors: list[list[tuple[int, int] | None]] | None = None,
     align_images: bool = True,
-    post_align_log_transform: bool = False,
+    align_in_log_space: bool = False,
     use_shift_crop_pad: bool = False,
+    forced_shifts: list[tuple[int, int] | None] | None = None,
+    broad_alignment_max_deviation: int | None = None,
 ) -> ConsensusAlignmentState:
     """Resize and align images to a reference template for consensus scoring.
+
+    `forced_shifts`, if given, must have one entry per image (None for images
+    that should still go through unconstrained template-match discovery).
+    Where an entry is not None, that image still runs template-match
+    discovery, but the search is restricted to a
+    `(2*broad_alignment_max_deviation+1)`-wide window around the given (rt,
+    im) shift instead of the whole correlation surface -- used by
+    MATCH_FEATURES_KWARGS.broad_alignment to bound per-candidate discovery to
+    a small neighborhood around a precalibrated, RT-binned majority-vote
+    shift, for peptides too low-S/N for unconstrained template matching to
+    trust on its own. `broad_alignment_max_deviation=0` collapses the window
+    to the forced shift itself (rescoring there without any freedom to move).
 
     If `template_anchor` is not given, it defaults to the centroid of all
     anchor points -- `anchors` plus every list in `additional_anchors` (e.g.
@@ -1549,12 +2262,18 @@ def align_images_to_reference(
     narrowed) to the smallest fraction that still covers every anchor point
     around the resolved template anchor, capped at 0.5.
 
-    `post_align_log_transform`, if set, applies log2(1+x) to every aligned
-    image right after shift-finding -- template matching itself still runs
-    on the un-transformed images (less sensitive to noise amplified near
-    zero by the log), while everything downstream (consensus averaging,
-    descriptors) sees log-space images, same as the "raw"-stage log_transform
-    does today.
+    `align_in_log_space`, if set, runs the template-matching correlation itself on a
+    log2(1+x) transform of the reference template and every candidate image, purely
+    to find the shift; the discovered shift is then applied to the linear image
+    either way. The returned `resized_images`/`aligned_images` (and everything built
+    from them downstream: consensus averaging, descriptors) therefore always stay
+    linear regardless of this flag -- see MATCH_FEATURES_KWARGS.denoise.log_transform
+    for the separate, always-linear-then-log-once step applied downstream to build
+    descriptor images. Only the returned `template` itself is in search space (log or
+    linear, matching this flag), since its only consumer is shift-finding -- decoy
+    builders that reuse it (e.g. _build_consensus_peptide_swap_decoy) read
+    `align_in_log_space` back off the returned state to transform their own candidate
+    image into the same space before correlating against it.
 
     `use_shift_crop_pad`, if set, skips cv2.resize entirely: match_template
     runs directly on each run's native-shaped image, and the found integer
@@ -1582,6 +2301,11 @@ def align_images_to_reference(
                     "each list in additional_anchors must have the same length "
                     f"as images (got {len(_extra)}, expected {len(images)})."
                 )
+    if forced_shifts is not None and len(forced_shifts) != len(images):
+        raise ValueError(
+            "forced_shifts must have the same length as images "
+            f"(got {len(forced_shifts)}, expected {len(images)})."
+        )
     if not (0 < template_frac <= 0.5):
         raise ValueError(f"template_frac must be in (0, 0.5], got {template_frac}.")
 
@@ -1644,12 +2368,18 @@ def align_images_to_reference(
         resolved_template_anchor,
         resolved_template_frac,
     )
+    # search_template/search_image(s) below are used only to find each shift; the
+    # positions (template_bounds/anchor_row/anchor_col) are unaffected by this
+    # monotonic transform, and every returned/stored image stays linear.
+    search_template = np.log2(1 + template) if align_in_log_space else template
 
     aligned_images: list[np.ndarray] = []
     matched_boxes: list[tuple[int, int, int, int]] = []
     aligned_anchors: list[tuple[float, float] | None] = []
     shifts: list[tuple[int, int]] = []
     max_scores: list[float] = []
+    free_shifts: list[tuple[int, int] | None] = []
+    free_max_scores: list[float | None] = []
     match_score_maps: list[np.ndarray] = []
     match_score_peaks: list[tuple[int, int]] = []
     match_score_label_indices: list[int] = []
@@ -1661,6 +2391,8 @@ def align_images_to_reference(
             aligned_anchors.append(scaled_anchors[i])
             shifts.append((0, 0))
             max_scores.append(1.0)
+            free_shifts.append(None)
+            free_max_scores.append(None)
             continue
         if not align_images:
             aligned_images.append(
@@ -1672,10 +2404,34 @@ def align_images_to_reference(
             aligned_anchors.append(scaled_anchors[i])
             shifts.append((0, 0))
             max_scores.append(0.0)
+            free_shifts.append(None)
+            free_max_scores.append(None)
             continue
+        _search_center = (
+            forced_shifts[i]
+            if forced_shifts is not None and forced_shifts[i] is not None
+            else None
+        )
+        # A forced_shifts entry with no explicit max_deviation defaults to an
+        # exact rescore (deviation 0) rather than silently falling back to an
+        # unconstrained search that would ignore the caller's forced shift.
+        _max_deviation = (
+            (broad_alignment_max_deviation if broad_alignment_max_deviation is not None else 0)
+            if _search_center is not None
+            else None
+        )
         if use_shift_crop_pad:
+            _search_image = (
+                np.log2(1 + images[i]) if align_in_log_space else images[i]
+            )
             shift, max_score, match_score_map, match_score_peak = (
-                _find_shift_native_image(images[i], template, template_bounds)
+                _find_shift_native_image(
+                    _search_image,
+                    search_template,
+                    template_bounds,
+                    search_center=_search_center,
+                    max_deviation=_max_deviation,
+                )
             )
             aligned_image = _shift_and_fit(images[i], resolved_target_shape, shift)
             matched_box = template_bounds
@@ -1686,6 +2442,9 @@ def align_images_to_reference(
                 else None
             )
         else:
+            _search_image = (
+                np.log2(1 + resized_image) if align_in_log_space else resized_image
+            )
             (
                 aligned_image,
                 matched_box,
@@ -1696,21 +2455,29 @@ def align_images_to_reference(
                 match_score_peak,
             ) = _align_resized_image_to_template(
                 resized_image,
-                template,
+                search_template,
                 template_bounds,
                 scaled_anchors[i],
+                search_center=_search_center,
+                max_deviation=_max_deviation,
+                search_image=_search_image,
             )
         aligned_images.append(aligned_image)
         matched_boxes.append(matched_box)
         aligned_anchors.append(aligned_anchor)
         shifts.append(shift)
         max_scores.append(max_score)
+        if _search_center is not None and _max_deviation == 0:
+            free_shift, free_max_score = _global_best_from_score_map(
+                match_score_map, template_bounds
+            )
+        else:
+            free_shift, free_max_score = None, None
+        free_shifts.append(free_shift)
+        free_max_scores.append(free_max_score)
         match_score_maps.append(match_score_map)
         match_score_peaks.append(match_score_peak)
         match_score_label_indices.append(i)
-
-    if post_align_log_transform:
-        aligned_images = [np.log2(1 + img) for img in aligned_images]
 
     return ConsensusAlignmentState(
         reference_idx=reference_idx,
@@ -1718,7 +2485,7 @@ def align_images_to_reference(
         anchor_row=anchor_row,
         anchor_col=anchor_col,
         template_bounds=template_bounds,
-        template=template,
+        template=search_template,
         resized_images=resized_images,
         aligned_images=aligned_images,
         matched_boxes=matched_boxes,
@@ -1726,10 +2493,13 @@ def align_images_to_reference(
         scaled_anchors=scaled_anchors,
         shifts=shifts,
         max_scores=max_scores,
+        free_shifts=free_shifts,
+        free_max_scores=free_max_scores,
         match_score_maps=match_score_maps,
         match_score_peaks=match_score_peaks,
         match_score_label_indices=match_score_label_indices,
         use_shift_crop_pad=use_shift_crop_pad,
+        align_in_log_space=align_in_log_space,
     )
 
 
@@ -2022,75 +2792,116 @@ def _snap_all_anchors_to_watershed(
     )
 
 
-def _project_member_mask_to_common_run(
-    member: dict, common_run: str, common_run_position: int
-) -> set[tuple[int, int]]:
-    """Project one coSWA group member's own assigned-segment mask into
-    `common_run`'s absolute (frame_idx, mobility_index) coordinates.
-
-    The member's own aligned/consensus space differs only from
-    `common_run`'s own raw crop window by that run's per-run alignment shift
-    (`member["alignment"].shifts[common_run_position]`); adding back the
-    window's own absolute origin (`member["window_origin_by_run"][common_run]`)
-    lands the mask in `common_run`'s real coordinate grid, directly
-    comparable across members regardless of which run each one used as its
-    own alignment reference.
-    """
-    seg = member["segmentation"]
-    if not seg.target_label_ids:
-        return set()
-    mask = np.isin(seg.watershed_labels, seg.target_label_ids)
-    rows, cols = np.where(mask)
-    if rows.size == 0:
-        return set()
-    shift = member["alignment"].shifts[common_run_position]
-    origin = member["window_origin_by_run"][common_run]
-    abs_rows = rows - shift[0] + origin[0]
-    abs_cols = cols - shift[1] + origin[1]
-    return set(zip(abs_rows.tolist(), abs_cols.tolist()))
+def _place_mask_in_canvas(
+    local_mask: np.ndarray,
+    origin: tuple[int, int],
+    canvas_shape: tuple[int, int],
+) -> np.ndarray:
+    """Place a member's own local boolean mask into a zero-initialized
+    canvas-shaped array at `origin`, clamping all four bounds so a mask that
+    partially or fully falls outside the canvas degrades gracefully
+    (dropped pixels) instead of raising."""
+    H, W = canvas_shape
+    h, w = local_mask.shape
+    r0, c0 = int(origin[0]), int(origin[1])
+    src_r0, src_r1 = max(0, -r0), min(h, H - r0)
+    src_c0, src_c1 = max(0, -c0), min(w, W - c0)
+    dst_r0, dst_r1 = max(0, r0), min(H, r0 + h)
+    dst_c0, dst_c1 = max(0, c0), min(W, c0 + w)
+    placed = np.zeros(canvas_shape, dtype=bool)
+    if src_r1 > src_r0 and src_c1 > src_c0:
+        placed[dst_r0:dst_r1, dst_c0:dst_c1] = local_mask[src_r0:src_r1, src_c0:src_c1]
+    return placed
 
 
 def _mark_overlapping_group_members(
     members_by_group: dict[int, list[int]],
     member_cache: dict[int, dict],
-) -> dict[int, str]:
-    """Flag coSWA group members whose own independently-computed assigned
-    segments spatially overlap.
+    group_overlap_meta: dict[int, dict],
+) -> tuple[dict[int, str], dict[int, float], dict[int, float]]:
+    """Flag coSWA group members whose own (independently detected) segments
+    overlap, and report per-member pixel/intensity overlap fractions
+    against the rest of the group.
 
-    Each member in `member_cache` was aligned + segmented fully
-    independently (own roles, own anchors, own window). This projects every
-    member's own assigned-segment mask into one common run's absolute
-    coordinates (the group representative's -- i.e. min(mz_rank) --
-    reference run, fixed once per group for consistency across all pairwise
-    comparisons) and flags pairs whose projected pixel sets intersect.
-    Overlapping members within a group are connected-component-grouped and
-    given a shared tag, mirroring the old `undistinguishable_group_id`
-    convention.
+    Every present member was aligned and segmented fully independently (own
+    window, own anchor -- see match_features_batch's main loop), so each
+    member's own mask lives in its own local coordinate frame. `member_cache
+    [m]` provides that local mask plus its `placement_origin` -- where it
+    lands in the group's shared, registration-only canvas
+    (`group_overlap_meta[gid]["target_shape"]`, built in the group pre-pass
+    purely for this placement, no watershed of its own). Masks are placed
+    into that canvas via `_place_mask_in_canvas` before any comparison, so
+    overlap testing is always apples-to-apples regardless of which run each
+    member calls its own reference.
+
+    Returns `(tags, pixel_fraction, intensity_fraction)`:
+      - `tags`: `{mz_rank: "{group_id}_{component_index}"}` for members in a
+        >=2-member overlapping connected component, where an edge between
+        two members requires their PLACED masks' intersection to exceed 50%
+        of EITHER member's own placed pixel count (OR direction) -- not just
+        any nonzero overlap. Absent means untagged; caller defaults to -1.
+      - `pixel_fraction`: `{mz_rank: float in [0, 1]}` for EVERY present
+        group member (not just tagged ones) -- what fraction of this
+        member's own placed pixels is also claimed by the union of every
+        OTHER present member's placed mask. Never gates the tag by itself
+        (only the pairwise >50% test above does); purely a continuous
+        diagnostic.
+      - `intensity_fraction`: same shape/semantics as `pixel_fraction`, but
+        over `group_overlap_meta[gid]["intensity_image"]` (the group's own
+        alignment-only consensus -- the one consistent intensity surface
+        available across independently-built, independently-scaled member
+        images) instead of a plain pixel count. Informational only -- never
+        used for flagging, since intensity isn't reliably comparable across
+        members built from different run subsets/scales.
     """
     tags: dict[int, str] = {}
+    pixel_fraction: dict[int, float] = {}
+    intensity_fraction: dict[int, float] = {}
     for gid, members in members_by_group.items():
         present = [m for m in members if m in member_cache]
         if len(present) < 2:
             continue
-        common_run = member_cache[min(present)]["reference_raw_file"]
-        projected: dict[int, set[tuple[int, int]]] = {}
-        for m in present:
-            stack = member_cache[m]["consensus_raw_files"]
-            if common_run not in stack:
-                continue  # shouldn't happen: every member's own stack spans all runs
-            projected[m] = _project_member_mask_to_common_run(
-                member_cache[m], common_run, stack.index(common_run)
+        meta = group_overlap_meta[gid]
+        canvas_shape = meta["target_shape"]
+        intensity_img = meta["intensity_image"]
+        masks: dict[int, np.ndarray] = {
+            m: _place_mask_in_canvas(
+                member_cache[m]["mask"], member_cache[m]["placement_origin"], canvas_shape
             )
-        adj: dict[int, set[int]] = {m: set() for m in projected}
-        keys = list(projected)
-        for i, m1 in enumerate(keys):
-            for m2 in keys[i + 1 :]:
-                if projected[m1] & projected[m2]:
+            for m in present
+        }
+
+        for m in present:
+            own = masks[m]
+            other = np.zeros_like(own)
+            for m2 in present:
+                if m2 != m:
+                    other |= masks[m2]
+            shared = own & other
+            own_px = int(own.sum())
+            pixel_fraction[m] = float(shared.sum()) / own_px if own_px > 0 else 0.0
+            own_intensity = float(intensity_img[own].sum()) if own_px > 0 else 0.0
+            intensity_fraction[m] = (
+                float(intensity_img[shared].sum()) / own_intensity
+                if own_intensity > 0
+                else 0.0
+            )
+
+        adj: dict[int, set[int]] = {m: set() for m in present}
+        for i, m1 in enumerate(present):
+            for m2 in present[i + 1 :]:
+                inter = masks[m1] & masks[m2]
+                if not np.any(inter):
+                    continue
+                n1, n2 = int(masks[m1].sum()), int(masks[m2].sum())
+                frac1 = float(inter.sum()) / n1 if n1 > 0 else 0.0
+                frac2 = float(inter.sum()) / n2 if n2 > 0 else 0.0
+                if frac1 > 0.5 or frac2 > 0.5:
                     adj[m1].add(m2)
                     adj[m2].add(m1)
         visited: set[int] = set()
         counter = 0
-        for m in keys:
+        for m in present:
             if m in visited:
                 continue
             comp: list[int] = []
@@ -2108,7 +2919,7 @@ def _mark_overlapping_group_members(
                 counter += 1
                 for mm in comp:
                     tags[mm] = tag
-    return tags
+    return tags, pixel_fraction, intensity_fraction
 
 
 def segment_consensus_from_aligned(
@@ -2185,6 +2996,76 @@ def _align_raw_images_with_shifts(
     return raw_aligned
 
 
+def _multi_scale_feature_columns(
+    multi_scale_alignments: dict[float, ConsensusAlignmentState] | None,
+    run_index: int,
+) -> dict[str, float]:
+    """shift_rt/shift_im/template_matching_score (+delta_*) at each extra
+    MATCH_FEATURES_KWARGS.broad_alignment.multi_scale_template_fracs scale, for
+    one run index -- shared by real targets and off-target decoys (which reuse
+    the real target's own per-run alignment at every scale, same as they
+    already do at the main scale). Empty dict (no columns added) when
+    multi_scale_alignments is empty/None -- the default, zero-cost case."""
+    cols: dict[str, float] = {}
+    for _frac, _state in (multi_scale_alignments or {}).items():
+        _tag = f"frac_{_frac}"
+        _shift = _state.shifts[run_index]
+        _score = _state.max_scores[run_index]
+        _free_shift = (
+            _state.free_shifts[run_index]
+            if run_index < len(_state.free_shifts)
+            else None
+        )
+        _free_score = (
+            _state.free_max_scores[run_index]
+            if run_index < len(_state.free_max_scores)
+            else None
+        )
+        cols[f"shift_rt_{_tag}"] = float(_shift[0])
+        cols[f"shift_im_{_tag}"] = float(_shift[1])
+        # See free_shift_rt/im's comment in _extract_feature_rows_for_label_ids
+        # -- compare_peak_properties' rt_shift_frac_<x>/im_shift_frac_<x> read
+        # from these, not shift_rt_frac_<x>/shift_im_frac_<x>.
+        cols[f"free_shift_rt_{_tag}"] = (
+            float(_free_shift[0]) if _free_shift is not None else float(_shift[0])
+        )
+        cols[f"free_shift_im_{_tag}"] = (
+            float(_free_shift[1]) if _free_shift is not None else float(_shift[1])
+        )
+        cols[f"template_matching_score_{_tag}"] = float(_score)
+        cols[f"delta_shift_rt_{_tag}"] = (
+            float(abs(_free_shift[0] - _shift[0])) if _free_shift is not None else 0.0
+        )
+        cols[f"delta_shift_im_{_tag}"] = (
+            float(abs(_free_shift[1] - _shift[1])) if _free_shift is not None else 0.0
+        )
+        cols[f"delta_template_matching_score_{_tag}"] = (
+            float(_free_score - _score) if _free_score is not None else 0.0
+        )
+    return cols
+
+
+def _multi_scale_consensus_columns(
+    multi_scale_alignments: dict[float, ConsensusAlignmentState] | None,
+) -> dict[str, float]:
+    """Sentinel multi-scale columns for the consensus row itself -- shift is
+    always (0, 0) and score always 1.0 against itself, at every scale, mirroring
+    the single-scale consensus row's own sentinel shift/template_matching_score
+    (see _extract_feature_rows_from_prealigned's consensus_pp call)."""
+    cols: dict[str, float] = {}
+    for _frac in multi_scale_alignments or {}:
+        _tag = f"frac_{_frac}"
+        cols[f"shift_rt_{_tag}"] = 0.0
+        cols[f"shift_im_{_tag}"] = 0.0
+        cols[f"free_shift_rt_{_tag}"] = 0.0
+        cols[f"free_shift_im_{_tag}"] = 0.0
+        cols[f"template_matching_score_{_tag}"] = 1.0
+        cols[f"delta_shift_rt_{_tag}"] = 0.0
+        cols[f"delta_shift_im_{_tag}"] = 0.0
+        cols[f"delta_template_matching_score_{_tag}"] = 0.0
+    return cols
+
+
 def _extract_feature_rows_for_label_ids(
     label_ids: list[int],
     label_image: np.ndarray,
@@ -2195,6 +3076,9 @@ def _extract_feature_rows_for_label_ids(
     shift: tuple[int, int],
     template_matching_score: float,
     snap_resolver: Callable[[int], tuple[int, int] | None],
+    free_shift: tuple[int, int] | None = None,
+    free_max_score: float | None = None,
+    multi_scale_columns: dict[str, float] | None = None,
 ) -> pd.DataFrame | None:
     # Pick the dominant label by area in label_image (deterministic across runs
     # sharing the same segmentation).
@@ -2218,7 +3102,38 @@ def _extract_feature_rows_for_label_ids(
     peak_properties["snap_im"] = int(snap_rc[1])
     peak_properties["shift_rt"] = int(shift[0])
     peak_properties["shift_im"] = int(shift[1])
+    # Unconstrained/free registration shift -- falls back to `shift` itself
+    # when free_shift is None (i.e. no forced rescore was in effect, so
+    # `shift` already IS the free result). compare_peak_properties' rt_shift/
+    # im_shift (and the multi-scale _frac_<x> versions) are computed from
+    # THIS, not shift_rt/shift_im directly: under a max_deviation=0 forced
+    # rescore, a decoy's `shift` is forced to its paired target's own already-
+    # resolved shift (see _build_consensus_peptide_swap_decoy's forced_shift
+    # arg), so shift_rt/shift_im collapse to the same value for target and
+    # decoy alike and carry zero discriminative signal there -- free_shift_rt/
+    # im is what each candidate's own image content actually best correlates
+    # against, unconstrained, and so still differs between target and decoy.
+    peak_properties["free_shift_rt"] = (
+        int(free_shift[0]) if free_shift is not None else int(shift[0])
+    )
+    peak_properties["free_shift_im"] = (
+        int(free_shift[1]) if free_shift is not None else int(shift[1])
+    )
     peak_properties["template_matching_score"] = float(template_matching_score)
+    # Only populated for a max_deviation=0 forced rescore (see
+    # _global_best_from_score_map) -- 0.0 sentinel elsewhere, same convention
+    # as the descriptor comparisons below for "not applicable".
+    peak_properties["delta_shift_rt"] = (
+        float(abs(free_shift[0] - shift[0])) if free_shift is not None else 0.0
+    )
+    peak_properties["delta_shift_im"] = (
+        float(abs(free_shift[1] - shift[1])) if free_shift is not None else 0.0
+    )
+    peak_properties["delta_template_matching_score"] = (
+        float(free_max_score - template_matching_score)
+        if free_max_score is not None
+        else 0.0
+    )
     peak_properties["sift_des"] = None
     peak_properties.at[0, "sift_des"] = get_sift_descriptor(
         denoised_image,
@@ -2240,8 +3155,85 @@ def _extract_feature_rows_for_label_ids(
     seg_bbox = denoised_image[_r0:_r1, _c0:_c1]
     peak_properties["zernike"] = None
     peak_properties.at[0, "zernike"] = get_roi_descriptor(seg_bbox)
+    # RT/IM intensity profiles within the imposed mask, for scale-invariant
+    # shape comparison across runs (Pearson correlation in compare_peak_properties
+    # is invariant to the per-run gain/offset that real abundance differences
+    # introduce, so no separate normalization is needed here).
+    _region_mask = merged_mask.astype(bool)
+    _masked_intensity = np.where(_region_mask, raw_image, 0.0)
+    _mask_rows = np.where(_region_mask.any(axis=1))[0]
+    _mask_cols = np.where(_region_mask.any(axis=0))[0]
+    peak_properties["rt_profile"] = None
+    peak_properties["im_profile"] = None
+    peak_properties.at[0, "rt_profile"] = _masked_intensity.sum(axis=1)[
+        _mask_rows.min() : _mask_rows.max() + 1
+    ]
+    peak_properties.at[0, "im_profile"] = _masked_intensity.sum(axis=0)[
+        _mask_cols.min() : _mask_cols.max() + 1
+    ]
     peak_properties["Run_name"] = run_name
+    for _col, _val in (multi_scale_columns or {}).items():
+        peak_properties[_col] = _val
     return peak_properties
+
+
+def _extract_feature_rows_from_prealigned(
+    alignment_state: ConsensusAlignmentState,
+    segmentation_state: ConsensusSegmentationState,
+    raw_aligned: list[np.ndarray],
+    raw_aligned_logged: list[np.ndarray],
+    raw_consensus: np.ndarray,
+    raw_consensus_logged_mean: np.ndarray,
+    labels: list[str] | None = None,
+    multi_scale_alignments: dict[float, ConsensusAlignmentState] | None = None,
+) -> tuple[pd.DataFrame | None, list[pd.DataFrame | None]]:
+    """Extract per-run and consensus peak-property rows from ALREADY aligned
+    images against segmentation_state's watershed labels.
+
+    Factored out of extract_peak_properties_from_consensus_labels so a
+    caller with already-registered data can go straight to extraction --
+    re-running the raw-image alignment step on already-aligned arrays would
+    double-apply registration.
+    """
+    individual_pps: list[pd.DataFrame | None] = [None] * len(raw_aligned)
+    consensus_pp: pd.DataFrame | None = None
+    if not segmentation_state.target_label_ids:
+        return consensus_pp, individual_pps
+    for i in range(len(raw_aligned)):
+        run_name = labels[i] if (labels is not None and i < len(labels)) else str(i)
+        individual_pps[i] = _extract_feature_rows_for_label_ids(
+            segmentation_state.target_label_ids,
+            segmentation_state.watershed_labels,
+            raw_aligned[i],
+            raw_aligned_logged[i],
+            run_name=run_name,
+            shift=alignment_state.shifts[i],
+            template_matching_score=alignment_state.max_scores[i],
+            free_shift=alignment_state.free_shifts[i]
+            if i < len(alignment_state.free_shifts)
+            else None,
+            free_max_score=alignment_state.free_max_scores[i]
+            if i < len(alignment_state.free_max_scores)
+            else None,
+            snap_resolver=lambda label_id, i=i: (
+                segmentation_state.snapped_per_anchor[i]
+                if segmentation_state.snapped_per_anchor[i] is not None
+                else segmentation_state.label_to_snap.get(label_id)
+            ),
+            multi_scale_columns=_multi_scale_feature_columns(multi_scale_alignments, i),
+        )
+    consensus_pp = _extract_feature_rows_for_label_ids(
+        segmentation_state.target_label_ids,
+        segmentation_state.watershed_labels,
+        raw_consensus,
+        raw_consensus_logged_mean,
+        run_name="consensus",
+        shift=(0, 0),
+        template_matching_score=1.0,
+        snap_resolver=lambda label_id: segmentation_state.label_to_snap.get(label_id),
+        multi_scale_columns=_multi_scale_consensus_columns(multi_scale_alignments),
+    )
+    return consensus_pp, individual_pps
 
 
 def extract_peak_properties_from_consensus_labels(
@@ -2250,6 +3242,8 @@ def extract_peak_properties_from_consensus_labels(
     *,
     raw_images: list[np.ndarray] | None = None,
     labels: list[str] | None = None,
+    log_transform_enabled: bool = True,
+    multi_scale_alignments: dict[float, ConsensusAlignmentState] | None = None,
 ) -> tuple[
     pd.DataFrame | None,
     list[pd.DataFrame | None],
@@ -2277,39 +3271,30 @@ def extract_peak_properties_from_consensus_labels(
         alignment_state.use_shift_crop_pad,
     )  # no raw denoise kwargs
 
+    # raw_consensus is the linear-space mean of aligned_images (see
+    # segment_consensus_from_aligned) -- log2(1+x) is applied here, once, AFTER
+    # averaging/alignment, to both sides identically: this is what keeps the
+    # consensus descriptor and each individual run's own descriptor comparable
+    # (both "linear value -> log once"), instead of averaging already-logged images.
     raw_consensus = segmentation_state.consensus  # with raw denoise kwargs
-    raw_aligned_logged = alignment_state.aligned_images
-    raw_consensus_logged_mean = raw_consensus
-    consensus_pp: pd.DataFrame | None = None
-    if segmentation_state.target_label_ids:
-        for i in range(len(raw_aligned)):
-            run_name = labels[i] if (labels is not None and i < len(labels)) else str(i)
-            individual_pps[i] = _extract_feature_rows_for_label_ids(
-                segmentation_state.target_label_ids,
-                segmentation_state.watershed_labels,
-                raw_aligned[i],
-                raw_aligned_logged[i],
-                run_name=run_name,
-                shift=alignment_state.shifts[i],
-                template_matching_score=alignment_state.max_scores[i],
-                snap_resolver=lambda label_id, i=i: (
-                    segmentation_state.snapped_per_anchor[i]
-                    if segmentation_state.snapped_per_anchor[i] is not None
-                    else segmentation_state.label_to_snap.get(label_id)
-                ),
-            )
-        consensus_pp = _extract_feature_rows_for_label_ids(
-            segmentation_state.target_label_ids,
-            segmentation_state.watershed_labels,
-            raw_consensus,
-            raw_consensus_logged_mean,
-            run_name="consensus",
-            shift=(0, 0),
-            template_matching_score=1.0,
-            snap_resolver=lambda label_id: segmentation_state.label_to_snap.get(
-                label_id
-            ),
-        )
+    raw_aligned_logged = (
+        [np.log2(1 + img) for img in alignment_state.aligned_images]
+        if log_transform_enabled
+        else list(alignment_state.aligned_images)
+    )
+    raw_consensus_logged_mean = (
+        np.log2(1 + raw_consensus) if log_transform_enabled else raw_consensus
+    )
+    consensus_pp, individual_pps = _extract_feature_rows_from_prealigned(
+        alignment_state,
+        segmentation_state,
+        raw_aligned,
+        raw_aligned_logged,
+        raw_consensus,
+        raw_consensus_logged_mean,
+        labels=labels,
+        multi_scale_alignments=multi_scale_alignments,
+    )
 
     return (
         consensus_pp,
@@ -2381,6 +3366,7 @@ def build_consensus_feature_bundle(
     jump_dist_thres: tuple[int, int] = (0, 0),
     consensus_image_indices: list[int] | None = None,
     align_images: bool = True,
+    align_in_log_space: bool = False,
     use_shift_crop_pad: bool = False,
     reuse_from: ConsensusFeatureBundle | None = None,
     collapse_to_single_label: bool = False,
@@ -2388,8 +3374,19 @@ def build_consensus_feature_bundle(
     precomputed_states: (
         tuple[ConsensusAlignmentState, ConsensusSegmentationState] | None
     ) = None,
+    forced_shifts: list[tuple[int, int] | None] | None = None,
+    broad_alignment_max_deviation: int | None = None,
+    multi_scale_template_fracs: list[float] | None = None,
 ) -> ConsensusFeatureBundle:
     """Build alignment, segmentation, and feature tables for consensus scoring.
+
+    `forced_shifts`/`broad_alignment_max_deviation` are passed straight
+    through to align_images_to_reference (see its docstring) and are only
+    consulted when `reuse_from` and `precomputed_states` are both None --
+    both of those branches copy an already-resolved alignment (forced or
+    discovered) from elsewhere instead of discovering one here, so a coSWA
+    confounder-group member automatically inherits whatever shift its group
+    representative got.
 
     If reuse_from is given (a bundle already built for another candidate that
     shares identical per-run raw images -- a coSWA confounder-group
@@ -2425,11 +3422,12 @@ def build_consensus_feature_bundle(
             f"(got {len(labels)}, expected {_n_runs})."
         )
     _denoise_cfg = denoise_cfg or {}
-    _consensus_denoise_kwargs = _denoise_kwargs_for_stage(_denoise_cfg, "consensus")
-    _full_denoise_kwargs = _denoise_kwargs_all(_denoise_cfg)
-    _post_align_log_transform = bool(
-        _denoise_kwargs_for_stage(_denoise_cfg, "aligned").get("log_transform", False)
-    )
+    _log_enabled = _log_transform_enabled(_denoise_cfg)
+    _consensus_denoise_kwargs = {
+        **_denoise_kwargs_for_stage(_denoise_cfg, "consensus"),
+        "log_transform": _log_enabled,
+    }
+    _multi_scale_alignments: dict[float, ConsensusAlignmentState] = {}
     if precomputed_states is not None:
         alignment_state, segmentation_state = precomputed_states
     elif reuse_from is None:
@@ -2442,9 +3440,30 @@ def build_consensus_feature_bundle(
             anchors=anchors,
             additional_anchors=additional_anchors,
             align_images=align_images,
-            post_align_log_transform=_post_align_log_transform,
+            align_in_log_space=align_in_log_space,
             use_shift_crop_pad=use_shift_crop_pad,
+            forced_shifts=forced_shifts,
+            broad_alignment_max_deviation=broad_alignment_max_deviation,
         )
+        # Extra-scale alignments (see MATCH_FEATURES_KWARGS.broad_alignment.
+        # multi_scale_template_fracs): only the shift-search substep is
+        # repeated per extra scale -- segmentation/consensus averaging below
+        # still runs exactly once, off the main-scale alignment_state.
+        for _frac in multi_scale_template_fracs or []:
+            _multi_scale_alignments[_frac] = align_images_to_reference(
+                images=images,
+                reference_idx=reference_idx,
+                target_shape=target_shape,
+                template_anchor=template_anchor,
+                template_frac=_frac,
+                anchors=anchors,
+                additional_anchors=additional_anchors,
+                align_images=align_images,
+                align_in_log_space=align_in_log_space,
+                use_shift_crop_pad=use_shift_crop_pad,
+                forced_shifts=forced_shifts,
+                broad_alignment_max_deviation=broad_alignment_max_deviation,
+            )
         segmentation_state = segment_consensus_from_aligned(
             alignment_state,
             denoise_kwargs=_consensus_denoise_kwargs,
@@ -2483,6 +3502,8 @@ def build_consensus_feature_bundle(
         segmentation_state,
         raw_images=raw_images,
         labels=labels,
+        log_transform_enabled=_log_enabled,
+        multi_scale_alignments=_multi_scale_alignments,
     )
     return ConsensusFeatureBundle(
         alignment=alignment_state,
@@ -2493,6 +3514,7 @@ def build_consensus_feature_bundle(
         raw_aligned_denoised_images=raw_aligned_denoised,
         raw_consensus=raw_consensus,
         raw_consensus_denoised=raw_consensus_denoised,
+        multi_scale_alignments=_multi_scale_alignments,
     )
 
 
@@ -2572,18 +3594,34 @@ def _visualize_consensus_bundle(
     aligned_images: list[np.ndarray] | None = None,
     consensus: np.ndarray | None = None,
     consensus_denoised: np.ndarray | None = None,
+    log_transform_display: bool = False,
 ) -> None:
-    """Visualize aligned images plus consensus panels for targets or decoys."""
+    """Visualize aligned images plus consensus panels for targets or decoys.
+
+    `aligned_images`/`consensus` are always linear-space (see
+    align_images_to_reference / segment_consensus_from_aligned); `log_transform_display`
+    applies log2(1+x) to them for plotting only, for contrast on the same footing as
+    `consensus_denoised`, which already went through MATCH_FEATURES_KWARGS.denoise.
+    log_transform if that's enabled -- purely cosmetic, does not affect any feature.
+    """
 
     import math
     import matplotlib.lines as mlines
     import matplotlib.patches as mpatches
     import matplotlib.pyplot as plt
 
-    display_aligned = (
-        alignment_state.aligned_images if aligned_images is None else aligned_images
+    def _maybe_log(img: np.ndarray) -> np.ndarray:
+        return np.log2(1 + img) if log_transform_display else img
+
+    display_aligned = [
+        _maybe_log(img)
+        for img in (
+            alignment_state.aligned_images if aligned_images is None else aligned_images
+        )
+    ]
+    display_consensus = _maybe_log(
+        segmentation_state.consensus if consensus is None else consensus
     )
-    display_consensus = segmentation_state.consensus if consensus is None else consensus
     display_consensus_denoised = (
         segmentation_state.consensus_denoised
         if consensus_denoised is None
@@ -2865,7 +3903,7 @@ def _save_illustration_svgs(
     filename_prefix: str = "",
     segmentation_override: "ConsensusSegmentationState | None" = None,
     skip_per_run: bool = False,
-    log_transform_raw: bool = False,
+    log_transform_display: bool = False,
 ) -> None:
     """Save individual clean SVG images for one peptide: raw, aligned, consensus, watershed.
 
@@ -2875,8 +3913,11 @@ def _save_illustration_svgs(
     segmentation_override: if provided, use instead of bundle.segmentation for consensus panels.
     skip_per_run: if True, skip per-run raw/aligned panels (useful for off-target decoys where
                   per-run images are identical to the target).
-    log_transform_raw: if True, plot the per-run raw panel as log2(1 + x) instead of the raw
-                        linear intensity scale.
+    log_transform_display: if True, plot the raw/aligned/consensus panels as log2(1 + x)
+                            instead of their native linear intensity scale. Purely cosmetic
+                            (consensus_denoised already reflects
+                            MATCH_FEATURES_KWARGS.denoise.log_transform if that's enabled, so
+                            it is not affected by this flag).
     """
     import matplotlib.pyplot as plt
 
@@ -2920,13 +3961,18 @@ def _save_illustration_svgs(
             max(img.max() for img in imgs)
         )
 
-    def _maybe_log_raw(img: np.ndarray) -> np.ndarray:
-        return np.log2(1 + img) if log_transform_raw else img
+    def _maybe_log(img: np.ndarray) -> np.ndarray:
+        return np.log2(1 + img) if log_transform_display else img
 
-    # raw and denoised-aligned images live on different intensity scales — keep
-    # them separate so neither set looks empty next to the other
-    raw_vmin, raw_vmax = _range([_maybe_log_raw(img) for img in (raw_images or [])])
-    aligned_vmin, aligned_vmax = _range(aligned_imgs)
+    # raw, aligned, and consensus are all linear-space (see align_images_to_reference /
+    # segment_consensus_from_aligned) -- one shared range keeps them comparable.
+    _shared_vmin, _shared_vmax = _range(
+        [_maybe_log(img) for img in (raw_images or [])]
+        + [_maybe_log(img) for img in aligned_imgs]
+        + [_maybe_log(seg.consensus)]
+    )
+    raw_vmin, raw_vmax = _shared_vmin, _shared_vmax
+    aligned_vmin, aligned_vmax = _shared_vmin, _shared_vmax
 
     # anchor colour map — same indexing as _visualize_consensus_bundle
     non_none_indices = seg.non_none_indices
@@ -3012,18 +4058,18 @@ def _save_illustration_svgs(
             safe = _sanitize(label)
             if raw_images is not None and i < len(raw_images):
                 fig, ax = _make_ax(
-                    _maybe_log_raw(raw_images[i]), vmin=raw_vmin, vmax=raw_vmax
+                    _maybe_log(raw_images[i]), vmin=raw_vmin, vmax=raw_vmax
                 )
                 _overlay_run_anchor(ax, i, aligned=False)
                 _save_fig(fig, f"mz{pept_idx}_raw_{i:02d}_{safe}.svg")
             if i < len(aligned_imgs):
                 fig, ax = _make_ax(
-                    aligned_imgs[i], vmin=aligned_vmin, vmax=aligned_vmax
+                    _maybe_log(aligned_imgs[i]), vmin=aligned_vmin, vmax=aligned_vmax
                 )
                 _overlay_run_anchor(ax, i, aligned=True)
                 _save_fig(fig, f"mz{pept_idx}_aligned_{i:02d}_{safe}.svg")
 
-    fig, ax = _make_ax(seg.consensus, vmin=aligned_vmin, vmax=aligned_vmax)
+    fig, ax = _make_ax(_maybe_log(seg.consensus), vmin=aligned_vmin, vmax=aligned_vmax)
     _overlay_consensus_anchors(ax)
     _save_fig(fig, f"mz{pept_idx}_consensus.svg")
 
@@ -3143,41 +4189,165 @@ def _choose_off_target_shift(
     return None
 
 
+def _peptide_swap_decoy_multi_scale_columns(
+    decoy_denoised: np.ndarray,
+    multi_scale_alignments: dict[float, ConsensusAlignmentState] | None,
+    multi_scale_forced_shifts: dict[float, tuple[int, int] | None] | None,
+    max_deviation: int | None,
+) -> dict[str, float]:
+    """Same output shape as _multi_scale_feature_columns, but for a
+    peptide-swap decoy: re-searches the decoy's own (wrong-peptide) denoised
+    image against each extra-scale target's already-built template, mirroring
+    _build_consensus_peptide_swap_decoy's own shift-finding (minus the
+    raw-image alignment + peak-property extraction, not needed for these
+    summary columns alone) -- so the decoy gets a genuine
+    template_matching_score of its own at every scale too, same reasoning as
+    the main-scale search (see _build_consensus_peptide_swap_decoy docstring)."""
+    cols: dict[str, float] = {}
+    for _frac, _state in (multi_scale_alignments or {}).items():
+        _forced_shift = (multi_scale_forced_shifts or {}).get(_frac)
+        _max_deviation = (
+            (max_deviation if max_deviation is not None else 0)
+            if _forced_shift is not None
+            else None
+        )
+        _target_shape = _state.target_shape
+        _align_in_log_space = _state.align_in_log_space
+        if _state.use_shift_crop_pad:
+            _search_image = (
+                np.log2(1 + decoy_denoised) if _align_in_log_space else decoy_denoised
+            )
+            _shift, _score, _match_score_map, _ = _find_shift_native_image(
+                _search_image,
+                _state.template,
+                _state.template_bounds,
+                search_center=_forced_shift,
+                max_deviation=_max_deviation,
+            )
+        else:
+            _decoy_resized = _resize_image_to_shape(decoy_denoised, _target_shape)
+            _search_image = (
+                np.log2(1 + _decoy_resized) if _align_in_log_space else _decoy_resized
+            )
+            (_, _, _, _shift, _score, _match_score_map, _) = (
+                _align_resized_image_to_template(
+                    _decoy_resized,
+                    _state.template,
+                    _state.template_bounds,
+                    None,
+                    search_center=_forced_shift,
+                    max_deviation=_max_deviation,
+                    search_image=_search_image,
+                )
+            )
+        if _forced_shift is not None and _max_deviation == 0:
+            _free_shift, _free_score = _global_best_from_score_map(
+                _match_score_map, _state.template_bounds
+            )
+        else:
+            _free_shift, _free_score = None, None
+        _tag = f"frac_{_frac}"
+        cols[f"shift_rt_{_tag}"] = float(_shift[0])
+        cols[f"shift_im_{_tag}"] = float(_shift[1])
+        cols[f"free_shift_rt_{_tag}"] = (
+            float(_free_shift[0]) if _free_shift is not None else float(_shift[0])
+        )
+        cols[f"free_shift_im_{_tag}"] = (
+            float(_free_shift[1]) if _free_shift is not None else float(_shift[1])
+        )
+        cols[f"template_matching_score_{_tag}"] = float(_score)
+        cols[f"delta_shift_rt_{_tag}"] = (
+            float(abs(_free_shift[0] - _shift[0])) if _free_shift is not None else 0.0
+        )
+        cols[f"delta_shift_im_{_tag}"] = (
+            float(abs(_free_shift[1] - _shift[1])) if _free_shift is not None else 0.0
+        )
+        cols[f"delta_template_matching_score_{_tag}"] = (
+            float(_free_score - _score) if _free_score is not None else 0.0
+        )
+    return cols
+
+
 def _build_consensus_peptide_swap_decoy(
     bundle: ConsensusFeatureBundle,
     decoy_raw_image: np.ndarray,
     run_name: str,
     raw_denoise_kwargs: dict | None = None,
+    log_transform_enabled: bool = True,
+    forced_shift: tuple[int, int] | None = None,
+    max_deviation: int | None = None,
+    multi_scale_forced_shifts: dict[float, tuple[int, int] | None] | None = None,
 ) -> tuple[pd.DataFrame | None, tuple[int, int], float]:
-    """Align a wrong same-run peptide image and score it under target consensus labels."""
+    """Align a wrong same-run peptide image and score it under target consensus labels.
 
-    decoy_raw_logged = smooth_and_denoise_image(
+    `forced_shift`/`max_deviation`, if given, restrict template-match
+    discovery on the decoy's own (wrong-peptide) image content to a small
+    window around the real target's already-resolved shift for this run
+    (rather than an unconstrained search) -- used when broad_alignment is
+    enabled, so the decoy gets a genuine template_matching_score of its own
+    (needed for valid target-decoy competition in Percolator) while staying
+    anchored near the same registered coordinate frame as the target it's
+    compared against.
+
+    `bundle.alignment.template` lives in whatever search space that alignment used
+    (`bundle.alignment.align_in_log_space`); the decoy's own denoised image is put
+    through the same transform, purely for shift-finding, mirroring
+    align_images_to_reference. The descriptor image handed to
+    _extract_feature_rows_for_label_ids is always "linear denoised, aligned, then
+    log2(1+x) once if log_transform_enabled" -- same recipe as real targets and the
+    consensus, so decoys stay comparable to the target they compete against.
+    """
+
+    decoy_denoised = smooth_and_denoise_image(
         decoy_raw_image, **(raw_denoise_kwargs or {})
     )
     target_shape = bundle.alignment.target_shape
+    _align_in_log_space = bundle.alignment.align_in_log_space
+    # A forced_shift with no explicit max_deviation defaults to an exact
+    # rescore (deviation 0), same convention as align_images_to_reference.
+    _max_deviation = (
+        (max_deviation if max_deviation is not None else 0)
+        if forced_shift is not None
+        else None
+    )
     if bundle.alignment.use_shift_crop_pad:
-        shift, max_score, _match_score_map, _match_score_peak = (
+        _search_image = (
+            np.log2(1 + decoy_denoised) if _align_in_log_space else decoy_denoised
+        )
+        shift, max_score, match_score_map, _match_score_peak = (
             _find_shift_native_image(
-                decoy_raw_logged, bundle.alignment.template, bundle.alignment.template_bounds
+                _search_image,
+                bundle.alignment.template,
+                bundle.alignment.template_bounds,
+                search_center=forced_shift,
+                max_deviation=_max_deviation,
             )
         )
-        decoy_raw_logged_resized = _shift_and_fit(decoy_raw_logged, target_shape, shift)
+        decoy_denoised_aligned = _shift_and_fit(decoy_denoised, target_shape, shift)
         decoy_raw_aligned = _shift_and_fit(decoy_raw_image, target_shape, shift)
     else:
-        decoy_raw_logged_resized = _resize_image_to_shape(decoy_raw_logged, target_shape)
+        decoy_denoised_resized = _resize_image_to_shape(decoy_denoised, target_shape)
+        _search_image = (
+            np.log2(1 + decoy_denoised_resized)
+            if _align_in_log_space
+            else decoy_denoised_resized
+        )
         (
-            _aligned_denoised,
+            decoy_denoised_aligned,
             _matched_box,
             _aligned_anchor,
             shift,
             max_score,
-            _match_score_map,
+            match_score_map,
             _match_score_peak,
         ) = _align_resized_image_to_template(
-            decoy_raw_logged_resized,
+            decoy_denoised_resized,
             bundle.alignment.template,
             bundle.alignment.template_bounds,
             None,
+            search_center=forced_shift,
+            max_deviation=_max_deviation,
+            search_image=_search_image,
         )
         decoy_raw_resized = _resize_image_to_shape(decoy_raw_image, target_shape)
         from scipy.ndimage import shift as nd_shift
@@ -3186,15 +4356,35 @@ def _build_consensus_peptide_swap_decoy(
             decoy_raw_resized, shift=shift, mode="constant", cval=0.0
         )
 
+    if forced_shift is not None and _max_deviation == 0:
+        free_shift, free_max_score = _global_best_from_score_map(
+            match_score_map, bundle.alignment.template_bounds
+        )
+    else:
+        free_shift, free_max_score = None, None
+
+    decoy_descriptor_image = (
+        np.log2(1 + decoy_denoised_aligned)
+        if log_transform_enabled
+        else decoy_denoised_aligned
+    )
     decoy_pp = _extract_feature_rows_for_label_ids(
         bundle.segmentation.target_label_ids,
         bundle.segmentation.watershed_labels,
         decoy_raw_aligned,
-        decoy_raw_logged_resized,
+        decoy_descriptor_image,
         run_name=run_name,
         shift=shift,
         template_matching_score=max_score,
+        free_shift=free_shift,
+        free_max_score=free_max_score,
         snap_resolver=lambda label_id: bundle.segmentation.label_to_snap.get(label_id),
+        multi_scale_columns=_peptide_swap_decoy_multi_scale_columns(
+            decoy_denoised,
+            bundle.multi_scale_alignments,
+            multi_scale_forced_shifts,
+            max_deviation,
+        ),
     )
     return decoy_pp, shift, max_score
 
@@ -3236,6 +4426,12 @@ def _build_consensus_off_target_decoy(
         run_name=run_name,
         shift=bundle.alignment.shifts[run_index],
         template_matching_score=bundle.alignment.max_scores[run_index],
+        free_shift=bundle.alignment.free_shifts[run_index]
+        if run_index < len(bundle.alignment.free_shifts)
+        else None,
+        free_max_score=bundle.alignment.free_max_scores[run_index]
+        if run_index < len(bundle.alignment.free_max_scores)
+        else None,
         snap_resolver=lambda label_id: _resolve_shifted_label_snap(
             shifted_labels,
             label_id,
@@ -3249,6 +4445,13 @@ def _build_consensus_off_target_decoy(
                     + resolved_label_shift[1]
                 ),
             ),
+        ),
+        # Off-target decoys quantify the SAME run image (just against a
+        # deliberately shifted label mask), so their multi-scale shift/score
+        # are identical to the real target's own at that run index -- same
+        # reuse pattern as the main-scale shift/template_matching_score above.
+        multi_scale_columns=_multi_scale_feature_columns(
+            bundle.multi_scale_alignments, run_index
         ),
     )
     return decoy_pp, resolved_label_shift
@@ -3270,7 +4473,9 @@ def generate_consensus_image(
     filename: str = "consensus_image.png",
     apply_seg: bool = True,
     seg_mask_thres: tuple[int, int] = (3, 3),
+    align_in_log_space: bool = False,
     use_shift_crop_pad: bool = False,
+    log_transform_display: bool = False,
 ) -> tuple[
     np.ndarray,
     list[np.ndarray],
@@ -3343,6 +4548,7 @@ def generate_consensus_image(
         raw_images=raw_images,
         apply_seg=apply_seg,
         seg_mask_thres=seg_mask_thres,
+        align_in_log_space=align_in_log_space,
         use_shift_crop_pad=use_shift_crop_pad,
     )
     alignment = bundle.alignment
@@ -3372,6 +4578,7 @@ def generate_consensus_image(
             fig_dir=fig_dir,
             filename=filename,
             labels=labels,
+            log_transform_display=log_transform_display,
         )
 
     return (

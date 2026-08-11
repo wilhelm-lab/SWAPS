@@ -2252,11 +2252,12 @@ def plot_intensity_correlation_by_match_type(
 
     fig, ax = plt.subplots(figsize=(max(8, n * 1.5 + 2), 5), constrained_layout=True)
 
-    def _draw_bars(x_pos, corrs, color, hatch, label):
+    def _draw_bars(x_pos, corrs, counts, color, hatch, label):
         means = [np.mean(corrs[c]) if corrs[c] else np.nan for c in conditions]
         stds = [
             np.std(corrs[c], ddof=1) if len(corrs[c]) > 1 else 0.0 for c in conditions
         ]
+        avg_ns = [np.mean(counts[c]) if counts[c] else np.nan for c in conditions]
         bar_containers = ax.bar(
             x_pos,
             means,
@@ -2269,25 +2270,26 @@ def plot_intensity_correlation_by_match_type(
             error_kw={"elinewidth": 1.2, "capthick": 1.2},
             label=label,
         )
-        for bar, m in zip(bar_containers, means):
+        for bar, m, s, avg_n in zip(bar_containers, means, stds, avg_ns):
             if not np.isnan(m):
+                n_label = f"n≈{avg_n:,.0f}" if not np.isnan(avg_n) else "n=NA"
                 ax.text(
                     bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 0.005,
-                    f"{m:.3f}",
+                    bar.get_height() + s + 0.005,
+                    f"{m:.3f}\n{n_label}",
                     ha="center",
                     va="bottom",
                     fontsize=7,
                 )
 
-    _draw_bars(x_iq, corrs_iq, iq_color, hatch=None, label="IonQuant")
-    _draw_bars(x_sw, corrs_sw, sw_color, hatch=None, label="SWAPS")
+    _draw_bars(x_iq, corrs_iq, counts_iq, iq_color, hatch=None, label="IonQuant")
+    _draw_bars(x_sw, corrs_sw, counts_sw, sw_color, hatch=None, label="SWAPS")
 
     ax.set_xticks(x_centers)
     ax.set_xticklabels(conditions, rotation=20, ha="right")
     ax.set_xlabel("Match Type Combination")
     ax.set_ylabel("Pearson r  (log₂ intensity)")
-    ax.set_ylim(bottom=0)
+    ax.set_ylim(bottom=0, top=ax.get_ylim()[1] + 0.12)
     ax.set_title(
         f"Pairwise Intensity Correlation by Match Type{' (' + fig_name_suffix.strip('_') + ')' if fig_name_suffix else ''}"
     )
