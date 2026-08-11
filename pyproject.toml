@@ -49,6 +49,7 @@ mahotas = "^1.4.18"
 
 [tool.poetry.scripts]
 sbs_runner_ims = "sbs_runner_ims:main"
+rescore_msms_trusted_ims = "rescore_msms_trusted_ims:main"
 
 [build-system]
 requires = ["poetry-core"]

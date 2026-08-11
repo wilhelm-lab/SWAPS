@@ -3,6 +3,8 @@ Unit tests for postprocessing.rescore:
   - normalize_shift_by_runs
   - combine_matches_target_decoy
   - brew_with_percolator
+  - select_trusted_training_rows
+  - brew_trusted_target_model
 """
 
 import numpy as np
@@ -15,6 +17,8 @@ from postprocessing.rescore import (
     normalize_shift_by_runs,
     brew_with_percolator,
     split_pp_by_match_status,
+    select_trusted_training_rows,
+    brew_trusted_target_model,
 )
 
 
@@ -354,3 +358,330 @@ class TestBrewWithPercolator:
                 work_dir=str(tmp_path),
             )
         assert (tmp_path / "percolator_input.tsv").exists()
+
+
+# ---------------------------------------------------------------------------
+# select_trusted_training_rows / brew_trusted_target_model
+# ---------------------------------------------------------------------------
+
+
+def _make_tdc_rows(n, is_target, feature_mean, seed):
+    """tdc_df-shaped rows: mz_rank/matched_run/IsTarget/Decoy/Sequence/
+    Proteins/feature_instance_id/sequence_variant/Sequence_with_runs/feat1/
+    feat2, mirroring combine_matches_target_decoy's output schema."""
+    rng = np.random.default_rng(seed)
+    variant = "target_0" if is_target else "decoy_0"
+    return pd.DataFrame(
+        {
+            "matched_run": ["run_A"] * n,
+            "IsTarget": is_target,
+            "Decoy": not is_target,
+            "Sequence": [f"PEP{seed}_{i}K" for i in range(n)],
+            "Proteins": [f"PROT{seed}_{i}" for i in range(n)],
+            "feature_instance_id": [f"{seed}_{i}" for i in range(n)],
+            "sequence_variant": variant,
+            "Sequence_with_runs": [
+                f"PEP{seed}_{i}K_run_A_{seed}_{i}_{variant}" for i in range(n)
+            ],
+            "feat1": rng.normal(feature_mean, 1.0, n),
+            "feat2": rng.normal(feature_mean, 1.0, n),
+        }
+    )
+
+
+@pytest.fixture
+def trusted_training_tdc_df():
+    """40 MS/MS-confirmed targets (well-separated), 60 Not_Match targets
+    (indistinguishable from decoys), 80 decoys — all in run_A, unique
+    mz_rank per row."""
+    msms_targets = _make_tdc_rows(40, True, 2.0, seed=1)
+    msms_targets["mz_rank"] = np.arange(1000, 1040)
+    notmatch_targets = _make_tdc_rows(60, True, 0.0, seed=2)
+    notmatch_targets["mz_rank"] = np.arange(2000, 2060)
+    decoys = _make_tdc_rows(80, False, 0.0, seed=3)
+    decoys["mz_rank"] = np.arange(3000, 3080)
+    return pd.concat([msms_targets, notmatch_targets, decoys], ignore_index=True)
+
+
+@pytest.fixture
+def trusted_training_dict_ref(trusted_training_tdc_df):
+    """dict_ref labelling mz_rank 1000-1039 Reference, everything else Not_Match."""
+    mz_ranks = trusted_training_tdc_df["mz_rank"].unique()
+    status = np.where((mz_ranks >= 1000) & (mz_ranks < 1040), "Reference", "Not_Match")
+    return pd.DataFrame({"mz_rank": mz_ranks, "run_A": status})
+
+
+class TestSelectTrustedTrainingRows:
+    def test_only_msms_targets_selected(
+        self, trusted_training_tdc_df, trusted_training_dict_ref
+    ):
+        train_df = select_trusted_training_rows(
+            trusted_training_tdc_df, trusted_training_dict_ref, rng=0
+        )
+        target_rows = train_df.loc[train_df["IsTarget"]]
+        assert set(target_rows["mz_rank"]) == set(range(1000, 1040))
+
+    def test_decoy_count_matches_ratio(
+        self, trusted_training_tdc_df, trusted_training_dict_ref
+    ):
+        train_df = select_trusted_training_rows(
+            trusted_training_tdc_df,
+            trusted_training_dict_ref,
+            decoy_target_ratio=0.5,
+            rng=0,
+        )
+        n_targets = train_df["IsTarget"].sum()
+        n_decoys = (~train_df["IsTarget"]).sum()
+        assert n_targets == 40
+        assert n_decoys == 20
+
+    def test_falls_back_to_all_decoys_when_pool_too_small(
+        self, trusted_training_tdc_df, trusted_training_dict_ref
+    ):
+        train_df = select_trusted_training_rows(
+            trusted_training_tdc_df,
+            trusted_training_dict_ref,
+            decoy_target_ratio=10.0,  # would need 400 decoys, only 80 exist
+            rng=0,
+        )
+        assert (~train_df["IsTarget"]).sum() == 80
+
+    def test_raises_without_msms_targets(self, trusted_training_tdc_df):
+        dict_ref_no_msms = pd.DataFrame(
+            {
+                "mz_rank": trusted_training_tdc_df["mz_rank"].unique(),
+                "run_A": "Not_Match",
+            }
+        )
+        with pytest.raises(ValueError):
+            select_trusted_training_rows(
+                trusted_training_tdc_df, dict_ref_no_msms, rng=0
+            )
+
+    def test_seed_is_reproducible(
+        self, trusted_training_tdc_df, trusted_training_dict_ref
+    ):
+        train_df_1 = select_trusted_training_rows(
+            trusted_training_tdc_df, trusted_training_dict_ref, rng=42
+        )
+        train_df_2 = select_trusted_training_rows(
+            trusted_training_tdc_df, trusted_training_dict_ref, rng=42
+        )
+        assert set(train_df_1["mz_rank"]) == set(train_df_2["mz_rank"])
+
+
+class TestBrewTrustedTargetModel:
+    @pytest.mark.parametrize("model_type", ["percolator", "supervised"])
+    def test_scores_full_population(
+        self, trusted_training_tdc_df, trusted_training_dict_ref, model_type, tmp_path
+    ):
+        train_df = select_trusted_training_rows(
+            trusted_training_tdc_df, trusted_training_dict_ref, rng=0
+        )
+        targets_scored, full_scored, model = brew_trusted_target_model(
+            train_df,
+            trusted_training_tdc_df,
+            feature_cols=["feat1", "feat2"],
+            model_type=model_type,
+            train_fdr=0.1,
+            work_dir=str(tmp_path / model_type),
+        )
+        assert len(full_scored) == len(trusted_training_tdc_df)
+        assert {"score", "q-value"}.issubset(full_scored.columns)
+        assert targets_scored["label"].all()
+        assert set(targets_scored["mz_rank"]) == set(
+            trusted_training_tdc_df.loc[
+                trusted_training_tdc_df["IsTarget"], "mz_rank"
+            ]
+        )
+
+    @pytest.mark.parametrize("model_type", ["percolator", "supervised"])
+    def test_msms_targets_score_above_decoys(
+        self, trusted_training_tdc_df, trusted_training_dict_ref, model_type, tmp_path
+    ):
+        """Sanity check the model learned something: the well-separated
+        MS/MS-confirmed targets should score higher on average than decoys."""
+        train_df = select_trusted_training_rows(
+            trusted_training_tdc_df, trusted_training_dict_ref, rng=0
+        )
+        _, full_scored, _ = brew_trusted_target_model(
+            train_df,
+            trusted_training_tdc_df,
+            feature_cols=["feat1", "feat2"],
+            model_type=model_type,
+            train_fdr=0.1,
+            work_dir=str(tmp_path / model_type),
+        )
+        msms_scores = full_scored.loc[
+            full_scored["scannr"].isin(range(1000, 1040)), "score"
+        ]
+        decoy_scores = full_scored.loc[~full_scored["label"], "score"]
+        assert msms_scores.mean() > decoy_scores.mean()
+
+    @pytest.mark.parametrize("model_type", ["percolator", "supervised"])
+    def test_weights_file_written(
+        self, trusted_training_tdc_df, trusted_training_dict_ref, model_type, tmp_path
+    ):
+        train_df = select_trusted_training_rows(
+            trusted_training_tdc_df, trusted_training_dict_ref, rng=0
+        )
+        work_dir = tmp_path / model_type
+        brew_trusted_target_model(
+            train_df,
+            trusted_training_tdc_df,
+            feature_cols=["feat1", "feat2"],
+            model_type=model_type,
+            train_fdr=0.1,
+            work_dir=str(work_dir),
+        )
+        assert (work_dir / f"mokapot_trusted_{model_type}_weights.txt").exists()
+
+    @pytest.mark.parametrize("model_type", ["percolator", "supervised"])
+    def test_psms_tsv_is_percolator_compatible(
+        self, trusted_training_tdc_df, trusted_training_dict_ref, model_type, tmp_path
+    ):
+        """mokapot_trusted_<model_type>_psms.tsv must carry the same columns
+        FDR_benchmark_with_HeLa_HYE.build_filtered_combined_ions reads from
+        percolator_psms.tsv (PSMId/score/q-value/filename), and PSMId's
+        leading "<mz_rank>_" must round-trip back to the real mz_rank."""
+        train_df = select_trusted_training_rows(
+            trusted_training_tdc_df, trusted_training_dict_ref, rng=0
+        )
+        work_dir = tmp_path / model_type
+        targets_scored, _, _ = brew_trusted_target_model(
+            train_df,
+            trusted_training_tdc_df,
+            feature_cols=["feat1", "feat2"],
+            model_type=model_type,
+            train_fdr=0.1,
+            work_dir=str(work_dir),
+        )
+        psms_path = work_dir / f"mokapot_trusted_{model_type}_psms.tsv"
+        assert psms_path.exists()
+        psms_tsv = pd.read_csv(psms_path, sep="\t")
+        assert {"PSMId", "score", "q-value", "peptide", "proteinIds", "filename"}.issubset(
+            psms_tsv.columns
+        )
+        assert len(psms_tsv) == len(targets_scored)
+        recovered_mz_rank = psms_tsv["PSMId"].str.split("_").str[0].astype(int)
+        assert set(recovered_mz_rank) == set(targets_scored["mz_rank"])
+
+    def test_invalid_model_type_raises(
+        self, trusted_training_tdc_df, trusted_training_dict_ref, tmp_path
+    ):
+        train_df = select_trusted_training_rows(
+            trusted_training_tdc_df, trusted_training_dict_ref, rng=0
+        )
+        with pytest.raises(ValueError):
+            brew_trusted_target_model(
+                train_df,
+                trusted_training_tdc_df,
+                feature_cols=["feat1", "feat2"],
+                model_type="not_a_real_model_type",
+                work_dir=str(tmp_path),
+            )
+
+
+# ---------------------------------------------------------------------------
+# brew_trusted_target_model -- target-decoy competition (paired target/decoy
+# sharing an (mz_rank, matched_run) slot)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def tdc_df_with_paired_slots():
+    """Trusted-training pool (40 well-separated MS/MS targets + matching
+    decoys, disjoint mz_ranks -- same shape as trusted_training_tdc_df) plus
+    two special Not_Match slots where a target and its own decoy share
+    (mz_rank, matched_run):
+      - mz_rank 500: decoy outscores its target -> target must be dropped.
+      - mz_rank 600: target outscores its decoy -> target must survive.
+    """
+    msms_targets = _make_tdc_rows(40, True, 2.0, seed=1)
+    msms_targets["mz_rank"] = np.arange(1000, 1040)
+    decoys = _make_tdc_rows(40, False, 0.0, seed=3)
+    decoys["mz_rank"] = np.arange(3000, 3040)
+
+    def _paired_row(mz_rank, is_target, feat_val, seed):
+        row = _make_tdc_rows(1, is_target, 0.0, seed=seed)
+        row["mz_rank"] = mz_rank
+        row["feat1"] = feat_val
+        row["feat2"] = feat_val
+        return row
+
+    decoy_wins_target = _paired_row(500, True, -5.0, seed=10)
+    decoy_wins_decoy = _paired_row(500, False, 5.0, seed=11)
+    target_wins_target = _paired_row(600, True, 5.0, seed=12)
+    target_wins_decoy = _paired_row(600, False, -5.0, seed=13)
+
+    return pd.concat(
+        [
+            msms_targets,
+            decoys,
+            decoy_wins_target,
+            decoy_wins_decoy,
+            target_wins_target,
+            target_wins_decoy,
+        ],
+        ignore_index=True,
+    )
+
+
+@pytest.fixture
+def dict_ref_with_paired_slots(tdc_df_with_paired_slots):
+    mz_ranks = tdc_df_with_paired_slots["mz_rank"].unique()
+    status = np.where((mz_ranks >= 1000) & (mz_ranks < 1040), "Reference", "Not_Match")
+    return pd.DataFrame({"mz_rank": mz_ranks, "run_A": status})
+
+
+class TestBrewTrustedTargetModelCompetition:
+    @pytest.mark.parametrize("model_type", ["percolator", "supervised"])
+    def test_outscored_target_is_dropped_outscoring_target_survives(
+        self, tdc_df_with_paired_slots, dict_ref_with_paired_slots, model_type, tmp_path
+    ):
+        train_df = select_trusted_training_rows(
+            tdc_df_with_paired_slots, dict_ref_with_paired_slots, rng=0
+        )
+        targets_scored, full_scored, _ = brew_trusted_target_model(
+            train_df,
+            tdc_df_with_paired_slots,
+            feature_cols=["feat1", "feat2"],
+            model_type=model_type,
+            train_fdr=0.1,
+            work_dir=str(tmp_path / model_type),
+            rng=0,
+        )
+        # mz_rank 500: decoy outscored its target -> target dropped from
+        # targets_scored_df, and full_scored_df keeps only the decoy row.
+        assert 500 not in set(targets_scored["mz_rank"])
+        slot_500 = full_scored.loc[full_scored["scannr"] == 500]
+        assert len(slot_500) == 1
+        assert not slot_500["label"].iloc[0]
+
+        # mz_rank 600: target outscored its decoy -> target survives, and
+        # full_scored_df keeps only the target row.
+        assert 600 in set(targets_scored["mz_rank"])
+        slot_600 = full_scored.loc[full_scored["scannr"] == 600]
+        assert len(slot_600) == 1
+        assert slot_600["label"].iloc[0]
+
+    @pytest.mark.parametrize("model_type", ["percolator", "supervised"])
+    def test_full_scored_df_has_one_row_per_slot(
+        self, tdc_df_with_paired_slots, dict_ref_with_paired_slots, model_type, tmp_path
+    ):
+        train_df = select_trusted_training_rows(
+            tdc_df_with_paired_slots, dict_ref_with_paired_slots, rng=0
+        )
+        _, full_scored, _ = brew_trusted_target_model(
+            train_df,
+            tdc_df_with_paired_slots,
+            feature_cols=["feat1", "feat2"],
+            model_type=model_type,
+            train_fdr=0.1,
+            work_dir=str(tmp_path / model_type),
+            rng=0,
+        )
+        n_slots = tdc_df_with_paired_slots.drop_duplicates(
+            ["mz_rank", "matched_run"]
+        ).shape[0]
+        assert len(full_scored) == n_slots

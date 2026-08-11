@@ -5,6 +5,7 @@ import os
 import pickle
 from concurrent.futures import ThreadPoolExecutor, as_completed as tpe_as_completed
 from datetime import datetime
+from typing import Optional
 import time
 import argparse
 import yaml
@@ -445,31 +446,23 @@ def opt_scan_by_scan(config_path: str):
     )
 
 
-def run_fdr_control_onwards(
+def _filter_and_split_pp_by_msms(
     cfg,
-    processing_kwargs: dict,
     dict_ref: pd.DataFrame,
-    quant_dir: str,
     matches_target: pd.DataFrame,
     matches_decoy: pd.DataFrame,
-    pp_reference: pd.DataFrame,
     pp_match_target: pd.DataFrame,
     pp_match_decoy: pd.DataFrame,
 ):
-    """Run FDR control, DirectLFQ quantification, and result analysis.
+    """Intensity-filter pp_match_target/decoy (+ matching matches_target/decoy),
+    then split pp_match_target into Not_Match vs MS/MS-status subsets.
 
-    Takes the feature-feature-match outputs (either freshly computed by
-    opt_scan_by_scan, or loaded from a prior run's quant_dir) and carries the
-    pipeline through to the final result analysis plots.
+    Runs regardless of cfg.FDR.ENABLED — MS/MS-status rows must not bypass
+    intensity filtering just because they later skip the FDR/q-value filter.
+    Returns (matches_target, matches_decoy, pp_match_target, pp_match_decoy,
+    pp_match_target_notmsms, pp_match_target_msms); pp_match_target_msms is
+    None unless cfg.FDR.ONLY_SCORE_MATCH.
     """
-    logging.info("=================FDR control==================")
-
-    pp_match_target_msms = None
-
-    # Intensity filtering always runs first, on the full (unsplit) target/decoy
-    # pools, so it applies uniformly regardless of ONLY_SCORE_MATCH -- MS/MS-
-    # status rows must not bypass it just because they later skip the p-value
-    # filter.
     if cfg.FDR.INT_THRES > 0:
         pp_match_target = pp_match_target.loc[
             pp_match_target["intensity_sum"] >= cfg.FDR.INT_THRES
@@ -510,10 +503,12 @@ def run_fdr_control_onwards(
                 len(matches_decoy),
             )
 
-    # Percolator is always trained/scored on everything (Match + MS/MS-status
-    # rows alike). ONLY_SCORE_MATCH only changes what happens to the scored
-    # output below: MS/MS-status rows are kept regardless of q-value (already
-    # intensity-filtered above), Match rows still need q-value < 0.01.
+    # Percolator/mokapot are always trained/scored on everything (Match +
+    # MS/MS-status rows alike). ONLY_SCORE_MATCH only changes what happens to
+    # the scored output below: MS/MS-status rows are kept regardless of
+    # q-value (already intensity-filtered above), Match rows still need
+    # q-value < 0.01.
+    pp_match_target_msms = None
     if cfg.FDR.ONLY_SCORE_MATCH:
         pp_match_target_notmsms, pp_match_target_msms, _ = split_pp_by_match_status(
             dict_ref, pp_match_target, pp_match_decoy
@@ -521,91 +516,280 @@ def run_fdr_control_onwards(
     else:
         pp_match_target_notmsms = pp_match_target
 
-    if cfg.FDR.ENABLED:
-        matches_target_normalized, matches_decoy_normalized = normalize_shift_by_runs(
-            matches_target, matches_decoy
-        )
-        tdc_df = combine_matches_target_decoy(
-            matches_target_normalized, matches_decoy_normalized, dict_ref
-        )
-        tdc_df = tdc_df.merge(
-            dict_ref[["mz_rank", "count_confounders"]], on="mz_rank", how="left"
-        )
-        _align_images = bool(processing_kwargs.get("align_images", True))
-        _alignment_feature_cols = [
-            "im_shift_abs_scaled",
-            "rt_shift_abs_scaled",
-            "rt_shift",
-            "im_shift",
-            "template_matching_score",
+    return (
+        matches_target,
+        matches_decoy,
+        pp_match_target,
+        pp_match_decoy,
+        pp_match_target_notmsms,
+        pp_match_target_msms,
+    )
+
+
+def _build_fdr_feature_cols(
+    dict_ref: pd.DataFrame,
+    processing_kwargs: dict,
+    matches_target: pd.DataFrame,
+    matches_decoy: pd.DataFrame,
+):
+    """Normalize rt/im shift, build tdc_df, and select the FDR feature columns
+    available in it (config-driven: alignment/broad_alignment features are
+    only wired in when the config guarantees every row has a genuine value).
+    Returns (tdc_df, feature_cols).
+    """
+    matches_target_normalized, matches_decoy_normalized = normalize_shift_by_runs(
+        matches_target, matches_decoy
+    )
+    tdc_df = combine_matches_target_decoy(
+        matches_target_normalized, matches_decoy_normalized, dict_ref
+    )
+    tdc_df = tdc_df.merge(
+        dict_ref[["mz_rank", "count_confounders"]], on="mz_rank", how="left"
+    )
+    _align_images = bool(processing_kwargs.get("align_images", True))
+    _alignment_feature_cols = [
+        "im_shift_abs_scaled",
+        "rt_shift_abs_scaled",
+        "rt_shift",
+        "im_shift",
+        "template_matching_score",
+    ]
+    _base_feature_cols = [
+        # "im_shift_scaled",
+        # "rt_shift_scaled",
+        "sift_similarities",
+        "zernike_similarities",
+        "sift_distance",
+        "zernike_distance",
+        "count_confounders",
+        "rt_profile_corr",
+        "im_profile_corr",
+    ]
+    # rt_shift/im_shift/template_matching_score are meaningless when
+    # align_images=False (alignment is skipped, so shift is always (0,0)
+    # and the score a fixed 0.0 sentinel), but stay genuine per-candidate
+    # values under broad_alignment (search is centered on, not fixed to,
+    # the calibrated shift -- see align_images_to_reference's
+    # broad_alignment_max_deviation), so they remain useful FDR features.
+    _feature_cols = (
+        _base_feature_cols
+        if not _align_images
+        else _alignment_feature_cols + _base_feature_cols
+    )
+    # delta_shift_rt/im and delta_template_matching_score compare a
+    # max_deviation=0 forced rescore against the unconstrained global
+    # optimum over the same match_template surface (see
+    # _global_best_from_score_map) -- 0.0 sentinel everywhere else, which
+    # would look like "free search agrees exactly" rather than "not
+    # applicable" for every row if max_deviation != 0, so only wire these
+    # in when the config guarantees every row actually has a genuine
+    # value.
+    _broad_alignment_cfg = processing_kwargs.get("broad_alignment", {})
+    _broad_alignment_forced_rescore = (
+        _align_images
+        and bool(_broad_alignment_cfg.get("enabled", False))
+        and int(_broad_alignment_cfg.get("max_deviation", 5)) == 0
+    )
+    if _broad_alignment_forced_rescore:
+        _feature_cols = _feature_cols + [
+            "delta_shift_rt",
+            "delta_shift_im",
+            "delta_template_matching_score",
         ]
-        _base_feature_cols = [
-            # "im_shift_scaled",
-            # "rt_shift_scaled",
-            "sift_similarities",
-            "zernike_similarities",
-            "sift_distance",
-            "zernike_distance",
-            "count_confounders",
-            "rt_profile_corr",
-            "im_profile_corr",
-        ]
-        # rt_shift/im_shift/template_matching_score are meaningless when
-        # align_images=False (alignment is skipped, so shift is always (0,0)
-        # and the score a fixed 0.0 sentinel), but stay genuine per-candidate
-        # values under broad_alignment (search is centered on, not fixed to,
-        # the calibrated shift -- see align_images_to_reference's
-        # broad_alignment_max_deviation), so they remain useful FDR features.
-        _feature_cols = (
-            _base_feature_cols
-            if not _align_images
-            else _alignment_feature_cols + _base_feature_cols
-        )
-        # delta_shift_rt/im and delta_template_matching_score compare a
-        # max_deviation=0 forced rescore against the unconstrained global
-        # optimum over the same match_template surface (see
-        # _global_best_from_score_map) -- 0.0 sentinel everywhere else, which
-        # would look like "free search agrees exactly" rather than "not
-        # applicable" for every row if max_deviation != 0, so only wire these
-        # in when the config guarantees every row actually has a genuine
-        # value.
-        _broad_alignment_cfg = processing_kwargs.get("broad_alignment", {})
-        _broad_alignment_forced_rescore = (
-            _align_images
-            and bool(_broad_alignment_cfg.get("enabled", False))
-            and int(_broad_alignment_cfg.get("max_deviation", 5)) == 0
-        )
-        if _broad_alignment_forced_rescore:
+    # Extra template_frac scales (see MATCH_FEATURES_KWARGS.broad_alignment.
+    # multi_scale_template_fracs) -- same shape as the main-scale block
+    # above (rt_shift/im_shift/template_matching_score + delta_*), suffixed
+    # "_frac_<x>" per scale; only wired in under the same forced-rescore
+    # gating, since match_features.py only ever populates them there too.
+    if _broad_alignment_forced_rescore:
+        for _frac in _broad_alignment_cfg.get("multi_scale_template_fracs", []):
+            _tag = f"frac_{float(_frac)}"
             _feature_cols = _feature_cols + [
-                "delta_shift_rt",
-                "delta_shift_im",
-                "delta_template_matching_score",
+                f"template_matching_score_{_tag}",
+                f"rt_shift_{_tag}",
+                f"im_shift_{_tag}",
+                f"delta_shift_rt_{_tag}",
+                f"delta_shift_im_{_tag}",
+                f"delta_template_matching_score_{_tag}",
             ]
-        # Extra template_frac scales (see MATCH_FEATURES_KWARGS.broad_alignment.
-        # multi_scale_template_fracs) -- same shape as the main-scale block
-        # above (rt_shift/im_shift/template_matching_score + delta_*), suffixed
-        # "_frac_<x>" per scale; only wired in under the same forced-rescore
-        # gating, since match_features.py only ever populates them there too.
-        if _broad_alignment_forced_rescore:
-            for _frac in _broad_alignment_cfg.get("multi_scale_template_fracs", []):
-                _tag = f"frac_{float(_frac)}"
-                _feature_cols = _feature_cols + [
-                    f"template_matching_score_{_tag}",
-                    f"rt_shift_{_tag}",
-                    f"im_shift_{_tag}",
-                    f"delta_shift_rt_{_tag}",
-                    f"delta_shift_im_{_tag}",
-                    f"delta_template_matching_score_{_tag}",
-                ]
-        _missing_feature_cols = [c for c in _feature_cols if c not in tdc_df.columns]
-        if _missing_feature_cols:
-            logging.warning(
-                "Feature column(s) %s not present in tdc_df (matches_target/decoy "
-                "predate this feature being added) -- dropping from feature_cols "
-                "for this run instead of failing.",
-                _missing_feature_cols,
-            )
-            _feature_cols = [c for c in _feature_cols if c not in _missing_feature_cols]
+    _missing_feature_cols = [c for c in _feature_cols if c not in tdc_df.columns]
+    if _missing_feature_cols:
+        logging.warning(
+            "Feature column(s) %s not present in tdc_df (matches_target/decoy "
+            "predate this feature being added) -- dropping from feature_cols "
+            "for this run instead of failing.",
+            _missing_feature_cols,
+        )
+        _feature_cols = [c for c in _feature_cols if c not in _missing_feature_cols]
+    return tdc_df, _feature_cols
+
+
+def _finalize_fdr_results(
+    cfg,
+    quant_dir: str,
+    dir_name: str,
+    pp_match_target_filtered: pd.DataFrame,
+    pp_match_target_msms: Optional[pd.DataFrame],
+    pp_reference: pd.DataFrame,
+    dict_ref: pd.DataFrame,
+):
+    """Shared tail of FDR control: combined pivot, DirectLFQ, result analysis.
+
+    Identical regardless of what produced pp_match_target_filtered
+    (percolator, mokapot-trusted-target rescoring, or plain intensity
+    filtering with FDR disabled) -- dir_name namespaces the outputs of each
+    caller under its own quant_dir subdir.
+    """
+    os.makedirs(os.path.join(quant_dir, dir_name), exist_ok=True)
+    dfs_to_concat = {
+        "MBR": pp_match_target_filtered,
+        "MS/MS Ref": pp_reference,
+    }
+    if pp_match_target_msms is not None:
+        dfs_to_concat["MS/MS"] = pp_match_target_msms
+    pp_all = pd.DataFrame()
+    for df_type, df in dfs_to_concat.items():
+        df["Match Type"] = df_type
+        pp_all = pd.concat([pp_all, df], ignore_index=True)
+    pivot = build_pivot(pp_all, dict_ref)
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        futs = [
+            ex.submit(
+                _to_parquet_safe,
+                pp_all,
+                os.path.join(
+                    quant_dir,
+                    dir_name,
+                    "pp_reference_quant_only_match_target_filtered.parquet",
+                ),
+                index=False,
+            ),
+            ex.submit(
+                _to_parquet_safe,
+                pivot,
+                os.path.join(quant_dir, dir_name, "swaps_combined_ions.parquet"),
+            ),
+        ]
+        for f in futs:
+            f.result()
+
+    logging.info("=================DirectLFQ Analysis==================")
+    _ = reformat_swaps_combined_for_directlfq(
+        pivot,
+        dict_ref,
+        output_dir=os.path.join(quant_dir, dir_name),
+        ion_id_col="mz_rank",
+        protein_id_col="Proteins",
+    )
+    lfq_manager.run_lfq(
+        input_file=os.path.join(quant_dir, dir_name, "swaps.aq_reformat.tsv")
+    )
+    excl_input_file = os.path.join(
+        quant_dir,
+        dir_name,
+        undistinguishable_excl_output_name("swaps.aq_reformat.tsv"),
+    )
+    if os.path.exists(excl_input_file):
+        logging.info(
+            "Running DirectLFQ again excluding undistinguishable coSWA ions: %s",
+            excl_input_file,
+        )
+        lfq_manager.run_lfq(input_file=excl_input_file)
+
+    logging.info("=================Result Analysis==================")
+    result_analysis_dir = os.path.join(quant_dir, dir_name, "result_analysis")
+    calc_quant_corr(
+        pp_reference,
+        pp_match_target_filtered,
+        result_analysis_dir,
+    )
+    plot_match_type_from_combined(df=pivot, fig_dir=result_analysis_dir)
+    try:
+        # compare with IonQuant results
+        combined_ionquant = pd.read_csv(
+            os.path.join(cfg.SEARCH_OUTPUT_PATH, "combined_ion.tsv"),
+            sep="\t",
+        )
+        plot_match_type_from_combined(
+            df=combined_ionquant,
+            fig_dir=result_analysis_dir,
+            fig_name_suffix="_ionquant",
+        )
+    except FileNotFoundError:
+        logging.info(
+            "IonQuant combined_ion.csv not found in search output path. Skipping comparison with IonQuant results. Skipping"
+        )
+    plot_quantification_by_run(
+        pivot,
+        dataset_name="SWAPS_ions_raw",
+        int_col_keyword="Intensity",
+        label_char_range=(0, 10),
+        fig_dir=result_analysis_dir,
+    )
+    lfq_swaps_ion = pd.read_csv(
+        os.path.join(
+            quant_dir, dir_name, "swaps.aq_reformat.tsv.ion_intensities.tsv"
+        ),
+        sep="\t",
+    )
+    plot_quantification_by_run(
+        lfq_swaps_ion,
+        dataset_name="SWAPS_ions_directLFQ",
+        label_char_range=(0, 14),
+        id_cols=["protein", "ion"],
+        fig_dir=result_analysis_dir,
+    )
+    lfq_swaps_protein = pd.read_csv(
+        os.path.join(
+            quant_dir,
+            dir_name,
+            "swaps.aq_reformat.tsv.protein_intensities.tsv",
+        ),
+        sep="\t",
+    )
+    plot_quantification_by_run(
+        lfq_swaps_protein,
+        dataset_name="SWAPS_proteins_directLFQ",
+        label_char_range=(0, 14),
+        id_cols=["protein", "Protein"],
+        fig_dir=result_analysis_dir,
+    )
+
+
+def run_fdr_control_onwards(
+    cfg,
+    processing_kwargs: dict,
+    dict_ref: pd.DataFrame,
+    quant_dir: str,
+    matches_target: pd.DataFrame,
+    matches_decoy: pd.DataFrame,
+    pp_reference: pd.DataFrame,
+    pp_match_target: pd.DataFrame,
+    pp_match_decoy: pd.DataFrame,
+):
+    """Run FDR control, DirectLFQ quantification, and result analysis.
+
+    Takes the feature-feature-match outputs (either freshly computed by
+    opt_scan_by_scan, or loaded from a prior run's quant_dir) and carries the
+    pipeline through to the final result analysis plots.
+    """
+    logging.info("=================FDR control==================")
+
+    (
+        matches_target,
+        matches_decoy,
+        pp_match_target,
+        pp_match_decoy,
+        pp_match_target_notmsms,
+        pp_match_target_msms,
+    ) = _filter_and_split_pp_by_msms(
+        cfg, dict_ref, matches_target, matches_decoy, pp_match_target, pp_match_decoy
+    )
+
+    if cfg.FDR.ENABLED:
+        tdc_df, _feature_cols = _build_fdr_feature_cols(
+            dict_ref, processing_kwargs, matches_target, matches_decoy
+        )
         percolator_post_processing = cfg.FDR.PERCOLATOR_POST_PROCESSING
         # Percolator itself is trained/scored identically regardless of
         # ONLY_SCORE_MATCH, so its work_dir (and cache) is shared; only the
@@ -653,6 +837,7 @@ def run_fdr_control_onwards(
             index=False,
         )
         _mbr_df = pp_match_target_filtered.drop(columns=["filename"])
+        dir_name = percolator_dir_name
     else:
         logging.info(
             "cfg.FDR.ENABLED is False — skipping Mokapot/percolator FDR control; "
@@ -660,150 +845,32 @@ def run_fdr_control_onwards(
             "intensity filtering (FDR.INT_THRES) applied."
         )
         pp_match_target_filtered = pp_match_target_notmsms.copy()
-        percolator_dir_name = os.path.join(
+        dir_name = os.path.join(
             "intensity_filtered_postprocessing",
             f"only_score_match_{cfg.FDR.ONLY_SCORE_MATCH}",
         )
-        os.makedirs(os.path.join(quant_dir, percolator_dir_name), exist_ok=True)
+        os.makedirs(os.path.join(quant_dir, dir_name), exist_ok=True)
         _to_parquet_safe(
             pp_match_target_filtered,
-            os.path.join(
-                quant_dir, percolator_dir_name, "pp_match_target_filtered.parquet"
-            ),
+            os.path.join(quant_dir, dir_name, "pp_match_target_filtered.parquet"),
             index=False,
         )
         _mbr_df = pp_match_target_filtered
 
-    dfs_to_concat = {
-        "MBR": _mbr_df,
-        "MS/MS Ref": pp_reference,
-    }
-    if pp_match_target_msms is not None:
-        dfs_to_concat["MS/MS"] = pp_match_target_msms
-    pp_all = pd.DataFrame()
-    for df_type, df in dfs_to_concat.items():
-        df["Match Type"] = df_type
-        pp_all = pd.concat([pp_all, df], ignore_index=True)
-    pivot = build_pivot(pp_all, dict_ref)
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        futs = [
-            ex.submit(
-                _to_parquet_safe,
-                pp_all,
-                os.path.join(
-                    quant_dir,
-                    percolator_dir_name,
-                    "pp_reference_quant_only_match_target_filtered.parquet",
-                ),
-                index=False,
-            ),
-            ex.submit(
-                _to_parquet_safe,
-                pivot,
-                os.path.join(
-                    quant_dir, percolator_dir_name, "swaps_combined_ions.parquet"
-                ),
-            ),
-        ]
-        for f in futs:
-            f.result()
-
-    logging.info("=================DirectLFQ Analysis==================")
-    _ = reformat_swaps_combined_for_directlfq(
-        pivot,
-        dict_ref,
-        output_dir=os.path.join(quant_dir, percolator_dir_name),
-        ion_id_col="mz_rank",
-        protein_id_col="Proteins",
-    )
-    lfq_manager.run_lfq(
-        input_file=os.path.join(quant_dir, percolator_dir_name, "swaps.aq_reformat.tsv")
-    )
-    excl_input_file = os.path.join(
-        quant_dir,
-        percolator_dir_name,
-        undistinguishable_excl_output_name("swaps.aq_reformat.tsv"),
-    )
-    if os.path.exists(excl_input_file):
-        logging.info(
-            "Running DirectLFQ again excluding undistinguishable coSWA ions: %s",
-            excl_input_file,
-        )
-        lfq_manager.run_lfq(input_file=excl_input_file)
-
-    logging.info("=================Result Analysis==================")
-    result_analysis_dir = os.path.join(
-        quant_dir, percolator_dir_name, "result_analysis"
-    )
-    calc_quant_corr(
-        pp_reference,
-        pp_match_target_filtered,
-        result_analysis_dir,
-    )
-    plot_match_type_from_combined(df=pivot, fig_dir=result_analysis_dir)
-    try:
-        # compare with IonQuant results
-        combined_ionquant = pd.read_csv(
-            os.path.join(cfg.SEARCH_OUTPUT_PATH, "combined_ion.tsv"),
-            sep="\t",
-        )
-        plot_match_type_from_combined(
-            df=combined_ionquant,
-            fig_dir=result_analysis_dir,
-            fig_name_suffix="_ionquant",
-        )
-    except FileNotFoundError:
-        logging.info(
-            "IonQuant combined_ion.csv not found in search output path. Skipping comparison with IonQuant results. Skipping"
-        )
-    plot_quantification_by_run(
-        pivot,
-        dataset_name="SWAPS_ions_raw",
-        int_col_keyword="Intensity",
-        label_char_range=(0, 10),
-        fig_dir=result_analysis_dir,
-    )
-    lfq_swaps_ion = pd.read_csv(
-        os.path.join(
-            quant_dir, percolator_dir_name, "swaps.aq_reformat.tsv.ion_intensities.tsv"
-        ),
-        sep="\t",
-    )
-    plot_quantification_by_run(
-        lfq_swaps_ion,
-        dataset_name="SWAPS_ions_directLFQ",
-        label_char_range=(0, 14),
-        id_cols=["protein", "ion"],
-        fig_dir=result_analysis_dir,
-    )
-    lfq_swaps_protein = pd.read_csv(
-        os.path.join(
-            quant_dir,
-            percolator_dir_name,
-            "swaps.aq_reformat.tsv.protein_intensities.tsv",
-        ),
-        sep="\t",
-    )
-    plot_quantification_by_run(
-        lfq_swaps_protein,
-        dataset_name="SWAPS_proteins_directLFQ",
-        label_char_range=(0, 14),
-        id_cols=["protein", "Protein"],
-        fig_dir=result_analysis_dir,
+    _finalize_fdr_results(
+        cfg, quant_dir, dir_name, _mbr_df, pp_match_target_msms, pp_reference, dict_ref
     )
 
 
-def run_from_fdr_control(config_path: str):
-    """Resume the pipeline at FDR control, reusing a prior run's match outputs.
+def _load_fdr_control_inputs(cfg):
+    """Load dict_ref, quant_dir, and the matches_target/decoy + pp_reference/
+    pp_match_target/pp_match_decoy parquets a prior full-pipeline run left in
+    quant_dir = RESULT_PATH/MATCH_FEATURES_KWARGS.dir_name (as resolved from
+    cfg), instead of recomputing them via match_features_batches_parallel.
 
-    Loads dict_ref and the matches_target/decoy + pp_reference/pp_match_target/
-    pp_match_decoy parquets from quant_dir = RESULT_PATH/MATCH_FEATURES_KWARGS.dir_name
-    (as resolved from config_path) instead of recomputing them via
-    match_features_batches_parallel.
+    Returns (processing_kwargs, dict_ref, quant_dir, matches_target,
+    matches_decoy, pp_reference, pp_match_target, pp_match_decoy).
     """
-    cfg = get_cfg_defaults(swaps_optimization_cfg)  # type: ignore
-    merge_cfg_from_file(cfg, config_path)
-    logging.info("merge with cfg file %s", config_path)
     processing_kwargs = yaml.safe_load(cfg.MATCH_FEATURES_KWARGS.dump())
 
     dict_ref_path = os.path.join(cfg.RESULT_PATH, "dict_ref_with_activation.pkl")
@@ -823,6 +890,41 @@ def run_from_fdr_control(config_path: str):
         os.path.join(quant_dir, "pp_match_target.parquet")
     )
     pp_match_decoy = pd.read_parquet(os.path.join(quant_dir, "pp_match_decoy.parquet"))
+
+    return (
+        processing_kwargs,
+        dict_ref,
+        quant_dir,
+        matches_target,
+        matches_decoy,
+        pp_reference,
+        pp_match_target,
+        pp_match_decoy,
+    )
+
+
+def run_from_fdr_control(config_path: str):
+    """Resume the pipeline at FDR control, reusing a prior run's match outputs.
+
+    Loads dict_ref and the matches_target/decoy + pp_reference/pp_match_target/
+    pp_match_decoy parquets from quant_dir = RESULT_PATH/MATCH_FEATURES_KWARGS.dir_name
+    (as resolved from config_path) instead of recomputing them via
+    match_features_batches_parallel.
+    """
+    cfg = get_cfg_defaults(swaps_optimization_cfg)  # type: ignore
+    merge_cfg_from_file(cfg, config_path)
+    logging.info("merge with cfg file %s", config_path)
+
+    (
+        processing_kwargs,
+        dict_ref,
+        quant_dir,
+        matches_target,
+        matches_decoy,
+        pp_reference,
+        pp_match_target,
+        pp_match_decoy,
+    ) = _load_fdr_control_inputs(cfg)
 
     run_fdr_control_onwards(
         cfg,

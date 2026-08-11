@@ -54,6 +54,8 @@ Outputs: `matches_target/decoy.parquet`, `pp_*.parquet` (peak properties).
 ### 4. FDR Control (`swaps/postprocessing/rescore.py`)
 Normalizes RT/IM shift features per run, then trains Mokapot (XGBoost) using target-decoy competition. Features include `rt_shift`, `im_shift`, `template_matching_score`, SIFT score, and Zernike score. Applies 5% FDR training / 1% FDR test threshold with per-PSM deduplication.
 
+**Experimental alternative — MS/MS-trusted-target mokapot rescoring** (`swaps/rescore_msms_trusted_ims.py`, functions in `rescore.py`: `select_trusted_training_rows`, `brew_trusted_target_model`): trains on only the MS/MS-confirmed (Reference/Quant_Only) targets instead of all target candidates, via mokapot (semi-supervised `PercolatorModel` or a fully-supervised fixed-label `LinearSVC`), scoring the full candidate population afterward. Standalone CLI, resumes from an existing quant_dir (`--from-fdr`) same as `sbs_runner_ims.py`. **Not yet wired into `sbs_runner_ims.py`/the YACS config** — there is no `cfg.FDR` knob to select it; it must be invoked directly.
+
 ### 5. Label-Free Quantification (`swaps/postprocessing/direct_lfq.py`)
 Adapter layer reformats SWAPS peak areas into DirectLFQ's input format, runs protein-level quantification.
 
