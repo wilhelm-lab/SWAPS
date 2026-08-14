@@ -220,22 +220,7 @@ def brew_with_mokapot(
         peptide_info_dataframe,
         **kwargs,
     )
-    for col in new_feature_cols:
-        if col in mokapot_input.columns:
-            for label, group in mokapot_input.groupby("label"):
-                group[col].hist(bins=100, alpha=0.5, label=label)
-            plt.legend()
-            plt.savefig(
-                os.path.join(work_dir, f"feature_{col}_distr.png"),
-                dpi=300,
-                bbox_inches="tight",
-            )
-            plt.close()
-        else:
-            Logger.info(
-                "Feature column %s not found in mokapot input, skipping distribution plot.",
-                col,
-            )
+    _plot_feature_distributions(mokapot_input, new_feature_cols, work_dir)
     # mokapot_input['peptide'] = mokapot_input['proteins']
     Logger.info("Mokapot input columns: %s", mokapot_input.columns.tolist())
     # Use a temporary file to write the input .pin
@@ -358,22 +343,7 @@ def brew_with_percolator(
         pin_df.to_csv(input_path, sep="\t", index=False)
 
         feature_cols = kwargs.get("feature_cols", [])
-        for col in feature_cols:
-            if col in pin_df.columns:
-                for label, group in pin_df.groupby("label"):
-                    group[col].hist(bins=100, alpha=0.5, label=label)
-                plt.legend()
-                plt.savefig(
-                    os.path.join(work_dir, f"feature_{col}_distr.png"),
-                    dpi=300,
-                    bbox_inches="tight",
-                )
-                plt.close()
-            else:
-                Logger.info(
-                    "Feature column %s not found in percolator input, skipping distribution plot.",
-                    col,
-                )
+        _plot_feature_distributions(pin_df, feature_cols, work_dir)
     else:
         Logger.info(
             "Percolator input already exists, skipping preparation: %s", input_path
@@ -566,6 +536,32 @@ def _linear_weights(estimator, feature_names: List[str]) -> Optional[pd.Series]:
     )
 
 
+def _plot_feature_distributions(
+    df: pd.DataFrame,
+    feature_cols: List[str],
+    work_dir: str,
+    label_col: str = "label",
+    prefix: str = "feature",
+) -> None:
+    """Per-feature histogram split by label, saved as {prefix}_{col}_distr.png."""
+    for col in feature_cols:
+        if col not in df.columns:
+            Logger.info(
+                "Feature column %s not found in input, skipping distribution plot.",
+                col,
+            )
+            continue
+        for label, group in df.groupby(label_col):
+            group[col].hist(bins=100, alpha=0.5, label=label)
+        plt.legend()
+        plt.savefig(
+            os.path.join(work_dir, f"{prefix}_{col}_distr.png"),
+            dpi=300,
+            bbox_inches="tight",
+        )
+        plt.close()
+
+
 def _plot_score_and_qvalue_diagnostics(
     df: pd.DataFrame,
     score_col: str,
@@ -706,6 +702,9 @@ def brew_trusted_target_model(
     )
     train_input, feat_cols = prepare_mokapot_input(train_df, **prepare_kwargs)
     full_input, _ = prepare_mokapot_input(full_df, **prepare_kwargs)
+    _plot_feature_distributions(
+        full_input, feat_cols, work_dir, prefix=f"mokapot_trusted_{model_type}_feature"
+    )
     train_pin_path = os.path.join(work_dir, f"mokapot_trusted_{model_type}_train_input.pin")
     full_pin_path = os.path.join(work_dir, f"mokapot_trusted_{model_type}_full_input.pin")
     train_input.to_csv(train_pin_path, sep="\t", index=False)

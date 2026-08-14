@@ -39,6 +39,17 @@ import argparse
 import logging
 import os
 
+# Force the non-interactive Agg backend before anything transitively imports
+# matplotlib.pyplot (postprocessing.rescore, utils.plot, ...). This is a
+# batch CLI, often run detached/backgrounded on a shared node where DISPLAY
+# may be set (e.g. stale SSH X11 forwarding) but no longer reachable --
+# without this, matplotlib falls back to an interactive backend that raises
+# an uncatchable fatal X11 IO error (bypasses Python's exception handling
+# entirely) the moment that connection drops mid-run.
+import matplotlib
+
+matplotlib.use("Agg")
+
 from utils.config import get_cfg_defaults, merge_cfg_from_file
 from utils.singleton_swaps_optimization import swaps_optimization_cfg
 from postprocessing.rescore import (

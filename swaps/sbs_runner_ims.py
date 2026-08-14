@@ -1,5 +1,19 @@
 """Module providing a function calling the scan by scan optimization."""
 
+# Force the non-interactive Agg backend before anything transitively imports
+# matplotlib.pyplot (directlfq.lfq_manager, postprocessing.rescore,
+# utils.plot, ...). This is the top-level batch entry point, often run
+# detached/backgrounded on a shared node where DISPLAY may be set (e.g.
+# stale SSH X11 forwarding) but no longer reachable -- without this,
+# matplotlib falls back to an interactive backend that raises an
+# uncatchable fatal X11 IO error (bypasses Python's exception handling
+# entirely) the moment that connection drops mid-run. Must come before
+# every other import here, since several of them (directlfq in particular)
+# import matplotlib.pyplot themselves.
+import matplotlib
+
+matplotlib.use("Agg")
+
 import logging
 import os
 import pickle
