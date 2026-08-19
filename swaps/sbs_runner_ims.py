@@ -347,11 +347,16 @@ def opt_scan_by_scan(config_path: str):
     logging.info(
         "==================Quantification and Feature-Feature Match=================="
     )
+    # Derive raw_file_list from the configured .d datasets (not by listing
+    # RESULT_PATH) -- RESULT_PATH also holds non-raw-file cache/output dirs
+    # (e.g. broad_alignment_image_based_pairs, broad_alignment_rt_im_cache,
+    # broad_alignment_vis, peak_detection_2d) that a naive directory listing
+    # would wrongly treat as raw files, breaking downstream lookups like
+    # dict_ref's per-raw-file MS1_frame_idx_left_ref_<raw_file> columns.
     raw_file_list = [
-        d
-        for d in os.listdir(cfg.RESULT_PATH)
-        if os.path.isdir(os.path.join(cfg.RESULT_PATH, d))
-        and not d.startswith("quantification")
+        os.path.basename(dot_d_path).split(".")[0]
+        for data_path in cfg.DATA_PATH
+        for dot_d_path in get_dot_d_paths(data_path, cfg.EXCLUDE_DATASET_NAME)
     ]
 
     # One-time preprocessing: merge frame-partitioned parquets into a single
