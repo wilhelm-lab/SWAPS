@@ -534,7 +534,7 @@ def _init_match_features_worker(
     if bool((processing_kwargs or {}).get("broad_alignment", {}).get("enabled", False)):
         from .broad_alignment import build_shift_lookup, load_shift_table
 
-        _table_path = os.path.join(result_dir, "broad_alignment_shift_table.parquet")
+        _table_path = os.path.join(result_dir, "broad_alignment_shift_table_global_raw_image.parquet")
         _WORKER_CONTEXT["broad_alignment_lookup"] = build_shift_lookup(
             load_shift_table(_table_path)
         )
@@ -822,7 +822,7 @@ def match_features_batch(
         else:
             from .broad_alignment import build_shift_lookup, load_shift_table
 
-            _table_path = os.path.join(result_dir, "broad_alignment_shift_table.parquet")
+            _table_path = os.path.join(result_dir, "broad_alignment_shift_table_global_raw_image.parquet")
             _shift_lookup = build_shift_lookup(load_shift_table(_table_path))
 
     # coSWA groups are stored on disk as a single row-set keyed by their
@@ -997,7 +997,10 @@ def match_features_batch(
         if _shift_lookup is not None:
             _group_rt_pos = float(
                 np.mean(
-                    [dict_ref_by_mz.at[m, "RT_search_center"] for m in _gmembers]
+                    [
+                        dict_ref_by_mz.at[m, f"MS1_frame_idx_center_ref_{_group_ref_run}"]
+                        for m in _gmembers
+                    ]
                 )
             )
             _group_forced_shifts = [None] + [
@@ -1077,6 +1080,13 @@ def match_features_batch(
     for pept_idx in batch_np:
         pept_act_cache: dict[str, tuple[np.ndarray, int, int, tuple[int, int]]] = {}
         pept_act_raw_denoised_cache: dict[str, np.ndarray] = {}
+        # Populated below (broad_alignment only) with a derived ((rt_start, rt_end),
+        # (im_start, im_end)) window per Match run whose crop should come from the
+        # reference's own window shifted by the calibrated inter-run offset, rather
+        # than that run's own independently-predicted window -- see the
+        # forced_shifts-building block further down. Consulted by
+        # _get_pept_act_tuple below.
+        _window_overrides: dict[str, tuple] = {}
 
         # coSWA: every candidate -- group member or solo -- is processed
         # fully independently here (own roles, own anchors, own window, own
@@ -1104,6 +1114,7 @@ def match_features_batch(
                         dict_ref_by_mz,
                         raw_file,
                         return_offset=True,
+                        window_override=_window_overrides.get(raw_file),
                     )
                 )
             return pept_act_cache[raw_file]
@@ -1138,6 +1149,53 @@ def match_features_batch(
         # this member's own detected mask into the group's shared
         # (registration-only) frame for the post-hoc overlap check.
         _consensus_raw_files = [reference_raw_file] + match_raw_files
+
+        # Every non-reference run's own crop window (MS1_frame_idx_left/
+        # right_ref_<run>) is centered on THAT run's own independently
+        # predicted RT (same prediction-based mechanism regardless of whether
+        # the run is Match or Quant_Only -- having a real anchor doesn't
+        # change how the window itself was sized), so that window can start
+        # at a different absolute frame offset than the reference's. Naively
+        # applying the calibrated shift AS a search_center inside the
+        # already-cropped, differently-offset image doesn't correct for that
+        # offset difference at all (that's a SEPARATE thing from the shift
+        # itself). Deriving every non-reference run's window directly from
+        # the reference's own window shifted by the calibrated offset makes
+        # crops start-aligned by construction, so no forced_shift is needed
+        # downstream (pass (0, 0) instead of the raw calibrated shift) --
+        # applies to Quant_Only runs too, not just Match: the anchor
+        # computation inside get_pept_act_from_parquet re-derives that run's
+        # own observed exp position relative to whatever window it's given,
+        # so a genuine Quant_Only identification still shows up correctly
+        # positioned within the derived window. Must run BEFORE
+        # _positional_anchors below -- that's what triggers the first (and
+        # cached) image load for Quant_Only runs, so _window_overrides has to
+        # be populated before it, not after.
+        # parquet_df_to_dense_frame's (rt_start, rt_end)/(im_start, im_end)
+        # bounds are INCLUSIVE on both ends (shape = end - start + 1), not
+        # half-open -- end = start + shape - 1, not start + shape.
+        _forced_shifts = None
+        if _shift_lookup is not None:
+            _rt_pos = float(dict_ref_by_mz.at[pept_idx, f"MS1_frame_idx_center_ref_{reference_raw_file}"])
+            _raw_forced_shifts = [
+                _shift_lookup.lookup(reference_raw_file, rf, _rt_pos)
+                for rf in match_raw_files
+            ]
+            _ref_pept_act, _, _, (_ref_rt_start, _ref_im_start) = _get_pept_act_tuple(reference_raw_file)
+            _ref_rt_end = _ref_rt_start + _ref_pept_act.shape[0] - 1
+            _ref_im_end = _ref_im_start + _ref_pept_act.shape[1] - 1
+            _forced_shifts = [None]
+            for rf, _raw_fs in zip(match_raw_files, _raw_forced_shifts):
+                if _raw_fs is None:
+                    _forced_shifts.append(_raw_fs)
+                    continue
+                _shift_rt, _shift_im = _raw_fs
+                _window_overrides[rf] = (
+                    (_ref_rt_start - _shift_rt, _ref_rt_end - _shift_rt),
+                    (_ref_im_start - _shift_im, _ref_im_end - _shift_im),
+                )
+                _forced_shifts.append((0, 0))
+
         _consensus_anchors = _positional_anchors(
             _consensus_raw_files,
             reference_raw_file,
@@ -1150,13 +1208,6 @@ def match_features_batch(
         _anchor_image_indices = [
             i for i, a in enumerate(_consensus_anchors) if a is not None
         ]
-        _forced_shifts = None
-        if _shift_lookup is not None:
-            _rt_pos = float(dict_ref_by_mz.at[pept_idx, "RT_search_center"])
-            _forced_shifts = [None] + [
-                _shift_lookup.lookup(reference_raw_file, rf, _rt_pos)
-                for rf in match_raw_files
-            ]
         _consensus_bundle = build_consensus_feature_bundle(
             images=[_get_raw_denoised_pept_act(rf) for rf in _consensus_raw_files],
             reference_idx=0,

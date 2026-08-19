@@ -251,19 +251,28 @@ def get_pept_act_from_parquet(
     shape: Optional[tuple] = None,
     return_offset: bool = False,
     use_group_window: bool = False,
+    window_override: Optional[tuple] = None,
 ):
+    """`window_override`, if given, is `((rt_start, rt_end), (im_start, im_end))` --
+    used in place of run_name's own dict_ref-predicted window entirely (skips both
+    the group- and individual-window lookups below). broad_alignment consumers use
+    this to crop a "Match" run at a window DERIVED from the reference run's own
+    window shifted by the calibrated inter-run offset, instead of that run's own
+    independently-predicted (and for Match runs, unverified) window -- see
+    match_features.py's per-candidate loop."""
     # Support both a pre-indexed DataFrame (index == "mz_rank") and a plain one.
     if dict_ref.index.name == "mz_rank":
         row = dict_ref.loc[[pept_idx]]
     else:
         row = dict_ref.loc[dict_ref["mz_rank"] == pept_idx, :]
+    if window_override is not None:
+        (rt_start, rt_end), (im_start, im_end) = window_override
     # coSWA: confounder-group members crop to the merged (union) RT/IM window
     # the shared SWA solve spans, not each member's own narrower individual
     # window. Falls back to the individual window when group columns are absent
     # (solo candidates, or runs built without confounder merging).
-    _group_rt_left = f"MS1_frame_idx_left_group_ref_{run_name}"
-    if use_group_window and _group_rt_left in row.columns:
-        rt_start = row[_group_rt_left].values[0]
+    elif use_group_window and f"MS1_frame_idx_left_group_ref_{run_name}" in row.columns:
+        rt_start = row[f"MS1_frame_idx_left_group_ref_{run_name}"].values[0]
         rt_end = row[f"MS1_frame_idx_right_group_ref_{run_name}"].values[0]
         im_start = row[f"mobility_values_index_left_group_ref_{run_name}"].values[0]
         im_end = row[f"mobility_values_index_right_group_ref_{run_name}"].values[0]
@@ -273,14 +282,27 @@ def get_pept_act_from_parquet(
         im_start = row[f"mobility_values_index_left_ref_{run_name}"].values[0]
         im_end = row[f"mobility_values_index_right_ref_{run_name}"].values[0]
     # rt_exp_start = row["MS1_frame_idx_left_exp"].values[0] - rt_start
+    # Bounded on BOTH sides, not just the lower one: with window_override (see
+    # above), the window can come from the reference's own window shifted by a
+    # calibrated inter-run offset rather than from this run's own predicted
+    # RT -- a whole-image drift estimate, not a guarantee about where THIS
+    # peptide's own independently-observed position falls. When it falls
+    # outside the window entirely, falling back to the window's own center
+    # (same fallback the pre-existing lower-bound check already used) keeps
+    # the anchor sane instead of feeding _build_reference_template a wildly
+    # out-of-range value -- upstream of match_template's crash on an empty
+    # template.mean() (IndexError: too many indices for array, from an
+    # inverted/negative-size template slice).
+    _rt_exp = row[f"{run_name}_MS1_frame_idx_exp"].values[0]
     rt_exp_center = (
-        (row[f"{run_name}_MS1_frame_idx_exp"].values[0] - rt_start)
-        if row[f"{run_name}_MS1_frame_idx_exp"].values[0] > rt_start
+        (_rt_exp - rt_start)
+        if rt_start < _rt_exp <= rt_end
         else ((rt_start + rt_end) // 2 - rt_start)
     )
+    _im_exp = row[f"{run_name}_mobility_values_index_exp"].values[0]
     im_exp_center = (
-        (row[f"{run_name}_mobility_values_index_exp"].values[0] - im_start)
-        if row[f"{run_name}_mobility_values_index_exp"].values[0] > im_start
+        (_im_exp - im_start)
+        if im_start < _im_exp <= im_end
         else ((im_start + im_end) // 2 - im_start)
     )
     pept_act = parquet_df_to_dense_frame(act_df, (rt_start, rt_end), (im_start, im_end))
