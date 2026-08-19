@@ -536,6 +536,38 @@ class TestBrewTrustedTargetModel:
         )
         assert (work_dir / f"mokapot_trusted_{model_type}_weights.txt").exists()
 
+    def test_run_label_overrides_filenames_without_colliding(
+        self, trusted_training_tdc_df, trusted_training_dict_ref, tmp_path
+    ):
+        """run_label lets a second (e.g. reduced-feature) run share the same
+        work_dir as an original run without clobbering its files."""
+        train_df = select_trusted_training_rows(
+            trusted_training_tdc_df, trusted_training_dict_ref, rng=0
+        )
+        work_dir = tmp_path
+        brew_trusted_target_model(
+            train_df,
+            trusted_training_tdc_df,
+            feature_cols=["feat1", "feat2"],
+            model_type="supervised",
+            train_fdr=0.1,
+            work_dir=str(work_dir),
+        )
+        original_weights = (work_dir / "mokapot_trusted_supervised_weights.txt").read_text()
+
+        brew_trusted_target_model(
+            train_df,
+            trusted_training_tdc_df,
+            feature_cols=["feat1"],  # reduced feature set
+            model_type="supervised",
+            train_fdr=0.1,
+            work_dir=str(work_dir),
+            run_label="supervised_reduced_features",
+        )
+        assert (work_dir / "mokapot_trusted_supervised_reduced_features_weights.txt").exists()
+        # Original run's files must be untouched by the second run.
+        assert (work_dir / "mokapot_trusted_supervised_weights.txt").read_text() == original_weights
+
     @pytest.mark.parametrize("model_type", ["percolator", "supervised"])
     def test_psms_tsv_is_percolator_compatible(
         self, trusted_training_tdc_df, trusted_training_dict_ref, model_type, tmp_path

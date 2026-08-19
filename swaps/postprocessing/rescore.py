@@ -604,6 +604,7 @@ def brew_trusted_target_model(
     scannr_col: str = "mz_rank",
     specid_col: str = "Sequence_with_runs",
     rng: Optional[int] = None,
+    run_label: Optional[str] = None,
 ) -> tuple:
     """Train on a trusted (MS/MS-confirmed target + decoy) pool, score everything.
 
@@ -669,6 +670,12 @@ def brew_trusted_target_model(
     rng : int, optional
         Seed for the "supervised" class_weight CV fold shuffling
         (unused for "percolator", which seeds its own CV internally).
+    run_label : str, optional
+        Prefix for all output filenames (.pin files, weights.txt,
+        psms.tsv, plots) — "mokapot_trusted_{run_label}_...". Defaults to
+        model_type. Override when running variants (e.g. a reduced
+        feature set) into the same work_dir as a prior run, so the new
+        run's files don't clobber the original's.
 
     Returns
     -------
@@ -686,6 +693,7 @@ def brew_trusted_target_model(
         raise ValueError(
             f"model_type must be 'percolator' or 'supervised', got {model_type!r}"
         )
+    run_label = run_label if run_label is not None else model_type
     if work_dir is None:
         work_dir = os.getcwd()
     else:
@@ -703,10 +711,10 @@ def brew_trusted_target_model(
     train_input, feat_cols = prepare_mokapot_input(train_df, **prepare_kwargs)
     full_input, _ = prepare_mokapot_input(full_df, **prepare_kwargs)
     _plot_feature_distributions(
-        full_input, feat_cols, work_dir, prefix=f"mokapot_trusted_{model_type}_feature"
+        full_input, feat_cols, work_dir, prefix=f"mokapot_trusted_{run_label}_feature"
     )
-    train_pin_path = os.path.join(work_dir, f"mokapot_trusted_{model_type}_train_input.pin")
-    full_pin_path = os.path.join(work_dir, f"mokapot_trusted_{model_type}_full_input.pin")
+    train_pin_path = os.path.join(work_dir, f"mokapot_trusted_{run_label}_train_input.pin")
+    full_pin_path = os.path.join(work_dir, f"mokapot_trusted_{run_label}_full_input.pin")
     train_input.to_csv(train_pin_path, sep="\t", index=False)
     full_input.to_csv(full_pin_path, sep="\t", index=False)
 
@@ -781,7 +789,7 @@ def brew_trusted_target_model(
 
     if weights is not None:
         weights.to_csv(
-            os.path.join(work_dir, f"mokapot_trusted_{model_type}_weights.txt"),
+            os.path.join(work_dir, f"mokapot_trusted_{run_label}_weights.txt"),
             sep="\t",
             header=False,
         )
@@ -798,7 +806,7 @@ def brew_trusted_target_model(
         qvalue_col="q-value",
         label_col="label",
         work_dir=work_dir,
-        prefix=f"mokapot_trusted_{model_type}",
+        prefix=f"mokapot_trusted_{run_label}",
     )
 
     targets_scored_df = full_scored_df.loc[full_scored_df["label"]].rename(
@@ -823,7 +831,7 @@ def brew_trusted_target_model(
         ["PSMId", "score", "q-value", "peptide", "proteinIds", "filename"]
     ]
     psms_tsv.to_csv(
-        os.path.join(work_dir, f"mokapot_trusted_{model_type}_psms.tsv"),
+        os.path.join(work_dir, f"mokapot_trusted_{run_label}_psms.tsv"),
         sep="\t",
         index=False,
     )

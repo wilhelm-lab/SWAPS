@@ -102,6 +102,7 @@ def run_msms_trusted_rescoring(
     train_fdr: float = None,
     test_fdr: float = None,
     seed: int = 0,
+    exclude_features: list = None,
 ):
     """Resume at FDR control and rescore with MS/MS-trusted-target models.
 
@@ -112,6 +113,14 @@ def run_msms_trusted_rescoring(
     (q-value filtering, combined pivot, DirectLFQ, result-analysis plots)
     is produced for every requested only_score_match value -- see module
     docstring for the resulting directory layout.
+
+    exclude_features, if given, drops those columns from the feature set
+    before training/scoring -- e.g. for ablation runs. The run's files get
+    a "_reduced_features" run_label/dir suffix (parent_dir_name itself is
+    unchanged, i.e. it's still saved alongside a prior full-feature run
+    under the same mokapot_trusted_<model_type>_trainfdr<X>/ dir) so
+    nothing from an existing full-feature run in that same quant_dir gets
+    overwritten.
     """
     cfg = get_cfg_defaults(swaps_optimization_cfg)  # type: ignore
     merge_cfg_from_file(cfg, config_path)
@@ -149,6 +158,23 @@ def run_msms_trusted_rescoring(
         dict_ref, processing_kwargs, matches_target, matches_decoy
     )
 
+    if exclude_features:
+        missing = [c for c in exclude_features if c not in feature_cols]
+        if missing:
+            logging.warning(
+                "--exclude-features %s not found in the computed feature_cols "
+                "%s -- ignoring those (nothing to exclude).",
+                missing,
+                feature_cols,
+            )
+        feature_cols = [c for c in feature_cols if c not in exclude_features]
+        logging.info(
+            "Excluded %s -- training/scoring on remaining features: %s",
+            exclude_features,
+            feature_cols,
+        )
+    dir_suffix = "_reduced_features" if exclude_features else ""
+
     train_df = select_trusted_training_rows(
         tdc_df, dict_ref, decoy_target_ratio=decoy_target_ratio, rng=seed
     )
@@ -158,6 +184,7 @@ def run_msms_trusted_rescoring(
             "=================MS/MS-trusted mokapot rescoring (%s)==================",
             model_type,
         )
+        run_label = f"{model_type}{dir_suffix}"
         parent_dir_name = f"mokapot_trusted_{model_type}_trainfdr{train_fdr}"
         parent_work_dir = os.path.join(quant_dir, parent_dir_name)
         targets_scored, _, _ = brew_trusted_target_model(
@@ -172,6 +199,7 @@ def run_msms_trusted_rescoring(
             protein_col="Proteins",
             filename_col="matched_run",
             rng=seed,
+            run_label=run_label,
         )
         targets_filtered = targets_scored.loc[targets_scored["q-value"] < test_fdr]
 
@@ -180,7 +208,7 @@ def run_msms_trusted_rescoring(
                 dict_ref, pp_match_target, pp_match_decoy, only_score_match
             )
             dir_name = os.path.join(
-                parent_dir_name, f"only_score_match_{only_score_match}"
+                parent_dir_name, f"only_score_match_{only_score_match}{dir_suffix}"
             )
             pp_match_target_filtered = pp_match_target_notmsms.merge(
                 targets_filtered[["filename", "mz_rank"]],
@@ -279,11 +307,26 @@ def main():
         help="Overrides cfg.FDR.TEST if given.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Decoy subsampling random seed.")
+    parser.add_argument(
+        "--exclude-features",
+        default=None,
+        help=(
+            "Comma-separated feature column names to drop from training/"
+            "scoring (e.g. an ablation run). Output files/dirs get a "
+            "'_reduced_features' suffix so they don't overwrite a prior "
+            "full-feature run in the same quant_dir."
+        ),
+    )
     args = parser.parse_args()
 
     model_types = list(MODEL_TYPES) if args.model == "both" else [args.model]
     only_score_match_values = (
         [True, False] if args.only_score_match == "both" else [args.only_score_match]
+    )
+    exclude_features = (
+        [f.strip() for f in args.exclude_features.split(",") if f.strip()]
+        if args.exclude_features
+        else None
     )
     run_msms_trusted_rescoring(
         args.config_path,
@@ -293,6 +336,7 @@ def main():
         train_fdr=args.train_fdr,
         test_fdr=args.test_fdr,
         seed=args.seed,
+        exclude_features=exclude_features,
     )
 
 
