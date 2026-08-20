@@ -57,6 +57,12 @@ class ConsensusAlignmentState:
     # candidate image into first. `resized_images`/`aligned_images` are always linear
     # regardless of this flag -- only `template` (and the search itself) is affected.
     align_in_log_space: bool = False
+    # Fraction of each search image's/template's non-zero pixels (by
+    # intensity, top-x%) kept for the correlation search -- recorded so
+    # decoy builders that reuse `template` for their own shift search (e.g.
+    # _build_consensus_peptide_swap_decoy) can apply the same filter to their
+    # own candidate image before correlating against it. 1.0 = unfiltered.
+    top_intensity_frac: float = 1.0
 
 
 @dataclass
@@ -780,6 +786,9 @@ def match_features_batch(
     _use_shift_crop_pad = bool(
         (processing_kwargs or {}).get("use_shift_crop_pad", False)
     )
+    _top_intensity_frac = float(
+        (processing_kwargs or {}).get("template_match_top_intensity_frac", 1.0)
+    )
     _jump_dist_thres = _parse_jump_dist_thres(
         (processing_kwargs or {}).get("jump_dist_thres")
     )
@@ -1033,6 +1042,7 @@ def match_features_batch(
             use_shift_crop_pad=_use_shift_crop_pad,
             forced_shifts=_group_forced_shifts,
             broad_alignment_max_deviation=_broad_alignment_max_deviation,
+            top_intensity_frac=_top_intensity_frac,
         )
         _group_bundle_cache[_gid] = {
             "bundle": _group_bundle,
@@ -1231,6 +1241,7 @@ def match_features_batch(
             forced_shifts=_forced_shifts,
             broad_alignment_max_deviation=_broad_alignment_max_deviation,
             multi_scale_template_fracs=_multi_scale_fracs,
+            top_intensity_frac=_top_intensity_frac,
         )
 
         if _cached_group is not None:
@@ -1409,6 +1420,7 @@ def match_features_batch(
                         align_images=_align_images,
                         align_in_log_space=_align_in_log_space,
                         use_shift_crop_pad=_use_shift_crop_pad,
+                        top_intensity_frac=_top_intensity_frac,
                     )
                     if visualize_dir is not None:
                         _visualize_consensus_bundle(
@@ -2039,6 +2051,36 @@ def _resize_image_to_shape(
     return resized.astype(np.float64)
 
 
+def _resolve_top_intensity_pixel_count(
+    target_shape: tuple[int, int], frac: float
+) -> int | None:
+    """Fixed pixel count -- `frac * (target_shape's pixel count)` -- to keep
+    per image in a template-matching search, so the same n applies uniformly
+    to the template and every run's search image regardless of each image's
+    own size (`target_shape` is the reference image's shape, the common size
+    every image is resized/registered against -- see align_images_to_reference).
+    Returns None for `frac >= 1.0` (no filtering)."""
+    if frac >= 1.0:
+        return None
+    return max(0, int(round(frac * int(target_shape[0]) * int(target_shape[1]))))
+
+
+def _keep_top_n_intensity_pixels(image: np.ndarray, n: int) -> np.ndarray:
+    """Zero out all but the top `n` pixels by intensity in `image` -- e.g. so
+    a template-matching search sees only the strongest signal, ignoring
+    low-intensity background/noise pixels. Ties at the nth-largest value are
+    all kept, so slightly more than `n` pixels can survive. `n >= image.size`
+    is a no-op; `n <= 0` zeroes the image entirely. Monotonic transforms
+    (e.g. log2(1+x)) applied before this call don't change which pixels are
+    kept, since rank order is preserved."""
+    if n >= image.size:
+        return image
+    if n <= 0:
+        return np.zeros_like(image)
+    threshold = np.partition(image.ravel(), -n)[-n]
+    return np.where(image >= threshold, image, 0.0)
+
+
 def _shift_and_fit(
     image: np.ndarray, target_shape: tuple[int, int], shift: tuple[int, int]
 ) -> np.ndarray:
@@ -2289,6 +2331,7 @@ def align_images_to_reference(
     use_shift_crop_pad: bool = False,
     forced_shifts: list[tuple[int, int] | None] | None = None,
     broad_alignment_max_deviation: int | None = None,
+    top_intensity_frac: float = 1.0,
 ) -> ConsensusAlignmentState:
     """Resize and align images to a reference template for consensus scoring.
 
@@ -2332,6 +2375,20 @@ def align_images_to_reference(
     interpolation -- pad where a run's window is smaller than the
     reference's, crop where larger, both driven by the same shift so the two
     stay mutually registered.
+
+    `top_intensity_frac`, if less than 1.0, restricts the correlation search
+    to only the top `n = top_intensity_frac * (reference image's pixel
+    count)` pixels by intensity in each search image/template (see
+    _resolve_top_intensity_pixel_count / _keep_top_n_intensity_pixels),
+    zeroing the rest -- `n` is fixed once from the reference's own size and
+    applied uniformly to the template and every run's search image,
+    regardless of each image's own size. Applied after the
+    `align_in_log_space` transform, so it selects the same pixels regardless
+    of that flag (rank order is preserved by the monotonic log transform).
+    Same "search-space only" scope as `align_in_log_space`: the returned
+    `resized_images`/`aligned_images` are unaffected, only the returned
+    `template` (recorded on the returned state as `top_intensity_frac`, same
+    pattern as `align_in_log_space`, for decoy builders to reuse).
     """
 
     if not images:
@@ -2423,6 +2480,11 @@ def align_images_to_reference(
     # positions (template_bounds/anchor_row/anchor_col) are unaffected by this
     # monotonic transform, and every returned/stored image stays linear.
     search_template = np.log2(1 + template) if align_in_log_space else template
+    _n_top_pixels = _resolve_top_intensity_pixel_count(
+        resolved_target_shape, top_intensity_frac
+    )
+    if _n_top_pixels is not None:
+        search_template = _keep_top_n_intensity_pixels(search_template, _n_top_pixels)
 
     aligned_images: list[np.ndarray] = []
     matched_boxes: list[tuple[int, int, int, int]] = []
@@ -2475,6 +2537,8 @@ def align_images_to_reference(
             _search_image = (
                 np.log2(1 + images[i]) if align_in_log_space else images[i]
             )
+            if _n_top_pixels is not None:
+                _search_image = _keep_top_n_intensity_pixels(_search_image, _n_top_pixels)
             shift, max_score, match_score_map, match_score_peak = (
                 _find_shift_native_image(
                     _search_image,
@@ -2496,6 +2560,8 @@ def align_images_to_reference(
             _search_image = (
                 np.log2(1 + resized_image) if align_in_log_space else resized_image
             )
+            if _n_top_pixels is not None:
+                _search_image = _keep_top_n_intensity_pixels(_search_image, _n_top_pixels)
             (
                 aligned_image,
                 matched_box,
@@ -2551,6 +2617,7 @@ def align_images_to_reference(
         match_score_label_indices=match_score_label_indices,
         use_shift_crop_pad=use_shift_crop_pad,
         align_in_log_space=align_in_log_space,
+        top_intensity_frac=top_intensity_frac,
     )
 
 
@@ -3428,6 +3495,7 @@ def build_consensus_feature_bundle(
     forced_shifts: list[tuple[int, int] | None] | None = None,
     broad_alignment_max_deviation: int | None = None,
     multi_scale_template_fracs: list[float] | None = None,
+    top_intensity_frac: float = 1.0,
 ) -> ConsensusFeatureBundle:
     """Build alignment, segmentation, and feature tables for consensus scoring.
 
@@ -3495,6 +3563,7 @@ def build_consensus_feature_bundle(
             use_shift_crop_pad=use_shift_crop_pad,
             forced_shifts=forced_shifts,
             broad_alignment_max_deviation=broad_alignment_max_deviation,
+            top_intensity_frac=top_intensity_frac,
         )
         # Extra-scale alignments (see MATCH_FEATURES_KWARGS.broad_alignment.
         # multi_scale_template_fracs): only the shift-search substep is
@@ -3514,6 +3583,7 @@ def build_consensus_feature_bundle(
                 use_shift_crop_pad=use_shift_crop_pad,
                 forced_shifts=forced_shifts,
                 broad_alignment_max_deviation=broad_alignment_max_deviation,
+                top_intensity_frac=top_intensity_frac,
             )
         segmentation_state = segment_consensus_from_aligned(
             alignment_state,
@@ -3670,6 +3740,22 @@ def _visualize_consensus_bundle(
             alignment_state.aligned_images if aligned_images is None else aligned_images
         )
     ]
+    # Reflect MATCH_FEATURES_KWARGS.template_match_top_intensity_frac in the
+    # displayed per-run panels -- that filter only ever restricts the
+    # correlation *search* space (see align_images_to_reference), never the
+    # returned aligned_images, but showing the same top-n-by-intensity mask
+    # applied here (post-shift) is equivalent to what the search actually saw
+    # (pre-shift) since translation and an intensity threshold commute, and
+    # it's the only way to visually confirm the filter is doing what's
+    # intended. Consensus panels below stay unfiltered on purpose --
+    # averaging/segmentation never see this filter either.
+    _viz_n_top_pixels = _resolve_top_intensity_pixel_count(
+        alignment_state.target_shape, alignment_state.top_intensity_frac
+    )
+    if _viz_n_top_pixels is not None:
+        display_aligned = [
+            _keep_top_n_intensity_pixels(img, _viz_n_top_pixels) for img in display_aligned
+        ]
     display_consensus = _maybe_log(
         segmentation_state.consensus if consensus is None else consensus
     )
@@ -3940,7 +4026,13 @@ def _visualize_consensus_bundle(
         framealpha=0.8,
         bbox_to_anchor=(0.5, 0.0),
     )
-    fig.suptitle("Resized, aligned images and mean consensus", fontsize=11)
+    _title = "Resized, aligned images and mean consensus"
+    if _viz_n_top_pixels is not None:
+        _title += (
+            f" (per-run panels: top {_viz_n_top_pixels} intensity pixels, "
+            "as seen by the search)"
+        )
+    fig.suptitle(_title, fontsize=11)
     plt.tight_layout(rect=[0, 0.05, 1, 1])
     _save_or_show(fig, fig_dir, filename)
 
@@ -4264,10 +4356,15 @@ def _peptide_swap_decoy_multi_scale_columns(
         )
         _target_shape = _state.target_shape
         _align_in_log_space = _state.align_in_log_space
+        _n_top_pixels = _resolve_top_intensity_pixel_count(
+            _target_shape, _state.top_intensity_frac
+        )
         if _state.use_shift_crop_pad:
             _search_image = (
                 np.log2(1 + decoy_denoised) if _align_in_log_space else decoy_denoised
             )
+            if _n_top_pixels is not None:
+                _search_image = _keep_top_n_intensity_pixels(_search_image, _n_top_pixels)
             _shift, _score, _match_score_map, _ = _find_shift_native_image(
                 _search_image,
                 _state.template,
@@ -4280,6 +4377,8 @@ def _peptide_swap_decoy_multi_scale_columns(
             _search_image = (
                 np.log2(1 + _decoy_resized) if _align_in_log_space else _decoy_resized
             )
+            if _n_top_pixels is not None:
+                _search_image = _keep_top_n_intensity_pixels(_search_image, _n_top_pixels)
             (_, _, _, _shift, _score, _match_score_map, _) = (
                 _align_resized_image_to_template(
                     _decoy_resized,
@@ -4354,6 +4453,9 @@ def _build_consensus_peptide_swap_decoy(
     )
     target_shape = bundle.alignment.target_shape
     _align_in_log_space = bundle.alignment.align_in_log_space
+    _n_top_pixels = _resolve_top_intensity_pixel_count(
+        target_shape, bundle.alignment.top_intensity_frac
+    )
     # A forced_shift with no explicit max_deviation defaults to an exact
     # rescore (deviation 0), same convention as align_images_to_reference.
     _max_deviation = (
@@ -4365,6 +4467,8 @@ def _build_consensus_peptide_swap_decoy(
         _search_image = (
             np.log2(1 + decoy_denoised) if _align_in_log_space else decoy_denoised
         )
+        if _n_top_pixels is not None:
+            _search_image = _keep_top_n_intensity_pixels(_search_image, _n_top_pixels)
         shift, max_score, match_score_map, _match_score_peak = (
             _find_shift_native_image(
                 _search_image,
@@ -4383,6 +4487,8 @@ def _build_consensus_peptide_swap_decoy(
             if _align_in_log_space
             else decoy_denoised_resized
         )
+        if _n_top_pixels is not None:
+            _search_image = _keep_top_n_intensity_pixels(_search_image, _n_top_pixels)
         (
             decoy_denoised_aligned,
             _matched_box,

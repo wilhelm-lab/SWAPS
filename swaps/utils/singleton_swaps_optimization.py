@@ -120,6 +120,7 @@ __C.MATCH_FEATURES_KWARGS.jump_dist_thres = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.jump_dist_thres.rt = 10  # max RT jump in pixels; 0 = disabled
 __C.MATCH_FEATURES_KWARGS.jump_dist_thres.im = 10  # max IM jump in pixels; 0 = disabled
 __C.MATCH_FEATURES_KWARGS.template_frac = 0.3  # half-width (as a fraction of each dim) of the template patch used for SIFT/consensus template matching; must be in (0, 0.5]
+__C.MATCH_FEATURES_KWARGS.template_match_top_intensity_frac = 1.0  # restrict the template-matching correlation search to only the top n pixels by intensity in each search image/template, where n = this fraction * (reference image's pixel count) -- a fixed pixel budget derived once from the reference's own size and applied uniformly to the template and every run's search image, regardless of each image's own size. E.g. 0.05 on a 200x50-pixel reference keeps only the strongest 500 pixels per search image, zeroing the rest, to make the shift search robust to low-intensity background/noise pixels. Must be in (0, 1]; 1.0 (default) = no filtering, uses every pixel. Only affects the search space used to find rt_shift/im_shift/template_matching_score -- the returned aligned/consensus images stay unfiltered, same scope as align_in_log_space.
 # denoise: smooth/clean are staged ops (smooth.at / clean.at select which pipeline
 # stage each runs at); log_transform is NOT staged -- see below.
 #   "raw"       → applied to each run's own image before template-matching alignment
