@@ -45,7 +45,7 @@ import threadpoolctl
 from utils.tools import get_dot_d_paths
 
 from .broad_alignment import _TABLE_COLUMNS
-from .rt_im_image_registration import load_rt_im_image, run_pair
+from .rt_im_image_registration import load_rt_im_image, raw_file_rt_im_range_bounds, run_pair
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +141,8 @@ def _select_optimal_curve(pair, residuals_df: pd.DataFrame, curves_by_combo: dic
 def _process_pair(
     ref_run: str, mov_run: str, raw_file_paths: dict, cache_dir: str, pairs_dir: str,
     window_widths: tuple, strides: tuple, upsample_factor: int,
+    rt_range_minutes: tuple[float, float] | None = None,
+    im_range: tuple[float, float] | None = None,
 ) -> list[dict]:
     """One pair's full param sweep + optimal-curve selection + forward/reverse table
     rows. Module-level (not a closure) so it's picklable for ProcessPoolExecutor --
@@ -152,6 +154,7 @@ def _process_pair(
     residuals_df, pair, curves_by_combo = run_pair(
         raw_file_paths[ref_run], raw_file_paths[mov_run], cache_dir, pair_out_dir,
         list(window_widths), list(strides), upsample_factor=upsample_factor, return_curves=True,
+        rt_range_minutes=rt_range_minutes, im_range=im_range,
     )
 
     best_curve, best_im_shift, best_label, best_residual = _select_optimal_curve(pair, residuals_df, curves_by_combo)
@@ -167,11 +170,36 @@ def _process_pair(
     return rows
 
 
+def _shared_rt_im_range(dict_ref_path: str | None) -> tuple[tuple[float, float] | None, tuple[float, float] | None]:
+    """Global RT (minutes)/IM (1/K0) range across the WHOLE dict_ref -- not
+    per-peptide -- so every raw file's collapsed rt/im image is built from the
+    same physical range (see load_rt_im_image's docstring). None/None when no
+    dict_ref_path is given, keeping each run's old, unrestricted, whole-native
+    image (e.g. for standalone use without a dict_ref on hand)."""
+    if dict_ref_path is None:
+        return None, None
+    dict_ref = pd.read_pickle(dict_ref_path)
+    rt_range_minutes = (
+        float(dict_ref["RT_search_left"].min()),
+        float(dict_ref["RT_search_right"].max()),
+    )
+    im_range = (
+        float(dict_ref["IM_search_left"].min()),
+        float(dict_ref["IM_search_right"].max()),
+    )
+    logger.info(
+        "Shared rt/im image range from %s: rt=%.4f-%.4f min, im=%.4f-%.4f",
+        dict_ref_path, *rt_range_minutes, *im_range,
+    )
+    return rt_range_minutes, im_range
+
+
 def calibrate_broad_alignment_image_based(
     result_dir: str,
     raw_file_list: list[str],
     data_paths: list[str],
     exclude_dataset_names: list[str],
+    dict_ref_path: str | None = None,
     output_path: str | None = None,
     window_widths: tuple[int, ...] = (40, 60, 120, 240),
     strides: tuple[int, ...] = (5, 20),
@@ -184,10 +212,22 @@ def calibrate_broad_alignment_image_based(
     pair) and broad_alignment_image_based_pairs/<ref>__vs__<mov>/ww<W>_stride<S>/
     (per-pair-per-combo diagnostic plots + residuals.csv, from rt_im_image_registration's
     run_param_combo) under result_dir, alongside the final table.
+
+    `dict_ref_path` (a dict_ref[_with_activation].pkl), when given, restricts phase-
+    correlation SHIFT ESTIMATION (not the collapsed image itself, which always stays the
+    whole native run) to the shared RT/IM range spanned by the whole dict_ref (min
+    RT_search_left/max RT_search_right, min IM_search_left/max IM_search_right), mapped
+    onto each run's own frame/scan index via nearest-match -- mirrors dict_add_rt_index/
+    dict_add_im_index's per-peptide treatment, applied here to the whole collapsed image's
+    correlation input instead (see rt_im_image_registration.raw_file_rt_im_range_bounds /
+    prepare_pair_images). Out-of-range pixels are masked (zeroed) only for that purpose;
+    curves still cover the full native frame range. Omitting it keeps every step exactly
+    as before this parameter existed.
     """
     raw_file_paths = _resolve_raw_file_paths(raw_file_list, data_paths, exclude_dataset_names)
     cache_dir = os.path.join(result_dir, "broad_alignment_rt_im_cache")
     pairs_dir = os.path.join(result_dir, "broad_alignment_image_based_pairs")
+    rt_range_minutes, im_range = _shared_rt_im_range(dict_ref_path)
 
     # Deliberately capped low and independent of max_workers/N_CPU: each raw .d file's
     # AlphaTims TimsTOF object (+ HDF backing) peaks at ~15GB RSS while building the
@@ -200,12 +240,20 @@ def calibrate_broad_alignment_image_based(
     effective_cache_workers = min(2, len(raw_file_list))
     logger.info("Building rt/im image cache for %d raw files (max_workers=%d)...", len(raw_file_list), effective_cache_workers)
     with ThreadPoolExecutor(max_workers=effective_cache_workers) as executor:
-        futures = {executor.submit(load_rt_im_image, raw_file_paths[rf], cache_dir): rf for rf in raw_file_list}
+        futures = {}
+        for rf in raw_file_list:
+            futures[executor.submit(load_rt_im_image, raw_file_paths[rf], cache_dir)] = rf
+            if rt_range_minutes is not None:
+                # Range bounds only need cheap frame/mobility metadata (no
+                # bin_intensities), but reopening the .d file is still worth
+                # doing up front, in parallel, rather than lazily inside
+                # _process_pair -- primed here alongside the image build.
+                futures[executor.submit(raw_file_rt_im_range_bounds, raw_file_paths[rf], cache_dir, rt_range_minutes, im_range)] = rf
         for future in futures:
             rf = futures[future]
             exc = future.exception()
             if exc:
-                raise RuntimeError(f"Failed to build rt/im image for raw file {rf}") from exc
+                raise RuntimeError(f"Failed to build rt/im image or range bounds for raw file {rf}") from exc
 
     pair_list = list(itertools.combinations(raw_file_list, 2))
     effective_max_workers = max_workers if max_workers and max_workers > 0 else min(8, len(pair_list))
@@ -216,6 +264,7 @@ def calibrate_broad_alignment_image_based(
             executor.submit(
                 _process_pair, ref_run, mov_run, raw_file_paths, cache_dir, pairs_dir,
                 tuple(window_widths), tuple(strides), upsample_factor,
+                rt_range_minutes, im_range,
             ): (ref_run, mov_run)
             for ref_run, mov_run in pair_list
         }
@@ -239,6 +288,12 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--raw-file", action="append", required=True, dest="raw_file_list")
     parser.add_argument("--data-path", action="append", required=True, dest="data_paths")
     parser.add_argument("--exclude-dataset-name", action="append", default=[], dest="exclude_dataset_names")
+    parser.add_argument(
+        "--dict-ref-path",
+        default=None,
+        help="dict_ref[_with_activation].pkl -- when given, restricts every raw file's "
+        "collapsed image to the shared RT/IM range spanned by the whole dict_ref.",
+    )
     parser.add_argument("--output-path", default=None)
     parser.add_argument("--window-widths", default="40,60,120,240")
     parser.add_argument("--strides", default="5,20")
@@ -262,6 +317,7 @@ if __name__ == "__main__":
         raw_file_list=_args.raw_file_list,
         data_paths=_args.data_paths,
         exclude_dataset_names=_args.exclude_dataset_names,
+        dict_ref_path=_args.dict_ref_path,
         output_path=_args.output_path,
         window_widths=tuple(int(w) for w in _args.window_widths.split(",")),
         strides=tuple(int(s) for s in _args.strides.split(",")),

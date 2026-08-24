@@ -418,6 +418,9 @@ def opt_scan_by_scan(config_path: str):
                 raw_file_list=raw_file_list,
                 data_paths=cfg.DATA_PATH,
                 exclude_dataset_names=cfg.EXCLUDE_DATASET_NAME,
+                dict_ref_path=os.path.join(
+                    cfg.RESULT_PATH, "dict_ref_with_activation.pkl"
+                ),
                 output_path=image_based_table_path,
                 window_widths=cfg.MATCH_FEATURES_KWARGS.broad_alignment.image_based.window_widths,
                 strides=cfg.MATCH_FEATURES_KWARGS.broad_alignment.image_based.strides,
