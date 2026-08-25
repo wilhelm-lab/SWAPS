@@ -374,3 +374,38 @@ class TestBroadAlignmentConfig:
     def test_alignment_cols_dropped_when_align_images_false(self):
         cols = self._feature_cols(align_images=False)
         assert "rt_shift" not in cols
+
+
+class TestFdrMokapotTrustedConfig:
+    def test_default_method_is_percolator(self, cfg):
+        """Default preserves current production behaviour untouched."""
+        assert cfg.FDR.METHOD == "percolator"
+
+    def test_mokapot_trusted_keys_present(self, cfg):
+        for key in ["MODEL_TYPE", "DECOY_TARGET_RATIO", "DECOY_MSMS_ONLY", "SEED"]:
+            assert hasattr(cfg.FDR.MOKAPOT_TRUSTED, key), f"Missing FDR.MOKAPOT_TRUSTED.{key}"
+
+    def test_mokapot_trusted_defaults(self, cfg):
+        assert cfg.FDR.MOKAPOT_TRUSTED.MODEL_TYPE == "percolator"
+        assert cfg.FDR.MOKAPOT_TRUSTED.DECOY_TARGET_RATIO == 1.0
+        assert cfg.FDR.MOKAPOT_TRUSTED.DECOY_MSMS_ONLY is False
+        assert cfg.FDR.MOKAPOT_TRUSTED.SEED == 0
+
+    def test_method_overridable_via_yaml(self, tmp_path):
+        from utils.config import merge_cfg_from_file
+
+        data = {
+            "FDR": {
+                "METHOD": "mokapot_trusted",
+                "MOKAPOT_TRUSTED": {"MODEL_TYPE": "supervised", "DECOY_MSMS_ONLY": True},
+            }
+        }
+        p = tmp_path / "fdr_override.yaml"
+        p.write_text(yaml.dump(data))
+        cfg = get_cfg_defaults(swaps_optimization_cfg)
+        merge_cfg_from_file(cfg, str(p))
+        assert cfg.FDR.METHOD == "mokapot_trusted"
+        assert cfg.FDR.MOKAPOT_TRUSTED.MODEL_TYPE == "supervised"
+        assert cfg.FDR.MOKAPOT_TRUSTED.DECOY_MSMS_ONLY is True
+        # untouched sibling key keeps its default
+        assert cfg.FDR.MOKAPOT_TRUSTED.DECOY_TARGET_RATIO == 1.0
