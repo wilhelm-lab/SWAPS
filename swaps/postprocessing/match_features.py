@@ -63,6 +63,24 @@ class ConsensusAlignmentState:
     # _build_consensus_peptide_swap_decoy) can apply the same filter to their
     # own candidate image before correlating against it. 1.0 = unfiltered.
     top_intensity_frac: float = 1.0
+    # "template_match" (match_template on `template`, the docstring's default
+    # path) or "phase_correlation" (skimage phase_cross_correlation on the full
+    # reference/candidate image pair -- see _find_shift_via_phase_correlation).
+    # Recorded so decoy builders reuse the same shift-finding method as the
+    # target they compete against.
+    alignment_method: str = "template_match"
+    # Full reference image in search space (log/top-intensity-filtered per
+    # align_in_log_space/top_intensity_frac, but NOT cropped to template_bounds
+    # like `template` is) -- only populated when alignment_method is
+    # "phase_correlation", which correlates whole image pairs rather than a
+    # template crop within a larger search image. Reused by decoy builders
+    # (e.g. _build_consensus_peptide_swap_decoy) as the phase-correlation
+    # reference.
+    reference_search_image: np.ndarray | None = None
+    # upsample_factor/normalization used for phase_correlation alignment_method
+    # (see MATCH_FEATURES_KWARGS.phase_correlation_kwargs) -- recorded so decoy
+    # builders re-run phase_cross_correlation with identical settings.
+    phase_correlation_kwargs: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -786,6 +804,32 @@ def match_features_batch(
     _use_shift_crop_pad = bool(
         (processing_kwargs or {}).get("use_shift_crop_pad", False)
     )
+    _alignment_method = str(
+        (processing_kwargs or {}).get("alignment_method", "template_match")
+    )
+    _phase_correlation_kwargs = dict(
+        (processing_kwargs or {}).get("phase_correlation_kwargs", {})
+    )
+    if _alignment_method not in ("template_match", "phase_correlation"):
+        raise ValueError(
+            "MATCH_FEATURES_KWARGS.alignment_method must be 'template_match' or "
+            f"'phase_correlation', got {_alignment_method!r}."
+        )
+    if _alignment_method == "phase_correlation":
+        if _use_shift_crop_pad:
+            raise ValueError(
+                "MATCH_FEATURES_KWARGS.alignment_method='phase_correlation' requires "
+                "use_shift_crop_pad=False (phase correlation needs equal-shaped, "
+                "resized image pairs)."
+            )
+        if bool(
+            (processing_kwargs or {}).get("broad_alignment", {}).get("enabled", False)
+        ):
+            raise ValueError(
+                "MATCH_FEATURES_KWARGS.alignment_method='phase_correlation' does not "
+                "support broad_alignment.enabled (no windowed-search/correlation-"
+                "surface concept); use alignment_method='template_match' instead."
+            )
     _top_intensity_frac = float(
         (processing_kwargs or {}).get("template_match_top_intensity_frac", 1.0)
     )
@@ -1043,6 +1087,8 @@ def match_features_batch(
             forced_shifts=_group_forced_shifts,
             broad_alignment_max_deviation=_broad_alignment_max_deviation,
             top_intensity_frac=_top_intensity_frac,
+            alignment_method=_alignment_method,
+            phase_correlation_kwargs=_phase_correlation_kwargs,
         )
         _group_bundle_cache[_gid] = {
             "bundle": _group_bundle,
@@ -1242,6 +1288,8 @@ def match_features_batch(
             broad_alignment_max_deviation=_broad_alignment_max_deviation,
             multi_scale_template_fracs=_multi_scale_fracs,
             top_intensity_frac=_top_intensity_frac,
+            alignment_method=_alignment_method,
+            phase_correlation_kwargs=_phase_correlation_kwargs,
         )
 
         if _cached_group is not None:
@@ -1421,6 +1469,8 @@ def match_features_batch(
                         align_in_log_space=_align_in_log_space,
                         use_shift_crop_pad=_use_shift_crop_pad,
                         top_intensity_frac=_top_intensity_frac,
+                        alignment_method=_alignment_method,
+                        phase_correlation_kwargs=_phase_correlation_kwargs,
                     )
                     if visualize_dir is not None:
                         _visualize_consensus_bundle(
@@ -2065,6 +2115,23 @@ def _resolve_top_intensity_pixel_count(
     return max(0, int(round(frac * int(target_shape[0]) * int(target_shape[1]))))
 
 
+def _top_n_intensity_mask(image: np.ndarray, n: int) -> np.ndarray:
+    """Boolean mask selecting the top `n` pixels of `image` by intensity --
+    the same selection _keep_top_n_intensity_pixels zeroes everything outside
+    of, exposed separately so callers can reuse the identical mask against a
+    DIFFERENT image (e.g. gating a moving/candidate image by a reference
+    image's own top-intensity pixels, so both sides of a comparison are
+    restricted to the same locations). Ties at the nth-largest value are all
+    kept, so slightly more than `n` pixels can be True. `n >= image.size`
+    selects everything; `n <= 0` selects nothing."""
+    if n >= image.size:
+        return np.ones(image.shape, dtype=bool)
+    if n <= 0:
+        return np.zeros(image.shape, dtype=bool)
+    threshold = np.partition(image.ravel(), -n)[-n]
+    return image >= threshold
+
+
 def _keep_top_n_intensity_pixels(image: np.ndarray, n: int) -> np.ndarray:
     """Zero out all but the top `n` pixels by intensity in `image` -- e.g. so
     a template-matching search sees only the strongest signal, ignoring
@@ -2073,12 +2140,7 @@ def _keep_top_n_intensity_pixels(image: np.ndarray, n: int) -> np.ndarray:
     is a no-op; `n <= 0` zeroes the image entirely. Monotonic transforms
     (e.g. log2(1+x)) applied before this call don't change which pixels are
     kept, since rank order is preserved."""
-    if n >= image.size:
-        return image
-    if n <= 0:
-        return np.zeros_like(image)
-    threshold = np.partition(image.ravel(), -n)[-n]
-    return np.where(image >= threshold, image, 0.0)
+    return np.where(_top_n_intensity_mask(image, n), image, 0.0)
 
 
 def _shift_and_fit(
@@ -2174,6 +2236,92 @@ def _global_best_from_score_map(
     rt_topleft, im_topleft = np.unravel_index(np.argmax(match_score), match_score.shape)
     shift = (int(template_rt_start - rt_topleft), int(template_im_start - im_topleft))
     return shift, float(match_score[rt_topleft, im_topleft])
+
+
+def _find_shift_via_phase_correlation(
+    reference_image: np.ndarray,
+    moving_image: np.ndarray,
+    upsample_factor: int = 10,
+    normalization: str | None = None,
+    error_window_bounds: tuple[int, int, int, int] | None = None,
+    error_top_intensity_frac: float = 1.0,
+) -> tuple[tuple[int, int], float]:
+    """Locate the shift that registers `moving_image` onto `reference_image`
+    (same shape required) via FFT-based phase cross-correlation, as an
+    alternative to _find_shift_via_template_match's sliding-window search.
+
+    Returns (shift, error): `shift` is rounded to the nearest integer pixel,
+    in the same scipy.ndimage.shift convention _find_shift_via_template_match
+    uses (nd_shift(moving_image, shift) aligns it onto reference_image);
+    `error` is phase_cross_correlation's own registration error in place of
+    match_template's [0, 1] correlation score -- lower is better, unbounded,
+    the opposite sense of a template-matching score.
+
+    `error_window_bounds` (row_start, col_start, row_end, col_end), if given,
+    restricts `error` to phase_cross_correlation's own formula recomputed on a
+    crop of both images at that window -- taken from `reference_image`
+    directly, and from `moving_image` AFTER applying the just-discovered
+    `shift` (so the two crops are in the same registered frame) -- instead of
+    the full image pair. The global, full-image search above still finds
+    `shift` itself (phase correlation has to search the whole image; it can't
+    crop before it knows where the signal is), but the full-image error's
+    src_amp/target_amp Fourier-energy terms are otherwise diluted by
+    background pixels far from the actual peptide signal, so a small
+    peak-centred window (typically the same template_bounds crop
+    template_match uses) makes the ratio reflect how well the signal region
+    itself matches rather than the whole (mostly empty) patch.
+
+    `error_top_intensity_frac` (only consulted when `error_window_bounds` is
+    also given -- MATCH_FEATURES_KWARGS.template_match_top_intensity_frac),
+    if less than 1.0, further restricts the crop to a `reference_mask`: the
+    top `error_top_intensity_frac` fraction of the CROPPED reference's own
+    pixels by intensity (same top-n-by-intensity selection
+    _keep_top_n_intensity_pixels/_resolve_top_intensity_pixel_count already
+    use elsewhere, but resolved from the crop's own pixel count rather than
+    the full image's, since the crop -- not the whole patch -- is the
+    relevant budget here). The SAME mask (derived from the reference) then
+    zeroes out non-signal pixels in both the reference and registered-moving
+    crops before phase_cross_correlation runs, so background/near-zero
+    pixels even inside the anchor-centred window don't count toward the
+    error -- only the genuine signal region's own match quality does.
+    1.0 (default) = no masking, crop-only (same as before this parameter
+    existed).
+
+    Only `error` is affected by either parameter -- the returned `shift` is
+    always the unconstrained, full-image result.
+    """
+    from skimage.registration import phase_cross_correlation
+
+    shift_estimate, error, _ = phase_cross_correlation(
+        reference_image,
+        moving_image,
+        upsample_factor=upsample_factor,
+        normalization=normalization,
+    )
+    shift = (int(round(shift_estimate[0])), int(round(shift_estimate[1])))
+    if error_window_bounds is not None:
+        from scipy.ndimage import shift as nd_shift
+
+        r0, c0, r1, c1 = error_window_bounds
+        registered_moving = nd_shift(
+            moving_image, shift=shift, mode="constant", cval=0.0
+        )
+        ref_crop = reference_image[r0:r1, c0:c1]
+        mov_crop = registered_moving[r0:r1, c0:c1]
+        _n_top = _resolve_top_intensity_pixel_count(
+            ref_crop.shape, error_top_intensity_frac
+        )
+        if _n_top is not None:
+            reference_mask = _top_n_intensity_mask(ref_crop, _n_top)
+            ref_crop = np.where(reference_mask, ref_crop, 0.0)
+            mov_crop = np.where(reference_mask, mov_crop, 0.0)
+        _, error, _ = phase_cross_correlation(
+            ref_crop,
+            mov_crop,
+            upsample_factor=upsample_factor,
+            normalization=normalization,
+        )
+    return shift, float(error)
 
 
 def _find_shift_native_image(
@@ -2332,8 +2480,34 @@ def align_images_to_reference(
     forced_shifts: list[tuple[int, int] | None] | None = None,
     broad_alignment_max_deviation: int | None = None,
     top_intensity_frac: float = 1.0,
+    alignment_method: str = "template_match",
+    phase_correlation_kwargs: dict | None = None,
 ) -> ConsensusAlignmentState:
     """Resize and align images to a reference template for consensus scoring.
+
+    `alignment_method` selects the shift-finding algorithm: "template_match"
+    (default, see the rest of this docstring) or "phase_correlation"
+    (skimage.registration.phase_cross_correlation on the FULL resized
+    reference/candidate image pair instead of a template crop within a larger
+    search image -- FFT-based, sub-pixel accurate to
+    `1/phase_correlation_kwargs["upsample_factor"]` then rounded to the
+    nearest integer pixel). The shift itself always comes from the full,
+    unconstrained image pair (phase correlation has to search the whole image
+    to find the signal), but the returned `max_scores` error is then
+    recomputed on the same `template_bounds` crop template_match uses
+    (anchor-centred, `template_frac`-sized -- see _find_shift_via_
+    phase_correlation's `error_window_bounds`), not the full image, so the
+    error reflects how well the signal region itself matches rather than
+    being diluted by background pixels elsewhere in the patch --
+    `template_frac` therefore stays meaningful under phase_correlation too,
+    just as the error-measurement window rather than the search window. Under
+    "phase_correlation", `max_scores` hold this windowed registration error
+    (lower is better) instead of match_template's [0, 1] correlation score
+    (higher is better) -- see MATCH_FEATURES_KWARGS.alignment_method. Requires
+    `use_shift_crop_pad=False` (phase correlation needs equal-shaped image
+    pairs) and no `forced_shifts` (no windowed-search/correlation-surface
+    concept -- MATCH_FEATURES_KWARGS.broad_alignment and
+    `multi_scale_template_fracs` stay template_match-only).
 
     `forced_shifts`, if given, must have one entry per image (None for images
     that should still go through unconstrained template-match discovery).
@@ -2416,6 +2590,26 @@ def align_images_to_reference(
         )
     if not (0 < template_frac <= 0.5):
         raise ValueError(f"template_frac must be in (0, 0.5], got {template_frac}.")
+    if alignment_method not in ("template_match", "phase_correlation"):
+        raise ValueError(
+            "alignment_method must be 'template_match' or 'phase_correlation', "
+            f"got {alignment_method!r}."
+        )
+    if alignment_method == "phase_correlation":
+        if use_shift_crop_pad:
+            raise ValueError(
+                "alignment_method='phase_correlation' requires use_shift_crop_pad="
+                "False (phase correlation needs equal-shaped, resized image pairs)."
+            )
+        if forced_shifts is not None and any(f is not None for f in forced_shifts):
+            raise ValueError(
+                "alignment_method='phase_correlation' does not support forced_shifts "
+                "(MATCH_FEATURES_KWARGS.broad_alignment); use alignment_method="
+                "'template_match' for broad_alignment.enabled."
+            )
+    _phase_correlation_kwargs = dict(phase_correlation_kwargs or {})
+    _upsample_factor = int(_phase_correlation_kwargs.get("upsample_factor", 10))
+    _normalization = _phase_correlation_kwargs.get("normalization", None)
 
     ref_image = images[reference_idx]
     resolved_target_shape = (
@@ -2485,6 +2679,18 @@ def align_images_to_reference(
     )
     if _n_top_pixels is not None:
         search_template = _keep_top_n_intensity_pixels(search_template, _n_top_pixels)
+    # Full (uncropped) reference in the same search space as search_template --
+    # only used by alignment_method="phase_correlation", which correlates whole
+    # image pairs rather than a template crop within a larger search image.
+    search_reference_full: np.ndarray | None = None
+    if alignment_method == "phase_correlation":
+        search_reference_full = (
+            np.log2(1 + reference_resized) if align_in_log_space else reference_resized
+        )
+        if _n_top_pixels is not None:
+            search_reference_full = _keep_top_n_intensity_pixels(
+                search_reference_full, _n_top_pixels
+            )
 
     aligned_images: list[np.ndarray] = []
     matched_boxes: list[tuple[int, int, int, int]] = []
@@ -2503,7 +2709,9 @@ def align_images_to_reference(
             matched_boxes.append(template_bounds)
             aligned_anchors.append(scaled_anchors[i])
             shifts.append((0, 0))
-            max_scores.append(1.0)
+            # Best-possible-score sentinel: 1.0 for match_template's [0, 1]
+            # correlation score, 0.0 for phase_correlation's zero-is-perfect error.
+            max_scores.append(1.0 if alignment_method == "template_match" else 0.0)
             free_shifts.append(None)
             free_max_scores.append(None)
             continue
@@ -2533,7 +2741,33 @@ def align_images_to_reference(
             if _search_center is not None
             else None
         )
-        if use_shift_crop_pad:
+        if alignment_method == "phase_correlation":
+            _search_image = (
+                np.log2(1 + resized_image) if align_in_log_space else resized_image
+            )
+            if _n_top_pixels is not None:
+                _search_image = _keep_top_n_intensity_pixels(_search_image, _n_top_pixels)
+            shift, max_score = _find_shift_via_phase_correlation(
+                search_reference_full,
+                _search_image,
+                upsample_factor=_upsample_factor,
+                normalization=_normalization,
+                error_window_bounds=template_bounds,
+                error_top_intensity_frac=top_intensity_frac,
+            )
+            from scipy.ndimage import shift as nd_shift
+
+            aligned_image = nd_shift(resized_image, shift=shift, mode="constant", cval=0.0)
+            matched_box = template_bounds
+            scaled_anchor = scaled_anchors[i]
+            aligned_anchor = (
+                (float(scaled_anchor[0] + shift[0]), float(scaled_anchor[1] + shift[1]))
+                if scaled_anchor is not None
+                else None
+            )
+            match_score_map = None
+            match_score_peak = None
+        elif use_shift_crop_pad:
             _search_image = (
                 np.log2(1 + images[i]) if align_in_log_space else images[i]
             )
@@ -2618,6 +2852,9 @@ def align_images_to_reference(
         use_shift_crop_pad=use_shift_crop_pad,
         align_in_log_space=align_in_log_space,
         top_intensity_frac=top_intensity_frac,
+        alignment_method=alignment_method,
+        reference_search_image=search_reference_full,
+        phase_correlation_kwargs=_phase_correlation_kwargs,
     )
 
 
@@ -3347,7 +3584,11 @@ def _extract_feature_rows_from_prealigned(
         raw_consensus_logged_mean,
         run_name="consensus",
         shift=(0, 0),
-        template_matching_score=1.0,
+        # Best-possible-score sentinel: 1.0 (template_match) / 0.0 (phase_correlation),
+        # same convention as the reference run's own sentinel in align_images_to_reference.
+        template_matching_score=(
+            1.0 if alignment_state.alignment_method == "template_match" else 0.0
+        ),
         snap_resolver=lambda label_id: segmentation_state.label_to_snap.get(label_id),
         multi_scale_columns=_multi_scale_consensus_columns(multi_scale_alignments),
     )
@@ -3496,6 +3737,8 @@ def build_consensus_feature_bundle(
     broad_alignment_max_deviation: int | None = None,
     multi_scale_template_fracs: list[float] | None = None,
     top_intensity_frac: float = 1.0,
+    alignment_method: str = "template_match",
+    phase_correlation_kwargs: dict | None = None,
 ) -> ConsensusFeatureBundle:
     """Build alignment, segmentation, and feature tables for consensus scoring.
 
@@ -3564,6 +3807,8 @@ def build_consensus_feature_bundle(
             forced_shifts=forced_shifts,
             broad_alignment_max_deviation=broad_alignment_max_deviation,
             top_intensity_frac=top_intensity_frac,
+            alignment_method=alignment_method,
+            phase_correlation_kwargs=phase_correlation_kwargs,
         )
         # Extra-scale alignments (see MATCH_FEATURES_KWARGS.broad_alignment.
         # multi_scale_template_fracs): only the shift-search substep is
@@ -3584,6 +3829,8 @@ def build_consensus_feature_bundle(
                 forced_shifts=forced_shifts,
                 broad_alignment_max_deviation=broad_alignment_max_deviation,
                 top_intensity_frac=top_intensity_frac,
+                alignment_method=alignment_method,
+                phase_correlation_kwargs=phase_correlation_kwargs,
             )
         segmentation_state = segment_consensus_from_aligned(
             alignment_state,
@@ -4463,7 +4710,41 @@ def _build_consensus_peptide_swap_decoy(
         if forced_shift is not None
         else None
     )
-    if bundle.alignment.use_shift_crop_pad:
+    if bundle.alignment.alignment_method == "phase_correlation":
+        # forced_shift is always None here (broad_alignment requires
+        # alignment_method="template_match" -- see align_images_to_reference),
+        # so no windowed search / free_shift concept applies.
+        decoy_denoised_resized = _resize_image_to_shape(decoy_denoised, target_shape)
+        _search_image = (
+            np.log2(1 + decoy_denoised_resized)
+            if _align_in_log_space
+            else decoy_denoised_resized
+        )
+        if _n_top_pixels is not None:
+            _search_image = _keep_top_n_intensity_pixels(_search_image, _n_top_pixels)
+        shift, max_score = _find_shift_via_phase_correlation(
+            bundle.alignment.reference_search_image,
+            _search_image,
+            upsample_factor=bundle.alignment.phase_correlation_kwargs.get(
+                "upsample_factor", 10
+            ),
+            normalization=bundle.alignment.phase_correlation_kwargs.get(
+                "normalization", None
+            ),
+            error_window_bounds=bundle.alignment.template_bounds,
+            error_top_intensity_frac=bundle.alignment.top_intensity_frac,
+        )
+        from scipy.ndimage import shift as nd_shift
+
+        decoy_denoised_aligned = nd_shift(
+            decoy_denoised_resized, shift=shift, mode="constant", cval=0.0
+        )
+        decoy_raw_resized = _resize_image_to_shape(decoy_raw_image, target_shape)
+        decoy_raw_aligned = nd_shift(
+            decoy_raw_resized, shift=shift, mode="constant", cval=0.0
+        )
+        match_score_map = None
+    elif bundle.alignment.use_shift_crop_pad:
         _search_image = (
             np.log2(1 + decoy_denoised) if _align_in_log_space else decoy_denoised
         )
