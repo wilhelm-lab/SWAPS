@@ -440,6 +440,7 @@ def select_trusted_training_rows(
     decoy_target_ratio: float = 1.0,
     run_col: str = "matched_run",
     rng: Optional[int] = None,
+    decoy_msms_only: bool = False,
 ) -> pd.DataFrame:
     """Build a trusted target+decoy training pool from tdc_df.
 
@@ -447,8 +448,10 @@ def select_trusted_training_rows(
     Reference/Quant_Only in dict_ref, i.e. the run-peptide pair already
     has an MS/MS identification — as opposed to Not_Match candidates
     awaiting MBR, which should not be used to teach the model what a
-    correct match looks like. The decoy pool (all decoy rows in
-    tdc_df) is subsampled down to
+    correct match looks like. The decoy pool (by default all decoy
+    rows in tdc_df, or only decoy rows whose own (mz_rank, run_col)
+    slot is itself MS/MS-confirmed when decoy_msms_only=True — see
+    that parameter) is subsampled down to
     round(n_trusted_targets * decoy_target_ratio) so training starts
     from a balanced target/decoy pool, falling back to the full decoy
     pool (with a warning) if it's smaller than requested.
@@ -467,6 +470,18 @@ def select_trusted_training_rows(
         Column in tdc_df identifying the run (default "matched_run").
     rng : int, optional
         Random seed for decoy subsampling.
+    decoy_msms_only : bool, optional
+        If True, restrict the decoy pool to decoys generated at
+        MS/MS-confirmed (mz_rank, run_col) slots — i.e. only the
+        "sibling" decoys of trusted targets, each a peptide-swapped
+        competitor of that same confirmed candidate. Default False:
+        decoys are drawn from the full pool, including decoys
+        generated at Not_Match (MBR) candidate slots that have no
+        MS/MS-confirmed counterpart. Since decoys are generated ~1:1
+        per candidate slot, restricting can shrink the pool to
+        roughly 1 decoy per trusted target — expect decoy_target_ratio
+        > 1 to routinely fall back to "use all available" (a logged
+        warning, not an error) once decoy_msms_only=True.
 
     Returns
     -------
@@ -484,17 +499,21 @@ def select_trusted_training_rows(
             "No MS/MS-confirmed (Reference/Quant_Only) target rows found in "
             "tdc_df — cannot build a trusted training pool."
         )
-    decoy_pool = tdc_df.loc[~tdc_df["IsTarget"]]
+    decoy_mask = ~tdc_df["IsTarget"]
+    if decoy_msms_only:
+        decoy_mask &= is_msms
+    decoy_pool = tdc_df.loc[decoy_mask]
     n_decoy_wanted = round(len(trusted_targets) * decoy_target_ratio)
     if n_decoy_wanted >= len(decoy_pool):
         if n_decoy_wanted > len(decoy_pool):
             Logger.warning(
                 "select_trusted_training_rows: requested %d decoys (ratio=%s x "
-                "%d trusted targets) but only %d decoys are available — using "
-                "all of them.",
+                "%d trusted targets, decoy_msms_only=%s) but only %d decoys "
+                "are available — using all of them.",
                 n_decoy_wanted,
                 decoy_target_ratio,
                 len(trusted_targets),
+                decoy_msms_only,
                 len(decoy_pool),
             )
         decoy_train = decoy_pool
@@ -502,10 +521,11 @@ def select_trusted_training_rows(
         decoy_train = decoy_pool.sample(n=n_decoy_wanted, random_state=rng)
     Logger.info(
         "select_trusted_training_rows: %d MS/MS-trusted targets, %d decoys "
-        "(pool=%d)",
+        "(pool=%d, decoy_msms_only=%s)",
         len(trusted_targets),
         len(decoy_train),
         len(decoy_pool),
+        decoy_msms_only,
     )
     return pd.concat([trusted_targets, decoy_train], ignore_index=True)
 
