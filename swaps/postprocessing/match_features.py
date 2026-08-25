@@ -983,7 +983,10 @@ def match_features_batch(
     _group_overlap_meta: dict[int, dict] = {}
 
     def _load_group_pept_act(
-        pept_idx: int, raw_file: str, gid: int
+        pept_idx: int,
+        raw_file: str,
+        gid: int,
+        window_overrides: dict[str, tuple] | None = None,
     ) -> tuple[np.ndarray, int, int, tuple[int, int]]:
         return get_pept_act_from_parquet(  # pyright: ignore[reportArgumentType]
             _select_mz(raw_file, gid),
@@ -992,6 +995,7 @@ def match_features_batch(
             raw_file,
             return_offset=True,
             use_group_window=True,
+            window_override=(window_overrides or {}).get(raw_file),
         )
 
     _group_seg_mask_thres = _parse_seg_mask_thres(
@@ -1021,12 +1025,55 @@ def match_features_batch(
                     _seen_rf.add(_rf)
         _group_stack_index = {rf: i for i, rf in enumerate(_group_raw_files)}
 
+        # Mirrors the solo per-candidate path further down (see
+        # _window_overrides/_forced_shifts there): each non-reference run's
+        # own group window (MS1_frame_idx_left/right_group_ref_<run>) is
+        # independently predicted, so it can start at a different absolute
+        # frame offset than the group reference run's window -- applying the
+        # calibrated shift as a forced search_center inside that
+        # independently-offset crop doesn't correct for the offset itself.
+        # Deriving every non-reference run's window directly from the
+        # reference's own window shifted by the calibrated offset makes crops
+        # start-aligned by construction, so the forced shift collapses to
+        # (0, 0) -- template matching still runs, just within
+        # broad_alignment_max_deviation of that aligned position.
+        _group_window_overrides: dict[str, tuple] = {}
+        _group_forced_shifts = None
+        if _shift_lookup is not None:
+            _group_rt_pos = float(
+                np.mean(
+                    [
+                        dict_ref_by_mz.at[m, f"MS1_frame_idx_center_ref_{_group_ref_run}"]
+                        for m in _gmembers
+                    ]
+                )
+            )
+            _ref_group_act, _, _, (_ref_rt_start, _ref_im_start) = _load_group_pept_act(
+                _group_repr, _group_ref_run, _gid
+            )
+            _ref_rt_end = _ref_rt_start + _ref_group_act.shape[0] - 1
+            _ref_im_end = _ref_im_start + _ref_group_act.shape[1] - 1
+            _group_forced_shifts = [None]
+            for rf in _group_raw_files[1:]:
+                _raw_fs = _shift_lookup.lookup(_group_ref_run, rf, _group_rt_pos)
+                if _raw_fs is None:
+                    _group_forced_shifts.append(None)
+                    continue
+                _shift_rt, _shift_im = _raw_fs
+                _group_window_overrides[rf] = (
+                    (_ref_rt_start - _shift_rt, _ref_rt_end - _shift_rt),
+                    (_ref_im_start - _shift_im, _ref_im_end - _shift_im),
+                )
+                _group_forced_shifts.append((0, 0))
+
         _all_member_anchors: dict[int, list[tuple[int, int] | None]] = {
             _m: _positional_anchors(
                 _group_raw_files,
                 _member_roles[_m][0],
                 set(_member_roles[_m][1]),
-                lambda rf, _m=_m: _load_group_pept_act(_m, rf, _gid),
+                lambda rf, _m=_m: _load_group_pept_act(
+                    _m, rf, _gid, window_overrides=_group_window_overrides
+                ),
             )
             for _m in _gmembers
         }
@@ -1039,27 +1086,15 @@ def match_features_batch(
         )
 
         _group_raw_images = [
-            _load_group_pept_act(_group_repr, rf, _gid)[0] for rf in _group_raw_files
+            _load_group_pept_act(
+                _group_repr, rf, _gid, window_overrides=_group_window_overrides
+            )[0]
+            for rf in _group_raw_files
         ]
         _group_denoised_images = [
             smooth_and_denoise_image(img, **raw_denoise_kwargs)
             for img in _group_raw_images
         ]
-
-        _group_forced_shifts = None
-        if _shift_lookup is not None:
-            _group_rt_pos = float(
-                np.mean(
-                    [
-                        dict_ref_by_mz.at[m, f"MS1_frame_idx_center_ref_{_group_ref_run}"]
-                        for m in _gmembers
-                    ]
-                )
-            )
-            _group_forced_shifts = [None] + [
-                _shift_lookup.lookup(_group_ref_run, rf, _group_rt_pos)
-                for rf in _group_raw_files[1:]
-            ]
 
         # apply_seg=False: segment_consensus_from_aligned still always
         # computes consensus/consensus_denoised (the linear-space average
@@ -1094,6 +1129,7 @@ def match_features_batch(
             "bundle": _group_bundle,
             "reference_run": _group_ref_run,
             "stack_index": _group_stack_index,
+            "window_overrides": _group_window_overrides,
         }
         _group_overlap_meta[_gid] = {
             "target_shape": _group_bundle.alignment.target_shape,
@@ -1305,7 +1341,10 @@ def match_features_batch(
             # member's own reference run differing from the group's.
             _own_origin_at_own_ref = _get_pept_act_tuple(reference_raw_file)[3]
             _group_origin_at_own_ref = _load_group_pept_act(
-                int(pept_idx), reference_raw_file, _group_id
+                int(pept_idx),
+                reference_raw_file,
+                _group_id,
+                window_overrides=_cached_group.get("window_overrides"),
             )[3]
             _reg_shift = _cached_group["bundle"].alignment.shifts[
                 _cached_group["stack_index"][reference_raw_file]
