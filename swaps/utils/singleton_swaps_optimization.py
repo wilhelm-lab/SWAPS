@@ -169,14 +169,26 @@ __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.normalize_before_hmaxima = False
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.strategies = [
     "peptide_swap",
-]  # ["peptide_swap", "off_target_shift"]
+]  # ["peptide_swap", "off_target_shift", "bbox_swap"]
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.n_peptide_swap_decoys = 1
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.n_off_target_shift_decoys = 1
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.off_target_min_offset_frac = 0.35
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.off_target_max_overlap_fraction = 0.05
-# peptide_swap only: prefer near-isobaric co-eluting candidates (confounders column
-# in dict_ref) as decoy source; falls back to full batch if none are in-batch
+# peptide_swap/bbox_swap only: prefer near-isobaric co-eluting candidates
+# (confounders column in dict_ref) as decoy source; falls back to full batch if
+# none are in-batch
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.use_confounder_sampling = True
+# bbox_swap: BEFORE alignment, splices a randomly sampled foreign peptide's
+# own center-cropped patch (native shape, no whole-image resize) into this
+# run's own genuine raw image at its own known anchor (Reference/Quant_Only
+# runs) or its own geometric center (Match runs), then pushes the resulting
+# hybrid image through the SAME search a whole-image peptide_swap decoy uses
+# -- so it earns its own rt/im shift + template_matching_score instead of
+# reusing the target's. See _build_bbox_swap_decoy_raw_image in
+# match_features.py.
+__C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.n_bbox_swap_decoys = 1
+__C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.bbox_swap_template_frac = 0.2  # half-width (as a fraction of each dim) of the swapped bbox; independent of the alignment template_frac above
+__C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.bbox_swap_max_intensity_tries = 5  # resample a different foreign peptide up to this many times if the sampled patch is all-zero; whether the eventual intensity is real signal or background noise doesn't matter, only that it's non-empty
 
 __C.FDR = ConfigurationNode()
 __C.FDR.ENABLED = True  # if False, skip Mokapot/percolator FDR control entirely; pp_match_target_filtered is pp_match_target with only intensity filtering (FDR.INT_THRES) applied

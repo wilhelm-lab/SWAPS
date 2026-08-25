@@ -1418,6 +1418,15 @@ def match_features_batch(
         _off_target_max_overlap_fraction = float(
             _consensus_decoy_kwargs.get("off_target_max_overlap_fraction", 0.05)
         )
+        _n_bbox_swap_decoys = max(
+            int(_consensus_decoy_kwargs.get("n_bbox_swap_decoys", 1)), 0
+        )
+        _bbox_swap_template_frac = float(
+            _consensus_decoy_kwargs.get("bbox_swap_template_frac", 0.2)
+        )
+        _bbox_swap_max_intensity_tries = max(
+            int(_consensus_decoy_kwargs.get("bbox_swap_max_intensity_tries", 5)), 1
+        )
         _batch_exclude = (
             batch_np[batch_np != pept_idx]
             if match_decoy and batch_np.size > 1
@@ -1530,6 +1539,139 @@ def match_features_batch(
                             _batch_svg_dir,
                             raw_images=_plot_raw_images,
                             filename_prefix=f"decoy_peptide_swap_rep{_rep}_",
+                            log_transform_display=illustration_log_transform,
+                        )
+
+        # bbox_swap: unlike off_target_shift, this decoy needs its own genuine
+        # rt/im shift + template_matching_score (not the target's, which would
+        # give it zero discriminative signal on those features) -- so it must
+        # be built BEFORE alignment, from each run's own raw (pre-alignment)
+        # image, and then pushed through the SAME search
+        # (_build_consensus_peptide_swap_decoy) the whole-image peptide_swap
+        # decoy uses, same as a genuine candidate. Per (rep, run): sample a
+        # foreign peptide's own raw image (native shape, unresized), take its
+        # own geometric-center patch (resample up to
+        # _bbox_swap_max_intensity_tries times if a draw's center patch is
+        # all-zero -- prefer non-empty content, real signal or background
+        # noise doesn't matter), and splice it into THIS run's own genuine raw
+        # image at its own known anchor (Reference/Quant_Only runs) or its own
+        # geometric center (Match runs, whose true peak position isn't known
+        # until alignment discovers it) -- see _build_bbox_swap_decoy_raw_image.
+        _bbox_swap_decoys_by_rep: list[dict[str, dict[str, Any]]] = []
+        if (
+            match_decoy
+            and "bbox_swap" in _consensus_decoy_strategies
+            and _n_bbox_swap_decoys > 0
+            and _batch_exclude.size > 0
+        ):
+            for _rep in range(_n_bbox_swap_decoys):
+                _rep_specs: dict[str, dict[str, Any]] = {}
+                _plot_raw_images: list[np.ndarray] = []
+                _plot_raw_denoised_images: list[np.ndarray] = []
+                _plot_labels: list[str] = []
+                for _idx, _rf in enumerate(_consensus_raw_files):
+                    if _rf == reference_raw_file:
+                        _plot_raw_images.append(_get_pept_act_tuple(_rf)[0])
+                        _plot_raw_denoised_images.append(
+                            _get_raw_denoised_pept_act(_rf)
+                        )
+                        _plot_labels.append(_rf)
+                        continue
+                    _decoy_pool = (
+                        _confounder_in_batch
+                        if _confounder_in_batch.size > 0
+                        else _batch_exclude
+                    )
+                    _src_mz = None
+                    _src_raw = None
+                    for _ in range(_bbox_swap_max_intensity_tries):
+                        _src_mz = int(np.random.choice(_decoy_pool))
+                        _src_act_df = _select_mz(_rf, _act_lookup_key(_src_mz))
+                        _src_raw, _, _ = get_pept_act_from_parquet(
+                            _src_act_df, _src_mz, dict_ref_by_mz, _rf
+                        )
+                        _src_rows, _src_cols = _src_raw.shape
+                        _sr0, _sc0, _sr1, _sc1 = _anchor_centered_bounds(
+                            _src_rows // 2,
+                            _src_cols // 2,
+                            (_src_rows, _src_cols),
+                            _bbox_swap_template_frac,
+                        )
+                        if _sr1 > _sr0 and _sc1 > _sc0 and np.any(
+                            _src_raw[_sr0:_sr1, _sc0:_sc1] > 0
+                        ):
+                            break
+                    _hybrid_raw = _build_bbox_swap_decoy_raw_image(
+                        _get_pept_act_tuple(_rf)[0],
+                        _src_raw,
+                        _consensus_anchors[_idx],
+                        _bbox_swap_template_frac,
+                    )
+                    if _hybrid_raw is None:
+                        continue
+                    _hybrid_raw_denoised = smooth_and_denoise_image(
+                        _hybrid_raw, **raw_denoise_kwargs
+                    )
+                    _rep_specs[_rf] = {
+                        "decoy_mz_rank": _src_mz,
+                        "decoy_raw_image": _hybrid_raw,
+                    }
+                    _plot_raw_images.append(_hybrid_raw)
+                    _plot_raw_denoised_images.append(_hybrid_raw_denoised)
+                    _plot_labels.append(f"{_rf}\n(bbox_swap mz{_src_mz})")
+                _bbox_swap_decoys_by_rep.append(_rep_specs)
+                if visualize_dir is not None or _batch_svg_dir is not None:
+                    _plot_anchors = [_consensus_anchors[0]] + [None] * (
+                        len(_plot_labels) - 1
+                    )
+                    _decoy_bundle = build_consensus_feature_bundle(
+                        images=_plot_raw_denoised_images,
+                        reference_idx=0,
+                        template_frac=float(
+                            (processing_kwargs or {}).get("template_frac", 0.3)
+                        ),
+                        anchors=_plot_anchors,
+                        denoise_cfg=denoise_cfg,
+                        watershed_kwargs=dict(
+                            (processing_kwargs or {}).get("peak_consensus_kwargs", {})
+                        ),
+                        raw_images=_plot_raw_images,
+                        labels=_plot_labels,
+                        apply_seg=bool(
+                            (processing_kwargs or {}).get("apply_seg", True)
+                        ),
+                        seg_mask_thres=_parse_seg_mask_thres(
+                            (processing_kwargs or {}).get("seg_mask_thres")
+                        ),
+                        jump_dist_thres=_parse_jump_dist_thres(
+                            (processing_kwargs or {}).get("jump_dist_thres")
+                        ),
+                        align_images=_align_images,
+                        align_in_log_space=_align_in_log_space,
+                        use_shift_crop_pad=_use_shift_crop_pad,
+                        top_intensity_frac=_top_intensity_frac,
+                        alignment_method=_alignment_method,
+                        phase_correlation_kwargs=_phase_correlation_kwargs,
+                    )
+                    if visualize_dir is not None:
+                        _visualize_consensus_bundle(
+                            _decoy_bundle.alignment,
+                            _decoy_bundle.segmentation,
+                            fig_dir=visualize_dir,
+                            filename=(
+                                f"mz{pept_idx}_consensus_decoy_bbox_swap_rep{_rep}.png"
+                            ),
+                            labels=_plot_labels,
+                            log_transform_display=illustration_log_transform,
+                        )
+                    if _batch_svg_dir is not None:
+                        _save_illustration_svgs(
+                            int(pept_idx),
+                            _decoy_bundle,
+                            _plot_labels,
+                            _batch_svg_dir,
+                            raw_images=_plot_raw_images,
+                            filename_prefix=f"decoy_bbox_swap_rep{_rep}_",
                             log_transform_display=illustration_log_transform,
                         )
 
@@ -1811,6 +1953,108 @@ def match_features_batch(
                         _match_d["decoy_rep"] = _rep
                         _match_d["label_shift_rt"] = int(label_shift[0])
                         _match_d["label_shift_im"] = int(label_shift[1])
+                        results_decoy.append(_match_d)
+
+                if (
+                    "bbox_swap" in _consensus_decoy_strategies
+                    and _n_bbox_swap_decoys > 0
+                    and _bbox_swap_decoys_by_rep
+                ):
+                    for _rep in range(_n_bbox_swap_decoys):
+                        _rep_spec = _bbox_swap_decoys_by_rep[_rep].get(_rf)
+                        if _rep_spec is None:
+                            continue
+                        decoy_pept_idx = int(_rep_spec["decoy_mz_rank"])
+                        decoy_act = _rep_spec["decoy_raw_image"]
+                        # Same search path a whole-image peptide_swap decoy
+                        # uses -- this hybrid image is genuine target content
+                        # everywhere except its own anchor-centred bbox, but
+                        # still needs a real alignment search of its own so its
+                        # rt/im shift + template_matching_score are earned, not
+                        # borrowed from the target (see the selection loop's
+                        # comment above and _build_bbox_swap_decoy_raw_image).
+                        decoy_pp_raw, _, _ = _build_consensus_peptide_swap_decoy(
+                            _consensus_bundle,
+                            decoy_act,
+                            _rf,
+                            raw_denoise_kwargs=raw_denoise_kwargs,
+                            log_transform_enabled=_log_enabled,
+                            forced_shift=(
+                                _consensus_bundle.alignment.shifts[_ci]
+                                if _broad_alignment_enabled
+                                else None
+                            ),
+                            max_deviation=(
+                                _broad_alignment_max_deviation
+                                if _broad_alignment_enabled
+                                else None
+                            ),
+                            multi_scale_forced_shifts=(
+                                {
+                                    _frac: _state.shifts[_ci]
+                                    for _frac, _state in (
+                                        _consensus_bundle.multi_scale_alignments.items()
+                                    )
+                                }
+                                if _broad_alignment_enabled
+                                else None
+                            ),
+                        )
+                        if decoy_pp_raw is None:
+                            no_quant_log.append(
+                                {
+                                    "mz_rank": pept_idx,
+                                    "run_name": _rf,
+                                    "type": "match_decoy",
+                                    "feature_instance_id": feature_instance_id,
+                                    "decoy_strategy": "bbox_swap_consensus",
+                                    "decoy_rep": _rep,
+                                    "decoy_mz_rank": decoy_pept_idx,
+                                }
+                            )
+                            no_match_log.append(
+                                {
+                                    "mz_rank": pept_idx,
+                                    "run_name": _rf,
+                                    "type": "match_decoy",
+                                    "feature_instance_id": feature_instance_id,
+                                    "decoy_strategy": "bbox_swap_consensus",
+                                    "decoy_rep": _rep,
+                                    "decoy_mz_rank": decoy_pept_idx,
+                                }
+                            )
+                            continue
+                        _prop_d = _annotate_peak_properties(
+                            decoy_pp_raw,
+                            mz_rank=pept_idx,
+                            run_name=_rf,
+                            own_anchor_id=own_anchor_id,
+                            assimilated_to_anchor_id=own_anchor_id,
+                            feature_instance_id=feature_instance_id,
+                            own_feature_instance_id=feature_instance_id,
+                            source_run="consensus",
+                            source_type="Consensus",
+                            decoy_mz_rank=decoy_pept_idx,
+                        )
+                        if _prop_d is None:
+                            continue
+                        _prop_d["decoy_strategy"] = "bbox_swap_consensus"
+                        _prop_d["decoy_rep"] = _rep
+                        pp_match_decoy_list.append(_prop_d)
+                        _match_d = compare_peak_properties(
+                            _consensus_bundle.consensus_pp,
+                            _prop_d,
+                            multi_scale_fracs=_multi_scale_fracs,
+                        )
+                        _match_d["mz_rank"] = pept_idx
+                        _match_d["decoy_mz_rank"] = decoy_pept_idx
+                        _match_d["feature_instance_id"] = feature_instance_id
+                        _match_d["own_anchor_id"] = own_anchor_id
+                        _match_d["assimilated_to_anchor_id"] = own_anchor_id
+                        _match_d["source_run"] = "consensus"
+                        _match_d["source_type"] = "Consensus"
+                        _match_d["decoy_strategy"] = "bbox_swap_consensus"
+                        _match_d["decoy_rep"] = _rep
                         results_decoy.append(_match_d)
         else:
             # consensus_pp is None: consensus generation failed — log all runs
@@ -2429,22 +2673,37 @@ def _scale_anchor_to_target_shape(
     return (float(anchor[0]) * scale_r, float(anchor[1]) * scale_c)
 
 
+def _anchor_centered_bounds(
+    anchor_row: int, anchor_col: int, shape: tuple[int, int], frac: float
+) -> tuple[int, int, int, int]:
+    """(row_start, col_start, row_end, col_end) of an anchor-centred
+    ±frac*dim box, clipped to `shape` -- the bbox math _build_reference_template
+    uses for its own template crop, factored out so other anchor-centred-box
+    consumers (e.g. _build_bbox_swap_decoy_raw_image) share it."""
+    rows, cols = shape
+    row_start = max(int(anchor_row - frac * rows), 0)
+    row_end = min(int(anchor_row + frac * rows), rows)
+    col_start = max(int(anchor_col - frac * cols), 0)
+    col_end = min(int(anchor_col + frac * cols), cols)
+    return row_start, col_start, row_end, col_end
+
+
 def _build_reference_template(
     reference_image: np.ndarray,
     template_anchor: tuple[int, int] | None,
     template_frac: float,
 ) -> tuple[int, int, tuple[int, int, int, int], np.ndarray]:
-    rows, cols = reference_image.shape
     if template_anchor is None:
         anchor_row, anchor_col = np.unravel_index(
             np.argmax(reference_image), reference_image.shape
         )
     else:
         anchor_row, anchor_col = int(template_anchor[0]), int(template_anchor[1])
-    template_rt_start = max(int(anchor_row - template_frac * rows), 0)
-    template_rt_end = min(int(anchor_row + template_frac * rows), rows)
-    template_im_start = max(int(anchor_col - template_frac * cols), 0)
-    template_im_end = min(int(anchor_col + template_frac * cols), cols)
+    template_rt_start, template_im_start, template_rt_end, template_im_end = (
+        _anchor_centered_bounds(
+            anchor_row, anchor_col, reference_image.shape, template_frac
+        )
+    )
     template_bounds = (
         template_rt_start,
         template_im_start,
@@ -4932,6 +5191,74 @@ def _build_consensus_off_target_decoy(
         ),
     )
     return decoy_pp, resolved_label_shift
+
+
+def _build_bbox_swap_decoy_raw_image(
+    target_raw_image: np.ndarray,
+    source_raw_image: np.ndarray,
+    target_anchor: tuple[int, int] | None,
+    bbox_frac: float,
+) -> np.ndarray | None:
+    """Splice a foreign peptide's own center-cropped patch into a copy of
+    `target_raw_image`, returning the hybrid RAW image for a genuine
+    downstream alignment search (see _build_consensus_peptide_swap_decoy,
+    which this feeds into for the bbox_swap consensus decoy strategy).
+
+    Complements the other two consensus decoy strategies: peptide_swap
+    substitutes the WHOLE image with a foreign one; off_target_shift keeps
+    the real image but shifts the label mask; this one corrupts only an
+    anchor-centred bbox (half-width `bbox_frac` * each image's own dims) the
+    peak itself is expected to occupy, splicing in `source_raw_image`'s own
+    geometric-center patch -- not a coordinate-matched crop, since this runs
+    BEFORE alignment (no shared coordinate frame with the target yet exists,
+    and using the target's own registered coordinates here would make the
+    decoy's rt/im shift and template_matching_score collapse onto the
+    target's own already-resolved values instead of being independently
+    discovered). `target_anchor`, if given (Reference/Quant_Only runs, whose
+    real predicted apex is already known), centers the target-side bbox
+    there; otherwise (Match runs, whose true peak position isn't known until
+    alignment discovers it) it falls back to `target_raw_image`'s own
+    geometric center -- windows are already built centred on the predicted
+    RT/IM, so this sits close to where the real peak is expected. The source
+    patch is resized only if it doesn't already match the target bbox's own
+    pixel shape (native per-peptide window sizes can differ) -- no whole-
+    image resize of either side.
+
+    Everything outside the bbox is genuine target content, so the returned
+    image is a partial, not full, corruption -- probing whether scoring
+    stays sensitive to the peak's own local image content even after a
+    plausible-looking realignment, not just whether a wrong image or a
+    mis-positioned mask can be told apart from a right one.
+
+    Returns None if either image's own bbox is degenerate (frac too large
+    relative to its own tiny dimension, or a zero-sized image).
+    """
+    rows, cols = target_raw_image.shape
+    anchor_row, anchor_col = (
+        (int(target_anchor[0]), int(target_anchor[1]))
+        if target_anchor is not None
+        else (rows // 2, cols // 2)
+    )
+    row_start, col_start, row_end, col_end = _anchor_centered_bounds(
+        anchor_row, anchor_col, (rows, cols), bbox_frac
+    )
+    if row_end <= row_start or col_end <= col_start:
+        return None
+    src_rows, src_cols = source_raw_image.shape
+    src_row_start, src_col_start, src_row_end, src_col_end = _anchor_centered_bounds(
+        src_rows // 2, src_cols // 2, (src_rows, src_cols), bbox_frac
+    )
+    if src_row_end <= src_row_start or src_col_end <= src_col_start:
+        return None
+    source_patch = source_raw_image[
+        src_row_start:src_row_end, src_col_start:src_col_end
+    ]
+    target_patch_shape = (row_end - row_start, col_end - col_start)
+    if source_patch.shape != target_patch_shape:
+        source_patch = _resize_image_to_shape(source_patch, target_patch_shape)
+    hybrid = target_raw_image.copy()
+    hybrid[row_start:row_end, col_start:col_end] = source_patch
+    return hybrid
 
 
 def generate_consensus_image(

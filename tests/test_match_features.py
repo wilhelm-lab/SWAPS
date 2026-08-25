@@ -10,8 +10,11 @@ import pytest
 
 from swaps.postprocessing import match_features as match_features_module
 from swaps.postprocessing.match_features import (
+    _anchor_centered_bounds,
+    _build_bbox_swap_decoy_raw_image,
     _build_consensus_peptide_swap_decoy,
     _build_peptide_batches,
+    _build_reference_template,
     _carve_out_oversized,
     _confounder_pool,
     _estimate_peptide_pixel_weights,
@@ -243,6 +246,114 @@ class TestBroadAlignmentForcedShift:
         )
         assert abs(shift[0] - (-2)) <= 3
         assert abs(shift[1] - (-2)) <= 3
+
+
+class TestBboxSwapDecoy:
+    def test_anchor_centered_bounds_matches_reference_template(self):
+        img = _two_blob_image()
+        anchor_row, anchor_col, template_bounds, _ = _build_reference_template(
+            img, (10, 10), 0.2
+        )
+        bounds = _anchor_centered_bounds(anchor_row, anchor_col, img.shape, 0.2)
+        assert bounds == template_bounds
+
+    def test_anchor_centered_bounds_clips_to_shape(self):
+        row_start, col_start, row_end, col_end = _anchor_centered_bounds(
+            2, 2, (40, 40), 0.3
+        )
+        assert row_start == 0
+        assert col_start == 0
+        assert row_end <= 40
+        assert col_end <= 40
+
+    def test_splices_source_center_at_given_target_anchor(self):
+        target = np.ones((40, 40))
+        source = np.zeros((40, 40))
+        source[16:24, 16:24] = 9.0  # source's own center patch (frac=0.1 -> ±4px)
+        hybrid = _build_bbox_swap_decoy_raw_image(
+            target, source, target_anchor=(20, 20), bbox_frac=0.1
+        )
+        assert hybrid is not None
+        assert hybrid.shape == target.shape
+        np.testing.assert_array_equal(hybrid[16:24, 16:24], 9.0)
+        # Untouched outside the bbox -- genuine target content only.
+        assert hybrid[0, 0] == 1.0
+        assert hybrid[39, 39] == 1.0
+
+    def test_falls_back_to_target_geometric_center_when_anchor_is_none(self):
+        target = np.ones((40, 40))
+        source = np.full((40, 40), 9.0)
+        hybrid = _build_bbox_swap_decoy_raw_image(
+            target, source, target_anchor=None, bbox_frac=0.1
+        )
+        assert hybrid is not None
+        # Center of a 40x40 image is (20, 20) -- same bbox as an explicit
+        # (20, 20) anchor above.
+        np.testing.assert_array_equal(hybrid[16:24, 16:24], 9.0)
+        assert hybrid[0, 0] == 1.0
+
+    def test_uses_source_own_center_not_a_coordinate_matched_crop(self):
+        target = np.ones((40, 40))
+        source = np.zeros((40, 40))
+        source[16:24, 16:24] = 9.0  # only the source's own center carries signal
+        # Target anchor is off-center (near the top-left corner) -- if the
+        # source were cropped at the SAME (target-anchor) coordinates instead
+        # of its own center, this patch would come back all-zero.
+        hybrid = _build_bbox_swap_decoy_raw_image(
+            target, source, target_anchor=(4, 4), bbox_frac=0.1
+        )
+        assert hybrid is not None
+        assert np.any(hybrid[0:8, 0:8] > 0)
+
+    def test_resizes_source_patch_when_native_shapes_differ(self):
+        target = np.ones((40, 40))
+        source = np.full((80, 80), 9.0)  # different native window size
+        hybrid = _build_bbox_swap_decoy_raw_image(
+            target, source, target_anchor=(20, 20), bbox_frac=0.1
+        )
+        assert hybrid is not None
+        assert hybrid.shape == target.shape
+        np.testing.assert_array_equal(hybrid[16:24, 16:24], 9.0)
+
+    def test_returns_none_for_degenerate_target_bbox(self):
+        target = np.ones((1, 1))
+        source = np.ones((40, 40))
+        result = _build_bbox_swap_decoy_raw_image(
+            target, source, target_anchor=(0, 0), bbox_frac=0.2
+        )
+        assert result is None
+
+    def test_returns_none_for_degenerate_source_bbox(self):
+        target = np.ones((40, 40))
+        source = np.ones((1, 1))
+        result = _build_bbox_swap_decoy_raw_image(
+            target, source, target_anchor=(20, 20), bbox_frac=0.2
+        )
+        assert result is None
+
+    def test_bbox_swap_hybrid_feeds_peptide_swap_decoy_search(self):
+        # End-to-end sanity: the hybrid image produced here is exactly what
+        # match_features_batch hands to _build_consensus_peptide_swap_decoy
+        # for the bbox_swap strategy, so it must be a valid search input that
+        # earns its own (non-degenerate) shift/score rather than erroring out.
+        img = _two_blob_image()
+        bundle = build_consensus_feature_bundle(
+            images=[img, img],
+            anchors=[(10, 10), (10, 10)],
+            raw_images=[img, img],
+            labels=["R1", "R2"],
+        )
+        source = _two_blob_image(centers=((25, 5), (25, 25)))
+        hybrid = _build_bbox_swap_decoy_raw_image(
+            img, source, target_anchor=(10, 10), bbox_frac=0.2
+        )
+        assert hybrid is not None
+        decoy_pp, shift, max_score = _build_consensus_peptide_swap_decoy(
+            bundle, hybrid, "R2"
+        )
+        assert decoy_pp is not None
+        assert not np.isnan(max_score)
+        assert isinstance(shift, tuple)
 
 
 # ---------------------------------------------------------------------------
@@ -716,7 +827,15 @@ def _build_group_dict_ref(raw_files, anchors):
     return pd.DataFrame(rows)
 
 
-def _run_group_scenario(tmp_path, group_blobs, a_anchor_offset, b_anchor_offset):
+def _run_group_scenario(
+    tmp_path,
+    group_blobs,
+    a_anchor_offset,
+    b_anchor_offset,
+    match_decoy=False,
+    visualize_dir=None,
+    processing_kwargs_extra=None,
+):
     """Two runs, three candidates: mz_rank 1 (A) and 2 (B) are a confounder
     group sharing the IDENTICAL activation image `group_blobs` in every run
     (as coSWA's SWA-level merge would produce -- see
@@ -748,14 +867,47 @@ def _run_group_scenario(tmp_path, group_blobs, a_anchor_offset, b_anchor_offset)
     }
     dict_ref = _build_group_dict_ref(raw_files, anchors)
 
+    processing_kwargs = {"apply_seg": True, **(processing_kwargs_extra or {})}
     return match_features_batch(
         dict_ref=dict_ref,
         raw_file_list=raw_files,
         result_dir=str(tmp_path),
         batch=[1, 2, 3],
-        processing_kwargs={"apply_seg": True},
-        match_decoy=False,
+        processing_kwargs=processing_kwargs,
+        match_decoy=match_decoy,
+        visualize_dir=visualize_dir,
     )
+
+
+class TestMatchFeaturesBatchDecoyVisualization:
+    """Regression coverage for match_decoy=True + visualize_dir actually
+    rendering a decoy illustration PNG for every enabled decoy strategy --
+    bbox_swap was added without this wiring initially (peptide_swap and
+    off_target_shift already had it), so a fresh decoy strategy silently
+    produced no visualization output despite visualize_dir being set."""
+
+    def test_all_three_decoy_strategies_render_visualization_images(self, tmp_path):
+        viz_dir = tmp_path / "viz"
+        os.makedirs(viz_dir, exist_ok=True)
+        _run_group_scenario(
+            tmp_path,
+            group_blobs=[(15, 8, 10.0, 2.0), (15, 18, 10.0, 2.0)],
+            a_anchor_offset=(15, 8),
+            b_anchor_offset=(15, 18),
+            match_decoy=True,
+            visualize_dir=str(viz_dir),
+            processing_kwargs_extra={
+                "consensus_decoy_kwargs": {
+                    "strategies": ["peptide_swap", "off_target_shift", "bbox_swap"],
+                    "n_peptide_swap_decoys": 1,
+                    "n_off_target_shift_decoys": 1,
+                    "n_bbox_swap_decoys": 1,
+                }
+            },
+        )
+        rendered = set(os.listdir(viz_dir))
+        for strategy in ("peptide_swap", "off_target_shift", "bbox_swap"):
+            assert f"mz3_consensus_decoy_{strategy}_rep0.png" in rendered
 
 
 class TestSelectGroupReferenceRun:
