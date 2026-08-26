@@ -11,6 +11,7 @@ import pytest
 from swaps.postprocessing import match_features as match_features_module
 from swaps.postprocessing.match_features import (
     _anchor_centered_bounds,
+    _build_bbox_noise_decoy_raw_image,
     _build_bbox_swap_decoy_raw_image,
     _build_consensus_peptide_swap_decoy,
     _build_peptide_batches,
@@ -346,6 +347,82 @@ class TestBboxSwapDecoy:
         source = _two_blob_image(centers=((25, 5), (25, 25)))
         hybrid = _build_bbox_swap_decoy_raw_image(
             img, source, target_anchor=(10, 10), bbox_frac=0.2
+        )
+        assert hybrid is not None
+        decoy_pp, shift, max_score = _build_consensus_peptide_swap_decoy(
+            bundle, hybrid, "R2"
+        )
+        assert decoy_pp is not None
+        assert not np.isnan(max_score)
+        assert isinstance(shift, tuple)
+
+
+class TestBboxNoiseDecoy:
+    def test_bbox_filled_from_background_values(self):
+        target = np.full((40, 40), 9.0)  # uniform background
+        target[16:24, 16:24] = 5.0  # bbox region, pre-replacement
+        hybrid = _build_bbox_noise_decoy_raw_image(
+            target, target_anchor=(20, 20), bbox_frac=0.1
+        )
+        assert hybrid is not None
+        assert hybrid.shape == target.shape
+        # Bbox content is entirely resampled from the (9.0-valued)
+        # background, not left as the original 5.0.
+        assert np.all(hybrid[16:24, 16:24] == 9.0)
+        # Outside the bbox stays genuine target content.
+        assert hybrid[0, 0] == 9.0
+
+    def test_falls_back_to_target_geometric_center_when_anchor_is_none(self):
+        target = np.ones((40, 40))
+        target[16:24, 16:24] = 5.0
+        hybrid = _build_bbox_noise_decoy_raw_image(
+            target, target_anchor=None, bbox_frac=0.1
+        )
+        assert hybrid is not None
+        # Center of a 40x40 image is (20, 20) -- same bbox as an explicit
+        # (20, 20) anchor.
+        assert np.all(hybrid[16:24, 16:24] == 1.0)
+
+    def test_sampled_values_come_from_background_pool(self):
+        target = np.arange(1600, dtype=float).reshape(40, 40)
+        background_values = set(target.ravel().tolist())
+        background_values -= set(target[16:24, 16:24].ravel().tolist())
+        hybrid = _build_bbox_noise_decoy_raw_image(
+            target, target_anchor=(20, 20), bbox_frac=0.1
+        )
+        assert hybrid is not None
+        for v in hybrid[16:24, 16:24].ravel():
+            assert v in background_values
+
+    def test_returns_none_for_degenerate_bbox(self):
+        target = np.ones((1, 1))
+        result = _build_bbox_noise_decoy_raw_image(
+            target, target_anchor=(0, 0), bbox_frac=0.2
+        )
+        assert result is None
+
+    def test_returns_none_when_bbox_covers_whole_image(self):
+        target = np.ones((10, 10))
+        result = _build_bbox_noise_decoy_raw_image(
+            target, target_anchor=(5, 5), bbox_frac=0.5
+        )
+        assert result is None
+
+    def test_bbox_noise_hybrid_feeds_peptide_swap_decoy_search(self):
+        # End-to-end sanity: the hybrid image produced here is exactly what
+        # match_features_batch hands to _build_consensus_peptide_swap_decoy
+        # for the bbox_noise strategy, so it must be a valid search input
+        # that earns its own (non-degenerate) shift/score rather than
+        # erroring out.
+        img = _two_blob_image()
+        bundle = build_consensus_feature_bundle(
+            images=[img, img],
+            anchors=[(10, 10), (10, 10)],
+            raw_images=[img, img],
+            labels=["R1", "R2"],
+        )
+        hybrid = _build_bbox_noise_decoy_raw_image(
+            img, target_anchor=(10, 10), bbox_frac=0.2
         )
         assert hybrid is not None
         decoy_pp, shift, max_score = _build_consensus_peptide_swap_decoy(
@@ -886,7 +963,7 @@ class TestMatchFeaturesBatchDecoyVisualization:
     off_target_shift already had it), so a fresh decoy strategy silently
     produced no visualization output despite visualize_dir being set."""
 
-    def test_all_three_decoy_strategies_render_visualization_images(self, tmp_path):
+    def test_all_four_decoy_strategies_render_visualization_images(self, tmp_path):
         viz_dir = tmp_path / "viz"
         os.makedirs(viz_dir, exist_ok=True)
         _run_group_scenario(
@@ -898,15 +975,26 @@ class TestMatchFeaturesBatchDecoyVisualization:
             visualize_dir=str(viz_dir),
             processing_kwargs_extra={
                 "consensus_decoy_kwargs": {
-                    "strategies": ["peptide_swap", "off_target_shift", "bbox_swap"],
+                    "strategies": [
+                        "peptide_swap",
+                        "off_target_shift",
+                        "bbox_swap",
+                        "bbox_noise",
+                    ],
                     "n_peptide_swap_decoys": 1,
                     "n_off_target_shift_decoys": 1,
                     "n_bbox_swap_decoys": 1,
+                    "n_bbox_noise_decoys": 1,
                 }
             },
         )
         rendered = set(os.listdir(viz_dir))
-        for strategy in ("peptide_swap", "off_target_shift", "bbox_swap"):
+        for strategy in (
+            "peptide_swap",
+            "off_target_shift",
+            "bbox_swap",
+            "bbox_noise",
+        ):
             assert f"mz3_consensus_decoy_{strategy}_rep0.png" in rendered
 
 

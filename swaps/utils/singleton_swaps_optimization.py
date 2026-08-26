@@ -170,7 +170,7 @@ __C.MATCH_FEATURES_KWARGS.peak_consensus_kwargs.normalize_before_hmaxima = False
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs = ConfigurationNode()
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.strategies = [
     "peptide_swap",
-]  # ["peptide_swap", "off_target_shift", "bbox_swap"]
+]  # ["peptide_swap", "off_target_shift", "bbox_swap", "bbox_noise"]
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.n_peptide_swap_decoys = 1
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.n_off_target_shift_decoys = 1
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.off_target_min_offset_frac = 0.35
@@ -190,6 +190,15 @@ __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.use_confounder_sampling = True
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.n_bbox_swap_decoys = 1
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.bbox_swap_template_frac = 0.2  # half-width (as a fraction of each dim) of the swapped bbox; independent of the alignment template_frac above
 __C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.bbox_swap_max_intensity_tries = 5  # resample a different foreign peptide up to this many times if the sampled patch is all-zero; whether the eventual intensity is real signal or background noise doesn't matter, only that it's non-empty
+# bbox_noise: BEFORE alignment, replaces this run's own anchor-centred bbox
+# with a per-pixel resample of the REST of that same run's own image (its own
+# background, outside the bbox) -- no foreign peptide involved, unlike
+# bbox_swap. Pixel-level resampling destroys spatial coherence regardless of
+# where the source pixels came from, so this is the cheapest possible
+# construction (zero extra I/O). Same downstream search as bbox_swap/
+# peptide_swap. See _build_bbox_noise_decoy_raw_image in match_features.py.
+__C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.n_bbox_noise_decoys = 1
+__C.MATCH_FEATURES_KWARGS.consensus_decoy_kwargs.bbox_noise_template_frac = 0.2  # half-width (as a fraction of each dim) of the resampled bbox; independent of the alignment template_frac and of bbox_swap_template_frac above
 
 __C.FDR = ConfigurationNode()
 __C.FDR.ENABLED = True  # if False, skip Mokapot/percolator FDR control entirely; pp_match_target_filtered is pp_match_target with only intensity filtering (FDR.INT_THRES) applied
