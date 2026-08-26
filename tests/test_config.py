@@ -379,7 +379,7 @@ class TestBroadAlignmentConfig:
 class TestFdrMokapotTrustedConfig:
     def test_default_method_is_percolator(self, cfg):
         """Default preserves current production behaviour untouched."""
-        assert cfg.FDR.METHOD == "percolator"
+        assert cfg.FDR.METHOD == ["percolator"]
 
     def test_mokapot_trusted_keys_present(self, cfg):
         for key in ["MODEL_TYPE", "DECOY_TARGET_RATIO", "DECOY_MSMS_ONLY", "SEED"]:
@@ -396,7 +396,7 @@ class TestFdrMokapotTrustedConfig:
 
         data = {
             "FDR": {
-                "METHOD": "mokapot_trusted",
+                "METHOD": ["mokapot_trusted"],
                 "MOKAPOT_TRUSTED": {"MODEL_TYPE": "supervised", "DECOY_MSMS_ONLY": True},
             }
         }
@@ -404,8 +404,20 @@ class TestFdrMokapotTrustedConfig:
         p.write_text(yaml.dump(data))
         cfg = get_cfg_defaults(swaps_optimization_cfg)
         merge_cfg_from_file(cfg, str(p))
-        assert cfg.FDR.METHOD == "mokapot_trusted"
+        assert cfg.FDR.METHOD == ["mokapot_trusted"]
         assert cfg.FDR.MOKAPOT_TRUSTED.MODEL_TYPE == "supervised"
         assert cfg.FDR.MOKAPOT_TRUSTED.DECOY_MSMS_ONLY is True
         # untouched sibling key keeps its default
         assert cfg.FDR.MOKAPOT_TRUSTED.DECOY_TARGET_RATIO == 1.0
+
+    def test_multiple_methods_overridable_via_yaml(self, tmp_path):
+        """Listing both methods is a valid config -- run_fdr_control_onwards
+        reruns the rescoring + finalize tail once per listed method."""
+        from utils.config import merge_cfg_from_file
+
+        data = {"FDR": {"METHOD": ["percolator", "mokapot_trusted"]}}
+        p = tmp_path / "fdr_multi_method.yaml"
+        p.write_text(yaml.dump(data))
+        cfg = get_cfg_defaults(swaps_optimization_cfg)
+        merge_cfg_from_file(cfg, str(p))
+        assert cfg.FDR.METHOD == ["percolator", "mokapot_trusted"]

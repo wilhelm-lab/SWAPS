@@ -833,98 +833,112 @@ def run_fdr_control_onwards(
         cfg, dict_ref, matches_target, matches_decoy, pp_match_target, pp_match_decoy
     )
 
+    # One (dir_name, pp_match_target_filtered) entry per cfg.FDR.METHOD entry
+    # (or exactly one, FDR-disabled entry) -- _finalize_fdr_results runs once
+    # per entry below, each writing into its own dir_name subdir, so listing
+    # multiple methods just reruns the rescoring + finalize tail once per
+    # method instead of picking one.
+    _fdr_runs: list[tuple[str, pd.DataFrame]] = []
     if cfg.FDR.ENABLED:
         tdc_df, _feature_cols = _build_fdr_feature_cols(
             dict_ref, processing_kwargs, matches_target, matches_decoy
         )
-        fdr_method = cfg.FDR.METHOD
-        if fdr_method == "percolator":
-            percolator_post_processing = cfg.FDR.PERCOLATOR_POST_PROCESSING
-            # Percolator itself is trained/scored identically regardless of
-            # ONLY_SCORE_MATCH, so its work_dir (and cache) is shared; only
-            # the downstream filtered outputs differ, so they get their own
-            # subdir. train_fdr changes what percolator actually learns
-            # (unlike ONLY_SCORE_MATCH, which only gates downstream
-            # filtering), so every value gets its own work_dir to avoid
-            # silently overwriting a different train_fdr's
-            # percolator_psms.tsv.
-            base_dir_name = (
-                f"percolator_postprocessing_{percolator_post_processing}"
-                f"_trainfdr{cfg.FDR.TRAIN}"
-            )
-            psms, peptide, all_psms = brew_with_percolator(
-                tdc_df,
-                feature_cols=_feature_cols,
-                train_fdr=cfg.FDR.TRAIN,
-                test_fdr=cfg.FDR.TEST,
-                work_dir=os.path.join(quant_dir, base_dir_name),
-                post_processing=percolator_post_processing,
-                decoy_col="Decoy",
-                filename_col="matched_run",
-                peptide_col="Sequence",
-                protein_col="Proteins",
-            )
-            # Filter for the columns passed the makopot filter
-            psms["mz_rank"] = psms["PSMId"].str.split("_").str[0].astype(int)
+        fdr_methods = cfg.FDR.METHOD
+        assert fdr_methods, "cfg.FDR.METHOD is empty -- must list at least one method."
+        for fdr_method in fdr_methods:
+            if fdr_method == "percolator":
+                percolator_post_processing = cfg.FDR.PERCOLATOR_POST_PROCESSING
+                # Percolator itself is trained/scored identically regardless
+                # of ONLY_SCORE_MATCH, so its work_dir (and cache) is shared;
+                # only the downstream filtered outputs differ, so they get
+                # their own subdir. train_fdr changes what percolator
+                # actually learns (unlike ONLY_SCORE_MATCH, which only gates
+                # downstream filtering), so every value gets its own
+                # work_dir to avoid silently overwriting a different
+                # train_fdr's percolator_psms.tsv.
+                base_dir_name = (
+                    f"percolator_postprocessing_{percolator_post_processing}"
+                    f"_trainfdr{cfg.FDR.TRAIN}"
+                )
+                psms, peptide, all_psms = brew_with_percolator(
+                    tdc_df,
+                    feature_cols=_feature_cols,
+                    train_fdr=cfg.FDR.TRAIN,
+                    test_fdr=cfg.FDR.TEST,
+                    work_dir=os.path.join(quant_dir, base_dir_name),
+                    post_processing=percolator_post_processing,
+                    decoy_col="Decoy",
+                    filename_col="matched_run",
+                    peptide_col="Sequence",
+                    protein_col="Proteins",
+                )
+                # Filter for the columns passed the makopot filter
+                psms["mz_rank"] = psms["PSMId"].str.split("_").str[0].astype(int)
 
-            # Filter for the columns passed the makopot filter
-            psms_filtered = psms.loc[(psms["q-value"] < 0.01)]
-        elif fdr_method == "mokapot_trusted":
-            model_type = cfg.FDR.MOKAPOT_TRUSTED.MODEL_TYPE
-            # Same work_dir-sharing rationale as the percolator branch above:
-            # training/scoring is invariant to ONLY_SCORE_MATCH, so it's
-            # shared across that flag's values; train_fdr changes what the
-            # model learns, so it gets its own work_dir.
-            base_dir_name = f"mokapot_trusted_{model_type}_trainfdr{cfg.FDR.TRAIN}"
-            train_df = select_trusted_training_rows(
-                tdc_df,
-                dict_ref,
-                decoy_target_ratio=cfg.FDR.MOKAPOT_TRUSTED.DECOY_TARGET_RATIO,
-                run_col="matched_run",
-                rng=cfg.FDR.MOKAPOT_TRUSTED.SEED,
-                decoy_msms_only=cfg.FDR.MOKAPOT_TRUSTED.DECOY_MSMS_ONLY,
-            )
-            psms_filtered_full, _, _ = brew_trusted_target_model(
-                train_df,
-                tdc_df,
-                _feature_cols,
-                model_type=model_type,
-                train_fdr=cfg.FDR.TRAIN,
-                work_dir=os.path.join(quant_dir, base_dir_name),
-                decoy_col="Decoy",
-                peptide_col="Sequence",
-                protein_col="Proteins",
-                filename_col="matched_run",
-                rng=cfg.FDR.MOKAPOT_TRUSTED.SEED,
-            )
-            # psms_filtered_full already has "mz_rank"/"filename"/"q-value"
-            # columns (see brew_trusted_target_model's return contract),
-            # matching the percolator branch's psms shape above.
-            psms_filtered = psms_filtered_full.loc[
-                psms_filtered_full["q-value"] < cfg.FDR.TEST
-            ]
-        else:
-            raise ValueError(
-                f"Unknown cfg.FDR.METHOD: {fdr_method!r} -- expected "
-                "'percolator' or 'mokapot_trusted'"
-            )
+                # Filter for the columns passed the makopot filter
+                psms_filtered = psms.loc[(psms["q-value"] < 0.01)]
+            elif fdr_method == "mokapot_trusted":
+                model_type = cfg.FDR.MOKAPOT_TRUSTED.MODEL_TYPE
+                # Same work_dir-sharing rationale as the percolator branch
+                # above: training/scoring is invariant to ONLY_SCORE_MATCH,
+                # so it's shared across that flag's values; train_fdr
+                # changes what the model learns, so it gets its own
+                # work_dir.
+                base_dir_name = (
+                    f"mokapot_trusted_{model_type}_trainfdr{cfg.FDR.TRAIN}"
+                )
+                train_df = select_trusted_training_rows(
+                    tdc_df,
+                    dict_ref,
+                    decoy_target_ratio=cfg.FDR.MOKAPOT_TRUSTED.DECOY_TARGET_RATIO,
+                    run_col="matched_run",
+                    rng=cfg.FDR.MOKAPOT_TRUSTED.SEED,
+                    decoy_msms_only=cfg.FDR.MOKAPOT_TRUSTED.DECOY_MSMS_ONLY,
+                )
+                psms_filtered_full, _, _ = brew_trusted_target_model(
+                    train_df,
+                    tdc_df,
+                    _feature_cols,
+                    model_type=model_type,
+                    train_fdr=cfg.FDR.TRAIN,
+                    work_dir=os.path.join(quant_dir, base_dir_name),
+                    decoy_col="Decoy",
+                    peptide_col="Sequence",
+                    protein_col="Proteins",
+                    filename_col="matched_run",
+                    rng=cfg.FDR.MOKAPOT_TRUSTED.SEED,
+                )
+                # psms_filtered_full already has "mz_rank"/"filename"/
+                # "q-value" columns (see brew_trusted_target_model's return
+                # contract), matching the percolator branch's psms shape
+                # above.
+                psms_filtered = psms_filtered_full.loc[
+                    psms_filtered_full["q-value"] < cfg.FDR.TEST
+                ]
+            else:
+                raise ValueError(
+                    f"Unknown cfg.FDR.METHOD entry: {fdr_method!r} -- expected "
+                    "'percolator' or 'mokapot_trusted'"
+                )
 
-        dir_name = os.path.join(
-            base_dir_name, f"only_score_match_{cfg.FDR.ONLY_SCORE_MATCH}"
-        )
-        pp_match_target_filtered = pp_match_target_notmsms.merge(
-            psms_filtered[["filename", "mz_rank"]],
-            left_on=["mz_rank", "Run_name"],
-            right_on=["mz_rank", "filename"],
-            how="inner",
-        )
-        os.makedirs(os.path.join(quant_dir, dir_name), exist_ok=True)
-        _to_parquet_safe(
-            pp_match_target_filtered,
-            os.path.join(quant_dir, dir_name, "pp_match_target_filtered.parquet"),
-            index=False,
-        )
-        _mbr_df = pp_match_target_filtered.drop(columns=["filename"])
+            dir_name = os.path.join(
+                base_dir_name, f"only_score_match_{cfg.FDR.ONLY_SCORE_MATCH}"
+            )
+            pp_match_target_filtered = pp_match_target_notmsms.merge(
+                psms_filtered[["filename", "mz_rank"]],
+                left_on=["mz_rank", "Run_name"],
+                right_on=["mz_rank", "filename"],
+                how="inner",
+            )
+            os.makedirs(os.path.join(quant_dir, dir_name), exist_ok=True)
+            _to_parquet_safe(
+                pp_match_target_filtered,
+                os.path.join(quant_dir, dir_name, "pp_match_target_filtered.parquet"),
+                index=False,
+            )
+            _fdr_runs.append(
+                (dir_name, pp_match_target_filtered.drop(columns=["filename"]))
+            )
     else:
         logging.info(
             "cfg.FDR.ENABLED is False — skipping Mokapot/percolator FDR control; "
@@ -942,11 +956,18 @@ def run_fdr_control_onwards(
             os.path.join(quant_dir, dir_name, "pp_match_target_filtered.parquet"),
             index=False,
         )
-        _mbr_df = pp_match_target_filtered
+        _fdr_runs.append((dir_name, pp_match_target_filtered))
 
-    _finalize_fdr_results(
-        cfg, quant_dir, dir_name, _mbr_df, pp_match_target_msms, pp_reference, dict_ref
-    )
+    for _dir_name, _mbr_df in _fdr_runs:
+        _finalize_fdr_results(
+            cfg,
+            quant_dir,
+            _dir_name,
+            _mbr_df,
+            pp_match_target_msms,
+            pp_reference,
+            dict_ref,
+        )
 
 
 def _load_fdr_control_inputs(cfg):
