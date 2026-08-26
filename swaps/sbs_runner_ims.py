@@ -405,29 +405,30 @@ def opt_scan_by_scan(config_path: str):
                 output_path=broad_alignment_table_path,
             )
 
-        image_based_table_path = os.path.join(
-            cfg.RESULT_PATH, "broad_alignment_shift_table_global_raw_image.parquet"
-        )
-        if os.path.exists(image_based_table_path):
-            logging.info(
-                "image-based broad_alignment shift table already exists, skipping calibration: %s",
-                image_based_table_path,
+        if cfg.MATCH_FEATURES_KWARGS.broad_alignment.image_based.enabled:
+            image_based_table_path = os.path.join(
+                cfg.RESULT_PATH, "broad_alignment_shift_table_global_raw_image.parquet"
             )
-        else:
-            logging.info("Calibrating image-based broad_alignment shift table...")
-            calibrate_broad_alignment_image_based(
-                result_dir=cfg.RESULT_PATH,
-                raw_file_list=raw_file_list,
-                data_paths=cfg.DATA_PATH,
-                exclude_dataset_names=cfg.EXCLUDE_DATASET_NAME,
-                dict_ref_path=os.path.join(
-                    cfg.RESULT_PATH, "dict_ref_with_activation.pkl"
-                ),
-                output_path=image_based_table_path,
-                window_widths=cfg.MATCH_FEATURES_KWARGS.broad_alignment.image_based.window_widths,
-                strides=cfg.MATCH_FEATURES_KWARGS.broad_alignment.image_based.strides,
-                max_workers=cfg.N_CPU,
-            )
+            if os.path.exists(image_based_table_path):
+                logging.info(
+                    "image-based broad_alignment shift table already exists, skipping calibration: %s",
+                    image_based_table_path,
+                )
+            else:
+                logging.info("Calibrating image-based broad_alignment shift table...")
+                calibrate_broad_alignment_image_based(
+                    result_dir=cfg.RESULT_PATH,
+                    raw_file_list=raw_file_list,
+                    data_paths=cfg.DATA_PATH,
+                    exclude_dataset_names=cfg.EXCLUDE_DATASET_NAME,
+                    dict_ref_path=os.path.join(
+                        cfg.RESULT_PATH, "dict_ref_with_activation.pkl"
+                    ),
+                    output_path=image_based_table_path,
+                    window_widths=cfg.MATCH_FEATURES_KWARGS.broad_alignment.image_based.window_widths,
+                    strides=cfg.MATCH_FEATURES_KWARGS.broad_alignment.image_based.strides,
+                    max_workers=cfg.N_CPU,
+                )
 
     (
         matches_target,

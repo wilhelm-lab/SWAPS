@@ -82,10 +82,21 @@ def _build_dict_ref(raw_files, rt_centers, blob_centers):
 
 
 class TestSelectCalibrationPeptides:
-    def test_requires_score_columns(self):
-        df = pd.DataFrame({"mz_rank": [1, 2], "RT_search_center": [1.0, 2.0]})
+    def test_requires_mz_rank_and_rt_column(self):
+        df = pd.DataFrame({"RT_search_center": [1.0, 2.0]})
         with pytest.raises(KeyError):
             select_calibration_peptides(df, n_peptides=1)
+
+    def test_falls_back_to_unranked_sampling_when_score_columns_absent(self):
+        """dict_ref predating reference_score/n_identifications/score_std
+        (added after some datasets' Stage 1 already ran) must not hard-fail
+        calibration -- these columns are a ranking preference, not a
+        requirement, since calibration only needs the peptides' own
+        activation images (always present after Stage 2)."""
+        df = pd.DataFrame({"mz_rank": [1, 2], "RT_search_center": [1.0, 2.0]})
+        selected = select_calibration_peptides(df, n_peptides=2)
+        assert set(selected) <= {1, 2}
+        assert len(selected) > 0
 
     def test_prefers_higher_reference_score_within_rt_bin(self):
         df = pd.DataFrame(

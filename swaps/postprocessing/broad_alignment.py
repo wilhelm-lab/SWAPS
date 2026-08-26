@@ -62,30 +62,47 @@ def select_calibration_peptides(
     n_rt_bins: int = 20,
     random_seed: int = 42,
 ) -> np.ndarray:
-    """RT-stratified mz_rank sample, biased toward reliably-identified peptides.
+    """RT-stratified mz_rank sample, biased toward reliably-identified peptides
+    when reference_score/n_identifications/score_std are available.
 
     Uses only dict_ref columns -- no pp_reference/match_features output --
-    since this is meant to run before match_features ever exists. Within
-    each RT stratum, prefers higher reference_score (the search engine's own
+    since this is meant to run before match_features ever exists. Within each
+    RT stratum, prefers higher reference_score (the search engine's own
     confidence in that peptide's reference identification), with
-    n_identifications/score_std as secondary tie-breakers.
+    n_identifications/score_std as secondary tie-breakers. Calibration itself
+    only needs the selected peptides' activation images (always present after
+    Stage 2), so these three columns are a ranking preference, not a hard
+    requirement -- datasets whose dict_ref predates them (built before
+    prepare_dict.py started computing these columns) fall back to an
+    unranked, shuffled-within-bin RT-stratified sample instead of raising.
     """
-    required = ["mz_rank", rt_column, "reference_score", "n_identifications", "score_std"]
+    score_cols = ["reference_score", "n_identifications", "score_std"]
+    required = ["mz_rank", rt_column]
     missing = [c for c in required if c not in dict_ref.columns]
     if missing:
         raise KeyError(f"select_calibration_peptides requires dict_ref columns {missing}")
+    available_score_cols = [c for c in score_cols if c in dict_ref.columns]
+    if len(available_score_cols) < len(score_cols):
+        Logger.info(
+            "select_calibration_peptides: dict_ref missing %s -- falling back to "
+            "unranked RT-stratified sampling.",
+            [c for c in score_cols if c not in available_score_cols],
+        )
 
-    df = dict_ref[required].dropna(subset=[rt_column]).copy()
+    df = dict_ref[required + available_score_cols].dropna(subset=[rt_column]).copy()
     if df.empty:
         return np.array([], dtype=int)
 
     n_bins = max(1, min(n_rt_bins, df[rt_column].nunique()))
     df["_rt_bin"] = pd.cut(df[rt_column], bins=n_bins, duplicates="drop")
-    df = df.sort_values(
-        ["reference_score", "n_identifications", "score_std"],
-        ascending=[False, False, True],
-        na_position="last",
-    )
+    if available_score_cols:
+        df = df.sort_values(
+            available_score_cols,
+            ascending=[False, False, True][: len(available_score_cols)],
+            na_position="last",
+        )
+    else:
+        df = df.sample(frac=1, random_state=random_seed)
     per_bin = max(1, ceil(n_peptides / df["_rt_bin"].nunique(dropna=True)))
     selected = df.groupby("_rt_bin", observed=True, group_keys=False).head(per_bin)
 
