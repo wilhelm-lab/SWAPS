@@ -179,6 +179,67 @@ def prepare_mokapot_input(
     return df_pin, no_normalize_cols + normalize_feature_cols
 
 
+_MOKAPOT_FDR_BACKOFF_STEPS = (0.01, 0.05, 0.1, 0.15, 0.2, 0.25)
+_MOKAPOT_FDR_BACKOFF_CEIL = _MOKAPOT_FDR_BACKOFF_STEPS[-1]
+
+
+def _is_no_psms_below_fdr_error(exc: Exception) -> bool:
+    """True for mokapot's "No PSMs found below the 'eval_fdr'" RuntimeError.
+
+    Raised from mokapot.dataset._find_best_feature (via PercolatorModel.fit /
+    mokapot.brew) when no feature ranks any PSM under train_fdr, so the
+    semi-supervised loop has no positive seed set to start from.
+    """
+    msg = str(exc).lower()
+    return "eval_fdr" in msg or "no psms found below" in msg
+
+
+def _fit_mokapot_with_fdr_backoff(
+    fit_fn,
+    train_fdr: float,
+    what: str = "mokapot fit",
+    steps: tuple = _MOKAPOT_FDR_BACKOFF_STEPS,
+):
+    """Run ``fit_fn(train_fdr)``; on the "no PSMs below eval_fdr" RuntimeError,
+    step ``train_fdr`` up to the next value in ``steps`` (0.01, 0.05, 0.1,
+    0.15, 0.2, capped at 0.25), log a warning, and retry.
+
+    mokapot hard-raises where percolator (run with ``--no-terminate`` in
+    brew_with_percolator) would only warn and carry on with whatever initial
+    direction it can find; this gives the mokapot path the same graceful
+    degradation. Re-raises once the last step is exhausted or for any other
+    error.
+
+    Returns ``(fit_fn result, train_fdr actually used)``.
+    """
+    attempt_fdr = train_fdr
+    while True:
+        try:
+            return fit_fn(attempt_fdr), attempt_fdr
+        except RuntimeError as exc:
+            if not _is_no_psms_below_fdr_error(exc):
+                raise
+            nxt = next((s for s in steps if s > attempt_fdr), None)
+            if nxt is None:
+                Logger.error(
+                    "%s: mokapot still finds no PSMs below train_fdr=%s at the "
+                    "%s ceiling — giving up.",
+                    what,
+                    attempt_fdr,
+                    steps[-1],
+                )
+                raise
+            Logger.warning(
+                "%s: mokapot found no PSMs below train_fdr=%s (%s). "
+                "Retrying with train_fdr=%s.",
+                what,
+                attempt_fdr,
+                exc,
+                nxt,
+            )
+            attempt_fdr = nxt
+
+
 def brew_with_mokapot(
     peptide_info_dataframe: pd.DataFrame,
     train_fdr: float = 0.1,
@@ -230,14 +291,20 @@ def brew_with_mokapot(
 
     # Read the .pin file and run mokapot
     psms_pin = mokapot.read_pin(os.path.join(work_dir, "mokapot_input.pin"))
-    if model is None:
-        mokapot_model = mokapot.model.PercolatorModel(
-            train_fdr=train_fdr, direction=direction
+
+    def _brew(fdr):
+        if model is None:
+            mokapot_model = mokapot.model.PercolatorModel(
+                train_fdr=fdr, direction=direction
+            )
+        else:
+            mokapot_model = mokapot.model.Model(model, train_fdr=fdr)
+        return mokapot.brew(
+            psms_pin, model=mokapot_model, test_fdr=test_fdr, folds=5
         )
-    else:
-        mokapot_model = mokapot.model.Model(model, train_fdr=train_fdr)
-    result, model = mokapot.brew(
-        psms_pin, model=mokapot_model, test_fdr=test_fdr, folds=5
+
+    (result, model), train_fdr = _fit_mokapot_with_fdr_backoff(
+        _brew, train_fdr, what="brew_with_mokapot"
     )
 
     # Clean up the temporary file
@@ -742,8 +809,15 @@ def brew_trusted_target_model(
     full_psms = mokapot.read_pin(full_pin_path)
 
     if model_type == "percolator":
-        model = mokapot.model.PercolatorModel(train_fdr=train_fdr)
-        model.fit(train_psms)
+
+        def _fit(fdr):
+            m = mokapot.model.PercolatorModel(train_fdr=fdr)
+            m.fit(train_psms)
+            return m
+
+        model, train_fdr = _fit_mokapot_with_fdr_backoff(
+            _fit, train_fdr, what="brew_trusted_target_model(percolator)"
+        )
         scores_full = model.predict(full_psms)
         weights = _linear_weights(model.estimator, model.features)
     else:
