@@ -57,8 +57,11 @@ def _write_activation_parquet(act_dir, images_by_mz_rank):
     pq.write_table(table, os.path.join(act_dir, "activation_sorted_by_mz.parquet"))
 
 
-def _build_dict_ref(raw_files, rt_centers, blob_centers):
-    """blob_centers: dict[mz_rank] -> dict[run] -> (im_c, rt_c) absolute frame/im index."""
+def _build_dict_ref(raw_files, rt_centers, blob_centers, statuses=None):
+    """blob_centers: dict[mz_rank] -> dict[run] -> (im_c, rt_c) absolute frame/im index.
+    statuses: dict[mz_rank] -> dict[run] -> status string (default "Reference"
+    for every run, i.e. MS/MS-identified everywhere -- matches every existing
+    caller's assumption before require_msms_both_runs existed)."""
     rows = []
     for mz_rank, rt_center in rt_centers.items():
         row = {
@@ -77,6 +80,7 @@ def _build_dict_ref(raw_files, rt_centers, blob_centers):
             im_c, rt_c = blob_centers[mz_rank][rf]
             row[f"{rf}_MS1_frame_idx_exp"] = rt_c
             row[f"{rf}_mobility_values_index_exp"] = im_c
+            row[rf] = (statuses or {}).get(mz_rank, {}).get(rf, "Reference")
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -155,6 +159,79 @@ class TestPairwiseCalibrationAlignment:
         assert r1_to_r2["shift_rt"] == 2
         assert r1_to_r2["shift_im"] == -3
         assert r1_to_r2["template_matching_score"] > 0.9
+
+
+class TestRequireMsmsBothRuns:
+    """require_msms_both_runs restricts which (peptide, ref_run, match_run)
+    triplets contribute a sample to only those where the peptide has a
+    direct MS/MS id (Reference/Quant_Only) in BOTH runs, not an MBR-only
+    Match position in either."""
+
+    def _three_run_dict_ref(self, statuses):
+        raw_files = ["R1", "R2", "R3"]
+        blob_centers = {1: {"R1": (15, 15), "R2": (15, 15), "R3": (15, 15)}}
+        return raw_files, _build_dict_ref(
+            raw_files, {1: 3.0}, blob_centers, statuses={1: statuses}
+        )
+
+    def test_default_keeps_every_pair_regardless_of_status(self, tmp_path):
+        raw_files, dict_ref = self._three_run_dict_ref(
+            {"R1": "Reference", "R2": "Match", "R3": "Match"}
+        )
+        for rf in raw_files:
+            _write_activation_parquet(
+                str(tmp_path / rf / "activation"), {1: _blob_image((15, 15))}
+            )
+        samples = run_pairwise_calibration_alignment(
+            np.array([1]), raw_files, str(tmp_path), dict_ref, max_workers=1
+        )
+        assert len(samples) == 6  # every ordered pair among 3 runs
+
+    def test_drops_triplets_missing_msms_on_either_side(self, tmp_path):
+        # R1: Reference (MS/MS), R2: Quant_Only (MS/MS), R3: Match (MBR only).
+        # Only the R1<->R2 pair (both directions) has MS/MS on both ends.
+        raw_files, dict_ref = self._three_run_dict_ref(
+            {"R1": "Reference", "R2": "Quant_Only", "R3": "Match"}
+        )
+        for rf in raw_files:
+            _write_activation_parquet(
+                str(tmp_path / rf / "activation"), {1: _blob_image((15, 15))}
+            )
+        samples = run_pairwise_calibration_alignment(
+            np.array([1]),
+            raw_files,
+            str(tmp_path),
+            dict_ref,
+            max_workers=1,
+            require_msms_both_runs=True,
+        )
+        pairs = set(zip(samples["reference_run"], samples["matched_run"]))
+        assert pairs == {("R1", "R2"), ("R2", "R1")}
+
+    def test_calibrate_broad_alignment_threads_flag_through(self, tmp_path):
+        raw_files, dict_ref = self._three_run_dict_ref(
+            {"R1": "Reference", "R2": "Quant_Only", "R3": "Match"}
+        )
+        for rf in raw_files:
+            _write_activation_parquet(
+                str(tmp_path / rf / "activation"), {1: _blob_image((15, 15))}
+            )
+        dict_ref_path = tmp_path / "dict_ref.pkl"
+        dict_ref.to_pickle(dict_ref_path)
+        table = calibrate_broad_alignment(
+            result_dir=str(tmp_path),
+            raw_file_list=raw_files,
+            dict_ref_path=str(dict_ref_path),
+            output_path=str(tmp_path / "shift_table_msms_both.parquet"),
+            n_peptides=1,
+            max_workers=1,
+            require_msms_both_runs=True,
+        )
+        pairs = set(zip(table["reference_run"], table["matched_run"]))
+        assert pairs <= {("R1", "R2"), ("R2", "R1")}
+        assert os.path.exists(tmp_path / "shift_table_msms_both.parquet")
+        # original default-named table untouched/never created by this call
+        assert not os.path.exists(tmp_path / "broad_alignment_shift_table.parquet")
 
 
 class TestBuildShiftTable:

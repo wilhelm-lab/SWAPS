@@ -123,12 +123,14 @@ def _init_calibration_worker(
     result_dir: str,
     rt_column: str,
     im_column: str = "IM_search_center",
+    require_msms_both_runs: bool = False,
 ) -> None:
     _CALIBRATION_WORKER_CONTEXT["dict_ref_by_mz"] = dict_ref_by_mz
     _CALIBRATION_WORKER_CONTEXT["raw_file_list"] = raw_file_list
     _CALIBRATION_WORKER_CONTEXT["result_dir"] = result_dir
     _CALIBRATION_WORKER_CONTEXT["rt_column"] = rt_column
     _CALIBRATION_WORKER_CONTEXT["im_column"] = im_column
+    _CALIBRATION_WORKER_CONTEXT["require_msms_both_runs"] = require_msms_both_runs
 
 
 def _calibration_batch_worker(mz_chunk: np.ndarray) -> list[dict]:
@@ -140,6 +142,7 @@ def _calibration_batch_worker(mz_chunk: np.ndarray) -> list[dict]:
         ctx["dict_ref_by_mz"],
         ctx["rt_column"],
         ctx["im_column"],
+        require_msms_both_runs=ctx.get("require_msms_both_runs", False),
     )
 
 
@@ -167,6 +170,11 @@ def _load_calibration_images(
     }
 
 
+_MSMS_STATUSES = {"Reference", "Quant_Only"}  # direct MS/MS identification in that
+# run -- "Match" is an MBR-predicted position only (no MS/MS in that run for this
+# peptide); see prepare_dict.py's pivot_psm_by_mz_rank label_logic.
+
+
 def _pairwise_align_chunk(
     mz_chunk: np.ndarray,
     raw_file_list: list[str],
@@ -174,12 +182,22 @@ def _pairwise_align_chunk(
     dict_ref_by_mz: pd.DataFrame,
     rt_column: str,
     im_column: str = "IM_search_center",
+    require_msms_both_runs: bool = False,
 ) -> list[dict]:
     """One direct one-hop template match per (peptide, reference run, matched run).
 
     Template built fresh from the reference run's own image, matched
     directly against the matched run's own image -- no composition through
     a third run, no compounding of two independently-noisy legs.
+
+    `require_msms_both_runs`, if True, skips a (peptide, ref_run, match_run)
+    triplet unless the peptide has a direct MS/MS identification (status
+    "Reference" or "Quant_Only" -- see _MSMS_STATUSES) in BOTH ref_run and
+    match_run, not just an MBR "Match" position in either. Narrows the
+    calibration signal to genuinely-observed positions on both sides of the
+    pair, at the cost of fewer (and RT/run-pair-imbalanced) samples --
+    peptides/pairs with no MS/MS-confirmed run image on both ends
+    contribute nothing.
     """
     images_by_run = {
         raw_file: _load_calibration_images(mz_chunk, raw_file, result_dir, dict_ref_by_mz)
@@ -190,9 +208,16 @@ def _pairwise_align_chunk(
         rt_pos = float(dict_ref_by_mz.at[int(mz), rt_column])
         im_pos = float(dict_ref_by_mz.at[int(mz), im_column])
         for ref_run in raw_file_list:
+            if require_msms_both_runs and dict_ref_by_mz.at[int(mz), ref_run] not in _MSMS_STATUSES:
+                continue
             ref_image = images_by_run[ref_run][int(mz)]
             for match_run in raw_file_list:
                 if match_run == ref_run:
+                    continue
+                if (
+                    require_msms_both_runs
+                    and dict_ref_by_mz.at[int(mz), match_run] not in _MSMS_STATUSES
+                ):
                     continue
                 match_image = images_by_run[match_run][int(mz)]
                 alignment = align_images_to_reference(
@@ -222,6 +247,7 @@ def run_pairwise_calibration_alignment(
     im_column: str = "IM_search_center",
     chunk_size: int = 25,
     max_workers: int | None = None,
+    require_msms_both_runs: bool = False,
 ) -> pd.DataFrame:
     """Direct one-hop pairwise shift samples for every (A, B) raw-file pair.
 
@@ -231,6 +257,8 @@ def run_pairwise_calibration_alignment(
     rt_position -- build_shift_table still only bins by RT (rt_column), but
     having im_position on every sample lets downstream analysis/diagnostics
     look at either axis without a second pass.
+
+    `require_msms_both_runs` -- see _pairwise_align_chunk.
     """
     dict_ref_by_mz = (
         dict_ref.set_index("mz_rank")
@@ -246,7 +274,14 @@ def run_pairwise_calibration_alignment(
     with ProcessPoolExecutor(
         max_workers=max_workers,
         initializer=_init_calibration_worker,
-        initargs=(dict_ref_by_mz, raw_file_list, result_dir, rt_column, im_column),
+        initargs=(
+            dict_ref_by_mz,
+            raw_file_list,
+            result_dir,
+            rt_column,
+            im_column,
+            require_msms_both_runs,
+        ),
     ) as executor:
         for chunk_rows in executor.map(_calibration_batch_worker, chunks):
             rows.extend(chunk_rows)
@@ -428,12 +463,17 @@ def calibrate_broad_alignment(
     min_samples_per_bin: int = 10,
     max_neighbor_search_bins: int = 5,
     max_workers: int | None = None,
+    require_msms_both_runs: bool = False,
 ) -> pd.DataFrame:
     """Build and persist the broad-alignment shift table for one dataset.
 
     Uses only dict_ref (or dict_ref_with_activation.pkl) and Stage-2
     activation/*.parquet output -- runnable between Stage 2 and Stage 3,
     before match_features output exists.
+
+    `require_msms_both_runs` -- see _pairwise_align_chunk. Peptide selection
+    (select_calibration_peptides) is unaffected; this only restricts which
+    (peptide, reference_run, matched_run) triplets contribute a sample.
     """
     dict_ref = _load_dict_ref(dict_ref_path)
     calibration_mz_ranks = select_calibration_peptides(
@@ -451,6 +491,7 @@ def calibrate_broad_alignment(
         dict_ref,
         rt_column=rt_column,
         max_workers=max_workers,
+        require_msms_both_runs=require_msms_both_runs,
     )
     table = build_shift_table(
         samples,
@@ -479,6 +520,13 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--bin-width-minutes", type=float, default=0.4)
     parser.add_argument("--min-samples-per-bin", type=int, default=10)
     parser.add_argument("--max-neighbor-search-bins", type=int, default=5)
+    parser.add_argument(
+        "--require-msms-both-runs",
+        action="store_true",
+        help="Only use (peptide, ref_run, match_run) triplets where the peptide has a "
+        "direct MS/MS identification (status Reference or Quant_Only) in BOTH runs, "
+        "not an MBR-predicted Match position in either.",
+    )
     return parser.parse_args()
 
 
@@ -495,4 +543,5 @@ if __name__ == "__main__":
         bin_width_minutes=_args.bin_width_minutes,
         min_samples_per_bin=_args.min_samples_per_bin,
         max_neighbor_search_bins=_args.max_neighbor_search_bins,
+        require_msms_both_runs=_args.require_msms_both_runs,
     )
