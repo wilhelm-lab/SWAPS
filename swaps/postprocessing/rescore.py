@@ -179,6 +179,67 @@ def prepare_mokapot_input(
     return df_pin, no_normalize_cols + normalize_feature_cols
 
 
+_MOKAPOT_FDR_BACKOFF_STEPS = (0.01, 0.05, 0.1, 0.15, 0.2, 0.25)
+_MOKAPOT_FDR_BACKOFF_CEIL = _MOKAPOT_FDR_BACKOFF_STEPS[-1]
+
+
+def _is_no_psms_below_fdr_error(exc: Exception) -> bool:
+    """True for mokapot's "No PSMs found below the 'eval_fdr'" RuntimeError.
+
+    Raised from mokapot.dataset._find_best_feature (via PercolatorModel.fit /
+    mokapot.brew) when no feature ranks any PSM under train_fdr, so the
+    semi-supervised loop has no positive seed set to start from.
+    """
+    msg = str(exc).lower()
+    return "eval_fdr" in msg or "no psms found below" in msg
+
+
+def _fit_mokapot_with_fdr_backoff(
+    fit_fn,
+    train_fdr: float,
+    what: str = "mokapot fit",
+    steps: tuple = _MOKAPOT_FDR_BACKOFF_STEPS,
+):
+    """Run ``fit_fn(train_fdr)``; on the "no PSMs below eval_fdr" RuntimeError,
+    step ``train_fdr`` up to the next value in ``steps`` (0.01, 0.05, 0.1,
+    0.15, 0.2, capped at 0.25), log a warning, and retry.
+
+    mokapot hard-raises where percolator (run with ``--no-terminate`` in
+    brew_with_percolator) would only warn and carry on with whatever initial
+    direction it can find; this gives the mokapot path the same graceful
+    degradation. Re-raises once the last step is exhausted or for any other
+    error.
+
+    Returns ``(fit_fn result, train_fdr actually used)``.
+    """
+    attempt_fdr = train_fdr
+    while True:
+        try:
+            return fit_fn(attempt_fdr), attempt_fdr
+        except RuntimeError as exc:
+            if not _is_no_psms_below_fdr_error(exc):
+                raise
+            nxt = next((s for s in steps if s > attempt_fdr), None)
+            if nxt is None:
+                Logger.error(
+                    "%s: mokapot still finds no PSMs below train_fdr=%s at the "
+                    "%s ceiling — giving up.",
+                    what,
+                    attempt_fdr,
+                    steps[-1],
+                )
+                raise
+            Logger.warning(
+                "%s: mokapot found no PSMs below train_fdr=%s (%s). "
+                "Retrying with train_fdr=%s.",
+                what,
+                attempt_fdr,
+                exc,
+                nxt,
+            )
+            attempt_fdr = nxt
+
+
 def brew_with_mokapot(
     peptide_info_dataframe: pd.DataFrame,
     train_fdr: float = 0.1,
@@ -230,14 +291,20 @@ def brew_with_mokapot(
 
     # Read the .pin file and run mokapot
     psms_pin = mokapot.read_pin(os.path.join(work_dir, "mokapot_input.pin"))
-    if model is None:
-        mokapot_model = mokapot.model.PercolatorModel(
-            train_fdr=train_fdr, direction=direction
+
+    def _brew(fdr):
+        if model is None:
+            mokapot_model = mokapot.model.PercolatorModel(
+                train_fdr=fdr, direction=direction
+            )
+        else:
+            mokapot_model = mokapot.model.Model(model, train_fdr=fdr)
+        return mokapot.brew(
+            psms_pin, model=mokapot_model, test_fdr=test_fdr, folds=5
         )
-    else:
-        mokapot_model = mokapot.model.Model(model, train_fdr=train_fdr)
-    result, model = mokapot.brew(
-        psms_pin, model=mokapot_model, test_fdr=test_fdr, folds=5
+
+    (result, model), train_fdr = _fit_mokapot_with_fdr_backoff(
+        _brew, train_fdr, what="brew_with_mokapot"
     )
 
     # Clean up the temporary file
@@ -440,6 +507,7 @@ def select_trusted_training_rows(
     decoy_target_ratio: float = 1.0,
     run_col: str = "matched_run",
     rng: Optional[int] = None,
+    decoy_msms_only: bool = False,
 ) -> pd.DataFrame:
     """Build a trusted target+decoy training pool from tdc_df.
 
@@ -447,8 +515,10 @@ def select_trusted_training_rows(
     Reference/Quant_Only in dict_ref, i.e. the run-peptide pair already
     has an MS/MS identification — as opposed to Not_Match candidates
     awaiting MBR, which should not be used to teach the model what a
-    correct match looks like. The decoy pool (all decoy rows in
-    tdc_df) is subsampled down to
+    correct match looks like. The decoy pool (by default all decoy
+    rows in tdc_df, or only decoy rows whose own (mz_rank, run_col)
+    slot is itself MS/MS-confirmed when decoy_msms_only=True — see
+    that parameter) is subsampled down to
     round(n_trusted_targets * decoy_target_ratio) so training starts
     from a balanced target/decoy pool, falling back to the full decoy
     pool (with a warning) if it's smaller than requested.
@@ -467,6 +537,18 @@ def select_trusted_training_rows(
         Column in tdc_df identifying the run (default "matched_run").
     rng : int, optional
         Random seed for decoy subsampling.
+    decoy_msms_only : bool, optional
+        If True, restrict the decoy pool to decoys generated at
+        MS/MS-confirmed (mz_rank, run_col) slots — i.e. only the
+        "sibling" decoys of trusted targets, each a peptide-swapped
+        competitor of that same confirmed candidate. Default False:
+        decoys are drawn from the full pool, including decoys
+        generated at Not_Match (MBR) candidate slots that have no
+        MS/MS-confirmed counterpart. Since decoys are generated ~1:1
+        per candidate slot, restricting can shrink the pool to
+        roughly 1 decoy per trusted target — expect decoy_target_ratio
+        > 1 to routinely fall back to "use all available" (a logged
+        warning, not an error) once decoy_msms_only=True.
 
     Returns
     -------
@@ -484,17 +566,21 @@ def select_trusted_training_rows(
             "No MS/MS-confirmed (Reference/Quant_Only) target rows found in "
             "tdc_df — cannot build a trusted training pool."
         )
-    decoy_pool = tdc_df.loc[~tdc_df["IsTarget"]]
+    decoy_mask = ~tdc_df["IsTarget"]
+    if decoy_msms_only:
+        decoy_mask &= is_msms
+    decoy_pool = tdc_df.loc[decoy_mask]
     n_decoy_wanted = round(len(trusted_targets) * decoy_target_ratio)
     if n_decoy_wanted >= len(decoy_pool):
         if n_decoy_wanted > len(decoy_pool):
             Logger.warning(
                 "select_trusted_training_rows: requested %d decoys (ratio=%s x "
-                "%d trusted targets) but only %d decoys are available — using "
-                "all of them.",
+                "%d trusted targets, decoy_msms_only=%s) but only %d decoys "
+                "are available — using all of them.",
                 n_decoy_wanted,
                 decoy_target_ratio,
                 len(trusted_targets),
+                decoy_msms_only,
                 len(decoy_pool),
             )
         decoy_train = decoy_pool
@@ -502,10 +588,11 @@ def select_trusted_training_rows(
         decoy_train = decoy_pool.sample(n=n_decoy_wanted, random_state=rng)
     Logger.info(
         "select_trusted_training_rows: %d MS/MS-trusted targets, %d decoys "
-        "(pool=%d)",
+        "(pool=%d, decoy_msms_only=%s)",
         len(trusted_targets),
         len(decoy_train),
         len(decoy_pool),
+        decoy_msms_only,
     )
     return pd.concat([trusted_targets, decoy_train], ignore_index=True)
 
@@ -722,8 +809,15 @@ def brew_trusted_target_model(
     full_psms = mokapot.read_pin(full_pin_path)
 
     if model_type == "percolator":
-        model = mokapot.model.PercolatorModel(train_fdr=train_fdr)
-        model.fit(train_psms)
+
+        def _fit(fdr):
+            m = mokapot.model.PercolatorModel(train_fdr=fdr)
+            m.fit(train_psms)
+            return m
+
+        model, train_fdr = _fit_mokapot_with_fdr_backoff(
+            _fit, train_fdr, what="brew_trusted_target_model(percolator)"
+        )
         scores_full = model.predict(full_psms)
         weights = _linear_weights(model.estimator, model.features)
     else:

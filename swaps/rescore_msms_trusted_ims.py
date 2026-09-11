@@ -103,6 +103,7 @@ def run_msms_trusted_rescoring(
     test_fdr: float = None,
     seed: int = 0,
     exclude_features: list = None,
+    decoy_msms_only: bool = False,
 ):
     """Resume at FDR control and rescore with MS/MS-trusted-target models.
 
@@ -115,12 +116,14 @@ def run_msms_trusted_rescoring(
     docstring for the resulting directory layout.
 
     exclude_features, if given, drops those columns from the feature set
-    before training/scoring -- e.g. for ablation runs. The run's files get
-    a "_reduced_features" run_label/dir suffix (parent_dir_name itself is
-    unchanged, i.e. it's still saved alongside a prior full-feature run
-    under the same mokapot_trusted_<model_type>_trainfdr<X>/ dir) so
-    nothing from an existing full-feature run in that same quant_dir gets
-    overwritten.
+    before training/scoring -- e.g. for ablation runs. decoy_msms_only, if
+    True, restricts training decoys to those generated at MS/MS-confirmed
+    slots (see select_trusted_training_rows). Either/both add a dir/
+    run_label suffix ("_reduced_features", "_decoy_msms_only") so the
+    run's files don't overwrite a prior run in the same quant_dir
+    (parent_dir_name itself is unchanged -- variants coexist as
+    differently-suffixed files under the same
+    mokapot_trusted_<model_type>_trainfdr<X>/ dir).
     """
     cfg = get_cfg_defaults(swaps_optimization_cfg)  # type: ignore
     merge_cfg_from_file(cfg, config_path)
@@ -173,10 +176,19 @@ def run_msms_trusted_rescoring(
             exclude_features,
             feature_cols,
         )
-    dir_suffix = "_reduced_features" if exclude_features else ""
+    suffix_parts = []
+    if exclude_features:
+        suffix_parts.append("reduced_features")
+    if decoy_msms_only:
+        suffix_parts.append("decoy_msms_only")
+    dir_suffix = ("_" + "_".join(suffix_parts)) if suffix_parts else ""
 
     train_df = select_trusted_training_rows(
-        tdc_df, dict_ref, decoy_target_ratio=decoy_target_ratio, rng=seed
+        tdc_df,
+        dict_ref,
+        decoy_target_ratio=decoy_target_ratio,
+        rng=seed,
+        decoy_msms_only=decoy_msms_only,
     )
 
     for model_type in model_types:
@@ -295,6 +307,20 @@ def main():
         help="Decoys sampled per MS/MS-trusted target for training (default 1.0, balanced).",
     )
     parser.add_argument(
+        "--decoy-msms-only",
+        action="store_true",
+        help=(
+            "Restrict training decoys to those generated at MS/MS-confirmed "
+            "(mz_rank, matched_run) slots -- the 'sibling' decoy of each "
+            "trusted target -- instead of the full decoy pool (default: "
+            "off, i.e. decoys may also come from Not_Match/MBR slots). "
+            "Since decoys are generated ~1:1 per candidate slot, this "
+            "shrinks the pool to roughly 1 decoy per trusted target, so "
+            "--decoy-target-ratio > 1 will typically fall back to using "
+            "all available decoys (logged, not an error)."
+        ),
+    )
+    parser.add_argument(
         "--train-fdr",
         type=float,
         default=None,
@@ -337,6 +363,7 @@ def main():
         test_fdr=args.test_fdr,
         seed=args.seed,
         exclude_features=exclude_features,
+        decoy_msms_only=args.decoy_msms_only,
     )
 
 

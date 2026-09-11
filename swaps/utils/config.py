@@ -46,6 +46,15 @@ def merge_cfg_from_file(cfg: ConfigurationNode, cfg_filename: str) -> None:
         return
     if "DATA_PATH" in user_dict and isinstance(user_dict["DATA_PATH"], str):
         user_dict["DATA_PATH"] = [user_dict["DATA_PATH"]]
+    if (
+        "FDR" in user_dict
+        and isinstance(user_dict["FDR"], dict)
+        and isinstance(user_dict["FDR"].get("METHOD"), str)
+    ):
+        # Pre-dates FDR.METHOD becoming a list (one or more rescoring methods
+        # per run) -- effective_config.yaml files written before that change
+        # still record it as a bare scalar (e.g. "percolator").
+        user_dict["FDR"]["METHOD"] = [user_dict["FDR"]["METHOD"]]
     filtered_dict, unknown_keys = _filter_cfg_dict(cfg, user_dict)
     if unknown_keys:
         Logger.warning(

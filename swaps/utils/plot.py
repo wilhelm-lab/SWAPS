@@ -2391,7 +2391,8 @@ def plot_intensity_coverage_by_species(
     separate_by_match_type: bool = False,
     match_type_col_keyword: str = "Match Type",
     match_types: Optional[list[str]] = None,
-) -> tuple[Figure, plt.Axes, pd.DataFrame]:
+    plot: bool = True,
+) -> tuple[Optional[Figure], Optional[plt.Axes], pd.DataFrame]:
     """Stacked bar plot of intensity coverage broken down by species and missing values.
 
     Each bar corresponds to one intensity column. Values are counted as present
@@ -2447,6 +2448,12 @@ def plot_intensity_coverage_by_species(
         ``["MS/MS", "MBR", "unmatched"]``). Offsets and hatch patterns are
         assigned automatically based on the list length. Only used when
         ``separate_by_match_type=True``.
+    plot:
+        When False, skip building the figure entirely (no Axes/bars/legend,
+        no save, no interactive display) and only compute+return the counts
+        table -- faster, and avoids popping up an interactive window when
+        fig_dir is None. Returns ``(None, None, counts)``. ax/fig_dir are
+        ignored in this case.
     """
     int_cols = [c for c in df.columns if int_col_keyword in c]
     if not int_cols:
@@ -2543,6 +2550,9 @@ def plot_intensity_coverage_by_species(
             counts = counts.loc[total_present.sort_values(ascending=False).index]
             for bt in all_bar_types:
                 counts_by_type[bt] = counts_by_type[bt].loc[counts.index]
+
+        if not plot:
+            return None, None, pd.concat(counts_by_type, names=["match_type"])
 
         x_labels = (
             [label_shorten_fn(c) for c in counts.index]
@@ -2654,6 +2664,9 @@ def plot_intensity_coverage_by_species(
     if sort_columns:
         total_present = counts[species_order].sum(axis=1)
         counts = counts.loc[total_present.sort_values(ascending=False).index]
+
+    if not plot:
+        return None, None, counts
 
     x_labels = (
         [label_shorten_fn(c) for c in counts.index]

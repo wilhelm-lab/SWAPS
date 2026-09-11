@@ -470,6 +470,69 @@ class TestSelectTrustedTrainingRows:
         assert set(train_df_1["mz_rank"]) == set(train_df_2["mz_rank"])
 
 
+@pytest.fixture
+def slot_decoy_tdc_df():
+    """40 MS/MS-confirmed targets + 60 Not_Match targets (same as
+    trusted_training_tdc_df), but decoys carry the mz_rank of the candidate
+    slot they were generated against (20 decoys paired with MS/MS-confirmed
+    targets, 20 paired with Not_Match targets) -- mirrors production, where
+    combine_matches_target_decoy gives each decoy row its target's own
+    mz_rank rather than a disjoint decoy-only mz_rank range."""
+    msms_targets = _make_tdc_rows(40, True, 2.0, seed=1)
+    msms_targets["mz_rank"] = np.arange(1000, 1040)
+    notmatch_targets = _make_tdc_rows(60, True, 0.0, seed=2)
+    notmatch_targets["mz_rank"] = np.arange(2000, 2060)
+    msms_decoys = _make_tdc_rows(20, False, 0.0, seed=4)
+    msms_decoys["mz_rank"] = np.arange(1000, 1020)
+    notmatch_decoys = _make_tdc_rows(20, False, 0.0, seed=5)
+    notmatch_decoys["mz_rank"] = np.arange(2000, 2020)
+    return pd.concat(
+        [msms_targets, notmatch_targets, msms_decoys, notmatch_decoys],
+        ignore_index=True,
+    )
+
+
+@pytest.fixture
+def slot_decoy_dict_ref():
+    """dict_ref labelling mz_rank 1000-1039 Reference, 2000-2059 Not_Match."""
+    mz_ranks = np.arange(1000, 2060)
+    status = np.where((mz_ranks >= 1000) & (mz_ranks < 1040), "Reference", "Not_Match")
+    return pd.DataFrame({"mz_rank": mz_ranks, "run_A": status})
+
+
+class TestSelectTrustedTrainingRowsDecoyMsmsOnly:
+    def test_decoy_msms_only_restricts_to_msms_slot_decoys(
+        self, slot_decoy_tdc_df, slot_decoy_dict_ref
+    ):
+        train_df = select_trusted_training_rows(
+            slot_decoy_tdc_df,
+            slot_decoy_dict_ref,
+            decoy_target_ratio=1.0,
+            decoy_msms_only=True,
+            rng=0,
+        )
+        decoy_rows = train_df.loc[~train_df["IsTarget"]]
+        assert set(decoy_rows["mz_rank"]).issubset(set(range(1000, 1020)))
+        # only 20 msms-slot decoys exist, below the 40 wanted -> fallback to all
+        assert len(decoy_rows) == 20
+
+    def test_decoy_msms_only_false_includes_notmatch_slot_decoys(
+        self, slot_decoy_tdc_df, slot_decoy_dict_ref
+    ):
+        train_df = select_trusted_training_rows(
+            slot_decoy_tdc_df,
+            slot_decoy_dict_ref,
+            decoy_target_ratio=1.0,
+            decoy_msms_only=False,
+            rng=0,
+        )
+        decoy_rows = train_df.loc[~train_df["IsTarget"]]
+        # full pool is 40 (20 msms-slot + 20 not-match-slot), equal to the
+        # 40 wanted -> all of them, including some from Not_Match slots
+        assert len(decoy_rows) == 40
+        assert not set(decoy_rows["mz_rank"]).issubset(set(range(1000, 1020)))
+
+
 class TestBrewTrustedTargetModel:
     @pytest.mark.parametrize("model_type", ["percolator", "supervised"])
     def test_scores_full_population(
