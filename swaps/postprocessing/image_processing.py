@@ -506,42 +506,6 @@ def calculate_peak_property_from_labels_and_image(
         return df
 
 
-def estimate_floor_background(
-    raw_image: np.ndarray,
-    area: int,
-    smooth_kwargs: Optional[dict] = None,
-    threshold: float = 2.0,
-    min_size: int = 10,
-) -> Tuple[float, float, int]:
-    """Per-image background floor via removed-small-object intensity.
-
-    Gaussian-smooths raw_image, thresholds it (`> threshold`), and removes
-    connected components smaller than min_size (skimage remove_small_objects,
-    8-connectivity). The average pre-removal intensity of the removed pixels
-    is treated as this image's own local noise floor; multiplying by `area`
-    (the candidate's own watershed region size, in pixels) gives a background
-    estimate to subtract from that region's intensity_sum.
-
-    Runs per-image (typically once per run's own raw_image, not on a shared
-    consensus) since the background level need not be the same across runs.
-    `threshold` must be > 0 -- unlike MATCH_FEATURES_KWARGS.denoise.clean
-    (which thresholds at 0 and is a no-op after Gaussian smoothing, since a
-    Gaussian's tails leave the whole image nonzero), this needs a real cutoff
-    to have any small components to remove.
-
-    Returns (background_estimate, avg_noise_per_pixel, n_removed_px).
-    """
-    g_kw = dict(smooth_kwargs or {"sigma": 2, "mode": "nearest"})
-    smoothed = gaussian_filter(raw_image, **g_kw)
-    signal_mask = smoothed > threshold
-    kept_mask = remove_small_objects(signal_mask, min_size=min_size, connectivity=2)
-    removed_mask = signal_mask & ~kept_mask
-    n_removed = int(removed_mask.sum())
-    avg_noise_per_pixel = float(smoothed[removed_mask].mean()) if n_removed else 0.0
-    background_estimate = avg_noise_per_pixel * area
-    return background_estimate, avg_noise_per_pixel, n_removed
-
-
 def compute_row_smoothness_and_apex_index(
     labels,
     dy,

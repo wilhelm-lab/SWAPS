@@ -68,6 +68,10 @@ from postprocessing.direct_lfq import (
     reformat_swaps_combined_for_directlfq,
     undistinguishable_excl_output_name,
 )
+from postprocessing.extract_noise_floor import (
+    estimate_dataset_noise_median,
+    apply_floor_extraction,
+)
 
 # Clear existing logging handlers
 for handler in logging.root.handlers[:]:
@@ -115,6 +119,20 @@ def _resolve_fdr_variant(variant: dict) -> tuple[str, str, str, str]:
     training_data_token = "msms" if training_data == "ms/ms" else "all"
     method_token = method.replace("-", "")
     return training_data, method, training_data_token, method_token
+
+
+def _raw_file_list_from_cfg(cfg) -> list:
+    """Derive raw_file_list from the configured .d datasets (not by listing
+    RESULT_PATH) -- RESULT_PATH also holds non-raw-file cache/output dirs
+    (e.g. broad_alignment_image_based_pairs, broad_alignment_rt_im_cache,
+    broad_alignment_vis, peak_detection_2d) that a naive directory listing
+    would wrongly treat as raw files, breaking downstream lookups like
+    dict_ref's per-raw-file MS1_frame_idx_left_ref_<raw_file> columns."""
+    return [
+        os.path.basename(dot_d_path).split(".")[0]
+        for data_path in cfg.DATA_PATH
+        for dot_d_path in get_dot_d_paths(data_path, cfg.EXCLUDE_DATASET_NAME)
+    ]
 
 
 def _to_parquet_safe(df: pd.DataFrame, path: str, **kwargs):
@@ -408,17 +426,7 @@ def opt_scan_by_scan(config_path: str):
     logging.info(
         "==================Quantification and Feature-Feature Match=================="
     )
-    # Derive raw_file_list from the configured .d datasets (not by listing
-    # RESULT_PATH) -- RESULT_PATH also holds non-raw-file cache/output dirs
-    # (e.g. broad_alignment_image_based_pairs, broad_alignment_rt_im_cache,
-    # broad_alignment_vis, peak_detection_2d) that a naive directory listing
-    # would wrongly treat as raw files, breaking downstream lookups like
-    # dict_ref's per-raw-file MS1_frame_idx_left_ref_<raw_file> columns.
-    raw_file_list = [
-        os.path.basename(dot_d_path).split(".")[0]
-        for data_path in cfg.DATA_PATH
-        for dot_d_path in get_dot_d_paths(data_path, cfg.EXCLUDE_DATASET_NAME)
-    ]
+    raw_file_list = _raw_file_list_from_cfg(cfg)
 
     # One-time preprocessing: merge frame-partitioned parquets into a single
     # mz_rank-sorted parquet per directory so workers can skip row groups.
@@ -712,6 +720,7 @@ def _finalize_fdr_results(
     pp_match_target_msms: Optional[pd.DataFrame],
     pp_reference: pd.DataFrame,
     dict_ref: pd.DataFrame,
+    noise_median: Optional[float] = None,
 ):
     """Shared tail of FDR control: combined pivot, DirectLFQ, result analysis.
 
@@ -719,8 +728,32 @@ def _finalize_fdr_results(
     (percolator, mokapot-trusted-target rescoring, or plain intensity
     filtering with FDR disabled) -- dir_name namespaces the outputs of each
     caller under its own quant_dir subdir.
+
+    noise_median (dataset-level, computed once by the caller via
+    estimate_dataset_noise_median -- see MATCH_FEATURES_KWARGS.floor_extraction)
+    is applied here, before pp_all/pivot are built, to pp_reference,
+    pp_match_target_filtered, and pp_match_target_msms individually so every
+    downstream consumer of any of those three (build_pivot/DirectLFQ, the
+    raw ions_raw/rank-intensity/quant-by-run plots, and calc_quant_corr's own
+    QC plot below, which reads pp_reference/pp_match_target_filtered
+    directly rather than through the pivot) sees the corrected intensity_sum
+    consistently.
     """
     os.makedirs(os.path.join(quant_dir, dir_name), exist_ok=True)
+    if cfg.MATCH_FEATURES_KWARGS.floor_extraction.enabled:
+        assert noise_median is not None, (
+            "floor_extraction.enabled=True but noise_median was not provided -- "
+            "caller must estimate it via estimate_dataset_noise_median."
+        )
+        noise_fraction = cfg.MATCH_FEATURES_KWARGS.floor_extraction.noise_fraction
+        pp_match_target_filtered = apply_floor_extraction(
+            pp_match_target_filtered, noise_median, noise_fraction
+        )
+        pp_reference = apply_floor_extraction(pp_reference, noise_median, noise_fraction)
+        if pp_match_target_msms is not None:
+            pp_match_target_msms = apply_floor_extraction(
+                pp_match_target_msms, noise_median, noise_fraction
+            )
     dfs_to_concat = {
         "MBR": pp_match_target_filtered,
         "MS/MS Ref": pp_reference,
@@ -1010,6 +1043,21 @@ def run_fdr_control_onwards(
         )
         _fdr_runs.append((dir_name, pp_match_target_filtered))
 
+    noise_median = None
+    if cfg.MATCH_FEATURES_KWARGS.floor_extraction.enabled:
+        logging.info(
+            "=================Floor (background) noise estimation=================="
+        )
+        noise_median, _ = estimate_dataset_noise_median(
+            dict_ref,
+            _raw_file_list_from_cfg(cfg),
+            cfg.RESULT_PATH,
+            n_candidates=cfg.MATCH_FEATURES_KWARGS.floor_extraction.n_candidates_sampled,
+            seed=cfg.MATCH_FEATURES_KWARGS.floor_extraction.seed,
+            threshold=cfg.MATCH_FEATURES_KWARGS.floor_extraction.threshold,
+            min_size=cfg.MATCH_FEATURES_KWARGS.floor_extraction.min_size,
+        )
+
     for _dir_name, _mbr_df in _fdr_runs:
         _finalize_fdr_results(
             cfg,
@@ -1019,6 +1067,7 @@ def run_fdr_control_onwards(
             pp_match_target_msms,
             pp_reference,
             dict_ref,
+            noise_median=noise_median,
         )
 
 

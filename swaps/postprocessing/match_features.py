@@ -20,7 +20,6 @@ from .image_processing import (
     smooth_and_denoise_image,
     detect_2d_peak_with_watershed,
     calculate_peak_property_from_labels_and_image,
-    estimate_floor_background,
 )
 import duckdb
 from matplotlib.colors import ListedColormap
@@ -778,18 +777,8 @@ def match_features_batch(
     merge_confounders_enabled: bool = True,
     illustration_log_transform: bool = False,
     illustration_show_axes: bool = False,
-    bundle_collector: dict | None = None,
 ):
-    """Process one peptide batch using the consensus image path.
-
-    bundle_collector: when given, each target candidate's own
-    ConsensusFeatureBundle (alignment + segmentation state, including the
-    full multi-region watershed_labels array) is stored in-memory under its
-    mz_rank -- purely in-process introspection, no file I/O -- for callers
-    that need the raw segmentation structure itself (e.g. label-merge
-    prototyping) rather than the flattened peak-property rows this function
-    normally returns.
-    """
+    """Process one peptide batch using the consensus image path."""
     results_target, results_decoy = [], []
     pp_reference_list, pp_match_target_list, pp_match_decoy_list = [], [], []
     no_quant_log, no_match_log = [], []
@@ -809,7 +798,6 @@ def match_features_batch(
     denoise_cfg = dict((processing_kwargs or {}).get("denoise", {}))
     raw_denoise_kwargs = _denoise_kwargs_for_stage(denoise_cfg, "raw")
     _log_enabled = _log_transform_enabled(denoise_cfg)
-    floor_extraction_cfg = dict((processing_kwargs or {}).get("floor_extraction", {}) or {})
     _align_images = bool((processing_kwargs or {}).get("align_images", True))
     _align_in_log_space = bool(
         (processing_kwargs or {}).get("align_in_log_space", True)
@@ -1255,11 +1243,7 @@ def match_features_batch(
             top_intensity_frac=_top_intensity_frac,
             alignment_method=_alignment_method,
             phase_correlation_kwargs=_phase_correlation_kwargs,
-            floor_extraction=floor_extraction_cfg,
         )
-
-        if bundle_collector is not None:
-            bundle_collector[int(pept_idx)] = _consensus_bundle
 
         if _cached_group is not None:
             # Place this member's own independently-detected mask into the
@@ -1856,7 +1840,6 @@ def match_features_batch(
                                 if _broad_alignment_enabled
                                 else None
                             ),
-                            floor_extraction=floor_extraction_cfg,
                         )
                         if decoy_pp_raw is None:
                             no_quant_log.append(
@@ -1933,7 +1916,6 @@ def match_features_batch(
                             min_offset_frac=_off_target_min_offset_frac,
                             max_overlap_fraction=_off_target_max_overlap_fraction,
                             label_shift=_precomputed_shift,
-                            floor_extraction=floor_extraction_cfg,
                         )
                         if decoy_pp_raw is None or label_shift is None:
                             no_quant_log.append(
@@ -2038,7 +2020,6 @@ def match_features_batch(
                                 if _broad_alignment_enabled
                                 else None
                             ),
-                            floor_extraction=floor_extraction_cfg,
                         )
                         if decoy_pp_raw is None:
                             no_quant_log.append(
@@ -2136,7 +2117,6 @@ def match_features_batch(
                                 if _broad_alignment_enabled
                                 else None
                             ),
-                            floor_extraction=floor_extraction_cfg,
                         )
                         if decoy_pp_raw is None:
                             no_quant_log.append(
@@ -3868,7 +3848,6 @@ def _extract_feature_rows_for_label_ids(
     free_shift: tuple[int, int] | None = None,
     free_max_score: float | None = None,
     multi_scale_columns: dict[str, float] | None = None,
-    floor_extraction: dict | None = None,
 ) -> pd.DataFrame | None:
     # Pick the dominant label by area in label_image (deterministic across runs
     # sharing the same segmentation).
@@ -3888,29 +3867,6 @@ def _extract_feature_rows_for_label_ids(
         return None
 
     peak_properties = peak_properties.reset_index(drop=True)
-    if floor_extraction and floor_extraction.get("enabled", False):
-        _area = int(peak_properties["area"].values[0])
-        _bg_est, _avg_noise, _n_removed = estimate_floor_background(
-            raw_image,
-            _area,
-            smooth_kwargs=floor_extraction.get("gaussian_kwargs"),
-            threshold=float(floor_extraction.get("threshold", 2.0)),
-            min_size=int(floor_extraction.get("min_size", 10)),
-        )
-        peak_properties["floor_avg_noise_per_pixel"] = _avg_noise
-        peak_properties["floor_n_removed_px"] = _n_removed
-        peak_properties["floor_background_estimate"] = _bg_est
-        # intensity_sum becomes the floor-corrected value in place, so every
-        # existing downstream consumer (FDR.INT_THRES, DirectLFQ, decoy
-        # min_peak_sum_intensity, ...) picks it up automatically without
-        # needing to be repointed at a new column. The pre-correction value
-        # is preserved under its own name for diagnostics/rollback.
-        peak_properties["intensity_sum_without_floor_correction"] = peak_properties[
-            "intensity_sum"
-        ]
-        peak_properties["intensity_sum"] = (
-            peak_properties["intensity_sum"] - _bg_est
-        ).clip(lower=0)
     peak_properties["snap_rt"] = int(snap_rc[0])
     peak_properties["snap_im"] = int(snap_rc[1])
     peak_properties["shift_rt"] = int(shift[0])
@@ -3999,7 +3955,6 @@ def _extract_feature_rows_from_prealigned(
     raw_consensus_logged_mean: np.ndarray,
     labels: list[str] | None = None,
     multi_scale_alignments: dict[float, ConsensusAlignmentState] | None = None,
-    floor_extraction: dict | None = None,
 ) -> tuple[pd.DataFrame | None, list[pd.DataFrame | None]]:
     """Extract per-run and consensus peak-property rows from ALREADY aligned
     images against segmentation_state's watershed labels.
@@ -4008,10 +3963,6 @@ def _extract_feature_rows_from_prealigned(
     caller with already-registered data can go straight to extraction --
     re-running the raw-image alignment step on already-aligned arrays would
     double-apply registration.
-
-    floor_extraction, if given and enabled, is computed independently per
-    row (each run's own raw_aligned[i], plus separately for the consensus
-    row's own raw_consensus) -- see image_processing.estimate_floor_background.
     """
     individual_pps: list[pd.DataFrame | None] = [None] * len(raw_aligned)
     consensus_pp: pd.DataFrame | None = None
@@ -4039,7 +3990,6 @@ def _extract_feature_rows_from_prealigned(
                 else segmentation_state.label_to_snap.get(label_id)
             ),
             multi_scale_columns=_multi_scale_feature_columns(multi_scale_alignments, i),
-            floor_extraction=floor_extraction,
         )
     consensus_pp = _extract_feature_rows_for_label_ids(
         segmentation_state.target_label_ids,
@@ -4055,7 +4005,6 @@ def _extract_feature_rows_from_prealigned(
         ),
         snap_resolver=lambda label_id: segmentation_state.label_to_snap.get(label_id),
         multi_scale_columns=_multi_scale_consensus_columns(multi_scale_alignments),
-        floor_extraction=floor_extraction,
     )
     return consensus_pp, individual_pps
 
@@ -4068,7 +4017,6 @@ def extract_peak_properties_from_consensus_labels(
     labels: list[str] | None = None,
     log_transform_enabled: bool = True,
     multi_scale_alignments: dict[float, ConsensusAlignmentState] | None = None,
-    floor_extraction: dict | None = None,
 ) -> tuple[
     pd.DataFrame | None,
     list[pd.DataFrame | None],
@@ -4119,7 +4067,6 @@ def extract_peak_properties_from_consensus_labels(
         raw_consensus_logged_mean,
         labels=labels,
         multi_scale_alignments=multi_scale_alignments,
-        floor_extraction=floor_extraction,
     )
 
     return (
@@ -4206,7 +4153,6 @@ def build_consensus_feature_bundle(
     top_intensity_frac: float = 1.0,
     alignment_method: str = "template_match",
     phase_correlation_kwargs: dict | None = None,
-    floor_extraction: dict | None = None,
 ) -> ConsensusFeatureBundle:
     """Build alignment, segmentation, and feature tables for consensus scoring.
 
@@ -4340,7 +4286,6 @@ def build_consensus_feature_bundle(
         labels=labels,
         log_transform_enabled=_log_enabled,
         multi_scale_alignments=_multi_scale_alignments,
-        floor_extraction=floor_extraction,
     )
     return ConsensusFeatureBundle(
         alignment=alignment_state,
@@ -5150,7 +5095,6 @@ def _build_consensus_peptide_swap_decoy(
     forced_shift: tuple[int, int] | None = None,
     max_deviation: int | None = None,
     multi_scale_forced_shifts: dict[float, tuple[int, int] | None] | None = None,
-    floor_extraction: dict | None = None,
 ) -> tuple[pd.DataFrame | None, tuple[int, int], float]:
     """Align a wrong same-run peptide image and score it under target consensus labels.
 
@@ -5300,7 +5244,6 @@ def _build_consensus_peptide_swap_decoy(
             multi_scale_forced_shifts,
             max_deviation,
         ),
-        floor_extraction=floor_extraction,
     )
     return decoy_pp, shift, max_score
 
@@ -5313,7 +5256,6 @@ def _build_consensus_off_target_decoy(
     min_offset_frac: float = 0.35,
     max_overlap_fraction: float = 0.05,
     label_shift: tuple[int, int] | None = None,
-    floor_extraction: dict | None = None,
 ) -> tuple[pd.DataFrame | None, tuple[int, int] | None]:
     """Quantify the target run against a deliberately shifted consensus label mask."""
 
@@ -5370,7 +5312,6 @@ def _build_consensus_off_target_decoy(
         multi_scale_columns=_multi_scale_feature_columns(
             bundle.multi_scale_alignments, run_index
         ),
-        floor_extraction=floor_extraction,
     )
     return decoy_pp, resolved_label_shift
 
