@@ -813,7 +813,10 @@ def _finalize_fdr_results(
     )
     plot_match_type_from_combined(df=pivot, fig_dir=result_analysis_dir)
     try:
-        # compare with IonQuant results
+        # compare with IonQuant results (FragPipe-only: SEARCH_OUTPUT_PATH is
+        # a directory there; for MaxQuant/Sage it's a path to a single file,
+        # so the join below can't resolve and raises NotADirectoryError
+        # instead of FileNotFoundError)
         combined_ionquant = pd.read_csv(
             os.path.join(cfg.SEARCH_OUTPUT_PATH, "combined_ion.tsv"),
             sep="\t",
@@ -823,7 +826,7 @@ def _finalize_fdr_results(
             fig_dir=result_analysis_dir,
             fig_name_suffix="_ionquant",
         )
-    except FileNotFoundError:
+    except (FileNotFoundError, NotADirectoryError):
         logging.info(
             "IonQuant combined_ion.csv not found in search output path. Skipping comparison with IonQuant results. Skipping"
         )
