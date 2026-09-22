@@ -1042,18 +1042,22 @@ def split_pp_by_match_status(
     pp_match_target: pd.DataFrame,
     pp_match_decoy: pd.DataFrame,
 ) -> tuple:
-    """Split pp_match_target/decoy into Not_Match vs Reference/Quant_Only subsets.
+    """Split pp_match_target/decoy into rescoring vs Reference/Quant_Only subsets.
 
-    Returns (pp_not_match, pp_msms, pp_decoy_not_match).  pp_not_match and
-    pp_decoy_not_match contain only run-peptide pairs labelled Not_Match in
-    dict_ref (candidates for MBR rescoring); pp_msms contains pairs labelled
-    Reference or Quant_Only (passed through directly as MS/MS identifications).
+    Returns (pp_not_match, pp_msms, pp_decoy_not_match).  pp_msms contains
+    pairs labelled Reference or Quant_Only (passed through directly as MS/MS
+    identifications); pp_not_match and pp_decoy_not_match contain every other
+    run-peptide pair (candidates for MBR rescoring) -- not just those
+    labelled "Not_Match", but also e.g. "Match" (the search engine's own
+    MBR transfer, which still lacks direct MS/MS evidence in that run and so
+    must still compete under target-decoy control rather than being dropped
+    or exempted).
     """
     long = _match_status_long(dict_ref)
-    not_match_keys = long.loc[
-        long["match_type"] == "Not_Match", ["mz_rank", "Run_name"]
-    ].drop_duplicates()
     msms_keys = get_msms_run_keys(dict_ref)
+    not_match_keys = long.loc[
+        ~long["match_type"].isin(["Reference", "Quant_Only"]), ["mz_rank", "Run_name"]
+    ].drop_duplicates()
 
     pp_not_match = pp_match_target.merge(
         not_match_keys, on=["mz_rank", "Run_name"], how="inner"

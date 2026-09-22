@@ -126,6 +126,29 @@ class TestSplitPpByMatchStatus:
         assert len(pp_msms) == 0
         assert len(pp_decoy_not_match) == 0
 
+    def test_search_engine_own_mbr_status_goes_to_rescoring_not_dropped(
+        self, pp_target_for_split, pp_decoy_for_split
+    ):
+        """A search engine's own MBR transfer (e.g. MaxQuant's "Match" status)
+        still lacks direct MS/MS evidence, so it must be rescored like
+        Not_Match rather than silently dropped from both buckets."""
+        dict_ref_with_own_mbr = pd.DataFrame(
+            {
+                "mz_rank": [0, 1, 2],
+                "Sequence": ["PEPTIDEK", "SEQR", "ACDEFK"],
+                "Proteins": ["PROT0", "PROT1", "PROT2"],
+                "run_A": ["Reference", "Match", "Quant_Only"],
+                "run_B": ["Not_Match", "Quant_Only", "Not_Match"],
+            }
+        )
+        pp_not_match, pp_msms, _ = split_pp_by_match_status(
+            dict_ref_with_own_mbr, pp_target_for_split, pp_decoy_for_split
+        )
+        keys_not_match = set(zip(pp_not_match["mz_rank"], pp_not_match["Run_name"]))
+        keys_msms = set(zip(pp_msms["mz_rank"], pp_msms["Run_name"]))
+        assert (1, "run_A") in keys_not_match
+        assert (1, "run_A") not in keys_msms
+
 
 # ---------------------------------------------------------------------------
 # normalize_shift_by_runs
