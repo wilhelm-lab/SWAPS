@@ -1958,6 +1958,7 @@ def plot_match_type_comparison(
     quant_thres: float = 0,
     fig_dir: Optional[str] = None,
     fig_name_suffix: str = "",
+    baseline_label: str = "IonQuant",
 ) -> tuple:
     """Side-by-side stacked bar comparison of Match Type counts for SWAPS vs IonQuant.
 
@@ -2120,7 +2121,7 @@ def plot_match_type_comparison(
     ax.set_xlabel("Experiment")
     ax.set_ylabel("Count")
     ax.set_title(
-        f"Match Type Counts: IonQuant vs SWAPS{' (' + fig_name_suffix.strip('_') + ')' if fig_name_suffix else ''}"
+        f"Match Type Counts: {baseline_label} vs SWAPS{' (' + fig_name_suffix.strip('_') + ')' if fig_name_suffix else ''}"
     )
 
     # deduplicated legend: categories + source hatching
@@ -2132,12 +2133,12 @@ def plot_match_type_comparison(
             handles.append(h)
             lbls.append(l)
     handles += [
-        patches.Patch(facecolor="white", edgecolor="black", label="IonQuant (solid)"),
+        patches.Patch(facecolor="white", edgecolor="black", label=f"{baseline_label} (solid)"),
         patches.Patch(
             facecolor="white", edgecolor="black", hatch="//", label="SWAPS (hatched)"
         ),
     ]
-    lbls += ["IonQuant (solid)", "SWAPS (hatched)"]
+    lbls += [f"{baseline_label} (solid)", "SWAPS (hatched)"]
     ax.legend(
         handles=handles,
         labels=lbls,
@@ -2172,6 +2173,7 @@ def plot_intensity_correlation_by_match_type(
     min_rows: int = 10,
     fig_dir: Optional[str] = None,
     fig_name_suffix: str = "",
+    baseline_label: str = "IonQuant",
 ) -> tuple:
     """Bar plot with error bars of pairwise Pearson correlations of log2 intensities.
 
@@ -2282,7 +2284,7 @@ def plot_intensity_correlation_by_match_type(
                     fontsize=7,
                 )
 
-    _draw_bars(x_iq, corrs_iq, counts_iq, iq_color, hatch=None, label="IonQuant")
+    _draw_bars(x_iq, corrs_iq, counts_iq, iq_color, hatch=None, label=baseline_label)
     _draw_bars(x_sw, corrs_sw, counts_sw, sw_color, hatch=None, label="SWAPS")
 
     ax.set_xticks(x_centers)
