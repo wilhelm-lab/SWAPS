@@ -539,3 +539,21 @@ def test_identification_stats_from_msms_only(score_evidence_df):
     # single-identification std is NaN before fill; filled with column mean
     # (the only other value present, i.e. peptide A's own std).
     assert b["score_std"] == pytest.approx(a["score_std"])
+
+
+def test_min_rt_range_widens_narrow_windows_around_center(score_evidence_df):
+    base = get_rt_im_range(score_evidence_df)
+    width = base["RT_search_right"] - base["RT_search_left"]
+    min_range = float(width.max()) + 1.0
+    result = get_rt_im_range(score_evidence_df, min_rt_range=min_range)
+    new_width = result["RT_search_right"] - result["RT_search_left"]
+    assert new_width.to_numpy() == pytest.approx(min_range)
+    mid = (result["RT_search_left"] + result["RT_search_right"]) / 2
+    assert mid.to_numpy() == pytest.approx(result["RT_search_center"].to_numpy())
+
+
+def test_min_rt_range_keeps_wider_windows(score_evidence_df):
+    base = get_rt_im_range(score_evidence_df)
+    result = get_rt_im_range(score_evidence_df, min_rt_range=1e-6)
+    pd.testing.assert_series_equal(result["RT_search_left"], base["RT_search_left"])
+    pd.testing.assert_series_equal(result["RT_search_right"], base["RT_search_right"])

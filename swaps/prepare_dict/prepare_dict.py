@@ -1653,6 +1653,7 @@ def construct_dict_from_search_pivoted(
         evidence_cleaned,
         id_cols=["Sequence", "Modifications", "Charge", "Proteins"],
         summarize_without_match=cfg_prepare_dict.REF.SUMMARIZE_WITHOUT_MATCH,
+        min_rt_range=float(cfg_prepare_dict.REF.MIN_RT_RANGE),
     )
 
     # add extra columns
@@ -2184,6 +2185,19 @@ def align_rt_from_multiple_source(
     return ref_rt.reset_index().rename(columns={0: "Retention time_ref"})
 
 
+def _enforce_min_rt_range(df: pd.DataFrame, min_rt_range: float) -> pd.DataFrame:
+    """Widen RT_search_left/right in place to center -/+ min_rt_range/2 where
+    the window is narrower than min_rt_range (same unit as RT_search_*)."""
+    if min_rt_range <= 0:
+        return df
+    too_narrow = (df["RT_search_right"] - df["RT_search_left"]) < min_rt_range
+    half = min_rt_range / 2
+    df.loc[too_narrow, "RT_search_left"] = df.loc[too_narrow, "RT_search_center"] - half
+    df.loc[too_narrow, "RT_search_right"] = df.loc[too_narrow, "RT_search_center"] + half
+    Logger.info("Widened %d RT search windows to min range %s", too_narrow.sum(), min_rt_range)
+    return df
+
+
 def get_rt_im_range(
     evidence: pd.DataFrame,
     match_col: str = "Type",
@@ -2195,6 +2209,7 @@ def get_rt_im_range(
     mobility_col: str = "1/K0",
     mobility_length_col: str = "1/K0 length",
     summarize_without_match: bool = False,
+    min_rt_range: float = 0.0,
 ):
     # --- Step 7: Get rt and ion mobility experimental statistic
     # Identification-quality stats, always computed from direct MS/MS rows
@@ -2305,6 +2320,7 @@ def get_rt_im_range(
         )
         + evidence_group_summary["rt_length_std"]
     )
+    _enforce_min_rt_range(evidence_group_summary, min_rt_range)
     evidence_group_summary["IM_search_left"] = (
         evidence_group_summary["mobility_exp_min"]
         - evidence_group_summary["mobility_exp_std"]

@@ -59,6 +59,9 @@ __C.PREPARE_DICT.REF.DELTA_IM_95 = (
     -0.1
 )  # delta IM covering 95% of data; negative means infer from data; only used when IM_REF == "pred"
 __C.PREPARE_DICT.REF.SUMMARIZE_WITHOUT_MATCH = False
+__C.PREPARE_DICT.REF.MIN_RT_RANGE = (
+    0.0  # min RT_search_right - RT_search_left (same unit as RT_search_*); narrower windows are re-centered on RT_search_center; 0 = disabled
+)
 
 __C.PREPARE_DICT.SAGE = ConfigurationNode()
 __C.PREPARE_DICT.SAGE.RT_WINDOW = (

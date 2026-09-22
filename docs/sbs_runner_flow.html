@@ -509,6 +509,7 @@ flowchart TD
         <tr><td class="key">PREPARE_DICT.OK.DIR</td><td class="default">"" (disabled)</td><td class="effect">Non-empty path filters evidence by Oktoberfest rescoring output at <code>PREPARE_DICT.OK.FDR</code>, output type per <code>PREPARE_DICT.OK.OUTPUT</code> (psms/peptides).</td></tr>
         <tr><td class="key">PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED</td><td class="default">False</td><td class="effect">Turns on coSWA: co-eluting isobaric candidates get merged into one confounder group, later solved jointly in SWA and quantified with per-member role/anchor snapping in match_features.</td></tr>
         <tr><td class="key">PREPARE_DICT.RT_REF / IM_REF</td><td class="default">pred / ref</td><td class="effect">Reference RT from a PeptDeep prediction; reference IM taken directly from search-engine output.</td></tr>
+        <tr><td class="key">PREPARE_DICT.REF.MIN_RT_RANGE</td><td class="default">0.0 (disabled)</td><td class="effect">Minimum <code>RT_search_right - RT_search_left</code> (same unit as <code>RT_search_*</code>). Narrower windows from <code>get_rt_im_range</code> are re-set to <code>RT_search_center &plusmn; MIN_RT_RANGE/2</code> before confounder-group unions are built.</td></tr>
       </tbody>
     </table>
   </div>
