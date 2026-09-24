@@ -65,6 +65,7 @@ pytest-cov = "^7.1.0"
 ipywidgets = "^8.1.8"
 pyright = "^1.1.409"
 openpyxl = "^3.1.5"
+pomegranate = "^1.1.2"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
