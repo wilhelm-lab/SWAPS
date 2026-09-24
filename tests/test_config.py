@@ -109,8 +109,8 @@ class TestGetCfgDefaults:
     def test_optimization_keys_present(self, cfg):
         assert hasattr(cfg.OPTIMIZATION, "N_BATCH")
 
-    def test_default_search_engine_is_maxquant(self, cfg):
-        assert cfg.PREPARE_DICT.SEARCH_ENGINE == "maxquant"
+    def test_default_search_engine_is_fragpipe(self, cfg):
+        assert cfg.PREPARE_DICT.SEARCH_ENGINE == "fragpipe"
 
     def test_default_swa_is_true(self, cfg):
         assert cfg.SWA is True
@@ -335,11 +335,12 @@ class TestCpuAutoDetection:
 
 
 class TestBroadAlignmentConfig:
-    def test_disabled_by_default(self, cfg):
-        assert cfg.MATCH_FEATURES_KWARGS.broad_alignment.enabled is False
+    def test_enabled_by_default(self, cfg):
+        assert cfg.MATCH_FEATURES_KWARGS.broad_alignment.enabled is True
 
     def test_max_deviation_default(self, cfg):
-        assert cfg.MATCH_FEATURES_KWARGS.broad_alignment.max_deviation == 5
+        # 0 forces the exact calibrated shift (rescoring only, no local refinement)
+        assert cfg.MATCH_FEATURES_KWARGS.broad_alignment.max_deviation == 0
 
     def _feature_cols(self, align_images):
         alignment_feature_cols = [
