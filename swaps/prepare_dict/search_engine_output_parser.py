@@ -2,7 +2,18 @@ import pandas as pd
 import logging
 import numpy as np
 
+try:
+    from utils.singleton_swaps_optimization import swaps_optimization_cfg
+except ImportError:  # imported as swaps.prepare_dict..., swaps/ itself not on sys.path
+    from swaps.utils.singleton_swaps_optimization import swaps_optimization_cfg
+
 Logger = logging.getLogger(__name__)
+
+# Config default for PREPARE_DICT.SAGE.Q_VALUE_CUTOFF, for callers that have no cfg
+# in hand (e.g. postprocessing/sage_baseline.py). The pipeline itself passes the
+# (possibly overridden) cfg value to sage_parser explicitly.
+SAGE_Q_VALUE_CUTOFF = swaps_optimization_cfg.PREPARE_DICT.SAGE.Q_VALUE_CUTOFF
+
 sage_rename_dict = {
     "psm_id": "id",
     "peptide": "Modified sequence",
@@ -55,6 +66,7 @@ def sage_parser(
     sage_rename_dict: dict = sage_rename_dict,
     rt_window: float = 0.0,
     im_window: float = 0.0,
+    q_value_cutoff: float = SAGE_Q_VALUE_CUTOFF,
 ) -> pd.DataFrame:
     """
     Parse the SAGE output DataFrame and rename columns based on the provided dictionary.
@@ -66,6 +78,11 @@ def sage_parser(
             0 (default) triggers auto-calculation: 1% of the maximum observed RT.
         im_window (float): IM elution window in 1/K0 units to add as ``1/K0 length``.
             0 (default) triggers auto-calculation: 0.1 1/K0 units.
+        q_value_cutoff (float): rows are kept only if spectrum, peptide and protein
+            q-values are all <= this. Defaults to the PREPARE_DICT.SAGE.Q_VALUE_CUTOFF
+            config default; sbs_runner_ims.py already applies the same cutoff while
+            reading results.sage.tsv, so here it is a safety net for callers passing
+            an unfiltered dataframe.
 
     Returns:
         pd.DataFrame: The parsed DataFrame with renamed columns.
@@ -75,13 +92,19 @@ def sage_parser(
     sage_output["m/z"] = sage_output["expmass"] / sage_output["charge"]
     sage_output["calc_m/z"] = sage_output["calcmass"] / sage_output["charge"]
     Logger.info(
-        "Before filtering at 0.01 spectrum and peptide q-value: %s", len(sage_output)
+        "Before filtering at %s spectrum/peptide/protein q-value: %s",
+        q_value_cutoff,
+        len(sage_output),
     )
     sage_output = sage_output.loc[
-        (sage_output["peptide_q"] <= 0.01) & (sage_output["spectrum_q"] <= 0.01)
+        (sage_output["peptide_q"] <= q_value_cutoff)
+        & (sage_output["spectrum_q"] <= q_value_cutoff)
+        & (sage_output["protein_q"] <= q_value_cutoff)
     ].copy()
     Logger.info(
-        "After filtering at 0.01 peptide and spectrum q-value: %s", len(sage_output)
+        "After filtering at %s spectrum/peptide/protein q-value: %s",
+        q_value_cutoff,
+        len(sage_output),
     )
     # Rename columns based on the provided dictionary
     sage_output.rename(columns=sage_rename_dict, inplace=True)

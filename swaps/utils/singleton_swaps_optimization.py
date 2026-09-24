@@ -70,6 +70,9 @@ __C.PREPARE_DICT.SAGE.RT_WINDOW = (
 __C.PREPARE_DICT.SAGE.IM_WINDOW = (
     0.0  # IM elution window for SAGE; 0 = auto (0.1 1/K0 units)
 )
+__C.PREPARE_DICT.SAGE.Q_VALUE_CUTOFF = (
+    0.01  # spectrum/peptide/protein q-value cutoff applied when reading SAGE's results.sage.tsv
+)
 
 __C.PREPARE_DICT.MZ_BIN_DIGITS = 2
 __C.PREPARE_DICT.ISO_MIN_AB_THRES = 0.01

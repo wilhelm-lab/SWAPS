@@ -279,7 +279,7 @@ flowchart TD
     DICTREADY["dict_ref ready"]
     ENGINE{"PREPARE_DICT.SEARCH_ENGINE"}
     EVMQ["read evidence.txt"]
-    EVSAGE["read results.sage.tsv<br/>sage_parser RT/IM windows"]
+    EVSAGE["read results.sage.tsv (q-value cutoff pushed into DuckDB scan)<br/>sage_parser RT/IM windows"]
     EVFP["concat psm.tsv per experiment dir"]
     OK{"PREPARE_DICT.OK.DIR set?"}
     OKY["filter by Oktoberfest rescore @ OK.FDR"]
@@ -506,6 +506,7 @@ flowchart TD
       <thead><tr><th>Key</th><th>Default</th><th>Effect</th></tr></thead>
       <tbody>
         <tr><td class="key">PREPARE_DICT.SEARCH_ENGINE</td><td class="default">maxquant</td><td class="effect">One of <code>maxquant</code> / <code>sage</code> / <code>fragpipe</code>; selects the evidence file format and parser (<code>sage_parser</code>, <code>fragpipe_psm_parser</code>).</td></tr>
+        <tr><td class="key">PREPARE_DICT.SAGE.Q_VALUE_CUTOFF</td><td class="default">0.01</td><td class="effect">Sage only: spectrum, peptide <em>and</em> protein q-values must all be &le; this. Applied as a DuckDB <code>WHERE</code> while scanning <code>results.sage.tsv</code> (the unfiltered table is never loaded into pandas) and again inside <code>sage_parser</code>.</td></tr>
         <tr><td class="key">PREPARE_DICT.OK.DIR</td><td class="default">"" (disabled)</td><td class="effect">Non-empty path filters evidence by Oktoberfest rescoring output at <code>PREPARE_DICT.OK.FDR</code>, output type per <code>PREPARE_DICT.OK.OUTPUT</code> (psms/peptides).</td></tr>
         <tr><td class="key">PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED</td><td class="default">False</td><td class="effect">Turns on coSWA: co-eluting isobaric candidates get merged into one confounder group, later solved jointly in SWA and quantified with per-member role/anchor snapping in match_features.</td></tr>
         <tr><td class="key">PREPARE_DICT.RT_REF / IM_REF</td><td class="default">pred / ref</td><td class="effect">Reference RT from a PeptDeep prediction; reference IM taken directly from search-engine output.</td></tr>

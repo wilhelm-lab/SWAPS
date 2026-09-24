@@ -1743,7 +1743,10 @@ def construct_dict(
         "sage_discriminant_score" in maxquant_exp_df.columns
     ):  # infer search engine, remap column names
         Logger.debug("Sage discriminant score found, parsing sage results")
-        maxquant_exp_df = sage_parser(maxquant_exp_df)
+        maxquant_exp_df = sage_parser(
+            maxquant_exp_df,
+            q_value_cutoff=float(cfg_prepare_dict.SAGE.Q_VALUE_CUTOFF),
+        )
         Logger.debug("Renamed columns: %s", maxquant_exp_df.columns)
     Logger.info("maxquant_exp_df size: %s", maxquant_exp_df.shape)
     maxquant_exp_df = maxquant_exp_df.loc[

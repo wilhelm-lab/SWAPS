@@ -200,6 +200,7 @@ def minimal_sage_df():
             "posterior_error": [0.001, 0.005, 0.4],
             "spectrum_q": [0.001, 0.005, 0.3],
             "peptide_q": [0.001, 0.008, 0.4],
+            "protein_q": [0.001, 0.009, 0.5],
             "ms2_intensity": [50000.0, 30000.0, 5000.0],
         }
     )

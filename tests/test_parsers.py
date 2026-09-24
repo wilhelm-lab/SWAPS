@@ -131,6 +131,13 @@ class TestSageParser:
         result = sage_parser(minimal_sage_df)
         assert len(result) < len(minimal_sage_df)
 
+    def test_q_value_cutoff_param(self, minimal_sage_df):
+        # Row 1 has spectrum_q=0.005 / peptide_q=0.008 / protein_q=0.009: kept at
+        # the 0.01 default, dropped at a stricter cutoff.
+        assert len(sage_parser(minimal_sage_df.copy())) == 2
+        assert len(sage_parser(minimal_sage_df.copy(), q_value_cutoff=0.002)) == 1
+        assert len(sage_parser(minimal_sage_df.copy(), q_value_cutoff=0.05)) == 2
+
     def test_passing_rows_retained(self, minimal_sage_df):
         result = sage_parser(minimal_sage_df)
         # Rows 0 and 1 have q-values ≤ 0.01

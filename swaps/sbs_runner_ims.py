@@ -24,6 +24,7 @@ import time
 import argparse
 import yaml
 import pandas as pd
+import duckdb
 import directlfq.lfq_manager as lfq_manager
 
 from utils.tools import get_dot_d_paths, report_snap_log_collection
@@ -200,13 +201,33 @@ def opt_scan_by_scan(config_path: str):
                     cfg.SEARCH_OUTPUT_PATH, sep="\t", low_memory=False
                 )
             case "sage":
-                evidence = pd.read_csv(
-                    cfg.SEARCH_OUTPUT_PATH, sep="\t", low_memory=False
+                # Sage's results.sage.tsv carries every candidate PSM, not just
+                # the ones passing FDR control (e.g. ~265k rows for one 125pg
+                # run, ~60% of which get dropped by sage_parser's own q-value
+                # filter). Push the same peptide/spectrum/protein q-value
+                # cutoff down into the CSV scan itself so pandas never
+                # materializes the unfiltered table.
+                sage_q_cutoff = float(cfg.PREPARE_DICT.SAGE.Q_VALUE_CUTOFF)
+                con = duckdb.connect()
+                con.execute("SET enable_progress_bar = false")
+                evidence = con.execute(
+                    f"SELECT * FROM read_csv('{cfg.SEARCH_OUTPUT_PATH}', delim='\t', header=true) "
+                    f"WHERE peptide_q <= {sage_q_cutoff} "
+                    f"AND spectrum_q <= {sage_q_cutoff} "
+                    f"AND protein_q <= {sage_q_cutoff}"
+                ).df()
+                con.close()
+                logging.info(
+                    "Loaded %s Sage PSMs passing q<=%s (spectrum/peptide/protein) from %s",
+                    len(evidence),
+                    sage_q_cutoff,
+                    cfg.SEARCH_OUTPUT_PATH,
                 )
                 evidence = sage_parser(
                     evidence,
                     rt_window=cfg.PREPARE_DICT.SAGE.RT_WINDOW,
                     im_window=cfg.PREPARE_DICT.SAGE.IM_WINDOW,
+                    q_value_cutoff=sage_q_cutoff,
                 )
             case "fragpipe":
                 evidence = pd.DataFrame()

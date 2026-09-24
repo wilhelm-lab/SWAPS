@@ -60,6 +60,7 @@ def nested_yaml(tmp_path):
             "SAGE": {
                 "RT_WINDOW": 1.5,
                 "IM_WINDOW": 0.2,
+                "Q_VALUE_CUTOFF": 0.05,
             },
         },
     }
@@ -98,7 +99,7 @@ class TestGetCfgDefaults:
             assert hasattr(cfg.PREPARE_DICT.REF, key), f"Missing PREPARE_DICT.REF.{key}"
 
     def test_prepare_dict_sage_keys_present(self, cfg):
-        for key in ["RT_WINDOW", "IM_WINDOW"]:
+        for key in ["RT_WINDOW", "IM_WINDOW", "Q_VALUE_CUTOFF"]:
             assert hasattr(cfg.PREPARE_DICT.SAGE, key), f"Missing PREPARE_DICT.SAGE.{key}"
 
     def test_prepare_dict_ok_keys_present(self, cfg):
@@ -146,6 +147,9 @@ class TestGetCfgDefaults:
         """Zero values trigger auto-detection."""
         assert cfg.PREPARE_DICT.SAGE.RT_WINDOW == 0.0
         assert cfg.PREPARE_DICT.SAGE.IM_WINDOW == 0.0
+
+    def test_default_sage_q_value_cutoff(self, cfg):
+        assert cfg.PREPARE_DICT.SAGE.Q_VALUE_CUTOFF == 0.01
 
     def test_cfg_is_mutable_after_get_defaults(self, cfg):
         """get_cfg_defaults should return an unfrozen copy, ready to merge."""
@@ -196,6 +200,7 @@ class TestNestedSubNodeMerge:
         cfg.merge_from_file(nested_yaml)
         assert cfg.PREPARE_DICT.SAGE.RT_WINDOW == 1.5
         assert cfg.PREPARE_DICT.SAGE.IM_WINDOW == 0.2
+        assert cfg.PREPARE_DICT.SAGE.Q_VALUE_CUTOFF == 0.05
 
     def test_unrelated_defaults_unchanged(self, cfg, nested_yaml):
         cfg.merge_from_file(nested_yaml)
