@@ -1,6 +1,12 @@
 """Adapter that reshapes MaxQuant ``evidence.txt`` into the FragPipe/IonQuant
 ``combined_ion.tsv`` layout consumed by the SWAPS-vs-baseline benchmark plots
 (one row per ion, ``<run> Match Type`` / ``<run> Intensity`` columns per run).
+
+Also the dispatch point for every baseline tool the benchmark scripts compare SWAPS
+against (``load_baseline_combined_ions`` / ``baseline_label`` /
+``is_single_cutoff_baseline``): FragPipe/IonQuant ``combined_ion.tsv`` as-is, MaxQuant
+``evidence.txt`` via this module, Sage ``results.sage.tsv`` (+ ``lfq.tsv``) via
+sage_baseline.
 """
 
 import re
@@ -10,6 +16,7 @@ from typing import Optional, Union
 import pandas as pd
 
 MQ_EVIDENCE_NAME = "evidence.txt"
+SAGE_RESULTS_NAME = "results.sage.tsv"  # == sage_baseline.SAGE_RESULTS_NAME (kept here so dispatch needs no import)
 _FASTA_ACC_RE = re.compile(r"^>(?:\w+\|)?([^|\s]+)(?:\|(\S+))?")
 # MaxQuant runs launched from Windows record parameters.txt paths as
 # "W:\ORIGINS\data\...", where W: is that Windows box's mapped drive letter for
@@ -142,25 +149,63 @@ def mq_evidence_to_combined_ion(
     return out
 
 
-def load_baseline_combined_ions(search_output: Union[str, Path]) -> pd.DataFrame:
-    """Baseline (IonQuant/MaxQuant) combined-ion table for a SWAPS run's *search_output*.
-
-    Accepts a ``combined_ion.tsv`` path, a FragPipe dir holding one, or a MaxQuant
-    ``evidence.txt`` (or its ``txt/`` dir), dispatching to the matching reader.
-    """
+def _resolve_search_output_file(search_output: Union[str, Path]) -> Path:
+    """*search_output* as a file path: a dir resolves to the first of evidence.txt
+    (MaxQuant), results.sage.tsv (Sage), combined_ion.tsv (FragPipe) it holds."""
     p = Path(search_output)
     if p.is_dir():
-        p = p / MQ_EVIDENCE_NAME if (p / MQ_EVIDENCE_NAME).exists() else p / "combined_ion.tsv"
-    df = mq_evidence_to_combined_ion(p) if p.name == MQ_EVIDENCE_NAME else pd.read_csv(p, sep="\t")
+        for name in (MQ_EVIDENCE_NAME, SAGE_RESULTS_NAME):
+            if (p / name).exists():
+                return p / name
+        return p / "combined_ion.tsv"
+    return p
+
+
+def load_baseline_combined_ions(
+    search_output: Union[str, Path],
+    dict_ref: Optional[Union[pd.DataFrame, str, Path]] = None,
+    lfq_q_cutoff: Optional[float] = None,
+) -> pd.DataFrame:
+    """Baseline (IonQuant/MaxQuant/Sage) combined-ion table for a SWAPS run's *search_output*.
+
+    Accepts a ``combined_ion.tsv`` path, a FragPipe dir holding one, a MaxQuant
+    ``evidence.txt`` (or its ``txt/`` dir) or a Sage ``results.sage.tsv`` (or its
+    dir, next to ``lfq.tsv``), dispatching to the matching reader. *dict_ref* (the
+    SWAPS run's dict_ref, DataFrame or pickle path) is only used for Sage, where it
+    supplies the per-run identifications instead of re-parsing results.sage.tsv;
+    *lfq_q_cutoff* filters Sage's lfq.tsv by its own q_value (see
+    sage_baseline.sage_to_combined_ion); other tools ignore both.
+    """
+    p = _resolve_search_output_file(search_output)
+    if p.name == MQ_EVIDENCE_NAME:
+        df = mq_evidence_to_combined_ion(p)
+    elif p.name == SAGE_RESULTS_NAME:
+        from .sage_baseline import sage_to_combined_ion
+
+        df = sage_to_combined_ion(p, dict_ref=dict_ref, lfq_q_cutoff=lfq_q_cutoff)
+    else:
+        df = pd.read_csv(p, sep="\t")
     df.attrs["baseline_label"] = baseline_label(p)
     return df
 
 
 def baseline_label(search_output: Union[str, Path]) -> str:
     """Display name of the baseline tool behind *search_output* (see load_baseline_combined_ions)."""
-    p = Path(search_output)
-    is_mq = p.name == MQ_EVIDENCE_NAME or (p.is_dir() and (p / MQ_EVIDENCE_NAME).exists())
-    return "MaxQuant" if is_mq else "IonQuant"
+    name = _resolve_search_output_file(search_output).name
+    return {MQ_EVIDENCE_NAME: "MaxQuant", SAGE_RESULTS_NAME: "Sage"}.get(name, "IonQuant")
+
+
+def has_lfq_q_sweep(search_output: Union[str, Path]) -> bool:
+    """True for baselines whose quantification output carries its own q-value that
+    load_baseline_combined_ions(lfq_q_cutoff=...) can sweep (Sage's lfq.tsv)."""
+    return _resolve_search_output_file(search_output).name == SAGE_RESULTS_NAME
+
+
+def is_single_cutoff_baseline(search_output: Union[str, Path]) -> bool:
+    """True for baselines with one fixed result set and no per-FDR-cutoff re-runs
+    (MaxQuant evidence.txt, Sage results.sage.tsv) -- unlike IonQuant, whose
+    ``<stem><fdr>/combined_ion.tsv`` sibling dirs give one table per cutoff."""
+    return _resolve_search_output_file(search_output).name in (MQ_EVIDENCE_NAME, SAGE_RESULTS_NAME)
 
 
 def species_from_proteins(proteins: pd.Series, evidence_path: Union[str, Path]) -> pd.Series:
