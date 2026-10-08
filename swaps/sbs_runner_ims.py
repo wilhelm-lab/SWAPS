@@ -71,6 +71,11 @@ from postprocessing.direct_lfq import (
     undistinguishable_excl_output_name,
 )
 
+from swaps.evaluation.pipecho import (
+    resolve_select_by,
+    select_censored_combination,
+    censoring,
+)
 # Clear existing logging handlers
 for handler in logging.root.handlers[:]:
     logging.root.removeHandler(handler)
@@ -201,6 +206,18 @@ def opt_scan_by_scan(config_path: str):
                 before - len(evidence),
                 excluded_raw,
             )
+        if cfg.PIPECHO.ENABLED:
+            select_by = resolve_select_by(evidence, cfg.PIPECHO.SELECT_BY)
+            censored_combination = select_censored_combination(
+                evidence, select_by,
+                n_per_run=cfg.PIPECHO.N_PER_RUN,
+                seed=cfg.PIPECHO.SEED,
+                descending=cfg.PIPECHO.SELECT_DESCENDING,
+            )
+            censored_combination.to_csv(
+                os.path.join(cfg.RESULT_PATH, "pipecho_censored_combination.csv"), index=False)
+            evidence = censoring(evidence, censored_combination)
+        
         dict_ref = construct_dict_from_search_pivoted(
             cfg_prepare_dict=cfg.PREPARE_DICT,
             evidence=evidence,  # type: ignore
@@ -334,6 +351,12 @@ def opt_scan_by_scan(config_path: str):
                 logging.info("Loading non-IMS mzML data from %s", data_path)
                 ms1scans = load_mzml(data_path, unify_format=True)
                 ms1scans.set_index("MS1_frame_idx", inplace=True, drop=False)
+                run_dir = os.path.join(cfg.RESULT_PATH, dir_wo_extension)
+                os.makedirs(run_dir, exist_ok=True)
+                ms1scans[["MS1_frame_idx", "Time_minute"]].to_csv(
+                    os.path.join(run_dir, "ms1scans.csv"), index=False)
+                logging.info("Saved ms1scans.csv for %s (%d MS1 frames)",
+                             dir_wo_extension, len(ms1scans))
                 mobility_values_df = None
                 data = None
                 
@@ -434,11 +457,28 @@ def opt_scan_by_scan(config_path: str):
     # broad_alignment_vis, peak_detection_2d) that a naive directory listing
     # would wrongly treat as raw files, breaking downstream lookups like
     # dict_ref's per-raw-file MS1_frame_idx_left_ref_<raw_file> columns.
-    raw_file_list = [
-        os.path.basename(dot_d_path).split(".")[0]
-        for data_path in cfg.DATA_PATH
-        for dot_d_path in get_dot_d_paths(data_path, cfg.EXCLUDE_DATASET_NAME)
-    ]
+    if cfg.USE_IMS:
+        raw_file_list = [
+            os.path.basename(dot_d_path).split(".")[0]
+            for data_path in cfg.DATA_PATH
+            for dot_d_path in get_dot_d_paths(data_path, cfg.EXCLUDE_DATASET_NAME)
+        ]
+    else:
+        exclude_names = cfg.EXCLUDE_DATASET_NAME or []
+        raw_file_list = []
+        for data_path in cfg.DATA_PATH:
+            if os.path.isdir(data_path):
+                raw_file_list.extend(
+                    f.rsplit(".", 1)[0]
+                    for f in os.listdir(data_path)
+                    if f.endswith(".mzML")
+                    and not f.startswith(".")
+                    and not any(excl in f for excl in exclude_names)
+                )
+            elif os.path.isfile(data_path) and data_path.endswith(".mzML"):
+                base = os.path.basename(data_path)
+                if not base.startswith(".") and not any(excl in base for excl in exclude_names):
+                    raw_file_list.append(base.rsplit(".", 1)[0])
 
     # One-time preprocessing: merge frame-partitioned parquets into a single
     # mz_rank-sorted parquet per directory so workers can skip row groups.
@@ -484,6 +524,11 @@ def opt_scan_by_scan(config_path: str):
             )
 
         if cfg.MATCH_FEATURES_KWARGS.broad_alignment.image_based.enabled:
+            _dot_d_paths = [
+                p
+                for data_path in cfg.DATA_PATH
+                for p in get_dot_d_paths(data_path, cfg.EXCLUDE_DATASET_NAME)
+            ]
             image_based_table_path = os.path.join(
                 cfg.RESULT_PATH, "broad_alignment_shift_table_global_raw_image.parquet"
             )
@@ -491,6 +536,11 @@ def opt_scan_by_scan(config_path: str):
                 logging.info(
                     "image-based broad_alignment shift table already exists, skipping calibration: %s",
                     image_based_table_path,
+                )
+            elif not _dot_d_paths:
+                logging.warning(
+                    "image-based broad_alignment calibration skipped: no .d files found under DATA_PATH %s",
+                    cfg.DATA_PATH,
                 )
             else:
                 logging.info("Calibrating image-based broad_alignment shift table...")
@@ -508,30 +558,54 @@ def opt_scan_by_scan(config_path: str):
                     max_workers=cfg.N_CPU,
                 )
 
-    (
-        matches_target,
-        matches_decoy,
-        pp_reference,
-        pp_match_target,
-        pp_match_decoy,
-        df_no_quant,
-        df_no_match,
-        snap_log_collection,
-    ) = match_features_batches_parallel(
-        dict_ref=dict_ref,
-        raw_file_list=raw_file_list,
-        result_dir=cfg.RESULT_PATH,
-        peptide_indicies=dict_ref["mz_rank"].values,  # type: ignore
-        batch_size_max=cfg.MATCH_FEATURES_KWARGS.batching.batch_size_max,
-        max_workers=cfg.N_CPU,
-        processing_kwargs=processing_kwargs,
-        # Decoys only exist to feed Mokapot/percolator FDR control below —
-        # skip generating them entirely when FDR is disabled.
-        match_decoy=cfg.FDR.ENABLED,
-        merge_confounders_enabled=cfg.PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED,
-        oversize_multiplier=cfg.MATCH_FEATURES_KWARGS.batching.oversize_multiplier,
-        oversize_batch_size=cfg.MATCH_FEATURES_KWARGS.batching.oversize_batch_size,
-    )
+    if cfg.USE_IMS:
+        (
+            matches_target,
+            matches_decoy,
+            pp_reference,
+            pp_match_target,
+            pp_match_decoy,
+            df_no_quant,
+            df_no_match,
+            snap_log_collection,
+        ) = match_features_batches_parallel(
+            dict_ref=dict_ref,
+            raw_file_list=raw_file_list,
+            result_dir=cfg.RESULT_PATH,
+            peptide_indicies=dict_ref["mz_rank"].values,  # type: ignore
+            batch_size_max=cfg.MATCH_FEATURES_KWARGS.batching.batch_size_max,
+            max_workers=cfg.N_CPU,
+            processing_kwargs=processing_kwargs,
+            # Decoys only exist to feed Mokapot/percolator FDR control below —
+            # skip generating them entirely when FDR is disabled.
+            match_decoy=cfg.FDR.ENABLED,
+            merge_confounders_enabled=cfg.PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED,
+            oversize_multiplier=cfg.MATCH_FEATURES_KWARGS.batching.oversize_multiplier,
+            oversize_batch_size=cfg.MATCH_FEATURES_KWARGS.batching.oversize_batch_size,
+        )
+    else:
+        (
+            matches_target,
+            matches_decoy,
+            pp_reference,
+            pp_match_target,
+            pp_match_decoy,
+            df_no_quant,
+            df_no_match,
+            snap_log_collection,
+        ) = match_features_batches_parallel_non_ims(
+            dict_ref=dict_ref,
+            raw_file_list=raw_file_list,
+            result_dir=cfg.RESULT_PATH,
+            peptide_indicies=dict_ref["mz_rank"].values,  # type: ignore
+            batch_size_max=cfg.MATCH_FEATURES_KWARGS.batching.batch_size_max,
+            max_workers=cfg.N_CPU,
+            processing_kwargs=processing_kwargs,
+            match_decoy=cfg.FDR.ENABLED,
+            merge_confounders_enabled=cfg.PREPARE_DICT.MERGE_CONFOUNDERS.ENABLED,
+            oversize_multiplier=cfg.MATCH_FEATURES_KWARGS.batching.oversize_multiplier,
+            oversize_batch_size=cfg.MATCH_FEATURES_KWARGS.batching.oversize_batch_size,
+        )
     quant_dir = _quant_dir(cfg)
     os.makedirs(quant_dir, exist_ok=True)
     dfs_to_save = {
@@ -749,6 +823,61 @@ def _build_fdr_feature_cols(
     return tdc_df, _feature_cols
 
 
+def _build_fdr_feature_cols_non_ims(
+    dict_ref: pd.DataFrame,
+    processing_kwargs: dict,
+    matches_target: pd.DataFrame,
+    matches_decoy: pd.DataFrame,
+):
+    """Normalize rt shift, build tdc_df, and select the FDR feature columns
+    available in it for the non-IMS (1D curve) path.
+    Returns (tdc_df, feature_cols).
+    """
+    matches_target_normalized, matches_decoy_normalized = normalize_shift_by_runs(
+        matches_target, matches_decoy, cols_to_scale=["rt_shift"]
+    )
+    tdc_df = combine_matches_target_decoy(
+        matches_target_normalized, matches_decoy_normalized, dict_ref
+    )
+    tdc_df = tdc_df.merge(
+        dict_ref[["mz_rank", "count_confounders"]], on="mz_rank", how="left"
+    )
+    _feature_cols = [
+        "rt_shift_abs_scaled",
+        "rt_shift",
+        "rt_profile_corr",
+        "template_matching_score",
+        "int_sum_log_diff",
+        "count_confounders",
+        "moment_std_diff",
+        "profile_l2_dist",
+        "int_max_log_diff",
+        "deriv_l2_dist",
+        "profile_entropy_diff",
+        "peak_width_ratio",
+        "xcorr_center_ratio",
+        "xcorr_peak_lag",
+        "apex_pos_diff",
+        "rt_length_diff_rel",
+        "apex_offset_in_basin",
+        "basin_dominance",
+        "basin_coverage_diff",
+        "basin_coverage",
+    ]
+
+    _broad_alignment_cfg = processing_kwargs.get("broad_alignment", {})
+    _missing_feature_cols = [c for c in _feature_cols if c not in tdc_df.columns]
+    if _missing_feature_cols:
+        logging.warning(
+            "Feature column(s) %s not present in tdc_df (matches_target/decoy "
+            "predate this feature being added) -- dropping from feature_cols "
+            "for this run instead of failing.",
+            _missing_feature_cols,
+        )
+        _feature_cols = [c for c in _feature_cols if c not in _missing_feature_cols]
+    return tdc_df, _feature_cols
+
+
 def _finalize_fdr_results(
     cfg,
     quant_dir: str,
@@ -918,9 +1047,14 @@ def run_fdr_control_onwards(
     # method instead of picking one.
     _fdr_runs: list[tuple[str, pd.DataFrame]] = []
     if cfg.FDR.ENABLED:
-        tdc_df, _feature_cols = _build_fdr_feature_cols(
-            dict_ref, processing_kwargs, matches_target, matches_decoy
-        )
+        if cfg.USE_IMS:
+            tdc_df, _feature_cols = _build_fdr_feature_cols(
+                dict_ref, processing_kwargs, matches_target, matches_decoy
+            )
+        else:
+            tdc_df, _feature_cols = _build_fdr_feature_cols_non_ims(
+                dict_ref, processing_kwargs, matches_target, matches_decoy
+            )
         fdr_methods = cfg.FDR.METHOD
         assert fdr_methods, "cfg.FDR.METHOD is empty -- must list at least one method."
         for fdr_method in fdr_methods:
