@@ -1971,7 +1971,9 @@ def plot_match_type_comparison(
     digit run number. Use ``label_fn_from_part(n)`` to extract the nth
     underscore-separated field instead.
     ``iq_stack_order`` controls the stacking order for the IonQuant bars
-    independently of ``stack_order`` used for SWAPS.
+    independently of ``stack_order`` used for SWAPS. A baseline table with an ``In LFQ``
+    column (Sage, see postprocessing.sage_baseline) has its rows where that is False --
+    ions with no quantification row at all -- counted as "Not in LFQ" in every run.
     When ``is_quant=True``, columns matching ``swaps_quant_keyword`` /
     ``iq_quant_keyword`` are used instead of Match Type columns: values above
     ``quant_thres`` count as "Quantified", all others as "Not Quantified".
@@ -1990,6 +1992,7 @@ def plot_match_type_comparison(
             "MBR_undistinguished": "#DD8452",
             "unmatched": "#BBBBBB",
             "Zero Quant": "#CCB974",
+            "Not in LFQ": "#8172B3",
             "Quantified": "#55A868",
             "Not Quantified": "#BBBBBB",
         }
@@ -2008,9 +2011,10 @@ def plot_match_type_comparison(
                 "MBR",
                 "MBR_undistinguished",
                 "unmatched",
+                "Not in LFQ",  # baseline-only (see In LFQ); listed here too because _build_counts filters by this
             ]
         if iq_stack_order is None:
-            iq_stack_order = ["MS/MS", "Zero Quant", "MBR", "unmatched"]
+            iq_stack_order = ["MS/MS", "Zero Quant", "MBR", "unmatched", "Not in LFQ"]
 
     def _build_counts(
         df: pd.DataFrame, quant_keyword: Optional[str] = None
@@ -2033,6 +2037,10 @@ def plot_match_type_comparison(
                 counts_dict[label] = vc
         else:
             match_cols = [c for c in df.columns if match_type_col_keyword in c]
+            # Baseline tables can flag ions their quantification output has no row for at
+            # all (Sage's "In LFQ" column): those are their own category in every run
+            # instead of Zero Quant / unmatched.
+            not_in_lfq = ~df["In LFQ"].astype(bool) if "In LFQ" in df.columns else None
             counts_dict = {}
             for col in match_cols:
                 label = label_fn(col)
@@ -2055,6 +2063,8 @@ def plot_match_type_comparison(
                     mt_series = mt_series.mask(
                         (mt_series == "MBR") & missing_or_zero, "unmatched"
                     )
+                if not_in_lfq is not None:
+                    mt_series = mt_series.mask(not_in_lfq, "Not in LFQ")
                 vc = mt_series.value_counts(dropna=True)
                 counts_dict[label] = vc
         counts = pd.DataFrame(counts_dict).T.fillna(0)

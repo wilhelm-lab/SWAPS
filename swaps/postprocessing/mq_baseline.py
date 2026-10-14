@@ -9,14 +9,23 @@ against (``load_baseline_combined_ions`` / ``baseline_label`` /
 sage_baseline.
 """
 
+import logging
+import os
 import re
 from pathlib import Path
 from typing import Optional, Union
 
 import pandas as pd
 
+Logger = logging.getLogger(__name__)
+
 MQ_EVIDENCE_NAME = "evidence.txt"
 SAGE_RESULTS_NAME = "results.sage.tsv"  # == sage_baseline.SAGE_RESULTS_NAME (kept here so dispatch needs no import)
+# When set, a Sage results.sage.tsv baseline is read from <this dir>/<same condition dir>/
+# results.sage.tsv instead of the path a SWAPS run recorded (effective_config.yaml's
+# SEARCH_OUTPUT_PATH) -- to score an existing SWAPS run against a different Sage search
+# (e.g. one re-run with other LFQ settings) without touching the SWAPS dirs.
+SAGE_BASELINE_ROOT_ENV = "SWAPS_SAGE_BASELINE_ROOT"
 _FASTA_ACC_RE = re.compile(r"^>(?:\w+\|)?([^|\s]+)(?:\|(\S+))?")
 # MaxQuant runs launched from Windows record parameters.txt paths as
 # "W:\ORIGINS\data\...", where W: is that Windows box's mapped drive letter for
@@ -151,13 +160,18 @@ def mq_evidence_to_combined_ion(
 
 def _resolve_search_output_file(search_output: Union[str, Path]) -> Path:
     """*search_output* as a file path: a dir resolves to the first of evidence.txt
-    (MaxQuant), results.sage.tsv (Sage), combined_ion.tsv (FragPipe) it holds."""
+    (MaxQuant), results.sage.tsv (Sage), combined_ion.tsv (FragPipe) it holds. A Sage
+    path is redirected under $SWAPS_SAGE_BASELINE_ROOT when that is set (see
+    SAGE_BASELINE_ROOT_ENV)."""
     p = Path(search_output)
     if p.is_dir():
-        for name in (MQ_EVIDENCE_NAME, SAGE_RESULTS_NAME):
-            if (p / name).exists():
-                return p / name
-        return p / "combined_ion.tsv"
+        p = next(
+            (p / name for name in (MQ_EVIDENCE_NAME, SAGE_RESULTS_NAME) if (p / name).exists()),
+            p / "combined_ion.tsv",
+        )
+    root = os.environ.get(SAGE_BASELINE_ROOT_ENV)
+    if root and p.name == SAGE_RESULTS_NAME:
+        p = Path(root) / p.parent.name / p.name
     return p
 
 
@@ -177,6 +191,7 @@ def load_baseline_combined_ions(
     sage_baseline.sage_to_combined_ion); other tools ignore both.
     """
     p = _resolve_search_output_file(search_output)
+    Logger.info("Baseline search output: %s", p)
     if p.name == MQ_EVIDENCE_NAME:
         df = mq_evidence_to_combined_ion(p)
     elif p.name == SAGE_RESULTS_NAME:
@@ -199,6 +214,14 @@ def has_lfq_q_sweep(search_output: Union[str, Path]) -> bool:
     """True for baselines whose quantification output carries its own q-value that
     load_baseline_combined_ions(lfq_q_cutoff=...) can sweep (Sage's lfq.tsv)."""
     return _resolve_search_output_file(search_output).name == SAGE_RESULTS_NAME
+
+
+def lfq_q_cutoff_grid(search_output: Union[str, Path], step: float = 0.01):
+    """0.01-spaced ``lfq_q_cutoff`` values covering the q_value range of a Sage baseline's
+    lfq.tsv (see sage_baseline.lfq_q_cutoff_grid); only meaningful when has_lfq_q_sweep."""
+    from .sage_baseline import lfq_q_cutoff_grid as _grid
+
+    return _grid(_resolve_search_output_file(search_output), step)
 
 
 def is_single_cutoff_baseline(search_output: Union[str, Path]) -> bool:
