@@ -861,7 +861,9 @@ def _match_candidate_mz_and_binned_frame_mz_by_ppm(
     """
     # --- Bin frame m/z into stable bins ---
     mz_min, mz_max = frame_mz.min(), frame_mz.max()
-    bin_edges = np.arange(mz_min, mz_max + bin_width, bin_width)
+    bin_edges = np.arange(
+        np.floor(mz_min / bin_width) * bin_width, mz_max + bin_width, bin_width
+    )
     frame_bin_idx = np.digitize(frame_mz, bin_edges) - 1
 
     # Sum intensities per bin
@@ -886,12 +888,12 @@ def _match_candidate_mz_and_binned_frame_mz_by_ppm(
             )
 
     # --- Map candidate m/z into bins (with ppm tolerance) ---
-    candidate_mz_idx = np.searchsorted(binned_frame_mz, candidate_mz)
+    candidate_mz_idx = np.digitize(candidate_mz, bin_edges) - 1
     candidate_mz_idx = np.clip(candidate_mz_idx, 0, len(binned_frame_mz) - 1)
 
     # ppm check: keep only if candidate fits within tolerance to bin (weighted) center
     dist = np.abs(binned_frame_mz[candidate_mz_idx] - candidate_mz)
-    tol = candidate_mz * ppm_tol / 1e6
+    tol = np.maximum(candidate_mz * ppm_tol / 1e6, bin_width / 2)
     candidate_mz_mask = dist <= tol
     if candidate_mz_mask.sum() == 0:
         Logger.warning("No candidate mz left after ppm filtering!")
